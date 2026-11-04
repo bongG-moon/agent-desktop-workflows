@@ -2,7 +2,9 @@
 
 이 제품의 시험은 소스에 포함된 합성 Windows 앱과 로컬 저장소를 대상으로 한다. 회사 FX, FxMenuAgent, FarPoint 셀 인식, 실제 조회 결과 또는 Excel 내보내기 업무를 검증했다는 뜻이 아니다.
 
-0.1.1에서 단위 및 복구 테스트 103개, 실제 Windows 합성 앱의 녹화 및 영역 입력 16개, 작업 실행 연결 13개가 통과했다. Python 소스 교체와 기존 실행 및 저장 형식의 호환성을 확인한 결과다.
+0.1.2에서는 기존 검증에 실제 마우스/키보드로 수행하는 콤보 선택, 제출 전 입력값, 독립 목록 선택, 조회와 컨텍스트 내보내기의 녹화/재생 검증을 추가했다. 단위 테스트만으로 전체 사용자 흐름의 완성을 주장하지 않는다.
+
+배포 소스의 단위 및 복구 테스트 151개, 실제 Windows 합성 앱 검증 39개가 통과했다. 실제 앱 검증은 기존 녹화/영역 입력 16개, 실행 연결 13개, 전체 사용자 흐름 10개로 구성된다. 전체 흐름에서는 콤보 N, 제출값 Lot-42, 선택 행 Row B가 재생 시 유지됐고 조회와 내보내기 각각 1회 및 새 결과 파일을 확인했다.
 
 ## 재현 명령
 
@@ -13,10 +15,11 @@ python -X utf8 -B tools/build.py
 python -X utf8 -B -m unittest discover -s tests -v
 python -X utf8 -B tools/smoke_native.py --work-dir C:\LocalReview\NativeTest
 python -X utf8 -B tools/smoke_workflows.py --work-dir C:\LocalReview\WorkflowTest --recording C:\LocalReview\NativeTest\recording\draft.json
+python -X utf8 -B tools/smoke_userflow.py --work-dir C:\LocalReview\UserFlowTest
 python -X utf8 -B tools/build.py
 ```
 
-테스트마다 새로운 빈 작업 폴더를 지정한다. 두 `smoke` 명령은 개발자 검증용으로 제공된 C# 합성 앱을 로컬 .NET Framework 컴파일러로 빌드하고, 그 앱만 열어 조작한 뒤 닫는다. 이 시험용 EXE는 제품 ZIP에 포함되지 않으며 일반 녹화/실행 중 생성되지 않는다. 물리 입력을 사용하는 동안 다른 자동화나 사용자의 마우스 입력을 함께 실행하지 않는다. 결과는 지정한 폴더의 `summary.json`에 기록된다.
+테스트마다 새로운 빈 작업 폴더를 지정한다. `smoke` 명령은 개발자 검증용으로 제공된 C# 합성 앱을 로컬 .NET Framework 컴파일러로 빌드하고, 그 앱만 열어 조작한 뒤 닫는다. 이 시험용 EXE는 제품 ZIP에 포함되지 않으며 일반 녹화/실행 중 생성되지 않는다. 물리 입력을 사용하는 동안 다른 자동화나 사용자의 마우스 입력을 함께 실행하지 않는다. 결과는 지정한 폴더의 `summary.json`에 기록된다.
 
 ## 확인 항목
 

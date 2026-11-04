@@ -235,6 +235,25 @@ class Binding:
         root = root_window(hwnd)
         return root == self.hwnd or bool(user32.IsChild(self.hwnd, hwnd)) or owned(root, self.hwnd)
 
+    def recording_candidate(self, hwnd):
+        """Hook-safe metadata only; detached combo popups still require UIA proof."""
+        return self.contains_window(hwnd) or bool(hwnd and hwnd_pid(hwnd) == self.pid
+            and window_class(root_window(hwnd)) == 'ComboLBox')
+
+    def scoped_windows(self):
+        """Visible selected/owned HWNDs, without inspecting another app's UI."""
+        handles = []
+        callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+        def visit(hwnd, _):
+            if user32.IsWindowVisible(hwnd) and self.contains_window(hwnd):
+                handles.append(int(hwnd))
+            return len(handles) < 64
+        callback = callback_type(visit)
+        _sig(user32, 'EnumWindows', W.BOOL, callback_type, W.LPARAM)(callback, 0)
+        if len(handles) >= 64:
+            raise BridgeError('too_many_related_windows')
+        return handles
+
     def info(self):
         dpi = 96
         try:
@@ -519,16 +538,95 @@ class UIA:
     def observe_point(self, binding, x, y, window=None):
         binding.check()
         hit = window_from_point(x, y)
-        if not binding.contains_window(hit):
+        if hwnd_pid(hit) != binding.pid:
             raise BridgeError('point_outside_target')
         window = int(window if window is not None else root_window(hit))
-        if not binding.contains_window(window):
-            raise BridgeError('outside_target')
+        # Native ComboLBox HWNDs can have no GW_OWNER while their UIA list is
+        # a descendant of the selected combo. Prove that relation on this COM
+        # worker; never widen scope to arbitrary same-process business windows.
+        if not binding.contains_window(hit) or not binding.contains_window(window):
+            window = binding.hwnd
         root, element = self.from_handle(window), self.from_point(x, y)
         if root is None or element is None or self.pid(element) != binding.pid or not self.within(element, root):
             raise BridgeError('point_identity_unproven')
+        element = self.point_descendant(element, x, y, binding.pid)
+        if element.property(30003) in (50009, 50010) and binding.contains_window(hit):
+            semantic = self.menu_observation(binding, x, y, hit)
+            if semantic is not None:
+                binding.check()
+                return semantic
         binding.check()
-        return {'element': element, 'root': root, 'window': window, 'node': self.node(element, root)}
+        observed = {'element': element, 'root': root, 'window': window, 'hit_window': hit,
+                    'node': self.node(element, root)}
+        combo = self.combo_observation(observed)
+        observed['combo'] = combo
+        return observed
+
+    def menu_observation(self, binding, x, y, hit):
+        """A submenu's empty HWND peer may expose items under its owned parent."""
+        windows = binding.scoped_windows()
+        windows.sort(key=lambda h: (h == binding.hwnd, h != root_window(hit)))
+        found, count = [], 0
+        for hwnd in windows:
+            root = self.from_handle(hwnd)
+            if root is None or self.pid(root) != binding.pid:
+                return None
+            pending = deque([(root, 0)])
+            while pending:
+                element, depth = pending.popleft()
+                count += 1
+                if count > 2500 or depth > 18 or self.pid(element) != binding.pid:
+                    return None
+                if element.property(30003) == 50011 and element.property(30022) is False:
+                    bounds = self.bounds(element)
+                    if (bounds['width'] > 0 and bounds['height'] > 0
+                            and bounds['x'] <= x < bounds['x'] + bounds['width']
+                            and bounds['y'] <= y < bounds['y'] + bounds['height']
+                            and not any(self.same(element, prior['element']) for prior in found)):
+                        found.append({'element': element, 'root': root, 'window': hwnd,
+                                      'hit_window': hit, 'combo': None})
+                pending.extend((child, depth + 1) for child in self.children(element))
+        if len(found) != 1 or window_from_point(x, y) != hit:
+            return None
+        result = found[0]
+        result['node'] = self.node(result['element'], result['root'])
+        return result
+
+    def point_descendant(self, element, x, y, pid):
+        """Resolve providers that hit-test a menu container instead of its item."""
+        if element.property(30003) not in (50009, 50010, 50032):
+            return element
+        candidates, pending, visited = [], [(element, 0)], 0
+        while pending:
+            current, depth = pending.pop()
+            visited += 1
+            if visited > 150 or depth >= 8:
+                return element
+            inside = []
+            for child in self.children(current):
+                if self.pid(child) != pid or child.property(30022) is not False:
+                    continue
+                rect = self.bounds(child)
+                if rect['width'] > 0 and rect['height'] > 0 and rect['x'] <= x < rect['x'] + rect['width'] and rect['y'] <= y < rect['y'] + rect['height']:
+                    inside.append(child)
+            if inside:
+                pending.extend((child, depth + 1) for child in inside)
+            elif depth:
+                candidates.append(current)
+        return candidates[0] if len(candidates) == 1 else element
+
+    def combo_observation(self, observation):
+        """Find a writable combo only through this observation's proven ancestry."""
+        if 'combo' in observation:
+            return observation['combo']
+        root, current = observation['root'], observation['element']
+        for _ in range(16):
+            if current is None or self.same(current, root):
+                return None
+            if current.property(30003) == 50003 and 'SetValue' in self.actions(current):
+                return dict(observation, element=current, node=self.node(current, root))
+            current = self.parent(current)
+        return None
 
 
 def observe_point(binding, x, y, window=None, *, uia=None):

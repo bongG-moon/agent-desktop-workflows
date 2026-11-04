@@ -96,6 +96,60 @@ class BridgeTests(unittest.TestCase):
              patch.object(w, 'root_window', return_value=901), patch.object(w, 'owned', return_value=False):
             self.assertFalse(binding.contains_window(901))
 
+    def test_detached_combo_candidate_needs_worker_proof_and_not_sibling_scope(self):
+        binding = object.__new__(w.Binding)
+        binding.pid, binding.hwnd = 123, 900
+        binding.contains_window = MagicMock(return_value=False)
+        with patch.object(w, 'hwnd_pid', return_value=123), patch.object(w, 'root_window', return_value=901), \
+             patch.object(w, 'window_class', return_value='ComboLBox'):
+            self.assertTrue(binding.recording_candidate(901))
+        with patch.object(w, 'hwnd_pid', return_value=123), patch.object(w, 'root_window', return_value=901), \
+             patch.object(w, 'window_class', return_value='IndependentBusinessWindow'):
+            self.assertFalse(binding.recording_candidate(901))
+
+    def test_detached_popup_observation_requires_uia_ancestry_of_selected_root(self):
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.contains_window.return_value = False
+        uia = object.__new__(w.UIA)
+        option = Properties({30003: 50007})
+        uia.from_handle = MagicMock(return_value='main-root')
+        uia.from_point = MagicMock(return_value=option)
+        uia.pid = MagicMock(return_value=123)
+        uia.within = MagicMock(return_value=True)
+        uia.point_descendant = MagicMock(return_value=option)
+        uia.combo_observation = MagicMock(return_value=None)
+        uia.node = MagicMock(return_value={'name': 'N'})
+        with patch.object(w, 'window_from_point', return_value=901), patch.object(w, 'hwnd_pid', return_value=123):
+            result = uia.observe_point(binding, 10, 20, 901)
+            self.assertEqual(result['window'], 900)
+            self.assertEqual(result['hit_window'], 901)
+            uia.within.assert_called_with(option, 'main-root')
+            uia.within.return_value = False
+            with self.assertRaisesRegex(w.BridgeError, 'point_identity_unproven'):
+                uia.observe_point(binding, 10, 20, 901)
+
+    def test_empty_submenu_peer_uses_unique_item_under_owned_parent(self):
+        root, context, empty = [Properties({30003: 50032}) for _ in range(3)]
+        item = Properties({30003: 50011, 30022: False})
+        uia = object.__new__(w.UIA)
+        binding = MagicMock(pid=123, hwnd=10)
+        binding.scoped_windows.return_value = [10, 20, 30]
+        uia.from_handle = lambda hwnd: {10: root, 20: context, 30: empty}[hwnd]
+        uia.pid = lambda element: 123
+        tree = {root: [], context: [item], empty: [], item: []}
+        uia.children = lambda element: iter(tree[element])
+        uia.same = lambda first, second: first is second
+        uia.bounds = lambda element: {'x': 100, 'y': 100, 'width': 100, 'height': 30}
+        uia.node = lambda element, parent: {'name': 'Export to Excel', 'locator': {'name': 'Export to Excel'}}
+        with patch.object(w, 'root_window', return_value=30), patch.object(w, 'window_from_point', return_value=30):
+            found = uia.menu_observation(binding, 150, 110, 30)
+            self.assertIs(found['element'], item)
+            self.assertIs(found['root'], context)
+            self.assertEqual(found['window'], 20)
+            other = Properties({30003: 50011, 30022: False})
+            tree[root] = [other]; tree[other] = []
+            self.assertIsNone(uia.menu_observation(binding, 150, 110, 30))
+
     def _point_context(self, *, role='group', path='0/1', complete=True, secure=False, partial=False):
         binding = MagicMock(pid=123, hwnd=900)
         element = Properties({30019: False, 30010: True, 30022: False})

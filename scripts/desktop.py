@@ -21,6 +21,7 @@ BRIDGE = ROOT / 'scripts' / 'py_helper.py'
 BRIDGE_SOURCES = ('scripts/py_helper.py', 'scripts/win_bridge.py', 'scripts/recorder.py')
 MAX_JSON = 16 * 1024 * 1024
 ALIASES = {'edit': 'textfield', 'pane': 'group', 'listitem': 'listitem',
+           'listbox': 'list', 'option': 'listitem',
            'menu item': 'menuitem', 'combo box': 'combobox', 'check box': 'checkbox'}
 
 
@@ -48,18 +49,44 @@ def read_json(path):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError('invalid_json')))
 
 
-def write_json(path, value):
+def write_json(path, value, *, replace=False):
     path = Path(path)
     local_dir(path.parent)
-    with path.open('x', encoding='utf-8') as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.flush()
-        os.fsync(stream.fileno())
+    if ':' in path.name:
+        raise EngineError('invalid_output_file')
+    data = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+    if len(data.encode('utf-8')) > MAX_JSON:
+        raise EngineError('output_too_large')
+    def validate_destination():
+        local_dir(path.parent)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if path.is_symlink() or getattr(info, 'st_file_attributes', 0) & 1024 or not path.is_file() or info.st_nlink > 1:
+            raise EngineError('invalid_output_file')
+    validate_destination()
+    if not replace:
+        with path.open('x', encoding='utf-8') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return
+    temporary = path.with_name('.output-' + uuid.uuid4().hex + '.tmp')
+    try:
+        with temporary.open('x', encoding='utf-8') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        validate_destination()
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _bridge_script():
     manifest = read_json(ROOT / 'engine' / 'bridge-manifest.json')
-    if manifest.get('version') != '0.1.1' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
+    if manifest.get('version') != '0.1.2' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
         raise EngineError('bridge_manifest_invalid')
     for name in BRIDGE_SOURCES:
         path = ROOT / name
@@ -257,6 +284,25 @@ class DesktopAdapter:
         candidates = [w for w in inventory(self.run_dir) if w.get('pid') == self.binding['pid'] and match(w)
                       and (w.get('owner_hwnd') == self.binding['hwnd']
                            or w.get('root_owner_hwnd') == self.binding['hwnd'])]
+        if len(candidates) > 1:
+            # Nested owned menus commonly share a blank title and WinForms class.
+            # Their live contents must identify exactly one current surface.
+            matches = []
+            for candidate in candidates:
+                candidate_binding = _binding(candidate)
+                observed = inspect(candidate_binding, self.run_dir)
+                if observed.get('complete') is not True:
+                    raise EngineError('related_window_unproven')
+                try:
+                    resolve(observed.get('nodes', []), step.get('target', {}).get('locator'))
+                except EngineError as error:
+                    if str(error) == 'target_missing':
+                        continue
+                    raise EngineError('related_window_unproven') from error
+                matches.append((candidate_binding, observed))
+            if len(matches) == 1:
+                return matches[0]
+            raise EngineError('related_window_unproven')
         if len(candidates) != 1:
             raise EngineError('related_window_unproven')
         binding = _binding(candidates[0])

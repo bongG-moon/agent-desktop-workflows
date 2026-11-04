@@ -112,9 +112,12 @@ class Runner:
             raise StoreError("invalid_repair_continuation")
         return child_id
 
-    def start(self, workflow_id, binding, parameters=None):
+    def start(self, workflow_id, binding, parameters=None, *, expected_revision=None):
         self._cancel.clear()
         workflow = self.store.load(workflow_id)
+        if expected_revision is not None and (type(expected_revision) is not int
+                                               or workflow["revision"] != expected_revision):
+            raise StoreError("workflow_revision_changed")
         binding = _binding(binding, workflow)
         values = _parameters(workflow, parameters)
         run_id = uuid.uuid4().hex
@@ -148,6 +151,11 @@ class Runner:
                     raise StoreError("no_pending_confirmation")
                 return run
             if confirm_step_id is not None:
+                if run.get("diagnostic") == "completed_prefix_condition_changed":
+                    # Confirming a later manual/opaque action could otherwise remove
+                    # the failed checkpoint before it is read again. Require a plain
+                    # resume with the condition restored first, even for CLI callers.
+                    raise StoreError("completed_prefix_condition_changed")
                 pending = next((entry for entry in run["steps"] if entry["status"] not in DONE), None)
                 if pending is None or pending["id"] != confirm_step_id or pending["status"] not in ATTEMPTED:
                     raise StoreError("confirmation_step_mismatch")
@@ -157,7 +165,7 @@ class Runner:
             with self.store.lock("target-" + str(binding["pid"]) + "-" + str(binding["hwnd"])):
                 run["status"] = "running"
                 self._publish(run)
-                return self._drive(run)
+                return self._drive(run, recheck_prefix=True)
 
     def fork_repaired(self, run_id, binding):
         """Continue an explicitly repaired revision without replaying completed inputs."""
@@ -243,30 +251,101 @@ class Runner:
         self._publish(run)
         return run
 
-    def _drive(self, run):
+    def _condition_key(self, run, target, kind):
+        """Only merge declarations with the same explicit window and locator."""
+        if not isinstance(target, dict) or not target.get("locator"):
+            return None
+        window = target.get("window") or {key: run["workflow"]["target"][key]
+                                         for key in ("title", "class_name")}
+        return kind, json.dumps({"window": window, "locator": target["locator"]}, sort_keys=True)
+
+    def _recheck_prefix(self, run, adapter):
+        end = run.get("repair_prefix_pending")
+        completed_end = next((i for i, entry in enumerate(run["steps"]) if entry["status"] not in DONE),
+                             len(run["steps"]))
+        if end is None:
+            end = completed_end
+        if type(end) is not int or not 0 <= end <= len(run["steps"]):
+            raise StoreError("invalid_repair_prefix")
+        end = max(end, completed_end)
+        if any(entry["status"] not in DONE and not ("repair_prefix_pending" in run
+                and entry["status"] == "needs_review"
+                and entry.get("reason") == "completed_prefix_condition_changed") for entry in run["steps"][:end]):
+            raise StoreError("invalid_repair_prefix")
+        checkpoints = {}
+        writes = {"set-value": "value", "type": "value", "select": "value", "clear": "value",
+                  "check": "checked", "uncheck": "checked"}
+
+        def invalidate(step):
+            if step["action"] == "wait":
+                return
+            property_kind = writes.get(step["action"])
+            if property_kind:
+                checkpoints.pop(self._condition_key(run, step["target"], property_kind), None)
+            else:
+                # A submitted button, navigation or human action can consume/reset
+                # old fields. Its explicit completion condition establishes new state.
+                checkpoints.clear()
+
+        for step, entry in zip(run["workflow"]["steps"][:end], run["steps"][:end]):
+            invalidate(step)
+            kind = step["expect"]["kind"]
+            if kind not in {"value", "checked"}:
+                continue
+            runtime, value = self._runtime_step(run, step, entry)
+            target = runtime["expect"].get("target", runtime["target"])
+            key = self._condition_key(run, target, kind)
+            if key is not None:
+                checkpoints[key] = runtime, value, entry
+
+        if end < len(run["steps"]):
+            pending = run["steps"][end]
+            if pending["attempts"] and pending["input_dispatched"] is not False:
+                # An uncertain/already delivered action may have superseded an older
+                # condition. Only observe that pending action; never replay its prefix.
+                invalidate(run["workflow"]["steps"][end])
+        for runtime, value, entry in checkpoints.values():
+            if self._cancel.is_set():
+                run["status"] = "cancelled"
+                self._publish(run)
+                return False
+            checked = self._check(adapter, runtime, value)
+            entry["resume_recheck"] = checked
+            if checked["matched"] is not True:
+                # Preserve the completed action's receipt and status. A changed
+                # checkpoint is not a new attempt and cannot be confirmed as one.
+                entry["reason"] = "completed_prefix_condition_changed"
+                run.update(status="needs_review", diagnostic="completed_prefix_condition_changed",
+                           current_step_id=entry["id"])
+                self._publish(run)
+                return False
+            if entry.get("reason") == "completed_prefix_condition_changed":
+                if entry["status"] == "needs_review" and "repair_prefix_pending" in run:
+                    entry.update(status="skipped_confirmed" if entry.get("confirmation") else "verified")
+                entry.pop("reason")
+        for entry in run["steps"][:end]:
+            if entry.get("reason") == "completed_prefix_condition_changed":
+                # Compatibility with 0.1.1 repair journals, which changed a
+                # completed prefix entry into needs_review under this marker.
+                if entry["status"] == "needs_review" and "repair_prefix_pending" in run:
+                    entry.update(status="skipped_confirmed" if entry.get("confirmation") else "verified")
+                entry.pop("reason")
+        if "repair_prefix_pending" in run:
+            del run["repair_prefix_pending"]
+        if run.get("diagnostic") == "completed_prefix_condition_changed":
+            run.pop("diagnostic")
+        self._publish(run)
+        return True
+
+    def _drive(self, run, *, recheck_prefix=False):
         try:
             adapter = self._open_adapter(run)
         except (Exception, KeyboardInterrupt) as error:
             run.update(status="needs_review", diagnostic=str(error) if isinstance(error, StoreError) else "adapter_unavailable")
             self._publish(run)
             return run
-        if "repair_prefix_pending" in run:
-            end = run["repair_prefix_pending"]
-            if type(end) is not int or not 0 <= end <= len(run["steps"]):
-                raise StoreError("invalid_repair_prefix")
-            for step, entry in zip(run["workflow"]["steps"][:end], run["steps"][:end]):
-                if step["expect"]["kind"] not in {"value", "checked"}:
-                    continue
-                runtime, value = self._runtime_step(run, step, entry)
-                checked = self._check(adapter, runtime, value)
-                entry["repair_recheck"] = checked
-                if checked["matched"] is not True:
-                    run["current_step_id"] = entry["id"]
-                    return self._review(run, entry, "completed_prefix_condition_changed")
-                if entry["status"] == "needs_review" and entry.get("reason") == "completed_prefix_condition_changed":
-                    entry.update(status="verified", verification="repair_prefix_readback")
-            del run["repair_prefix_pending"]
-            self._publish(run)
+        if (recheck_prefix or "repair_prefix_pending" in run) and not self._recheck_prefix(run, adapter):
+            return run
         for step, entry in zip(run["workflow"]["steps"], run["steps"]):
             if entry["status"] in DONE:
                 continue
@@ -291,7 +370,7 @@ class Runner:
                 return self._review(run, entry, "manual_step")
             if step["target"]["kind"] == "region" and step["target"].get("reviewed") is not True:
                 return self._review(run, entry, "region_requires_review")
-            if "prepared" not in entry:
+            if "prepared" not in entry or step["action"] != "wait":
                 try:
                     prepare = getattr(adapter, "prepare", None)
                     prepared = prepare(runtime, value) if prepare else {}
@@ -301,8 +380,10 @@ class Runner:
                     self._publish(run)
                     runtime, value = self._runtime_step(run, step, entry)
                 except (Exception, KeyboardInterrupt):
-                    # Read-only preparation failed; no dispatch was started. A later resume may
-                    # prepare again, unlike a started/uncertain action which must never repeat.
+                    # Unattempted input always gets a current baseline on entry to this
+                    # drive. A prior prepared-then-cancelled baseline cannot prove a later
+                    # input's result. Read-only waits keep their original observation period;
+                    # started/uncertain actions take the readback-only branch above.
                     entry.update(reason="preparation_unavailable")
                     run["status"] = "needs_review"
                     self._publish(run)
@@ -337,6 +418,22 @@ class Runner:
                           "effect_verification": "unavailable", "diagnostic": "execution_interrupted"}
             entry.update(result=result, input_dispatched=result["input_dispatched"])
             self._publish(run)  # The dispatch result survives a later failed or interrupted readback.
+            if (result["input_dispatched"] is True and result.get("status") == "uncertain"
+                    and result.get("delivery") in {"delivered_verified", "delivered_unverified"}
+                    and result.get("diagnostic") == "snapshot_unavailable"
+                    and result.get("after_snapshot_available") is False
+                    and step["expect"]["kind"] in {"file", "value", "checked", "exists"}):
+                # A menu can close after a known-delivered export and make its own
+                # after-snapshot unavailable. Read the declared independent result
+                # once with the original baseline; never send the action again or
+                # rewrite the uncertain engine receipt as a successful delivery.
+                checked = self._check(adapter, runtime, value)
+                entry["check"] = checked
+                if checked["matched"] is True:
+                    entry.update(status="verified", verification="independent_postcondition_after_snapshot_unavailable")
+                    self._publish(run)
+                    continue
+                return self._review(run, entry, "postcondition_unverified")
             if result["input_dispatched"] is None or result.get("status") in {"uncertain", "interrupted"}:
                 return self._review(run, entry, "delivery_uncertain")
             if result.get("status") in {"blocked", "not_delivered", "verification_failed"}:

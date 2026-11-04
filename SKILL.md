@@ -3,7 +3,7 @@ name: agent-desktop-workflows
 description: Windows 업무 작업을 사용자의 시연으로 녹화하고, 단계별 인식 상태를 보완한 뒤 작업 이름과 입력 조건으로 재생한다. 로컬 명령과 파일 도구가 있는 사내 모델 환경에서 사용하며 기존 CUA MCP와 독립적으로 동작한다.
 ---
 
-# Agent Desktop Workflows 0.1.1
+# Agent Desktop Workflows 0.1.2
 
 이 스킬은 별도 제품이다. 기존 CUA MCP 또는 Agent Desktop Local을 실행하거나 그 설정, 저장소, 녹화 파일을 변경하지 않는다. Windows ZIP에 포함된 기존 `bin/agent-desktop.exe`와 64비트 Python 3.10 이상을 사용한다. 창 조회, 녹화와 영역 입력은 `scripts/py_helper.py`, `scripts/win_bridge.py`, `scripts/recorder.py`에서 실행한다. 녹화/편집 화면에는 tkinter가 필요하다. 설치와 첫 사용은 [사용가이드.html](사용가이드.html)을 안내한다.
 
@@ -13,6 +13,8 @@ description: Windows 업무 작업을 사용자의 시연으로 녹화하고, �
 - “저장한 작업 실행”은 [실행 방법](references/usage.md)을 읽고 작업 이름/ID, 현재 대상 창과 입력 변수를 확인해 `cli.py run`을 한 번 호출한다. 모델이 각 단계마다 ref를 복사하거나 임의 PowerShell 코드를 만들지 않는다. 현재 ref는 로컬 실행기가 단계 직전에 찾는다.
 - “한 단계 수정”은 UI의 단계 수정 또는 이 단계 다시 녹화를 사용한다. 이전 녹화와 수정본을 보존한다. 대상 ID와 좌표를 추정해 입력하지 않는다.
 - 중단된 실행은 결과를 확인하고 `resume`을 사용한다. 전달이 불명확한 동작을 새 실행으로 반복하지 않는다. 사람이 직접 확인한 단계만 `--confirm-step`으로 지정한다.
+
+`completed_prefix_condition_changed`는 현재 필요한 조건이 달라졌다는 뜻이다. 화면의 조건을 확인해 복원한 뒤 이어가며, `--confirm-step`으로 우회하지 않는다. 과거 실행 기록 화면에서 새 실행을 시작하려면 **최신 수정본 보기**로 단계와 입력 조건을 다시 확인한다. 조회 결과의 `--output` 파일은 반복 조회 시 갱신할 수 있지만 원본 작업 저장소나 설정 파일을 출력 경로로 사용하지 않는다.
 
 사용자가 이미 요청한 작업 범위의 각 클릭마다 재승인을 요구하지 않는다. 대상 업무 창이 모호하거나 요청 밖의 저장/삭제/전송이 필요하면 해당 지점만 확인한다. 기존 Claude Code의 파일/명령 권한과 회사 정책은 그대로 따른다.
 

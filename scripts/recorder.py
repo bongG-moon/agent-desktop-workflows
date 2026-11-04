@@ -7,6 +7,7 @@ outside the explicitly selected local recording directory.
 from __future__ import annotations
 
 import copy
+from collections import deque
 import ctypes
 from ctypes import wintypes
 import datetime
@@ -293,24 +294,27 @@ class HookPump:
                         x, y = int(m.point.x), int(m.point.y)
                         hit = self.bridge.window_from_point(x, y)
                         scope = self.binding.contains_window(hit)
+                        candidate = scope or self.binding.recording_candidate(hit)
                         button = 'right' if message in (0x204, 0x205) else 'left'
                         if message in (0x202, 0x205) and button in self.pending:
                             previous = self.pending.pop(button)
-                            if scope and abs(x - previous['x']) <= 8 and abs(y - previous['y']) <= 8:
+                            if candidate and abs(x - previous['x']) <= 8 and abs(y - previous['y']) <= 8:
                                 self.last_click = previous
                             else:
                                 self.last_click = None
-                            self._emit({'kind': 'up', 'token': previous['token'], 'x': x, 'y': y, 'inside': scope,
+                            self._emit({'kind': 'up', 'token': previous['token'], 'x': x, 'y': y, 'inside': candidate,
                                         'at': time.monotonic()})
-                        elif not scope:
+                        elif not candidate:
                             if message in (0x201, 0x204, 0x20A, 0x20E):
                                 self.last_click = None
                                 self.notices.put(('outside', None))
+                                self._emit({'kind': 'outside', 'at': time.monotonic()})
                         elif message in (0x201, 0x204):
                             self.sequence += 1
                             event = {'kind': 'down', 'token': self.sequence, 'x': x, 'y': y,
                                      'action': 'right-click' if button == 'right' else 'click',
                                      'window': self.bridge.root_window(hit), 'hit_window': hit,
+                                     'scope_proven': scope,
                                      'at': time.monotonic()}
                             if _double_pair(self.last_click, event, user.GetDoubleClickTime() / 1000,
                                             user.GetSystemMetrics(36), user.GetSystemMetrics(37)):
@@ -319,7 +323,9 @@ class HookPump:
                             self._emit(event)
                         elif message in (0x20A, 0x20E):
                             self.last_click = None
-                            self._emit({'kind': 'scroll', 'at': time.monotonic()})
+                            self._emit({'kind': 'scroll' if scope else 'candidate_scroll', 'x': x, 'y': y,
+                                        'window': self.bridge.root_window(hit), 'hit_window': hit,
+                                        'at': time.monotonic()})
                 except Exception:
                     self.notices.put(('fatal', 'input_observation_failed'))
                 return user.CallNextHookEx(mouse_hook, code, message, data)
@@ -383,8 +389,10 @@ class CaptureWorker(threading.Thread):
         self.watched = None
         self.watched_value = None
         self.watched_step = None
+        self.watched_samples = deque(maxlen=40)
         self.hovered = None
         self.hover_at = 0
+        self.hover_history = deque(maxlen=12)
         self.last_key = 0
         self.last_watch = 0
         self.last_hover = 0
@@ -404,6 +412,7 @@ class CaptureWorker(threading.Thread):
             self.invalidated = True
             self.enabled.clear()
             self.watched = self.watched_step = self.hovered = None
+            self.hover_history.clear()
             self.captures.clear()
             self.notices.put(('fatal', 'target_lifetime_changed'))
             return False
@@ -445,10 +454,14 @@ class CaptureWorker(threading.Thread):
 
     def observe_down(self, event):
         x, y = event['x'], event['y']
-        cached = self.hovered
-        if (cached and cached['window'] == event['window'] and 0 <= event['at'] - self.hover_at < 1.2
-                and _inside(cached['node'].get('bounds'), x, y)):
-            return cached
+        # A queued mouse event can predate the most recent poll. Retain prior
+        # proven observations instead of substituting a post-click container.
+        history = list(self.hover_history) + [(self.hover_at, self.hovered)]
+        for observed_at, cached in reversed(history):
+            if (cached and (cached['window'] == event['window'] or cached.get('hit_window') == event['hit_window'])
+                    and 0 <= event['at'] - observed_at < 1.2
+                    and _inside(cached['node'].get('bounds'), x, y)):
+                return cached
         try:
             if self.bridge.window_from_point(x, y) == event['hit_window']:
                 return self.uia.observe_point(self.binding, x, y, event['window'])
@@ -501,7 +514,7 @@ class CaptureWorker(threading.Thread):
 
     def watch(self, observation):
         if self.uia.secure(observation['element']):
-            self.finalize_watch(True)
+            self.freeze_watch()
             self.model.manual('보호된 입력', 'protected_input_not_recorded')
             return
         value = self.uia.value(observation['element'])
@@ -509,66 +522,123 @@ class CaptureWorker(threading.Thread):
             return
         if self.watched and self.uia.same(self.watched['element'], observation['element']):
             return
-        self.finalize_watch(True)
+        self.freeze_watch()
         self.watched, self.watched_value, self.watched_step = observation, value, None
+        self.watched_samples.clear()
+        self.watched_samples.append((time.monotonic(), value))
 
-    def finalize_watch(self, force):
+    def _drop_watch(self):
+        self.watched = self.watched_step = None
+        self.watched_samples.clear()
+
+    def _manual_watch(self, reason):
+        step = {'id': self.watched_step['id'] if self.watched_step else uuid.uuid4().hex,
+                'label': '입력 내용 보완 필요', 'action': 'manual',
+                'target': {'kind': 'manual', 'locator': {}}, 'expect': {'kind': 'manual'},
+                'recognition': {'target': 'unrecognized', 'action': 'manual',
+                                'result': 'manual', 'reason': reason}}
+        self.model.add(step)
+        self._drop_watch()
+
+    def _commit_value(self, current):
+        if not isinstance(current, str) or '\0' in current or len(current.encode('utf-8')) > MAX_VALUE_BYTES:
+            self._manual_watch('value_readback_unavailable')
+            return
+        try:
+            step = self.step('set-value', self.watched)
+        except RecorderError:
+            self._manual_watch('stable_locator_unavailable')
+            return
+        step.update(value=current, expect={'kind': 'value', 'value': current},
+                    recognition={'target': 'identified', 'action': 'supported', 'result': 'checkable'})
+        if self.watched_step:
+            step['id'] = self.watched_step['id']
+        self.model.add(step)
+        self.watched_step, self.watched_value = step, current
+
+    def freeze_watch(self, cutoff=None):
+        """Commit only evidence observed before a subsequent user transition.
+
+        UIA work can run after the application's click callback. A late read is
+        not evidence of what the user submitted. Keep a bounded history so even
+        a post-click poll cannot replace the last pre-click sample silently.
+        """
+        if not self.watched:
+            return
+        cutoff = time.monotonic() if cutoff is None else cutoff
+        samples = [(at, value) for at, value in self.watched_samples
+                   if at <= cutoff and (not self.last_key or at >= self.last_key + .05)]
+        if not samples:
+            self._manual_watch('value_before_transition_unproven')
+            return
+        self._commit_value(samples[-1][1])
+        self._drop_watch()
+
+    def finalize_watch(self, force, sample_only=False):
         observation = self.watched
         if not observation:
             return
         try:
             if self.uia.secure(observation['element']):
-                self.model.manual('보호된 입력', 'protected_input_not_recorded')
-                self.watched = None
+                self._manual_watch('protected_input_not_recorded')
                 return
             current = self.uia.value(observation['element'])
         except Exception:
             if force:
-                self.model.manual('입력 결과를 읽지 못함', 'value_readback_unavailable')
-                self.watched = None
+                self._manual_watch('value_readback_unavailable')
             return
         if not isinstance(current, str) or '\0' in current or len(current.encode('utf-8')) > MAX_VALUE_BYTES:
             if force:
-                self.model.manual('입력 결과 확인 필요', 'value_readback_unavailable')
-                self.watched = None
+                self._manual_watch('value_readback_unavailable')
             return
-        if current != self.watched_value or force:
-            try:
-                step = self.step('set-value', observation)
-            except RecorderError:
-                self.model.manual('입력 대상 식별 필요', 'stable_locator_unavailable')
-                self.watched = None
-                return
-            step.update(value=current, expect={'kind': 'value', 'value': current},
-                        recognition={'target': 'identified', 'action': 'supported', 'result': 'checkable'})
-            if self.watched_step:
-                step['id'] = self.watched_step['id']
-            self.model.add(step)
-            self.watched_step, self.watched_value = step, current
+        self.watched_samples.append((time.monotonic(), current))
+        if not sample_only and (current != self.watched_value or force):
+            self._commit_value(current)
         if force:
-            self.watched = self.watched_step = None
+            self._drop_watch()
+
+    def combo_for(self, observation):
+        if observation is None:
+            return None
+        return self.uia.combo_observation(observation)
+
+    def continues_watch(self, observation):
+        if not self.watched or observation is None:
+            return False
+        try:
+            combo = self.combo_for(observation)
+            element = combo['element'] if combo else observation['element']
+            return self.uia.same(element, self.watched['element'])
+        except Exception:
+            return False  # A vanished target cannot replace pre-transition input evidence.
 
     def capture_action(self, event, observation):
         if observation is None:
+            self.freeze_watch(event.get('at'))
             self.model.manual('대상을 찾지 못한 클릭', 'capture_target_unavailable')
             return
         node = observation['node']
-        if event['action'] == 'click' and node.get('role') == 'listitem' and self.watched:
-            self.finalize_watch(True)
+        combo = self.combo_for(observation) if event['action'] == 'click' else None
+        if combo:
+            if not self.continues_watch(observation):
+                self.freeze_watch(event.get('at'))
+            self.watch(combo)
+            if node.get('role') == 'listitem':
+                self.finalize_watch(True)
             return
         if self.uia.secure(observation['element']):
-            self.finalize_watch(True)
+            self.freeze_watch(event.get('at'))
             self.model.manual('보호된 입력', 'protected_input_not_recorded')
             return
         if not _locator_valid(node.get('locator')):
-            self.finalize_watch(True)
+            self.freeze_watch(event.get('at'))
             self.model.manual('이름 없는 요소 클릭', 'stable_locator_unavailable')
             return
         actions = node.get('available_actions', [])
         if event['action'] == 'click' and 'SetValue' in actions:
             self.watch(observation)
             return
-        self.finalize_watch(True)
+        self.freeze_watch(event.get('at'))
         if event['action'] == 'click' and 'Check' in actions:
             checked = self.uia.checked(observation['element'])
             if type(checked) is not bool:
@@ -629,13 +699,23 @@ class CaptureWorker(threading.Thread):
         if kind == 'down':
             if self.enabled.is_set():
                 self.model.set_state('recording')
-            self.captures[event['token']] = (event, self.observe_down(event))
+            observation = self.observe_down(event)
+            if not self.continues_watch(observation):
+                self.freeze_watch(event.get('at'))
+            if observation is None and event.get('scope_proven') is False:
+                # Metadata alone was a candidate, never permission to record
+                # unrelated same-PID UI contents or infer a selected option.
+                self.model.manual('팝업 대상 확인 필요', 'popup_scope_unproven')
+                event = dict(event, excluded=True)
+            self.captures[event['token']] = (event, observation)
         elif kind == 'up':
             down, observation = self.captures.pop(event['token'], (None, None))
             if not down:
                 self.model.manual('시작 지점이 없는 클릭', 'capture_target_unavailable')
+            elif down.get('excluded'):
+                return
             elif not event['inside'] or abs(event['x'] - down['x']) > 8 or abs(event['y'] - down['y']) > 8:
-                self.finalize_watch(True)
+                self.freeze_watch(down.get('at'))
                 self.model.manual('드래그 또는 영역 밖 이동', 'drag_needs_review')
             else:
                 time.sleep(.12)
@@ -655,8 +735,14 @@ class CaptureWorker(threading.Thread):
             if not self.watched and event['at'] - self.last_unreadable_input > .8:
                 self.last_unreadable_input = event['at']
                 self.model.manual('입력 대상 확인 필요', 'input_value_unavailable')
+        elif kind == 'outside':
+            self.freeze_watch(event.get('at'))
+        elif kind == 'candidate_scroll':
+            if self.observe_down(event) is not None:
+                self.freeze_watch(event.get('at'))
+                self.model.manual('스크롤 동작', 'scroll_needs_review')
         elif kind in {'scroll', 'enter', 'tab', 'escape', 'shortcut', 'pause'}:
-            self.finalize_watch(True)
+            self.freeze_watch(event.get('at'))
             labels = {'scroll': ('스크롤 동작', 'scroll_needs_review'),
                       'enter': ('Enter 확정 동작', 'keyboard_transition_needs_review'),
                       'tab': ('Tab 이동 동작', 'keyboard_transition_needs_review'),
@@ -678,10 +764,11 @@ class CaptureWorker(threading.Thread):
             self.last_hover = now
             x, y = self.bridge.cursor()
             hit = self.bridge.window_from_point(x, y)
-            if self.binding.contains_window(hit):
+            if self.binding.recording_candidate(hit):
                 try:
                     observation = self.uia.observe_point(self.binding, x, y, self.bridge.root_window(hit))
                     self.hovered, self.hover_at = observation, time.monotonic()
+                    self.hover_history.append((self.hover_at, observation))
                     with self.model.lock:
                         self.model.hover_target = copy.deepcopy(observation['node'].get('locator'))
                 except Exception:
@@ -690,9 +777,11 @@ class CaptureWorker(threading.Thread):
                 self.hovered = None
                 with self.model.lock:
                     self.model.hover_target = None
-        if self.watched and now - self.last_watch > .6 and now - self.last_key > .5:
+        if self.watched and now - self.last_watch > .08:
             self.last_watch = now
-            self.finalize_watch(False)
+            # Observe frequently into bounded memory, but only persist settled
+            # ValuePattern values (never raw keyboard text or partial keystrokes).
+            self.finalize_watch(False, sample_only=now - self.last_key < .5)
 
 
 def record(request):

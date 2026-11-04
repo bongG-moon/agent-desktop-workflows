@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Agent Desktop Workflows"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 ACTION_LABELS = {"click": "클릭", "double-click": "두 번 클릭", "right-click": "우클릭",
     "set-value": "값 설정", "type": "입력", "select": "항목 선택", "expand": "펼치기",
     "collapse": "접기", "check": "체크", "uncheck": "체크 해제", "focus": "포커스",
@@ -62,6 +62,7 @@ def _safe_reason(error):
         "binding_application_mismatch": "녹화한 앱과 현재 선택한 앱이 다릅니다. 대상 업무 창을 다시 선택하세요.",
         "resume_binding_mismatch": "이 실행이 시작된 창과 현재 창이 다릅니다. 원래 업무 창을 선택하세요.",
         "revision_conflict": "다른 수정본이 먼저 저장됐습니다. 작업을 다시 선택해 최신 수정본을 불러오세요.",
+        "workflow_revision_changed": "화면을 연 뒤 작업 수정본이 바뀌었습니다. 최신 수정본을 불러와 내용을 확인한 뒤 실행하세요.",
         "recording_cancelled": "녹화를 취소했습니다. 기존 작업은 유지됩니다.",
         "region_requires_review": "영역 대상의 검토가 필요합니다. 단계 수정에서 기록한 대상과 위치를 확인해 저장한 뒤 수정본으로 이어가세요.",
         "manual_step": "직접 수행하도록 기록한 단계입니다. 실제 작업을 수행한 뒤 현재 단계 확인으로 이어가세요.",
@@ -71,7 +72,7 @@ def _safe_reason(error):
         "wait_condition_unverified": "기다리던 조건이 확인되지 않습니다. 현재 화면과 완료 조건을 확인하세요.",
         "prior_attempt_requires_review": "이전 실행 시도가 있어 자동 반복할 수 없습니다. 저장된 기록과 현재 상태를 확인하세요.",
         "completed_prefix_changed": "이미 마친 앞부분의 정의가 바뀌어 수정본으로 이어갈 수 없습니다.",
-        "completed_prefix_condition_changed": "이미 마친 단계의 현재 상태가 달라졌습니다. 실제 화면을 먼저 확인하세요.",
+        "completed_prefix_condition_changed": "이어하기에 필요한 현재 조건이 달라졌습니다. 해당 조건을 확인하고 원래 상태로 복원한 뒤 이어하기를 다시 선택하세요. 완료 확인으로 건너뛸 수 없습니다.",
         "repair_scope_changed": "입력 변수나 작업 범위가 달라져 이전 실행을 이어갈 수 없습니다.",
         "repair_step_identity_changed": "중단된 단계의 ID가 달라져 이전 실행을 이어갈 수 없습니다.",
         "target_identity_changed": "대상 프로그램이나 창의 식별 정보가 달라졌습니다. 이전 실행의 입력은 이어 보내지 않습니다.",
@@ -137,6 +138,7 @@ class WorkflowApp(tk.Tk):
         self.busy = False
         self.runner = None
         self.run = None
+        self.history_view = False
         self.stop_event = threading.Event()
         self.param_vars = {}
         self.status = tk.StringVar(value="작업을 한 번 보여주고, 다음부터 이름과 조건으로 실행하세요.")
@@ -209,6 +211,8 @@ class WorkflowApp(tk.Tk):
         ttk.Label(heading, textvariable=self.workflow_title, style="Section.TLabel").pack(side="left")
         self.rename_button = ttk.Button(heading, text="이름 변경", command=self.rename)
         self.rename_button.pack(side="right")
+        self.latest_button = ttk.Button(heading, text="최신 수정본 보기", command=self.show_latest)
+        self.latest_button.pack(side="right", padx=(0, 6))
         ttk.Label(main, textvariable=self.workflow_meta, style="Card.TLabel", foreground="#617889").pack(anchor="w", pady=(4, 10))
         self.parameter_frame = ttk.Frame(main, style="Card.TFrame")
         self.parameter_frame.pack(fill="x", pady=(0, 10))
@@ -266,7 +270,7 @@ class WorkflowApp(tk.Tk):
         ttk.Label(footer, textvariable=self.status, wraplength=1120).pack(anchor="w")
         self.edit_controls = [self.record_button, self.import_button, self.rename_button, self.edit_button,
             self.repair_button, self.move_up_button, self.move_down_button, self.delete_button, self.run_button,
-            self.resume_button, self.repair_resume_button, self.confirm_button, self.refresh_button]
+            self.resume_button, self.repair_resume_button, self.confirm_button, self.refresh_button, self.latest_button]
         self._set_busy(False)
 
     def _detail(self, text):
@@ -279,6 +283,12 @@ class WorkflowApp(tk.Tk):
         self.busy = busy
         for control in getattr(self, "edit_controls", []):
             control.configure(state="disabled" if busy or self.demo else "normal")
+        if self.history_view:
+            self.run_button.configure(state="disabled")
+        if not self.workflow:
+            self.latest_button.configure(state="disabled")
+        if self.run and self.run.get("diagnostic") == "completed_prefix_condition_changed":
+            self.confirm_button.configure(state="disabled")
         self.pause_button.configure(state="normal" if busy and not self.demo else "disabled")
         self.window_combo.configure(state="disabled" if busy else "readonly")
 
@@ -369,18 +379,30 @@ class WorkflowApp(tk.Tk):
             return
         self.workflow = workflow
         self.run = None
+        self.history_view = False
         self.workflow_title.set(self.workflow["name"])
         count = len(self.workflow["steps"])
         self.workflow_meta.set(f"수정본 {self.workflow['revision']}  /  {count}단계  /  {self.workflow['target']['exe_name']}")
+        self._render_parameters(self.workflow.get("parameters", {}))
+        self._render_steps()
+        self._set_busy(self.busy)
+
+    def _render_parameters(self, values, *, readonly=False):
         for child in self.parameter_frame.winfo_children():
             child.destroy()
         self.param_vars = {}
-        for index, (name, value) in enumerate(self.workflow.get("parameters", {}).items()):
+        for index, (name, value) in enumerate(values.items()):
             ttk.Label(self.parameter_frame, text=name, style="Card.TLabel").grid(row=index // 3, column=(index % 3) * 2, sticky="w", padx=(0, 6), pady=4)
             variable = tk.StringVar(value=str(value))
             self.param_vars[name] = variable
-            ttk.Entry(self.parameter_frame, textvariable=variable, width=17).grid(row=index // 3, column=(index % 3) * 2 + 1, padx=(0, 17), pady=4, sticky="ew")
-        self._render_steps()
+            ttk.Entry(self.parameter_frame, textvariable=variable, width=17,
+                      state="readonly" if readonly else "normal").grid(row=index // 3, column=(index % 3) * 2 + 1, padx=(0, 17), pady=4, sticky="ew")
+
+    def show_latest(self):
+        if self.demo or self.busy or not self.workflow:
+            return
+        self.refresh_workflows(self.workflow["id"])
+        self.status.set("최신 수정본을 불러왔습니다. 단계와 입력 조건을 확인한 뒤 작업 실행을 선택하세요.")
 
     def _render_steps(self, selected_id=None):
         self.steps.delete(*self.steps.get_children())
@@ -541,6 +563,7 @@ class WorkflowApp(tk.Tk):
         self.refresh_workflows(saved["id"])
         if pending_run and pending_run.get("workflow_id") == saved["id"]:
             self.run = pending_run
+        self._set_busy(self.busy)
         if selected_id and self.steps.exists(selected_id):
             self.steps.selection_set(selected_id)
         self.status.set(f"수정본 {saved['revision']}을 저장했습니다. 이전 기록은 유지되며 진행 중 실행에 소급 적용되지 않습니다.")
@@ -589,6 +612,9 @@ class WorkflowApp(tk.Tk):
     def run_workflow(self):
         if self.demo or self.busy or not self.workflow:
             return
+        if self.history_view:
+            self.status.set("실행 기록을 보고 있습니다. 새 실행은 [최신 수정본 보기]에서 내용과 입력 조건을 확인한 뒤 시작하세요.")
+            return
         binding = self.binding()
         if not binding:
             return
@@ -598,15 +624,20 @@ class WorkflowApp(tk.Tk):
         parameters = {name: variable.get() for name, variable in self.param_vars.items()}
         self.status.set("현재 요소를 찾고 단계별로 실행합니다. 물리 입력 단계에서는 마우스와 키보드를 함께 사용하지 마세요.")
         workflow_id = self.workflow["id"]
-        self._background(lambda: self.runner.start(workflow_id, binding, parameters), self._run_done)
+        expected_revision = self.workflow["revision"]
+        self._background(lambda: self.runner.start(workflow_id, binding, parameters,
+                         expected_revision=expected_revision), self._run_done)
 
     def _run_done(self, run):
         self.run = run
+        self.history_view = True
         self.workflow = copy.deepcopy(run.get("workflow", self.workflow))
         if self.workflow:
             self.workflow_title.set(self.workflow["name"])
             self.workflow_meta.set(f"실행 당시 수정본 {self.workflow['revision']}  /  {len(self.workflow['steps'])}단계  /  {self.workflow['target']['exe_name']}")
+            self._render_parameters(run.get("parameters", self.workflow.get("parameters", {})), readonly=True)
         self._render_steps(run.get("current_step_id"))
+        self._set_busy(self.busy)
         label = STATE_LABELS.get(run.get("status"), run.get("status", "실행 기록 저장"))
         self.status.set(label + " / 실행 기록 " + run.get("id", "")[:8])
         self.show_step_detail()
@@ -614,7 +645,10 @@ class WorkflowApp(tk.Tk):
             current = next((s for s in run.get("steps", []) if s["id"] == run.get("current_step_id")), {})
             code = run.get("diagnostic") or current.get("result", {}).get("diagnostic") or current.get("reason")
             reason = _safe_reason(code) if code else "현재 단계의 대상과 결과를 확인하세요."
-            self._detail("현재 단계에 확인이 필요합니다. 이미 전달됐을 수 있는 입력은 자동 반복하지 않습니다.\n" + reason + "\n실제 결과를 확인한 단계만 [현재 단계 직접 확인 후 계속]을 선택하세요.")
+            if code == "completed_prefix_condition_changed":
+                self._detail(reason)
+            else:
+                self._detail("현재 단계에 확인이 필요합니다. 이미 전달됐을 수 있는 입력은 자동 반복하지 않습니다.\n" + reason + "\n실제 결과를 확인한 단계만 [현재 단계 직접 확인 후 계속]을 선택하세요.")
 
     def cancel(self):
         self.stop_event.set()
@@ -668,6 +702,9 @@ class WorkflowApp(tk.Tk):
 
     def confirm_pending(self):
         if self.demo or self.busy or not self.run:
+            return
+        if self.run.get("diagnostic") == "completed_prefix_condition_changed":
+            messagebox.showinfo(APP_NAME, _safe_reason("completed_prefix_condition_changed"), parent=self)
             return
         step_id = self.run.get("current_step_id")
         if self.run.get("status") != "needs_review" or not step_id:
@@ -731,7 +768,14 @@ class StepEditor(tk.Toplevel):
         entry(5, "expect", "완료 조건", step.get("expect", {}).get("kind", "manual"), tuple(EXPECT_LABELS))
         entry(6, "expected", "기대값 또는 출력 파일", step.get("expect", {}).get("path", step.get("expect", {}).get("value", "")))
         self.headed = tk.BooleanVar(value=bool(step.get("headed", step["action"] in {"type", "focus", "right-click", "double-click"})))
-        ttk.Checkbutton(frame, text="대상에 필요한 포커스 / 물리 입력 허용", variable=self.headed).grid(row=7, column=1, sticky="w", pady=8)
+        expected = step.get("expect", {})
+        self.expect_input_value = tk.BooleanVar(value=expected.get("kind") == "value"
+            and "value" not in expected and "target" not in expected
+            and step["action"] in {"set-value", "type", "select"})
+        flags = ttk.Frame(frame)
+        flags.grid(row=7, column=1, sticky="w", pady=8)
+        ttk.Checkbutton(flags, text="입력값을 완료 기대값으로 사용 (입력 변수 사용 시 자동 적용)", variable=self.expect_input_value).pack(anchor="w")
+        ttk.Checkbutton(flags, text="대상에 필요한 포커스 / 물리 입력 허용", variable=self.headed).pack(anchor="w")
         ttk.Label(frame, text="현재 대상", font=("맑은 고딕", 10, "bold")).grid(row=8, column=0, sticky="nw", pady=10)
         target = step.get("target", {})
         detail = target_text(target)
@@ -746,7 +790,7 @@ class StepEditor(tk.Toplevel):
         self.region_reviewed = tk.BooleanVar(value=bool(target.get("reviewed", False)))
         if target.get("kind") == "region":
             ttk.Checkbutton(frame, text="기록한 대상 영역과 내부 위치가 의도한 곳임을 직접 확인했습니다.", variable=self.region_reviewed).grid(row=9, column=0, columnspan=2, sticky="w", pady=8)
-        ttk.Label(frame, text="대상은 ‘이 단계 다시 녹화’로 지정합니다. 요소 ID나 좌표를 추측해서 입력하지 않습니다. 입력 변수를 쓰는 같은 대상의 값 확인은 실행 입력값을 따릅니다. 별도 완료 조건 대상의 기대값은 독립적으로 유지하며 빈 문자열도 값으로 저장합니다.\n‘전달 확인 후 계속’은 업무 결과 확인이 아닙니다. 조회/저장/내보내기에는 실제 완료 조건이나 사람 확인을 지정하세요.", wraplength=660, foreground="#617889").grid(row=10, column=0, columnspan=2, sticky="w", pady=12)
+        ttk.Label(frame, text="대상은 ‘이 단계 다시 녹화’로 지정합니다. 요소 ID나 좌표를 추측해서 입력하지 않습니다. 같은 대상에 입력 변수나 ‘입력값을 완료 기대값으로 사용’을 지정하면 실행 입력값을 확인합니다. 그 외에는 기대값 칸의 빈 문자열도 값으로 저장합니다. 별도 완료 조건 대상의 기대값은 독립적으로 유지합니다.\n‘전달 확인 후 계속’은 업무 결과 확인이 아닙니다. 조회/저장/내보내기에는 실제 완료 조건이나 사람 확인을 지정하세요.", wraplength=660, foreground="#617889").grid(row=10, column=0, columnspan=2, sticky="w", pady=12)
         controls = ttk.Frame(frame)
         controls.grid(row=11, column=0, columnspan=2, sticky="ew", pady=10)
         ttk.Button(controls, text="직접 수행 단계로 전환", command=self.make_manual).pack(side="left")
@@ -793,15 +837,19 @@ class StepEditor(tk.Toplevel):
         kind = self.vars["expect"].get()
         expected = self.vars["expected"].get()
         step["expect"] = {"kind": kind}
-        if kind == self.original.get("expect", {}).get("kind") and "target" in self.original.get("expect", {}):
+        if kind in {"value", "exists", "checked"} and "target" in self.original.get("expect", {}):
             step["expect"]["target"] = copy.deepcopy(self.original["expect"]["target"])
         if kind == "file":
             if not expected.strip():
                 messagebox.showinfo(APP_NAME, "확인할 출력 파일의 전체 경로를 입력하세요.", parent=self)
                 return
             step["expect"]["path"] = expected.strip()
-        elif kind == "value" and ("target" in step["expect"] or expected != "" and not parameter):
-            step["expect"]["value"] = expected
+        elif kind == "value":
+            use_input = (step["action"] in {"set-value", "type", "select"}
+                         and (bool(parameter) or self.expect_input_value.get())
+                         and "target" not in step["expect"])
+            if not use_input:
+                step["expect"]["value"] = expected
         elif kind == "checked":
             if expected.casefold() not in {"true", "false", "1", "0", "yes", "no"}:
                 messagebox.showinfo(APP_NAME, "체크 기대값은 true 또는 false로 입력하세요.", parent=self)

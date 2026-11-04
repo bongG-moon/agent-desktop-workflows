@@ -75,6 +75,37 @@ class IdentityAdapter(Adapter):
                 "main_window": dict(BINDING, title="Private title", class_name="FixtureClass")}
 
 
+class StatefulAdapter(Adapter):
+    """Actual condition comparisons with independently mutable synthetic UI state."""
+    def __init__(self):
+        super().__init__()
+        self.values = {"Field": "Y"}
+        self.flags = {}
+        self.effect = None
+
+    def execute(self, target, value):
+        self.executions.append((copy.deepcopy(target), value))
+        name = target["target"]["locator"].get("automation_id")
+        if name == "Missing":
+            return result("not_delivered", False, "unavailable")
+        if target["action"] in {"set-value", "type", "select", "clear"}:
+            self.values[name] = "" if target["action"] == "clear" else value
+            return result()
+        if target["action"] in {"check", "uncheck"}:
+            self.flags[name] = target["action"] == "check"
+            return result()
+        if self.effect:
+            return self.effect(target, value)
+        return result("executed_unverified", True, "unavailable")
+
+    def check(self, target, value):
+        self.reads.append((copy.deepcopy(target), value))
+        expected = target["expect"]
+        name = expected.get("target", target["target"])["locator"].get("automation_id")
+        current = self.flags.get(name) if expected["kind"] == "checked" else self.values.get(name)
+        return {"matched": current == expected.get("value", value)}
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -360,6 +391,75 @@ class WorkflowTests(unittest.TestCase):
         self.runner(adapter).resume(run["id"], BINDING)
         self.assertEqual(len(adapter.executions), 1)
 
+    def test_closed_export_popup_checks_actual_file_once_and_keeps_uncertain_receipt(self):
+        from desktop import DesktopAdapter
+        for creates_file in (True, False):
+            with self.subTest(creates_file=creates_file):
+                path = self.folder / ("export-" + str(creates_file) + ".xlsx")
+                saved = self.save(workflow([step("click", {"kind": "file", "path": str(path)})]))
+                returned = dict(result("uncertain", True, "unavailable"),
+                    delivery="delivered_unverified", diagnostic="snapshot_unavailable", after_snapshot_available=False)
+                class FileAdapter(Adapter):
+                    def _window(self, _):
+                        return BINDING, {}
+                    def prepare(self, target, value):
+                        self.preparations.append((copy.deepcopy(target), value))
+                        return DesktopAdapter.prepare(self, target, value)
+                    def execute(self, target, value):
+                        self.executions.append((copy.deepcopy(target), value))
+                        if creates_file:
+                            path.write_bytes(b"synthetic export")
+                        return returned
+                    def check(self, target, value):
+                        self.reads.append((copy.deepcopy(target), value))
+                        return DesktopAdapter.check(self, target, value)
+                adapter = FileAdapter()
+                runner = self.runner(adapter)
+                run = runner.start(saved["id"], BINDING)
+                self.assertEqual(run["status"], "completed" if creates_file else "needs_review")
+                self.assertEqual(run["task_verified"], creates_file)
+                self.assertEqual(run["steps"][0]["result"], returned)
+                self.assertEqual(run["steps"][0]["prepared"]["file_before"], {"exists": False})
+                self.assertEqual(len(adapter.executions), 1)
+                self.assertEqual(len(adapter.reads), 1)
+                runner.resume(run["id"], BINDING)
+                self.assertEqual(len(adapter.executions), 1)
+                self.assertEqual(len(adapter.preparations), 1)
+
+    def test_unavailable_snapshot_recovery_requires_known_delivery_and_explicit_condition(self):
+        base = dict(result("uncertain", True, "unavailable"), delivery="delivered_unverified",
+                    diagnostic="snapshot_unavailable", after_snapshot_available=False)
+        for changes, condition in [({'input_dispatched': None}, 'value'),
+                                   ({'input_dispatched': False}, 'value'),
+                                   ({'delivery': 'possibly_dispatched'}, 'value'),
+                                   ({'diagnostic': 'target_identity_changed'}, 'value'),
+                                   ({'status': 'interrupted'}, 'value'),
+                                   ({}, 'none'), ({}, 'manual')]:
+            with self.subTest(changes=changes, condition=condition):
+                saved = self.save(workflow([step(expect=condition)]))
+                adapter = Adapter([dict(base, **changes)], [{'matched': True}])
+                run = self.runner(adapter).start(saved['id'], BINDING)
+                self.assertEqual(run['status'], 'needs_review')
+                self.assertFalse(run['task_verified'])
+                self.assertEqual(adapter.reads, [])
+                self.assertEqual(len(adapter.executions), 1)
+
+    def test_known_delivery_snapshot_gap_uses_separate_value_checked_or_exists_read(self):
+        returned = dict(result("uncertain", True, "unavailable"), delivery="delivered_unverified",
+                        diagnostic="snapshot_unavailable", after_snapshot_available=False)
+        for kind in ("value", "checked", "exists"):
+            with self.subTest(kind=kind):
+                expected = {"kind": kind, "target": {"kind": "element", "locator": {"automation_id": "Result"}}}
+                if kind != "exists":
+                    expected["value"] = True if kind == "checked" else "Complete"
+                saved = self.save(workflow([step("click", expected)]))
+                adapter = Adapter([returned], [{'matched': True}])
+                run = self.runner(adapter).start(saved['id'], BINDING)
+                self.assertEqual(run['status'], 'completed')
+                self.assertEqual(run['steps'][0]['result'], returned)
+                self.assertEqual(len(adapter.reads), 1)
+                self.assertEqual(len(adapter.executions), 1)
+
     def test_postcondition_exception_preserves_dispatch_before_pause(self):
         saved = self.save(workflow([step("click", "exists")]))
         adapter = Adapter([result("executed_unverified", True, "unavailable")], [RuntimeError("private")])
@@ -606,6 +706,256 @@ with store.lock('target-100-200'):
         self.assertEqual(repaired["status"], "needs_review")
         self.assertEqual(repaired["steps"][0]["reason"], "completed_prefix_condition_changed")
         self.assertEqual(adapter.executions, [])
+
+    def test_expected_revision_blocks_before_adapter_or_run_creation(self):
+        saved = self.save()
+        saved["steps"].append(step("click", "none"))
+        latest = self.store.save(saved)
+        adapter = Adapter()
+        with self.assertRaisesRegex(StoreError, "workflow_revision_changed"):
+            self.runner(adapter).start(saved["id"], BINDING, expected_revision=1)
+        self.assertEqual(self.store.list_runs(), [])
+        self.assertEqual(adapter.preparations + adapter.executions, [])
+        done = self.runner(adapter).start(saved["id"], BINDING, expected_revision=latest["revision"])
+        self.assertEqual(done["workflow_revision"], latest["revision"])
+        self.assertEqual(len(adapter.executions), 2)
+
+    def test_resume_rechecks_changed_parameter_without_resetting_or_replaying_it(self):
+        first = step(parameter="Status")
+        value = workflow([first, step("click", "none")])
+        value["parameters"] = {"Status": "Y"}
+        saved = self.save(value)
+        adapter = StatefulAdapter()
+        stopped = []
+        def progress(event):
+            if event["completed_steps"] == 1 and not stopped:
+                stopped.append(True)
+                runner.cancel()
+        runner = self.runner(adapter, progress)
+        paused = runner.start(saved["id"], BINDING, {"Status": "N"})
+        original_receipt = copy.deepcopy(paused["steps"][0]["result"])
+        adapter.values["Field"] = "Y"
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["status"], "needs_review")
+        self.assertEqual(resumed["diagnostic"], "completed_prefix_condition_changed")
+        self.assertEqual(resumed["steps"][0]["status"], "verified")
+        self.assertEqual(resumed["steps"][0]["result"], original_receipt)
+        self.assertEqual(len(adapter.executions), 1)
+        self.assertEqual(adapter.reads[-1][0]["expect"]["value"], "N")
+        with self.assertRaisesRegex(StoreError, "completed_prefix_condition_changed"):
+            runner.resume(paused["id"], BINDING, first["id"])
+        adapter.values["Field"] = "N"
+        completed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(completed["status"], "completed_unverified")
+        self.assertNotIn("diagnostic", completed)
+        self.assertEqual(len(adapter.executions), 2)
+
+    def test_checkpoint_failure_cannot_be_bypassed_by_confirming_later_manual_step(self):
+        manual = step("manual", "manual", target={"kind": "manual"})
+        saved = self.save(workflow([step(), manual, step("click", "none")]))
+        adapter = StatefulAdapter()
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        adapter.values["Field"] = "Y"
+        blocked = runner.resume(paused["id"], BINDING)
+        self.assertEqual(blocked["diagnostic"], "completed_prefix_condition_changed")
+        with self.assertRaisesRegex(StoreError, "completed_prefix_condition_changed"):
+            runner.resume(paused["id"], BINDING, manual["id"])
+        retained = self.store.load_run(paused["id"])
+        self.assertEqual(retained["steps"][1]["status"], "needs_review")
+        self.assertNotIn("confirmation", retained["steps"][1])
+        self.assertEqual(len(adapter.executions), 1)
+        adapter.values["Field"] = "N"
+        reread = runner.resume(paused["id"], BINDING)
+        self.assertNotIn("diagnostic", reread)
+        completed = runner.resume(paused["id"], BINDING, manual["id"])
+        self.assertEqual(completed["status"], "completed_unverified")
+        self.assertEqual(len(adapter.executions), 2)
+
+    def test_repair_rechecks_latest_same_target_value_not_obsolete_intermediate_state(self):
+        value = workflow([step(value="N"), step(value="Y"),
+                          step("click", "none", target={"kind": "element", "locator": {"automation_id": "Missing"}})])
+        saved = self.save(value)
+        adapter = StatefulAdapter()
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        self.assertEqual(adapter.values["Field"], "Y")
+        saved["steps"][2]["target"]["locator"]["automation_id"] = "Fixed"
+        self.store.save(saved)
+        repaired = runner.fork_repaired(paused["id"], BINDING)
+        self.assertEqual(repaired["status"], "completed_unverified")
+        self.assertEqual([value for target, value in adapter.reads], ["Y"])
+        self.assertEqual([target["action"] for target, _ in adapter.executions],
+                         ["set-value", "set-value", "click", "click"])
+        self.assertEqual(self.store.load_run(paused["id"])["steps"][0]["status"], "verified")
+
+    def test_normal_resume_rechecks_latest_same_target_value(self):
+        saved = self.save(workflow([step(value="N"), step(value="Y"), step("click", "none")]))
+        adapter = StatefulAdapter()
+        stopped = []
+        def progress(event):
+            if event["completed_steps"] == 2 and not stopped:
+                stopped.append(True)
+                runner.cancel()
+        runner = self.runner(adapter, progress)
+        paused = runner.start(saved["id"], BINDING)
+        completed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(completed["status"], "completed_unverified")
+        self.assertEqual([value for target, value in adapter.reads], ["Y"])
+        self.assertEqual(len(adapter.executions), 3)
+
+    def test_checkpoint_identity_keeps_independent_values_and_checked_property(self):
+        option = step("check", {"kind": "checked", "value": True})
+        other = step(value="Other", target={"kind": "element", "locator": {"automation_id": "OtherField"}})
+        saved = self.save(workflow([step(value="N"), option, other, step("click", "none")]))
+        adapter = StatefulAdapter()
+        stopped = []
+        def progress(event):
+            if event["completed_steps"] == 3 and not stopped:
+                stopped.append(True)
+                runner.cancel()
+        runner = self.runner(adapter, progress)
+        paused = runner.start(saved["id"], BINDING)
+        adapter.flags["Field"] = False
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["diagnostic"], "completed_prefix_condition_changed")
+        self.assertEqual([target["expect"]["kind"] for target, _ in adapter.reads], ["value", "checked"])
+        self.assertEqual(len(adapter.executions), 3)
+        adapter.flags["Field"] = True
+        adapter.values["OtherField"] = "Changed"
+        again = runner.resume(paused["id"], BINDING)
+        self.assertEqual(again["current_step_id"], other["id"])
+        self.assertEqual(len(adapter.executions), 3)
+
+    def test_later_delivery_only_write_expires_older_declared_value(self):
+        saved = self.save(workflow([step(value="N"), step(expect="none", value="Y"), step("click", "none")]))
+        adapter = StatefulAdapter()
+        stopped = []
+        def progress(event):
+            if event["completed_steps"] == 2 and not stopped:
+                stopped.append(True)
+                runner.cancel()
+        runner = self.runner(adapter, progress)
+        paused = runner.start(saved["id"], BINDING)
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["status"], "completed_unverified")
+        self.assertEqual(adapter.values["Field"], "Y")
+        self.assertEqual(adapter.reads, [])
+        self.assertEqual(len(adapter.executions), 3)
+
+    def test_never_attempted_resumed_input_refreshes_file_baseline(self):
+        from desktop import DesktopAdapter
+        path = self.folder / "export.xlsx"
+        path.write_bytes(b"old")
+        saved = self.save(workflow([step("click", {"kind": "file", "path": str(path)})]))
+        class FileAdapter(Adapter):
+            def _window(self, _):
+                return BINDING, {}
+            def prepare(self, target, value):
+                self.preparations.append((copy.deepcopy(target), value))
+                baseline = DesktopAdapter.prepare(self, target, value)
+                if len(self.preparations) == 1:
+                    runner.cancel()
+                return baseline
+            def check(self, target, value):
+                return DesktopAdapter.check(self, target, value)
+        adapter = FileAdapter([result("executed_unverified", True, "unavailable")])
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        self.assertEqual(paused["steps"][0]["status"], "prepared")
+        self.assertEqual(adapter.executions, [])
+        path.write_bytes(b"unrelated change before resumed input")
+        current = path.read_bytes()
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["status"], "needs_review")
+        self.assertFalse(resumed["task_verified"])
+        self.assertEqual(len(adapter.preparations), 2)
+        self.assertEqual(len(adapter.executions), 1)
+        self.assertEqual(path.read_bytes(), current)
+        self.assertEqual(resumed["steps"][0]["prepared"]["file_before"]["size"], len(current))
+
+    def test_delivered_submit_supersedes_input_checkpoint_before_human_confirmed_resume(self):
+        submit = step("click", "manual", target={"kind": "element", "locator": {"automation_id": "Submit"}})
+        saved = self.save(workflow([step(), submit, step("click", "none")]))
+        adapter = StatefulAdapter()
+        def effect(target, _):
+            if target["target"]["locator"].get("automation_id") == "Submit":
+                adapter.values["Field"] = ""
+            return result("executed_unverified", True, "unavailable")
+        adapter.effect = effect
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        self.assertEqual(adapter.values["Field"], "")
+        completed = runner.resume(paused["id"], BINDING, submit["id"])
+        self.assertEqual(completed["status"], "completed_unverified")
+        self.assertEqual(adapter.reads, [])
+        self.assertEqual(len(adapter.executions), 3)
+
+    def test_unknown_submit_reads_only_its_result_not_obsolete_input(self):
+        status_target = {"kind": "element", "locator": {"automation_id": "Status"}}
+        submit = step("click", {"kind": "value", "value": "Complete", "target": status_target},
+                      target={"kind": "element", "locator": {"automation_id": "Submit"}})
+        saved = self.save(workflow([step(), submit]))
+        adapter = StatefulAdapter()
+        def effect(target, _):
+            adapter.values.update(Field="", Status="Complete")
+            return result("uncertain", None, "unavailable")
+        adapter.effect = effect
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        completed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(len(adapter.executions), 2)
+        self.assertEqual([target["expect"].get("target") for target, _ in adapter.reads], [status_target])
+
+    def test_known_unsent_action_does_not_invalidate_current_input_checkpoint(self):
+        saved = self.save(workflow([step(), step("click", "none",
+                          target={"kind": "element", "locator": {"automation_id": "Missing"}})]))
+        adapter = StatefulAdapter()
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        adapter.values["Field"] = "Y"
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["diagnostic"], "completed_prefix_condition_changed")
+        self.assertEqual(len(adapter.executions), 2)
+        self.assertEqual([value for target, value in adapter.reads], ["N"])
+
+    def test_opaque_action_explicit_result_establishes_new_resume_checkpoint(self):
+        status_target = {"kind": "element", "locator": {"automation_id": "Status"}}
+        submit = step("click", {"kind": "value", "value": "Complete", "target": status_target})
+        saved = self.save(workflow([step(), submit, step("click", "none")]))
+        adapter = StatefulAdapter()
+        def effect(target, _):
+            adapter.values.update(Field="", Status="Complete")
+            return result("executed_unverified", True, "unavailable")
+        adapter.effect = effect
+        stopped = []
+        def progress(event):
+            if event["completed_steps"] == 2 and not stopped:
+                stopped.append(True)
+                runner.cancel()
+        runner = self.runner(adapter, progress)
+        paused = runner.start(saved["id"], BINDING)
+        adapter.values["Status"] = "Changed"
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["diagnostic"], "completed_prefix_condition_changed")
+        self.assertEqual(resumed["current_step_id"], submit["id"])
+        self.assertEqual(len(adapter.executions), 2)
+        self.assertTrue(all(target["expect"].get("target") == status_target for target, _ in adapter.reads))
+
+    def test_legacy_repair_checkpoint_restores_obsolete_entry_without_replaying_it(self):
+        saved = self.save(workflow([step(value="N"), step(value="Y"), step("manual", "manual", target={"kind": "manual"})]))
+        adapter = StatefulAdapter()
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        paused["steps"][0].update(status="needs_review", reason="completed_prefix_condition_changed")
+        paused["repair_prefix_pending"] = 2
+        self.store._save_run(paused)
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["steps"][0]["status"], "verified")
+        self.assertNotIn("repair_prefix_pending", resumed)
+        self.assertEqual([value for target, value in adapter.reads], ["Y"])
+        self.assertEqual(len(adapter.executions), 2)
 
     def test_inconsistent_completed_journal_rejected(self):
         saved = self.save(workflow([step("manual", "manual", target={"kind": "manual"})]))

@@ -22,7 +22,7 @@ def _safe(run=None, *, status=None, diagnostic=None):
     allowed_statuses = {'unknown', 'written', 'imported', 'recorded_needs_review', 'completed',
                         'completed_unverified', 'verified', 'running', 'needs_review', 'cancelled',
                         'interrupted', 'blocked'}
-    result = {'product': 'Agent Desktop Workflows', 'version': '0.1.1',
+    result = {'product': 'Agent Desktop Workflows', 'version': '0.1.2',
               'status': reported_status if reported_status in allowed_statuses else 'unknown',
               'model_calls': 0, 'network_requests_by_wrapper': 0}
     for source, target in [('id', 'run_id'), ('run_id', 'run_id'), ('workflow_id', 'workflow_id')]:
@@ -44,6 +44,36 @@ def workflow_id(store, name):
     if len(matches) != 1:
         raise ValueError('workflow_name_not_unique')
     return matches[0]['id']
+
+
+def output_path(store, value):
+    """Explicit query exports can be refreshed, never application state or code."""
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError('absolute_local_path_required')
+    desktop.local_dir(path.parent)
+    canonical = path.resolve(strict=False)
+    if any(part.casefold() in {'.git', '.claude', '.codex', '.aws', '.ssh'} for part in canonical.parts):
+        raise ValueError('output_reserved_location')
+    roots = [Path(store.root), desktop.default_store()]
+    if any(canonical.is_relative_to(root.resolve(strict=False)) for root in roots):
+        raise ValueError('output_inside_workflow_store')
+    # Also protect another recognized workflow store selected in an earlier command.
+    for ancestor in canonical.parents:
+        if all((ancestor / name).is_dir() for name in ('workflows', 'recordings', 'runs', 'locks')):
+            raise ValueError('output_inside_workflow_store')
+    package = Path(__file__).resolve().parents[1]
+    if canonical.is_relative_to(package):
+        relative = canonical.relative_to(package)
+        reserved_dirs = {'scripts', 'engine', 'bin', 'tools', 'tests', 'references', '.github'}
+        reserved_files = {'license', 'notice.txt', 'third_party_notices.txt', 'upstream.json',
+                          'readme.md', 'skill.md', 'start.cmd', '사용가이드.html',
+                          'package-manifest.json', '.gitignore', '.gitattributes'}
+        if (not relative.parts or relative.parts[0].casefold() in reserved_dirs
+                or str(relative).casefold() in reserved_files):
+            raise ValueError('output_overwrites_product_file')
+    # Pass the original path so write_json can still reject redirected components.
+    return path
 
 
 def main(argv=None):
@@ -80,6 +110,7 @@ def main(argv=None):
         from workflows import Runner
         store = Store(Path(args.store) if args.store else None)
         if args.command in ('list', 'show', 'windows', 'status'):
+            destination = output_path(store, args.output)
             if args.command == 'list':
                 data = store.list_workflows()
             elif args.command == 'show':
@@ -88,7 +119,7 @@ def main(argv=None):
                 data = desktop.inventory(Path(store.root) / 'observations')
             else:
                 data = store.load_run(args.run)
-            desktop.write_json(Path(args.output), data)
+            desktop.write_json(destination, data, replace=True)
             result = _safe(status='written')
             if isinstance(data, list):
                 result['count'] = len(data)

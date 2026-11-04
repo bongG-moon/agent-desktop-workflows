@@ -28,6 +28,7 @@ class FakeUIA:
         self.protected = set()
         self.focused_element = 'field'
         self.checked_value = True
+        self.combo_parents = {}
 
     def secure(self, element):
         return element in self.protected
@@ -54,6 +55,11 @@ class FakeUIA:
 
     def node(self, element, root):
         return observation(element=element)['node']
+
+    def combo_observation(self, item):
+        if item['node']['role'] == 'combobox' and 'SetValue' in item['node']['available_actions']:
+            return item
+        return self.combo_parents.get(item['element'])
 
 
 class RecorderTests(unittest.TestCase):
@@ -265,6 +271,110 @@ class RecorderTests(unittest.TestCase):
         self.assertTrue(self.worker.abort.is_set())
         self.assertEqual(result['diagnostic'], 'recording_ui_failed')
         self.assertNotIn('private target data', json.dumps(result))
+
+    def test_combo_arrow_and_detached_option_record_final_combo_value(self):
+        combo = observation()
+        arrow = observation(role='button', actions=['Click'], element='arrow')
+        item = observation(role='listitem', actions=['Click', 'Select'], element='option')
+        self.worker.uia.combo_parents.update(arrow=combo, option=combo)
+        self.worker.capture_action({'action': 'click'}, arrow)
+        self.assertEqual(self.model.steps, [])
+        self.worker.uia.values['field'] = 'N'
+        self.worker.capture_action({'action': 'click'}, item)
+        self.assertEqual([s['action'] for s in self.model.steps], ['set-value'])
+        self.assertEqual(self.model.steps[0]['value'], 'N')
+        self.assertEqual(self.model.steps[0]['target']['locator'], combo['node']['locator'])
+
+    def test_independent_listitem_after_edit_is_not_swallowed(self):
+        self.worker.watch(observation(role='textfield'))
+        self.worker.uia.values['field'] = 'Lot-42'
+        self.worker.finalize_watch(False)
+        row = observation(role='listitem', actions=['Select'], element='other-row')
+        row['node']['name'] = 'Independent result'
+        row['node']['locator'] = {'automation_id': 'ResultsRow', 'role': 'listitem'}
+        self.worker.capture_action({'action': 'click'}, row)
+        self.assertEqual([s['action'] for s in self.model.steps], ['set-value', 'select'])
+        self.assertEqual(self.model.steps[1]['target']['locator']['automation_id'], 'ResultsRow')
+
+    def _watched_input(self):
+        with patch.object(recorder.time, 'monotonic', return_value=10):
+            self.worker.watch(observation(role='textfield'))
+        self.worker.uia.values['field'] = 'Lot-42'
+        with patch.object(recorder.time, 'monotonic', return_value=11):
+            self.worker.finalize_watch(False)
+        button = observation(role='button', actions=['Click'], element='submit')
+        button['node']['locator'] = {'automation_id': 'Submit', 'role': 'button'}
+        self.worker.observe_down = lambda event: button
+        return self.model.steps[0]['id']
+
+    def test_submit_clear_does_not_replace_input_with_post_click_value(self):
+        original = self._watched_input()
+        self.worker.handle({'kind': 'down', 'token': 1, 'x': 150, 'y': 175, 'action': 'click', 'at': 12})
+        self.worker.uia.values['field'] = ''  # Application consumed and cleared input.
+        with patch.object(recorder.time, 'sleep'):
+            self.worker.handle({'kind': 'up', 'token': 1, 'x': 150, 'y': 175, 'inside': True, 'at': 12.1})
+        self.assertEqual([s['action'] for s in self.model.steps], ['set-value', 'click'])
+        self.assertEqual((self.model.steps[0]['id'], self.model.steps[0]['value']), (original, 'Lot-42'))
+
+    def test_delayed_down_uses_pre_event_sample_not_newer_poll(self):
+        original = self._watched_input()
+        self.worker.uia.values['field'] = ''
+        with patch.object(recorder.time, 'monotonic', return_value=12.2):
+            self.worker.finalize_watch(False)
+        self.worker.handle({'kind': 'down', 'token': 1, 'x': 150, 'y': 175, 'action': 'click', 'at': 12})
+        self.assertEqual((self.model.steps[0]['id'], self.model.steps[0]['value']), (original, 'Lot-42'))
+        self.assertEqual([e['step'].get('value') for e in self.recorded_events()], ['Lot-42', '', 'Lot-42'])
+
+    def test_unsampled_typing_before_transition_becomes_manual_not_stale_value(self):
+        original = self._watched_input()
+        self.worker.last_key = 11.95
+        self.worker.handle({'kind': 'down', 'token': 1, 'x': 150, 'y': 175, 'action': 'click', 'at': 12})
+        self.assertEqual(self.model.steps[0]['id'], original)
+        self.assertEqual(self.model.steps[0]['action'], 'manual')
+        self.assertNotIn('value', self.model.steps[0])
+        self.assertEqual(self.model.steps[0]['recognition']['reason'], 'value_before_transition_unproven')
+
+    def test_unrecognized_click_preserves_input_before_manual_gap(self):
+        self._watched_input()
+        self.worker.observe_down = lambda event: None
+        self.worker.handle({'kind': 'down', 'token': 1, 'x': 150, 'y': 175, 'action': 'click', 'at': 12})
+        with patch.object(recorder.time, 'sleep'):
+            self.worker.handle({'kind': 'up', 'token': 1, 'x': 150, 'y': 175, 'inside': True})
+        self.assertEqual([s['action'] for s in self.model.steps], ['set-value', 'manual'])
+        self.assertEqual(self.model.steps[0]['value'], 'Lot-42')
+
+    def test_unproven_detached_popup_is_a_gap_without_other_window_content(self):
+        self.worker.observe_down = lambda event: None
+        self.worker.handle({'kind': 'down', 'token': 1, 'x': 150, 'y': 175, 'action': 'click', 'at': 12,
+                            'scope_proven': False})
+        self.worker.handle({'kind': 'up', 'token': 1, 'x': 150, 'y': 175, 'inside': True})
+        self.assertEqual(len(self.model.steps), 1)
+        self.assertEqual(self.model.steps[0]['recognition']['reason'], 'popup_scope_unproven')
+
+    def test_detached_combo_precapture_uses_native_hit_identity(self):
+        cached = observation(role='listitem', actions=['Select'])
+        cached['hit_window'] = 300
+        self.worker.hovered, self.worker.hover_at = cached, 10
+        observed = self.worker.observe_down({'window': 300, 'hit_window': 300, 'x': 150, 'y': 175, 'at': 10.2})
+        self.assertIs(observed, cached)
+
+    def test_preclick_hover_survives_newer_postclick_poll(self):
+        option = observation(role='listitem', actions=['Select'])
+        option['hit_window'] = 300
+        self.worker.hover_history.append((10, option))
+        self.worker.hovered, self.worker.hover_at = observation(role='window'), 10.3
+        observed = self.worker.observe_down({'window': 300, 'hit_window': 300, 'x': 150, 'y': 175, 'at': 10.2})
+        self.assertIs(observed, option)
+
+    def test_invalid_initial_sample_is_manual_and_draft_remains_importable(self):
+        for value in ('X' * (recorder.MAX_VALUE_BYTES + 1), 'prefix\0suffix'):
+            self.worker.uia.values['field'] = value
+            self.worker.watch(observation(role='textfield'))
+            self.worker.freeze_watch()
+            self.assertEqual(self.model.steps[-1]['action'], 'manual')
+            self.assertEqual(self.model.steps[-1]['recognition']['reason'], 'value_readback_unavailable')
+        self.model.finish()
+        validate_workflow(json.loads(self.model.draft.read_text(encoding='utf-8')))
 
 
 if __name__ == '__main__':
