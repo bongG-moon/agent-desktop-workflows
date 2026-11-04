@@ -1,10 +1,14 @@
-# Agent Desktop Workflows 0.1.0
+# Agent Desktop Workflows 0.1.1
 
 [별도 저장소](https://github.com/bongG-moon/agent-desktop-workflows) / [Windows ZIP과 사용 가이드 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/latest)
 
 Windows 업무를 한 번 직접 녹화하고, 인식되지 않은 단계만 보완한 뒤 작업 이름과 조건으로 실행하는 독립 시스템입니다. **기존 CUA MCP와 별도 실행 파일, 설정, 작업 저장소를 사용합니다.** CUA MCP 서버나 CUA Driver를 설치/실행하지 않습니다.
 
-처음 사용하는 분은 Windows ZIP 전체를 새 로컬 폴더에 풀고 **`사용가이드.html`**을 여세요. `Start.cmd`로 녹화/편집 화면을 실행합니다. Python 3.10 이상과 tkinter는 회사에서 승인한 환경에 별도로 준비해야 합니다. `bin/agent-desktop.exe`와 자체 녹화 도우미 `bin/WorkflowNative.exe`는 Windows ZIP에 포함됩니다.
+처음 사용하는 분은 Windows ZIP 전체를 새 로컬 폴더에 풀고 **`사용가이드.html`**을 여세요. `Start.cmd`로 녹화/편집 화면을 실행합니다. 64비트 Python 3.10 이상과 tkinter는 회사에서 승인한 환경에 별도로 준비해야 합니다.
+
+**0.1.1에서는 자체 도우미 EXE를 제거하고 창 조회, 녹화와 영역 입력을 공개된 Python 소스로 실행합니다.** Windows ZIP의 EXE는 이전 Agent Desktop Local 0.2.0에 포함된 것과 동일한 `bin/agent-desktop.exe` 하나입니다. 실행 중 EXE/DLL을 생성하거나 내려받지 않고, Python 표준 라이브러리로 Windows 기본 API를 호출합니다. 새 미서명 도우미의 배포 의존성을 없앤 변경이며 회사 보안 정책의 허용 여부를 보장하는 것은 아닙니다.
+
+Main의 **Code → Download ZIP** 또는 소스 ZIP을 사용하는 경우에도 자체 도우미를 빌드할 필요는 없습니다. 이전에 받은 Agent Desktop Local 0.2.0의 `bin/agent-desktop.exe`를 새 제품 폴더의 `bin/agent-desktop.exe`로 직접 복사하고 `UPSTREAM.json`의 SHA-256과 일치하는지 확인하면 됩니다. 이전 설치 폴더는 그대로 두며, 이 제품이 기존 설치나 설정을 자동으로 탐색하거나 가져오지 않습니다. 일반 요소 실행 전에도 해당 바이너리의 해시를 검사합니다.
 
 ## 사용 흐름
 
@@ -40,10 +44,10 @@ Windows 업무를 한 번 직접 녹화하고, 인식되지 않은 단계만 보
 
 기본 저장소는 `%LOCALAPPDATA%\AgentDesktopWorkflows`이며 기존 CUA 저장소를 읽거나 수정하지 않습니다. 녹화 원본, 작업 수정본과 실행 기록은 별도로 저장합니다. 업무 데이터, 입력값과 관찰 결과는 회사에서 승인한 사내 모델 환경에서만 읽습니다.
 
-제품 코드에는 외부 모델/API, JEV, 원격 로그, 자동 업데이트, npm 설치 또는 상시 감시 서비스가 없습니다. 자체 도우미는 녹화 동안 Windows 이벤트를 기록합니다. 호스트 모델이나 동기화 폴더의 외부 전송을 OS 차원에서 막는 도구는 아닙니다. 회사 정책이 실행/캡처를 차단하면 우회하지 않습니다.
+제품 코드에는 외부 모델/API, JEV, 원격 로그, 자동 업데이트, npm 설치 또는 상시 감시 서비스가 없습니다. Python 녹화 도우미는 녹화 동안 Windows 입력 이벤트를 관찰하고 선택한 창의 동작을 기록합니다. 호스트 모델이나 동기화 폴더의 외부 전송을 OS 차원에서 막는 도구는 아닙니다. 회사 정책이 실행/캡처를 차단하면 우회하지 않습니다.
 
 표 셀이 접근성에 노출되지 않으면 특정 행/셀 작업은 제한될 수 있습니다. 지역 입력은 현재 다시 식별한 녹화 영역에만 적용하며, 고정 좌표나 다른 창으로 대체하지 않습니다. 메뉴 항목을 읽을 수 있다는 사실도 실제 실행 가능성을 보장하지 않습니다. 실제 FX/FxMenuAgent와 회사 업무 결과는 현장 인수 시험이 필요합니다.
 
-실행 엔진 agent-desktop 1.1.0의 원본 바이너리를 고정해 포함합니다. `UPSTREAM.json`, `LICENSE`, `NOTICE.txt`, `THIRD_PARTY_NOTICES.txt`에서 출처와 고지를 확인할 수 있습니다. 원본 실행 파일과 자체 도우미가 회사 실행 정책에 맞는지도 확인하세요.
+실행 엔진 agent-desktop 1.1.0의 원본 바이너리를 고정해 포함합니다. `UPSTREAM.json`, `LICENSE`, `NOTICE.txt`, `THIRD_PARTY_NOTICES.txt`에서 출처와 고지를 확인할 수 있습니다. 회사 정책은 Python 실행과 입력 관찰에도 그대로 적용됩니다. [Python 도우미 규약](references/backend.md)은 소스 검토와 개발 시 참고하세요.
 
-0.1.0 로컬 검증: 단위 테스트 57개, 실제 Windows 합성 앱의 녹화/지역 입력 시험 16개, 작업 실행 연결 시험 13개 통과. [검증 범위와 재현 방법](references/validation.md)을 확인하세요.
+0.1.0의 녹화 원본, 작업 수정본, 실행 기록 형식과 기본 저장소를 유지합니다. 새 버전은 새 프로그램 폴더에 풀고 같은 작업 저장소를 사용하세요. [검증 범위와 재현 방법](references/validation.md)을 확인하세요.

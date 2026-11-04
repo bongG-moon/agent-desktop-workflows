@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
-<title>Agent Desktop Workflows 0.1.0 사용 가이드</title>
+<title>Agent Desktop Workflows 0.1.1 사용 가이드</title>
 <style>
 :root{--ink:#17364b;--muted:#5f7483;--line:#d9e5ec;--paper:#f0f5f8;--green:#087b74;--navy:#113a4e;--soft:#e9f5ef;--amber:#fff3dc}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Malgun Gothic","맑은 고딕","Segoe UI",sans-serif;line-height:1.85;font-size:16px;word-break:keep-all}main{max-width:1080px;margin:auto;padding:34px 25px 50px}.hero{background:var(--navy);color:white;padding:36px 42px;border-radius:22px}.eyebrow{color:#a9dfd6;font-size:13px;font-weight:bold}.hero h1{font-size:36px;line-height:1.42;letter-spacing:-.035em;margin:12px 0 18px}.hero p{color:#d7e7ef;max-width:850px;margin:0}.tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}.tag{font-size:13px;padding:3px 12px;border:1px solid #567c8a;border-radius:30px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin:22px 0}.card{background:white;border:1px solid var(--line);border-radius:15px;padding:22px}.card small{color:var(--muted)}.card strong{display:block;font-size:21px;line-height:1.5;margin-top:6px}.card p{color:var(--muted);font-size:14px;margin:9px 0 0}.section{margin:20px 0;background:#fff;border:1px solid var(--line);border-radius:17px;padding:28px 33px}.section h2{font-size:23px;line-height:1.5;letter-spacing:-.03em;margin:0 0 18px}.section h3{font-size:18px;margin:24px 0 9px}.section p{margin:10px 0}.section li{margin:7px 0}.section ol,.section ul{padding-left:24px}.num{display:inline-grid;place-items:center;width:34px;height:34px;background:var(--soft);color:var(--green);border-radius:10px;margin-right:11px;font-size:18px}.note{background:var(--soft);padding:15px 19px;margin:18px 0;border-left:4px solid var(--green);border-radius:0 10px 10px 0}.note.warn{background:var(--amber);border-color:#b98a25}.request{background:#eff6fb;border:1px solid #cddfe9;border-radius:11px;padding:19px 22px;margin:15px 0}.small{font-size:14px;color:var(--muted)}code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.94em}p code,li code,td code{background:#edf3f6;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{background:#173348;color:#f2f7fb;border-radius:11px;padding:17px 20px;line-height:1.7;overflow-x:auto;font-size:14px;word-break:normal;white-space:pre}.tree{background:#f4f8fa;color:var(--ink);border:1px solid var(--line)}.table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px;margin:15px 0}th,td{text-align:left;vertical-align:top;padding:12px 13px;border-bottom:1px solid var(--line)}th{background:#eef4f7}td:first-child{font-weight:bold;min-width:125px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}.flow div{padding:16px 12px;border:1px solid var(--line);border-radius:10px;text-align:center}.flow b{display:block;color:var(--green);font-size:12px}.flow span{font-size:14px}a{color:#006f91;text-underline-offset:4px}details{border:1px solid var(--line);border-radius:10px;padding:12px 17px;margin:15px 0}summary{font-weight:bold;cursor:pointer}.footer{text-align:center;color:var(--muted);font-size:13px;padding:17px 0}.footer a{margin:0 7px}.step-preview{border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:16px 0}.step-preview .head{background:#163e51;color:#fff;padding:14px 17px;font-weight:bold}.step-preview .row{display:grid;grid-template-columns:45px 1.25fr 1.1fr 1.4fr;gap:12px;align-items:start;padding:12px 16px;font-size:14px;border-bottom:1px solid var(--line)}.step-preview .row:last-child{border-bottom:0}.step-preview .attention{background:var(--amber)}.status{color:#0b756b;font-weight:bold}.status.warn{color:#8e6518}.section,.card,.note,pre{break-inside:avoid}
 @media(max-width:720px){body{font-size:15px}main{padding:16px 13px 32px}.hero{padding:27px 23px}.hero h1{font-size:28px}.cards{grid-template-columns:1fr;gap:10px}.card{padding:17px 21px}.section{padding:23px 21px}.section h2{font-size:20px}.flow{grid-template-columns:repeat(2,1fr)}pre{font-size:12px;padding:14px}.step-preview .row{grid-template-columns:25px 1fr;gap:6px}.step-preview .row span:nth-child(n+3){grid-column:2}}
@@ -13,15 +13,15 @@
 </head>
 <body><main>
 <header class="hero">
-<div class="eyebrow">Agent Desktop Workflows 0.1.0 | 독립형 Windows 작업 녹화</div>
+<div class="eyebrow">Agent Desktop Workflows 0.1.1 | Python 기반 Windows 작업 녹화</div>
 <h1>업무를 한 번 보여주고,<br>다음부터 이름과 조건으로 실행하세요.</h1>
 <p>Family 선택, 조회, 표 우클릭, Excel 내보내기를 직접 한 번 수행합니다. 인식되지 않은 단계만 보완하면, 이후에는 저장한 작업 이름과 입력값으로 실행할 수 있습니다. 기존 CUA MCP와 별도 시스템입니다.</p>
 <div class="tags"><span class="tag">별도 작업 저장소</span><span class="tag">녹화 중 인식 상태 안내</span><span class="tag">한 단계만 보완</span><span class="tag">사내 모델 연계</span></div>
 </header>
 <div class="cards">
-<div class="card"><small>어떤 파일을 받나요?</small><strong>Windows x64 ZIP</strong><p>실행 엔진, 자체 녹화 도우미, 스킬과 가이드가 포함됩니다. 소스 ZIP은 개발용입니다.</p></div>
+<div class="card"><small>어떤 파일을 받나요?</small><strong>Windows x64 ZIP</strong><p>기존 실행 엔진과 Python 녹화 소스, 스킬과 가이드가 포함됩니다. 새 도우미 EXE는 없습니다.</p></div>
 <div class="card"><small>기존 CUA가 필요한가요?</small><strong>필요 없습니다</strong><p>CUA MCP 서버, CUA Driver와 기존 녹화 저장소를 사용하지 않습니다.</p></div>
-<div class="card"><small>별도로 준비할 것은?</small><strong>Python 3.10 + tkinter</strong><p>회사가 승인한 Python 환경을 사용합니다. 모델 주소나 개인 설정을 바꾸지 않습니다.</p></div>
+<div class="card"><small>별도로 준비할 것은?</small><strong>64비트 Python 3.10 + tkinter</strong><p>회사가 승인한 Python 환경을 사용합니다. 모델 주소나 개인 설정을 바꾸지 않습니다.</p></div>
 </div>
 
 <section class="section">
@@ -32,14 +32,17 @@
 ├─ SKILL.md                ← Claude Code에 읽힐 스킬
 ├─ 사용가이드.html
 ├─ bin
-│  ├─ agent-desktop.exe    ← 고정된 실행 엔진
-│  └─ WorkflowNative.exe   ← 자체 녹화/영역 조작 도우미
+│  └─ agent-desktop.exe    ← 이전과 동일한 실행 엔진 1개
 ├─ scripts
-│  └─ cli.py               ← 작업 단위 명령
+│  ├─ cli.py               ← 작업 단위 명령
+│  ├─ py_helper.py         ← Python 도우미 시작점
+│  ├─ win_bridge.py        ← 창 조회와 영역 입력
+│  └─ recorder.py          ← Python 녹화 화면
 └─ references</code></pre>
+<details><summary>Main의 Download ZIP 또는 소스 ZIP을 사용하는 경우</summary><p>소스 ZIP에는 <code>agent-desktop.exe</code>가 없습니다. 이전에 받은 <strong>Agent Desktop Local 0.2.0</strong>의 <code>bin/agent-desktop.exe</code>를 새 제품 폴더의 같은 위치로 직접 복사하세요. 이전 폴더는 그대로 두면 됩니다. 자체 도우미를 추가로 빌드할 필요는 없습니다.</p><p>복사한 파일의 SHA-256이 <code>UPSTREAM.json</code>의 <code>binary_sha256</code>과 일치하는지 확인합니다. 일반 요소를 실행할 때도 프로그램이 해당 해시를 검사합니다. 이 제품은 기존 설치나 설정을 자동 검색하지 않으며 새 실행 파일을 생성하거나 내려받지 않습니다.</p></details>
 <p><code>Start.cmd</code>를 더블클릭하면 작업 화면을 엽니다. Python을 찾지 못하거나 tkinter가 없으면 설치 확인 안내가 표시됩니다.</p>
 <details><summary>Python 준비 상태를 직접 확인하려면</summary><p>탐색기에서 이 폴더를 열고 주소창에 <code>powershell</code>을 입력합니다.</p><pre><code>python --version
-python -c "import tkinter; print(tkinter.TkVersion)"</code></pre><p>Python이 경로에 없다면 회사에서 승인한 <code>python.exe</code>의 전체 경로를 사용합니다. 도구가 자동 설치나 회사 보안 정책 변경을 수행하지는 않습니다.</p></details>
+python -c "import struct, tkinter; print('Python bits:', struct.calcsize('P') * 8); print('Tk:', tkinter.TkVersion)"</code></pre><p>Python 비트 수는 64여야 합니다. Python이 경로에 없다면 회사에서 승인한 <code>python.exe</code>의 전체 경로를 사용합니다. 도구가 자동 설치나 회사 보안 정책 변경을 수행하지는 않습니다.</p></details>
 <div class="note">기본 작업 저장소는 <code>%LOCALAPPDATA%\AgentDesktopWorkflows</code>입니다. 이 제품의 녹화 원본, 수정본과 실행 기록을 보관하며 기존 CUA 저장소와 공유하지 않습니다.</div>
 <p class="small">Windows 10 1809 이상 x64의 현재 사용자 세션을 사용합니다. Python과 tkinter는 ZIP에 포함하지 않습니다. 회사 정책에서 실행 파일이 차단되면 우회하지 말고 승인된 실행 환경을 확인하세요.</p>
 </section>
@@ -82,7 +85,7 @@ python -c "import tkinter; print(tkinter.TkVersion)"</code></pre><p>Python이 �
 <section class="section">
 <h2><span class="num">5</span>작업 이름과 조건으로 실행합니다</h2>
 <p>UI에서는 대상 창과 변수 값을 확인하고 <strong>작업 실행</strong>을 누릅니다. Claude Code에서는 이 제품의 <code>SKILL.md</code> 전체 경로를 알려 준 뒤 요청합니다.</p>
-<div class="request">아래 경로의 <strong>Agent Desktop Workflows 0.1.0 SKILL.md</strong>를 읽고 따라 줘.<br><code>D:\LocalTools\agent-desktop-workflows\SKILL.md</code><br><br>저장한 ‘Device 조회 후 Excel 내보내기’를 Family=Hybrid, Status=N으로 실행해 줘. 대상 업무 창을 먼저 확인하고, 결과가 불명확한 단계는 멈춰서 알려 줘.</div>
+<div class="request">아래 경로의 <strong>Agent Desktop Workflows 0.1.1 SKILL.md</strong>를 읽고 따라 줘.<br><code>D:\LocalTools\agent-desktop-workflows\SKILL.md</code><br><br>저장한 ‘Device 조회 후 Excel 내보내기’를 Family=Hybrid, Status=N으로 실행해 줘. 대상 업무 창을 먼저 확인하고, 결과가 불명확한 단계는 멈춰서 알려 줘.</div>
 <p>경로는 실제 설치 위치로 바꿉니다. 사내 모델이 로컬 파일과 명령을 실행할 수 있는 Claude Code 환경이어야 합니다. 채팅 전용 모델에 ZIP을 첨부하는 것만으로 PC 실행 도구가 생기지는 않습니다.</p>
 <details><summary>프로젝트 스킬로 등록하려면</summary><p>프로젝트의 <code>.claude/skills/agent-desktop-workflows/</code>에 제품 폴더 내용 전체를 복사합니다. 최종 경로가 <code>.claude/skills/agent-desktop-workflows/SKILL.md</code>가 되게 합니다. 새 대화에서 <code>/agent-desktop-workflows</code>를 호출할 수 있습니다.</p><p>기존 CUA 스킬이나 개인 Claude 설정을 덮어쓰지 않습니다. 스킬 설치 방식은 <a href="https://code.claude.com/docs/en/skills">Claude Code 공식 문서</a>를 따릅니다.</p></details>
 <div class="note">이전 <code>agent-desktop-local</code>과 다른 제품입니다. 녹화와 작업 단위 실행을 요청할 때는 <strong>agent-desktop-workflows</strong>의 새 경로를 사용하세요. 모델 주소, API 키, MCP와 전역 권한을 이 제품 때문에 바꿀 필요는 없습니다.</div>
@@ -111,10 +114,11 @@ python -c "import tkinter; print(tkinter.TkVersion)"</code></pre><p>Python이 �
 
 <section class="section">
 <h2><span class="num">8</span>파일과 실행 환경은 로컬에 유지합니다</h2>
-<p>이 제품은 외부 모델/API, JEV, 원격 로그, 자동 업데이트, npm 설치와 상시 감시 서비스를 포함하지 않습니다. 기존 CUA 파일, 계정, 모델 설정과 보안 정책을 변경하지 않습니다. 실행 엔진과 녹화 도우미가 회사에서 승인한 사용자 세션에서 동작합니다.</p>
+<p>이 제품은 외부 모델/API, JEV, 원격 로그, 자동 업데이트, npm 설치와 상시 감시 서비스를 포함하지 않습니다. 기존 CUA 파일, 계정, 모델 설정과 보안 정책을 변경하지 않습니다. 기존 실행 엔진과 Python 녹화 도우미가 회사에서 승인한 사용자 세션에서 동작합니다.</p>
+<p>0.1.1에서는 자체 도우미 EXE를 Python 소스로 바꾸었습니다. 실행 중 EXE/DLL을 빌드하거나 다운로드하지 않으며 Python 표준 라이브러리로 Windows 기본 API를 호출합니다. 녹화와 지역 입력의 기능은 유지하므로 회사의 Python 실행 및 입력 관찰 정책은 그대로 적용됩니다. 다운로드 차단 해제를 보장하는 변경은 아닙니다.</p>
 <p>녹화와 실행 기록에는 창 제목, 입력값과 업무 화면 구조가 포함될 수 있습니다. 저장소 전체를 업무 자료로 취급하고, 회사가 승인한 사내 모델 환경에서만 읽으세요. OS 네트워크 차단 도구는 아니며 호스트 모델의 전송 경로와 폴더 동기화 정책은 별도 관리 대상입니다.</p>
 <p>실제 회사 FX/FxMenuAgent, 컨트롤 버전과 DPI별 동작은 현장 검증이 필요합니다. 합성 화면에서의 검사를 실제 업무 인수 시험으로 표현하지 않습니다. 메뉴나 셀을 현재 읽을 수 없으면 해당 단계의 한계를 표시하며, 회사 보안 정책을 우회하지 않습니다.</p>
 <details><summary>처음 실행할 때 자주 확인할 부분</summary><ul><li><strong>화면이 열리지 않음:</strong> <code>Start.cmd</code>의 Python/tkinter 안내를 확인합니다. 승인된 Python 경로로 <code>scripts/cli.py ui</code>를 실행할 수 있습니다.</li><li><strong>목록에 업무 창이 없음:</strong> 실제 앱이 현재 사용자 세션에 열려 있는지 확인하고 창 새로고침을 누릅니다.</li><li><strong>녹화된 단계가 미인식:</strong> 해당 단계만 다시 녹화하거나 수동 단계로 남깁니다. 단순히 녹화 시간이 길다고 해결되지는 않습니다.</li><li><strong>영역 우클릭이 차단됨:</strong> 대상 창의 복원/전경/가림과 현재 영역을 확인합니다. 임의 좌표로 대체하지 않습니다.</li><li><strong>계속 읽기 전용이라고 답함:</strong> 이전 Agent Desktop Local 스킬을 읽고 있지 않은지 확인하고 새 제품의 전체 경로를 명시합니다.</li><li><strong>실행이 회사 정책에 의해 차단됨:</strong> UAC, 백신, 방화벽과 관리자 권한을 임의로 변경하지 않습니다.</li></ul></details>
 </section>
-<footer class="footer">Agent Desktop Workflows 0.1.0 / 기존 CUA MCP와 독립된 로컬 작업 시스템<br><a href="README.md">제품 설명</a><a href="references/usage.md">CLI와 실행 절차</a><a href="SKILL.md">스킬</a></footer>
+<footer class="footer">Agent Desktop Workflows 0.1.1 / 기존 CUA MCP와 독립된 로컬 작업 시스템<br><a href="README.md">제품 설명</a><a href="references/usage.md">CLI와 실행 절차</a><a href="SKILL.md">스킬</a></footer>
 </main></body></html>

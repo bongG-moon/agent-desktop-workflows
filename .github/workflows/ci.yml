@@ -12,8 +12,5 @@ jobs:
           python-version: '3.12'
       - name: Unit and recovery checks
         run: python -X utf8 -B -m unittest discover -s tests -v
-      - name: Compile standalone Windows helper
-        shell: powershell
-        run: ./tools/build_native.ps1
       - name: Source publication preflight
         run: python -X utf8 -B tools/build.py --source-only

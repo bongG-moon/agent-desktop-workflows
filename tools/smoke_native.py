@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import threading
 import time
 
@@ -74,13 +75,13 @@ def main():
     subprocess.run([str(compiler), "/nologo", "/target:exe", "/out:" + str(exe),
         "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:System.Web.Extensions.dll",
         str(root / "tests/fixtures/NativeFixture.cs")], capture_output=True, check=True)
-    helper = root / "bin/WorkflowNative.exe"
+    helper = [sys.executable, '-I', '-X', 'utf8', '-B', str(root / 'scripts/py_helper.py')]
     results = []; sequence = 0
     def call(command, request, timeout=20):
         nonlocal sequence
         sequence += 1; req = work / (str(sequence) + "-request.json"); res = work / (str(sequence) + "-response.json")
         save(req, request)
-        process = subprocess.run([str(helper), command, "--request", str(req), "--response", str(res)],
+        process = subprocess.run([*helper, command, "--request", str(req), "--response", str(res)],
             capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
         assert not process.stdout and not process.stderr
         return read_json(res)
@@ -127,7 +128,7 @@ def main():
                           draft_path=str(recording_dir / "draft.json"), stop_path=str(recording_dir / "stop"),
                           name="Native recording acceptance", auto_start=True)
         req = recording_dir / "request.json"; res = recording_dir / "response.json"; save(req, record_req)
-        recorder = subprocess.Popen([str(helper), "record", "--request", str(req), "--response", str(res)], creationflags=subprocess.CREATE_NO_WINDOW)
+        recorder = subprocess.Popen([*helper, "record", "--request", str(req), "--response", str(res)], creationflags=subprocess.CREATE_NO_WINDOW)
         deadline = time.time() + 10
         while time.time() < deadline:
             if (recording_dir / "progress.json").exists():

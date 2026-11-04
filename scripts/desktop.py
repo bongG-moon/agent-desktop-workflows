@@ -17,7 +17,8 @@ import observe
 import interact
 from local_core import EngineError, validate_local_directory
 
-NATIVE = ROOT / 'bin' / 'WorkflowNative.exe'
+BRIDGE = ROOT / 'scripts' / 'py_helper.py'
+BRIDGE_SOURCES = ('scripts/py_helper.py', 'scripts/win_bridge.py', 'scripts/recorder.py')
 MAX_JSON = 16 * 1024 * 1024
 ALIASES = {'edit': 'textfield', 'pane': 'group', 'listitem': 'listitem',
            'menu item': 'menuitem', 'combo box': 'combobox', 'check box': 'checkbox'}
@@ -56,15 +57,19 @@ def write_json(path, value):
         os.fsync(stream.fileno())
 
 
-def _native_binary():
-    local_dir(NATIVE.parent)
-    info = NATIVE.lstat()
-    if NATIVE.is_symlink() or getattr(info, 'st_file_attributes', 0) & 1024:
-        raise EngineError('native_binary_redirected')
-    manifest = read_json(ROOT / 'bin' / 'native-manifest.json')
-    if manifest.get('sha256') != hashlib.sha256(NATIVE.read_bytes()).hexdigest():
-        raise EngineError('native_binary_hash_mismatch')
-    return NATIVE
+def _bridge_script():
+    manifest = read_json(ROOT / 'engine' / 'bridge-manifest.json')
+    if manifest.get('version') != '0.1.1' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
+        raise EngineError('bridge_manifest_invalid')
+    for name in BRIDGE_SOURCES:
+        path = ROOT / name
+        local_dir(path.parent)
+        info = path.lstat()
+        if path.is_symlink() or getattr(info, 'st_file_attributes', 0) & 1024 or not path.is_file():
+            raise EngineError('bridge_source_redirected')
+        if manifest['files'][name] != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise EngineError('bridge_source_hash_mismatch')
+    return BRIDGE
 
 
 def _native(command, payload, run_dir, *, timeout=15, on_progress=None, stop_event=None):
@@ -74,7 +79,9 @@ def _native(command, payload, run_dir, *, timeout=15, on_progress=None, stop_eve
     request, response = run / 'request.json', run / 'response.json'
     write_json(request, payload)
     environment = observe.child_environment(run)
-    proc = subprocess.Popen([str(_native_binary()), command, '--request', str(request),
+    # Isolated Python loads only the bundled transparent source. No compiler or
+    # additional executable is generated, downloaded, or used as a fallback.
+    proc = subprocess.Popen([sys.executable, '-I', '-X', 'utf8', '-B', str(_bridge_script()), command, '--request', str(request),
                              '--response', str(response)], cwd=run, env=environment,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,

@@ -1,6 +1,10 @@
 # 작업 녹화와 실행
 
-명령은 이 제품 폴더 기준이다. Python 3.10 이상을 사용하며 UI에는 tkinter가 필요하다. API 키, 모델 주소나 기존 CUA 설정을 받지 않는다. `%LOCALAPPDATA%\AgentDesktopWorkflows`가 기본 저장소다. `--store`를 지정할 때는 동기화되지 않는 로컬 고정 디스크의 절대 경로를 사용한다.
+명령은 이 제품 폴더 기준이다. 64비트 Python 3.10 이상을 사용하며 UI에는 tkinter가 필요하다. API 키, 모델 주소나 기존 CUA 설정을 받지 않는다. `%LOCALAPPDATA%\AgentDesktopWorkflows`가 기본 저장소다. `--store`를 지정할 때는 동기화되지 않는 로컬 고정 디스크의 절대 경로를 사용한다.
+
+0.1.1의 창 조회, 녹화와 영역 입력은 Python 도우미로 실행한다. Windows ZIP은 기존과 동일한 `agent-desktop.exe` 하나만 포함하며 자체 EXE/DLL의 다운로드 또는 실행 중 빌드를 하지 않는다. 0.1.0의 작업 저장소 형식은 유지하므로 새 프로그램 폴더와 기존 저장소를 함께 사용할 수 있다.
+
+소스 ZIP 또는 Main의 Download ZIP을 받았다면, 사용자가 이전에 받은 Agent Desktop Local 0.2.0의 `bin/agent-desktop.exe`를 새 제품의 `bin/agent-desktop.exe`로 직접 복사할 수 있다. 파일의 SHA-256은 `UPSTREAM.json`의 `binary_sha256`과 일치해야 한다. 고정 해시는 `2c8e9a627d87649a4562bfe5678450d045b793ab6f3fdec8af05c9571f32d5ef`다. 기존 설치 폴더와 설정은 유지하며 자동 검색이나 설치를 수행하지 않는다.
 
 ## 1. 녹화와 보완
 

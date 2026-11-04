@@ -1,4 +1,4 @@
-Agent Desktop Workflows 0.1.0
+Agent Desktop Workflows 0.1.1
 Independent local recording, workflow editing and desktop execution system, 2026.
 Distributed under the Apache License 2.0; see LICENSE.
 
@@ -8,7 +8,10 @@ Pinned source revision: d3dc190afbf34cd2377252398ddd5c30efbd093a
 See UPSTREAM.json and THIRD_PARTY_NOTICES.txt for provenance and dependency notices.
 
 The Python files under engine/ derive from Agent Desktop Local 0.2.0's
-independent observation and one-action wrappers. WorkflowNative, the workflow
-store/runner, application UI and task interface are separate local components.
+independent observation and one-action wrappers. The Python Windows bridge,
+recorder, workflow store/runner, application UI and task interface are separate
+local components. The former WorkflowNative.exe is not shipped or used in 0.1.1.
+No helper EXE or DLL is downloaded or compiled at runtime. Windows UI Automation
+and input APIs are called directly by the Python standard library.
 There is no runtime dependency on Computer Use MCP, its Driver, configurations,
 recordings or installed programs. No JEV or external model integration is included.
