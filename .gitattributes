@@ -1,0 +1,2 @@
+# Preserve the verbatim third-party license collection, including its whitespace.
+THIRD_PARTY_NOTICES.txt -text -whitespace

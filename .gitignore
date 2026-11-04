@@ -1,0 +1,7 @@
+.build/
+bin/*.exe
+__pycache__/
+*.pyc
+data/
+.local/
+CONTRACT.md
