@@ -86,7 +86,7 @@ def write_json(path, value, *, replace=False):
 
 def _bridge_script():
     manifest = read_json(ROOT / 'engine' / 'bridge-manifest.json')
-    if manifest.get('version') != '0.1.2' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
+    if manifest.get('version') != '0.1.3' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
         raise EngineError('bridge_manifest_invalid')
     for name in BRIDGE_SOURCES:
         path = ROOT / name

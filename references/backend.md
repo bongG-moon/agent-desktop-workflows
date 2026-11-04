@@ -1,6 +1,6 @@
 # Python helper protocol v1
 
-Agent Desktop Workflows 0.1.2 replaces its own compiled helper with three inspectable Python files: `scripts/py_helper.py`, `scripts/win_bridge.py`, and `scripts/recorder.py`. The supported runtime is x64 Python 3.10 or later on x64 Windows; the recorder UI also needs tkinter. Python's standard library calls Windows' built-in UI Automation COM and Win32 APIs. No CUA runtime, driver, model, third-party Python package, helper compiler, or runtime download is required.
+Agent Desktop Workflows 0.1.3 uses three inspectable Python files instead of its own compiled helper: `scripts/py_helper.py`, `scripts/win_bridge.py`, and `scripts/recorder.py`. The supported runtime is x64 Python 3.10 or later on x64 Windows; the recorder UI also needs tkinter. Python's standard library calls Windows' built-in UI Automation COM and Win32 APIs. No CUA runtime, driver, model, third-party Python package, helper compiler, or runtime download is required.
 
 The Windows ZIP still includes the unchanged upstream `bin/agent-desktop.exe` for semantic element actions. The source ZIP includes no EXE. A user can manually copy the previously obtained Agent Desktop Local 0.2.0 copy into this separate product's `bin` directory after checking its SHA-256 against `UPSTREAM.json`. The product does not search or import another installation. Removing the additional helper EXE changes the distribution; it does not override company rules governing Python, hooks, or desktop input.
 
@@ -12,7 +12,7 @@ The desktop adapter invokes the current Python interpreter with an isolated modu
 python -I -X utf8 -B scripts/py_helper.py COMMAND --request ABSOLUTE_JSON --response ABSOLUTE_JSON
 ```
 
-Use the public workflow CLI rather than invoking the helper to bypass workflow checks. The adapter checks all three source hashes against `engine/bridge-manifest.json` before every helper process. The manifest is `{version:"0.1.2",files:{"scripts/py_helper.py":"SHA256","scripts/win_bridge.py":"SHA256","scripts/recorder.py":"SHA256"}}`. `tools/build.py` refreshes it from source when producing release archives; it does not compile source or create executables. These files use LF line endings so Git checkout conversion does not invalidate their hashes. A hash mismatch fails closed; the runtime does not regenerate the manifest.
+Use the public workflow CLI rather than invoking the helper to bypass workflow checks. The adapter checks all three source hashes against `engine/bridge-manifest.json` before every helper process. The manifest is `{version:"0.1.3",files:{"scripts/py_helper.py":"SHA256","scripts/win_bridge.py":"SHA256","scripts/recorder.py":"SHA256"}}`. `tools/build.py` refreshes it from source when producing release archives; it does not compile source or create executables. These files use LF line endings so Git checkout conversion does not invalidate their hashes. A hash mismatch fails closed; the runtime does not regenerate the manifest.
 
 Release archives also contain `PACKAGE-MANIFEST.json` with the product, version, distribution and hashes of all allowlisted files. The build verifier rejects extra files and enforces exactly one pinned EXE in the Windows archive and none in the source archive. Hashes detect mismatch or corruption; they are not a digital signature or a sandbox against a party able to replace both source and manifests.
 

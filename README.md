@@ -1,10 +1,12 @@
-# Agent Desktop Workflows 0.1.2
+# Agent Desktop Workflows 0.1.3
 
 [별도 저장소](https://github.com/bongG-moon/agent-desktop-workflows) / [Windows ZIP과 사용 가이드 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/latest)
 
 Windows 업무를 한 번 직접 녹화하고, 인식되지 않은 단계만 보완한 뒤 작업 이름과 조건으로 실행하는 독립 시스템입니다. **기존 CUA MCP와 별도 실행 파일, 설정, 작업 저장소를 사용합니다.** CUA MCP 서버나 CUA Driver를 설치/실행하지 않습니다.
 
 처음 사용하는 분은 Windows ZIP 전체를 새 로컬 폴더에 풀고 **`사용가이드.html`**을 여세요. `Start.cmd`로 녹화/편집 화면을 실행합니다. 64비트 Python 3.10 이상과 tkinter는 회사에서 승인한 환경에 별도로 준비해야 합니다.
+
+**0.1.3은 FX 실습 가이드를 추가한 문서 업데이트입니다.** [사용가이드의 FX 실습](사용가이드.html#fx-walkthrough)에 Family=Hybrid, Status=N 설정부터 조회, 표 우클릭 Excel 내보내기, 첫 UI 실행과 Claude Code 재사용까지의 순서를 담았습니다. 입력 변수와 완료 조건 설정표, 사람 확인 후 이어하기 요청문을 포함합니다. ZIP 안의 가이드와 릴리즈의 별도 HTML 가이드에 같은 내용을 제공합니다. 실행 동작과 기존 EXE는 0.1.2와 같습니다.
 
 **0.1.2는 녹화와 재개 흐름을 보완한 버전입니다.** 콤보 목록 선택과 독립된 행 선택을 기록하고, 제출 버튼이 입력창을 비워도 제출 전 관찰한 값을 보존합니다. 빠른 입력 때문에 전환 전 값의 근거가 부족하면 보완 단계로 남깁니다. 이어하기는 현재도 필요한 최신 조건을 확인하고, 아직 입력하지 않은 작업의 파일 기준값을 새로 잡습니다. 실행 기록을 보는 중에는 **최신 수정본 보기**로 전환해 내용을 확인한 뒤 새 작업을 실행합니다.
 

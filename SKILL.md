@@ -3,11 +3,13 @@ name: agent-desktop-workflows
 description: Windows 업무 작업을 사용자의 시연으로 녹화하고, 단계별 인식 상태를 보완한 뒤 작업 이름과 입력 조건으로 재생한다. 로컬 명령과 파일 도구가 있는 사내 모델 환경에서 사용하며 기존 CUA MCP와 독립적으로 동작한다.
 ---
 
-# Agent Desktop Workflows 0.1.2
+# Agent Desktop Workflows 0.1.3
 
 이 스킬은 별도 제품이다. 기존 CUA MCP 또는 Agent Desktop Local을 실행하거나 그 설정, 저장소, 녹화 파일을 변경하지 않는다. Windows ZIP에 포함된 기존 `bin/agent-desktop.exe`와 64비트 Python 3.10 이상을 사용한다. 창 조회, 녹화와 영역 입력은 `scripts/py_helper.py`, `scripts/win_bridge.py`, `scripts/recorder.py`에서 실행한다. 녹화/편집 화면에는 tkinter가 필요하다. 설치와 첫 사용은 [사용가이드.html](사용가이드.html)을 안내한다.
 
 ## 요청을 작업 단위로 처리
+
+FX의 Family/Status 조회와 우클릭 Excel 내보내기를 처음 구성할 때는 [FX 실습 순서](사용가이드.html#fx-walkthrough)를 안내한다. 실제 단계의 인식 상태와 최종 내보내기 방식을 확인하고, 조회 완료 신호가 검증되기 전에는 `click` 동작에 `manual` 완료 조건을 사용한다.
 
 - “작업 녹화”는 `python -X utf8 -B scripts/cli.py ui`로 녹화/편집 화면을 연다. 사용자가 업무 창을 선택하고 직접 시연한다. 녹화한 동작은 이미 실제 앱에 적용된 동작이며, 인식 경고는 재생 준비가 부족하다는 뜻이다.
 - “저장한 작업 실행”은 [실행 방법](references/usage.md)을 읽고 작업 이름/ID, 현재 대상 창과 입력 변수를 확인해 `cli.py run`을 한 번 호출한다. 모델이 각 단계마다 ref를 복사하거나 임의 PowerShell 코드를 만들지 않는다. 현재 ref는 로컬 실행기가 단계 직전에 찾는다.

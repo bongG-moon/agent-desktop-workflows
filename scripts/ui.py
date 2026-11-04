@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Agent Desktop Workflows"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 ACTION_LABELS = {"click": "클릭", "double-click": "두 번 클릭", "right-click": "우클릭",
     "set-value": "값 설정", "type": "입력", "select": "항목 선택", "expand": "펼치기",
     "collapse": "접기", "check": "체크", "uncheck": "체크 해제", "focus": "포커스",
