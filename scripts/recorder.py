@@ -518,7 +518,7 @@ class CaptureWorker(threading.Thread):
             self.model.manual('보호된 입력', 'protected_input_not_recorded')
             return
         value = self.uia.value(observation['element'])
-        if value is None:
+        if value is None and observation['node'].get('role') != 'combobox':
             return
         if self.watched and self.uia.same(self.watched['element'], observation['element']):
             return
@@ -540,7 +540,27 @@ class CaptureWorker(threading.Thread):
         self.model.add(step)
         self._drop_watch()
 
+    def _unobserved_combo(self):
+        # Preserve the known field so users can repair its input without losing
+        # the original step ID or having to identify the combo again.
+        try:
+            step = self.step('manual', self.watched)
+        except RecorderError:
+            self._manual_watch('combo_value_unobserved')
+            return
+        step['label'] = _clip(step['label'].removesuffix(' / manual') + ' / 선택값 확인 필요')
+        step['expect'] = {'kind': 'manual'}
+        step['recognition'] = {'target': 'identified', 'action': 'manual',
+                               'result': 'manual', 'reason': 'combo_value_unobserved'}
+        if self.watched_step:
+            step['id'] = self.watched_step['id']
+        self.model.add(step)
+        self._drop_watch()
+
     def _commit_value(self, current):
+        if self.watched['node'].get('role') == 'combobox' and (current is None or current == ''):
+            self._unobserved_combo()
+            return
         if not isinstance(current, str) or '\0' in current or len(current.encode('utf-8')) > MAX_VALUE_BYTES:
             self._manual_watch('value_readback_unavailable')
             return
@@ -586,6 +606,13 @@ class CaptureWorker(threading.Thread):
         except Exception:
             if force:
                 self._manual_watch('value_readback_unavailable')
+            return
+        if observation['node'].get('role') == 'combobox' and (current is None or current == ''):
+            # Retain missing evidence in the timeline too: otherwise an older
+            # selection could survive a later unreadable user selection.
+            self.watched_samples.append((time.monotonic(), None))
+            if force:
+                self._unobserved_combo()
             return
         if not isinstance(current, str) or '\0' in current or len(current.encode('utf-8')) > MAX_VALUE_BYTES:
             if force:

@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Agent Desktop Workflows"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 ACTION_LABELS = {"click": "클릭", "double-click": "두 번 클릭", "right-click": "우클릭",
     "set-value": "값 설정", "type": "입력", "select": "항목 선택", "expand": "펼치기",
     "collapse": "접기", "check": "체크", "uncheck": "체크 해제", "focus": "포커스",
@@ -40,6 +40,8 @@ def target_text(target):
 def recognition_text(step):
     rec = step.get("recognition", {})
     kind = step.get("target", {}).get("kind")
+    if kind == "element" and rec.get("reason") == "combo_value_unobserved":
+        return "요소 확인 / 선택값 보완 필요"
     if kind == "manual" or step.get("action") == "manual":
         return "보완 필요"
     if kind == "region":
@@ -78,6 +80,14 @@ def _safe_reason(error):
         "target_identity_changed": "대상 프로그램이나 창의 식별 정보가 달라졌습니다. 이전 실행의 입력은 이어 보내지 않습니다.",
         "target_identity_missing": "이전 실행에 대상 식별 근거가 없어 자동으로 이어갈 수 없습니다.",
         "selection_action_not_supported": "현재 콤보는 항목 선택 동작을 지원하지 않습니다. 실제 지원 동작을 확인해 이 단계를 보완하세요.",
+        "combo_value_unobserved": "콤보 대상은 찾았지만 실제 선택값을 읽지 못했습니다. 단계 수정에서 실제 값이나 입력 변수와 기본값을 지정하세요. 같은 클릭을 다시 녹화하는 것만으로 해결되지 않을 수 있습니다.",
+        "empty_combo_value_requires_review": "콤보 설정값이 비어 있어 입력을 보내지 않았습니다. 단계 수정에서 실제 값 또는 입력 변수와 기본값을 지정하고 새 수정본으로 저장하세요.",
+        "combo_value_unavailable": "콤보의 실제 선택값을 확인할 근거가 부족합니다. 빈 값 비교로 성공 처리하지 않습니다. 현재 화면을 확인하세요.",
+        "combo_value_conflict": "콤보에서 읽은 선택값 근거가 서로 다릅니다. 현재 화면과 선택 항목을 확인하세요.",
+        "combo_value_mismatch": "입력은 전달됐지만 실제 콤보 선택값이 요청한 값과 다릅니다. 자동 반복하지 않고 현재 화면 확인을 기다립니다.",
+        "combo_value_observed": "콤보의 실제 선택값 근거가 요청한 값과 일치합니다.",
+        "combo_readback_interrupted": "입력 전달 후 선택값 확인이 중단됐습니다. 현재 화면을 확인하고 이어갈지 결정하세요. 입력을 자동 반복하지 않습니다.",
+        "combo_parent_value_unavailable": "값 쓰기는 전달됐지만 부모 콤보의 값만으로는 결과를 확인할 수 없습니다.",
     }
     if name in descriptions:
         return descriptions[name]
@@ -434,12 +444,16 @@ class WorkflowApp(tk.Tk):
             f"인식: {rec.get('target', '미확인')}  /  조작: {rec.get('action', '미확인')}  /  결과: {rec.get('result', '미확인')}"]
         if step.get("parameter"):
             lines.append(f"입력 변수: {step['parameter']} (현재 {_parameter_value(step, self.workflow)})")
+        elif "value" in step:
+            lines.append("설정값: " + (json.dumps(step["value"], ensure_ascii=False) if step["value"] != "" else "빈 문자열 (값 없음)"))
         if rec.get("reason"):
-            lines.append("보완 안내: " + rec["reason"])
+            lines.append("보완 안내: " + _safe_reason(rec["reason"]))
         if self.run:
             result = next((s for s in self.run.get("steps", []) if s["id"] == step["id"]), {})
             if result.get("reason"):
                 lines.append("실행 상태: " + _safe_reason(result["reason"]))
+            if result.get("result", {}).get("diagnostic"):
+                lines.append("실행 근거: " + _safe_reason(result["result"]["diagnostic"]))
         self._detail("\n".join(lines))
 
     def record(self, repair=False):
@@ -644,11 +658,15 @@ class WorkflowApp(tk.Tk):
         if run.get("status") == "needs_review":
             current = next((s for s in run.get("steps", []) if s["id"] == run.get("current_step_id")), {})
             code = run.get("diagnostic") or current.get("result", {}).get("diagnostic") or current.get("reason")
+            if code == "action_not_completed" and current.get("result", {}).get("diagnostic"):
+                code = current["result"]["diagnostic"]
             reason = _safe_reason(code) if code else "현재 단계의 대상과 결과를 확인하세요."
             if code == "completed_prefix_condition_changed":
                 self._detail(reason)
             else:
-                self._detail("현재 단계에 확인이 필요합니다. 이미 전달됐을 수 있는 입력은 자동 반복하지 않습니다.\n" + reason + "\n실제 결과를 확인한 단계만 [현재 단계 직접 확인 후 계속]을 선택하세요.")
+                delivery = ("현재 단계에는 입력을 보내지 않았습니다." if current.get("result", {}).get("input_dispatched") is False
+                            else "이미 전달됐을 수 있는 입력은 자동 반복하지 않습니다.")
+                self._detail("현재 단계에 확인이 필요합니다. " + delivery + "\n" + reason + "\n실제 결과를 확인한 단계만 [현재 단계 직접 확인 후 계속]을 선택하세요.")
 
     def cancel(self):
         self.stop_event.set()
@@ -819,6 +837,10 @@ class StepEditor(tk.Toplevel):
             return
         parameter = self.vars["parameter"].get().strip()
         value = self.vars["value"].get()
+        role = str(step.get("target", {}).get("locator", {}).get("role", "")).casefold().replace("_", "").replace(" ", "")
+        if role == "combobox" and step["action"] in {"set-value", "type", "select"} and value == "":
+            messagebox.showinfo(APP_NAME, _safe_reason("empty_combo_value_requires_review"), parent=self)
+            return
         parameters = copy.deepcopy(self.workflow.get("parameters", {}))
         step.pop("parameter", None)
         step.pop("value", None)
@@ -856,9 +878,15 @@ class StepEditor(tk.Toplevel):
                 return
             step["expect"]["value"] = expected.casefold() in {"true", "1", "yes"}
         if step["action"] == "manual":
-            step["target"] = {"kind": "manual", "locator": {}}
+            if step.get("target", {}).get("kind") != "element":
+                step["target"] = {"kind": "manual", "locator": {}}
             step["expect"] = {"kind": "manual"}
-            step["recognition"] = {"target": "manual", "action": "manual", "result": "manual", "reason": "사용자가 직접 수행하고 확인하는 단계입니다."}
+            if step.get("recognition", {}).get("reason") != "combo_value_unobserved":
+                step["recognition"] = {"target": "identified" if step["target"]["kind"] == "element" else "manual",
+                                       "action": "manual", "result": "manual", "reason": "사용자가 직접 수행하고 확인하는 단계입니다."}
+        elif step.get("recognition", {}).get("reason") == "combo_value_unobserved":
+            step["recognition"] = {"target": "identified", "action": "configured", "result": "pending",
+                                   "reason": "입력값을 보완했습니다. 실행 후 실제 선택값은 별도로 확인합니다."}
         self.result = (step, parameters)
         self.destroy()
 

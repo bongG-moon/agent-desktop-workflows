@@ -85,6 +85,49 @@ class HiddenUiTests(unittest.TestCase):
         self.assertEqual(step['parameter'], 'Status')
         self.assertEqual(parameters['Status'], 'N')
 
+    def test_empty_combo_cannot_be_saved_as_automatic_value_step(self):
+        for parameter in ('', 'Status'):
+            step = copy.deepcopy(self.saved['steps'][0])
+            step['target']['locator']['role'] = 'combobox'
+            editor = self.editor(step)
+            editor.vars['value'].set('')
+            editor.vars['parameter'].set(parameter)
+            with patch.object(ui.messagebox, 'showinfo') as notice:
+                editor.save()
+            self.assertIsNone(editor.result)
+            notice.assert_called_once()
+            editor.destroy()
+
+    def test_unobserved_combo_keeps_identity_through_manual_save_and_repair(self):
+        step = copy.deepcopy(self.saved['steps'][0])
+        step.update(action='manual', expect={'kind': 'manual'}, recognition={
+            'target': 'identified', 'action': 'manual', 'result': 'manual', 'reason': 'combo_value_unobserved'})
+        step.pop('value')
+        step['target']['locator']['role'] = 'combobox'
+        self.assertIn('선택값', ui.recognition_text(step))
+        editor = self.editor(step)
+        editor.save()
+        manual, _ = editor.result
+        self.assertEqual(manual['target'], step['target'])
+        self.assertEqual(manual['recognition']['reason'], 'combo_value_unobserved')
+        editor = self.editor(manual)
+        editor.vars['action'].set('set-value')
+        editor.vars['parameter'].set('Status')
+        editor.vars['value'].set('N')
+        editor.vars['expect'].set('value')
+        editor.save()
+        repaired, parameters = editor.result
+        self.assertEqual(repaired['id'], step['id'])
+        self.assertEqual(repaired['target'], step['target'])
+        self.assertEqual(repaired['parameter'], 'Status')
+        self.assertEqual(parameters['Status'], 'N')
+        self.assertEqual(repaired['expect'], {'kind': 'value'})
+        self.assertEqual(repaired['recognition']['result'], 'pending')
+        candidate = copy.deepcopy(self.saved)
+        candidate['steps'] = [repaired]
+        candidate['parameters'] = parameters
+        self.store.save(candidate, expected_revision=1)
+
     def test_independent_target_keeps_literal_even_with_input_parameter(self):
         step = copy.deepcopy(self.saved['steps'][0])
         other = {'kind': 'element', 'locator': {'automation_id': 'Result'}}

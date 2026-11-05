@@ -9,7 +9,7 @@ import shutil
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.1.3'
+VERSION = '0.1.4'
 BRIDGE_FILES = ('scripts/py_helper.py', 'scripts/win_bridge.py', 'scripts/recorder.py')
 BRIDGE_MANIFEST = 'engine/bridge-manifest.json'
 FILES = '''.gitignore
@@ -43,6 +43,7 @@ tools/build.py
 tools/smoke_native.py
 tools/smoke_workflows.py
 tools/smoke_userflow.py
+tools/smoke_combo_evidence.py
 tests/test_desktop.py
 tests/test_workflows.py
 tests/test_win_bridge.py
@@ -52,7 +53,8 @@ tests/test_py_helper.py
 tests/test_ui.py
 tests/test_cli.py
 tests/fixtures/ActionFixture.cs
-tests/fixtures/NativeFixture.cs'''.splitlines()
+tests/fixtures/NativeFixture.cs
+tests/fixtures/ComboEvidenceFixture.cs'''.splitlines()
 
 
 def digest(data):

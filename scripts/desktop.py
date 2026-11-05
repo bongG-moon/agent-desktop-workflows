@@ -86,7 +86,7 @@ def write_json(path, value, *, replace=False):
 
 def _bridge_script():
     manifest = read_json(ROOT / 'engine' / 'bridge-manifest.json')
-    if manifest.get('version') != '0.1.3' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
+    if manifest.get('version') != '0.1.4' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
         raise EngineError('bridge_manifest_invalid')
     for name in BRIDGE_SOURCES:
         path = ROOT / name
@@ -373,6 +373,10 @@ class DesktopAdapter:
         session = self.run_dir / result['receipt']
         observation = read_json(session / 'inspection.json')
         node = resolve(observation['nodes'], target['locator'])
+        combo = role(node.get('role')) == 'combobox'
+        if combo and action in interact.VALUE_ACTIONS and value == '':
+            return {'status': 'not_delivered', 'input_dispatched': False,
+                    'diagnostic': 'empty_combo_value_requires_review'}
         if not node.get('ref'):
             return {'status': 'not_delivered', 'input_dispatched': False,
                     'diagnostic': 'target_has_no_action_ref'}
@@ -386,7 +390,41 @@ class DesktopAdapter:
                                amount=step.get('amount'))
         if action == 'scroll':
             args.direction, args.amount = args.direction or 'down', args.amount or 3
-        return interact.run_act(args)
+        result = interact.run_act(args)
+        if combo and action in {'set-value', 'type', 'select', 'clear'}:
+            return self._combo_readback(result, step, '' if action == 'clear' else value)
+        return result
+
+    def _combo_readback(self, result, step, value):
+        """A raw combo ValuePattern receipt is separate from selected-value evidence.
+
+        Read the same target once through the Python helper after known delivery.
+        Preserve the engine receipt and never repeat input or try another action.
+        """
+        if not isinstance(result, dict) or result.get('input_dispatched') is not True:
+            return result
+        status = result.get('status')
+        if status not in {'completed', 'executed_unverified', 'verification_failed'}:
+            return result
+        check_step = dict(step, expect={'kind': 'value', 'value': value})
+        try:
+            checked = self.check(check_step, value)
+        except KeyboardInterrupt:
+            return dict(result, status='interrupted', engine_status=status,
+                        effect_verification='unavailable', diagnostic='combo_readback_interrupted',
+                        value_readback={'matched': None, 'diagnostic': 'combo_readback_interrupted'})
+        except Exception:
+            checked = {'matched': None, 'diagnostic': 'combo_value_unavailable'}
+        output = dict(result, engine_status=status, value_readback=checked)
+        matched = checked.get('matched')
+        if matched is True:
+            output.update(status='completed', effect_verification='matched', diagnostic='combo_value_observed')
+        elif matched is False:
+            output.update(status='verification_failed', effect_verification='mismatch', diagnostic='combo_value_mismatch')
+        else:
+            output.update(status='executed_unverified',
+                          effect_verification='unavailable', diagnostic=checked.get('diagnostic', 'combo_value_unavailable'))
+        return output
 
     def check(self, step, value=None):
         expected = step.get('expect', {})
@@ -417,6 +455,15 @@ class DesktopAdapter:
         if kind == 'value':
             wanted = expected.get('value', value)
             actual = node.get('value')
+            if role(node.get('role')) == 'combobox':
+                if observed.get('complete') is not True:
+                    return {'matched': None, 'diagnostic': 'combo_value_unavailable'}
+                evidence = node.get('value_evidence')
+                state = evidence.get('status') if isinstance(evidence, dict) else None
+                if (state != 'observed' or evidence.get('source') not in {'parent', 'editor', 'selection', 'corroborated'}
+                        or not isinstance(actual, str) or not actual or not isinstance(wanted, str) or not wanted):
+                    return {'matched': None, 'diagnostic': 'combo_value_conflict' if state == 'conflict' else 'combo_value_unavailable'}
+                return {'matched': actual == wanted, 'diagnostic': 'combo_value_observed'}
             return {'matched': actual == wanted if isinstance(actual, str) and isinstance(wanted, str) else None}
         if kind == 'checked':
             checked = node.get('checked')

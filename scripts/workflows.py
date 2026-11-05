@@ -40,7 +40,7 @@ def _action_result(value):
     if not isinstance(value, dict) or type(value.get("input_dispatched")) not in (bool, type(None)):
         return {"status": "uncertain", "input_dispatched": None, "effect_verification": "unavailable"}
     result = {key: copy.deepcopy(value[key]) for key in ("status", "input_dispatched", "effect_verification", "receipt",
-        "diagnostic", "delivery", "after_snapshot_available") if key in value}
+        "diagnostic", "delivery", "after_snapshot_available", "engine_status", "value_readback") if key in value}
     result.setdefault("input_dispatched", None)
     result.setdefault("effect_verification", "unavailable")
     if result.get("status") not in {"completed", "executed_unverified", "not_delivered", "uncertain", "blocked",

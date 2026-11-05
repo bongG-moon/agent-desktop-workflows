@@ -27,7 +27,8 @@ DIAGNOSTICS = {"invalid_arguments", "invalid_action", "headed_required", "invali
     "ref_scope_mismatch", "secure_target", "ref_preflight_failed", "binary_hash_mismatch",
     "window_process_mismatch", "process_executable_mismatch", "different_windows_session",
     "reparse_directory_rejected", "reparse_file_rejected", "local_absolute_directory_required",
-    "local_fixed_drive_required", "existing_output_directory_required", "windows_required"}
+    "local_fixed_drive_required", "existing_output_directory_required", "windows_required",
+    "empty_combo_value_requires_review", "combo_parent_value_unavailable"}
 
 
 def _read(path):
@@ -269,9 +270,12 @@ def verify_effect(before_node, after, action, value):
     result["node"] = node
     observed = node.get("value")
     expected = value if action in {"set-value", "select"} else "" if action == "clear" else None
-    if expected is not None and observed is not None:
+    # Custom combo providers can expose ValuePattern but always return "".
+    # That is not evidence that the current selection is empty or was cleared.
+    combo = str(node.get("role", "")).replace("ControlType.", "").lower() in {"combobox", "combo box"}
+    if expected is not None and observed is not None and not (combo and observed == ""):
         result.update(status="matched" if observed == expected else "mismatch", scope="control_value")
-    elif action == "select" and node.get("selected") is True and node.get("name") == value:
+    elif action == "select" and not combo and node.get("selected") is True and node.get("name") == value:
         result["status"] = "matched"
     elif action in {"check", "uncheck", "expand", "collapse", "focus"}:
         positive = {"check": "checked", "uncheck": "unchecked", "expand": "expanded", "collapse": "collapsed", "focus": "focused"}[action]
@@ -310,8 +314,45 @@ def read_missing_value(verification, after, session, run, action, value):
             or not isinstance(data.get("value"), str)):
         return verification
     expected = "" if action == "clear" else value
+    if str(node.get("role", "")).replace("ControlType.", "").lower() in {"combobox", "combo box"} and data["value"] == "":
+        return dict(verification, status="unavailable", scope="control_value",
+                    evidence="empty_combo_value_unavailable")
     return dict(verification, status="matched" if data["value"] == expected else "mismatch",
                 scope="control_value", node=dict(node, value=data["value"]), evidence="fresh_get_value")
+
+
+def _combo_postcondition_only_failure(raw, node, after, verification, action, value, dispatched, delivery):
+    """Recognize one completed semantic write whose raw combo readback was empty.
+
+    This is delivery evidence, not selection evidence. Do not use a currently
+    matching value to repair unknown/partial delivery or other engine failures.
+    """
+    if (action != "set-value" or not isinstance(value, str) or not value
+            or dispatched is not True or delivery != "delivered_unverified"
+            or str(node.get("role", "")).replace("ControlType.", "").lower() not in {"combobox", "combo box"}
+            or raw.get("ok") is not False or raw.get("command") != action):
+        return False
+    error = raw.get("error")
+    if not isinstance(error, dict) or error.get("code") != "ACTION_FAILED":
+        return False
+    details = error.get("details")
+    disposition = {"delivery": "delivered_unverified", "retry": "unsafe"}
+    if not isinstance(details, dict) or details.get("kind") != "post_action_verification" or error.get("disposition") != disposition:
+        return False
+    performed, state = details.get("after_action"), details.get("post_state")
+    if (not isinstance(performed, dict) or performed.get("action") != action
+            or performed.get("disposition") != disposition or performed.get("steps") != [
+                {"label": "ValuePattern.SetValue", "mechanism": "semantic_api", "outcome": "succeeded", "verified": False}]
+            or performed["steps"][0].get("verified") is not False
+            or not isinstance(state, dict) or state.get("role") != "combobox" or state.get("value") != ""):
+        return False
+    # run_act reaches this point only after the after-snapshot and process/window
+    # identity checks. Its unique matched target must also be present and complete.
+    observed = verification.get("node")
+    return (isinstance(observed, dict) and not observed.get("truncated")
+            and all(observed.get(key) == node.get(key) for key in ("role", "name", "native_id"))
+            and (node.get("native_id") or observed.get("path") == node.get("path"))
+            and derive(after).get("complete") is True)
 
 
 def run_act(args):
@@ -325,6 +366,9 @@ def run_act(args):
         if not re.fullmatch(r"[a-f0-9]{32}", run.name):
             raise EngineError("invalid_session")
         session, before, node = _load_session(run, args.ref)
+        if (args.action in VALUE_ACTIONS and getattr(args, "value", None) == ""
+                and str(node.get("role", "")).replace("ControlType.", "").lower() in {"combobox", "combo box"}):
+            raise EngineError("empty_combo_value_requires_review")
         # Atomic, permanent consumption serializes concurrent calls and survives crashes.
         try:
             _write(run, "consumed.json", {"consumed_at": time.time(), "ref": args.ref,
@@ -360,7 +404,11 @@ def run_act(args):
         verification = verify_effect(node, after, args.action, getattr(args, "value", None))
         verification = read_missing_value(verification, after, session, run, args.action, getattr(args, "value", None))
         _write(run, "verification.json", verification)
-        if raw.get("ok") is not True:
+        combo_readback_only = _combo_postcondition_only_failure(raw, node, after, verification,
+            args.action, getattr(args, "value", None), dispatched, delivery)
+        if combo_readback_only:
+            status = "verification_failed" if verification["status"] == "mismatch" else "executed_unverified"
+        elif raw.get("ok") is not True:
             status = "not_delivered" if dispatched is False else "uncertain"
         elif dispatched is None:
             # Matching UI state does not repair a missing/unknown action-delivery report.
@@ -374,6 +422,8 @@ def run_act(args):
         result = receipt(run, status, input_dispatched=dispatched, delivery=delivery)
         result["effect_verification"] = verification["status"]
         result["after_snapshot_available"] = True
+        if combo_readback_only:
+            result["diagnostic"] = "combo_parent_value_unavailable"
     except (Exception, KeyboardInterrupt) as exc:
         status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "uncertain" if attempted else "blocked"
         result = receipt(run, status, input_dispatched=dispatched, delivery=delivery,

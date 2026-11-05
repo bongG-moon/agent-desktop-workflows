@@ -471,11 +471,70 @@ class UIA:
             return {'x': 0, 'y': 0, 'width': 0, 'height': 0}
         return {'x': rect.left, 'y': rect.top, 'width': width, 'height': height}
 
-    def value(self, element):
+    def _pattern_value(self, element):
         if self.secure(element) or element.property(30043) is not True:
             return None
         value = element.property(30045)
         return value if isinstance(value, str) else None
+
+    def value_observation(self, element):
+        """Read a combo's selected value, never infer it from its option inventory.
+
+        Some providers advertise ValuePattern but always return an empty string
+        on the combo peer. Only its own nonempty value, a related edit value, or
+        an explicitly selected list item supplies selection evidence. Ordinary
+        edit controls retain meaningful empty-string values (for clear actions).
+        """
+        unavailable = {'value': None, 'value_evidence': {'status': 'unavailable', 'source': 'none'}}
+        conflict = {'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}}
+        if self.secure(element):
+            return unavailable
+        parent_value = self._pattern_value(element)
+        if element.property(30003) != 50003:
+            return {'value': parent_value}
+        owner_pid = self.pid(element)
+        if type(owner_pid) is not int or owner_pid <= 0:
+            return unavailable
+        values = [('parent', parent_value)] if parent_value else []
+        editors, selections, visited = 0, 0, 0
+        pending = deque((child, 1) for child in self.children(element))
+        while pending:
+            child, depth = pending.popleft()
+            visited += 1
+            if visited > 256 or depth > 8 or self.pid(child) != owner_pid:
+                return unavailable  # Partial/foreign trees cannot justify a unique selection.
+            if self.secure(child):
+                return unavailable
+            role = child.property(30003)
+            if role == 50003:
+                continue  # An independently nested combo is not this combo's editor.
+            if role == 50007:
+                if child.property(30036) is True and child.property(30079) is True:
+                    selections += 1
+                    name = child.property(30005)
+                    if not isinstance(name, str) or not name:
+                        return unavailable
+                    values.append(('selection', name))
+                continue  # Text inside an unselected option is not an editor value.
+            if role == 50004:
+                # Uniqueness concerns editor candidates, not just readable
+                # nonempty values. A blank or unavailable sibling may be the
+                # real editor; do not pick another editor because it has text.
+                editors += 1
+                edit_value = self._pattern_value(child)
+                if edit_value:
+                    values.append(('editor', edit_value))
+                continue
+            pending.extend((nested, depth + 1) for nested in self.children(child))
+        if editors > 1 or selections > 1 or len({value for _, value in values}) > 1:
+            return conflict
+        if not values:
+            return unavailable
+        return {'value': values[0][1], 'value_evidence': {
+            'status': 'observed', 'source': values[0][0] if len(values) == 1 else 'corroborated'}}
+
+    def value(self, element):
+        return self.value_observation(element)['value']
 
     def checked(self, element):
         if element.property(30041) is not True:
@@ -529,7 +588,7 @@ class UIA:
         # NativeWindowHandle is a 32-bit UIA property even on x64; HWNDs are sign-extended.
         hwnd = int(native_handle or 0) & 0xffffffff
         return {'name': element.property(30005) or '', 'role': ROLES.get(element.property(30003), 'unknown'),
-                'automation_id': element.property(30011) or '', 'value': self.value(element),
+                'automation_id': element.property(30011) or '', **self.value_observation(element),
                 'checked': self.checked(element), 'enabled': element.property(30010) is True,
                 'offscreen': element.property(30022) is not False or not valid, 'secure': self.secure(element),
                 'states': states, 'available_actions': self.actions(element), 'locator': self.locator(element, root),

@@ -22,7 +22,7 @@ def _safe(run=None, *, status=None, diagnostic=None):
     allowed_statuses = {'unknown', 'written', 'imported', 'recorded_needs_review', 'completed',
                         'completed_unverified', 'verified', 'running', 'needs_review', 'cancelled',
                         'interrupted', 'blocked'}
-    result = {'product': 'Agent Desktop Workflows', 'version': '0.1.3',
+    result = {'product': 'Agent Desktop Workflows', 'version': '0.1.4',
               'status': reported_status if reported_status in allowed_statuses else 'unknown',
               'model_calls': 0, 'network_requests_by_wrapper': 0}
     for source, target in [('id', 'run_id'), ('run_id', 'run_id'), ('workflow_id', 'workflow_id')]:

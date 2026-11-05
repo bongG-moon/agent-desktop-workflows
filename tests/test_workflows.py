@@ -208,6 +208,82 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(run["status"], "needs_review")
                 self.assertEqual(len(adapter.reads), 1)
 
+    def test_legacy_empty_combo_workflow_cannot_dispatch_or_verify_empty_parent(self):
+        import desktop
+        saved = self.save(workflow([step(value='', expect={'kind': 'value', 'value': ''})]))
+        adapter = object.__new__(desktop.DesktopAdapter)
+        adapter.binding, adapter.run_dir, adapter.lifetime = BINDING, self.folder, 'same'
+        adapter.main = {'title': saved['target']['title'], 'class_name': saved['target']['class_name']}
+        observed = {'complete': True, 'nodes': [dict(path='0', role='combobox', automation_id='Field', value=None,
+                                   value_evidence={'status': 'unavailable', 'source': 'none'})]}
+        node = dict(path='0', role='combobox', automation_id='Field', value='', ref='@snew:e1')
+        with patch.object(adapter, '_window', return_value=(BINDING, observed)), \
+             patch.object(desktop.interact, 'run_inspect', return_value={'status': 'ready', 'receipt': 'a'*32}), \
+             patch.object(desktop, 'read_json', return_value={'nodes': [node]}), \
+             patch.object(desktop.interact, 'run_act') as action:
+            run = self.runner(adapter).start(saved['id'], BINDING)
+        self.assertEqual(run['status'], 'needs_review')
+        self.assertFalse(run['task_verified'])
+        self.assertIs(run['steps'][0]['input_dispatched'], False)
+        self.assertEqual(run['steps'][0]['result']['diagnostic'], 'empty_combo_value_requires_review')
+        action.assert_not_called()
+
+    def test_combo_workflow_uses_semantic_readback_and_preserves_engine_disposition(self):
+        import desktop
+        for actual, engine_status, final_status in [('N', 'verification_failed', 'completed'),
+                                                    ('W', 'completed', 'needs_review'),
+                                                    ('N', 'uncertain', 'needs_review')]:
+            with self.subTest(actual=actual, engine_status=engine_status):
+                saved = self.save(workflow([step()]))
+                adapter = object.__new__(desktop.DesktopAdapter)
+                adapter.binding, adapter.run_dir, adapter.lifetime = BINDING, self.folder, 'same'
+                adapter.main = {'title': saved['target']['title'], 'class_name': saved['target']['class_name']}
+                observed = {'complete': True, 'nodes': [dict(path='0', role='combobox', automation_id='Field', value=actual,
+                                           value_evidence={'status': 'observed', 'source': 'selection'})]}
+                node = dict(path='0', role='combobox', automation_id='Field', value='', ref='@snew:e1')
+                engine = dict(result(engine_status, True, 'matched' if engine_status == 'completed' else 'mismatch'),
+                              receipt='b'*32, delivery='delivered_unverified', after_snapshot_available=True)
+                with patch.object(adapter, '_window', return_value=(BINDING, observed)), \
+                     patch.object(desktop.interact, 'run_inspect', return_value={'status': 'ready', 'receipt': 'a'*32}), \
+                     patch.object(desktop, 'read_json', return_value={'nodes': [node]}), \
+                     patch.object(desktop.interact, 'run_act', return_value=engine) as action:
+                    run = self.runner(adapter).start(saved['id'], BINDING)
+                self.assertEqual(run['status'], final_status)
+                self.assertEqual(action.call_count, 1)
+                stored = run['steps'][0]['result']
+                self.assertEqual(stored['receipt'], 'b'*32)
+                if engine_status != 'uncertain':
+                    self.assertEqual(stored['engine_status'], engine_status)
+                    self.assertIs(stored['value_readback']['matched'], actual == 'N')
+                else:
+                    self.assertEqual(stored['status'], 'uncertain')
+                    self.assertEqual(run['steps'][0]['reason'], 'delivery_uncertain')
+
+    def test_combo_readback_interrupt_stops_before_second_check_or_next_input(self):
+        import desktop
+        saved = self.save(workflow([step(), step('click', 'none',
+            target={'kind': 'element', 'locator': {'name': 'Submit', 'role': 'button'}})]))
+        adapter = object.__new__(desktop.DesktopAdapter)
+        adapter.binding, adapter.run_dir, adapter.lifetime = BINDING, self.folder, 'same'
+        adapter.main = {'title': saved['target']['title'], 'class_name': saved['target']['class_name']}
+        node = dict(path='0', role='combobox', automation_id='Field', value='', ref='@snew:e1')
+        engine = dict(result('executed_unverified', True, 'unavailable'), receipt='b'*32,
+                      delivery='delivered_unverified', after_snapshot_available=True)
+        with patch.object(adapter, '_window', return_value=(BINDING, {'nodes': [node]})), \
+             patch.object(desktop.interact, 'run_inspect', return_value={'status': 'ready', 'receipt': 'a'*32}), \
+             patch.object(desktop, 'read_json', return_value={'nodes': [node]}), \
+             patch.object(desktop.interact, 'run_act', return_value=engine) as action, \
+             patch.object(adapter, 'check', side_effect=[KeyboardInterrupt, {'matched': True}]) as check:
+            run = self.runner(adapter).start(saved['id'], BINDING)
+        self.assertEqual(run['status'], 'needs_review')
+        self.assertEqual(action.call_count, 1)
+        self.assertEqual(check.call_count, 1)
+        self.assertEqual(run['steps'][0]['result']['status'], 'interrupted')
+        self.assertEqual(run['steps'][0]['result']['engine_status'], 'executed_unverified')
+        self.assertEqual(run['steps'][0]['result']['receipt'], 'b'*32)
+        self.assertIs(run['steps'][0]['input_dispatched'], True)
+        self.assertEqual(run['steps'][1]['attempts'], 0)
+
     def test_network_relative_storage_and_path_traversal_rejected(self):
         for path in ("relative", r"\\server\share\store", "//server/share/store"):
             with self.assertRaises(StoreError):

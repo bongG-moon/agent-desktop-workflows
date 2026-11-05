@@ -1,4 +1,6 @@
-# Agent Desktop Workflows 0.1.3
+# Agent Desktop Workflows 0.1.4
+
+**0.1.4는 콤보의 이름은 인식하지만 선택값이 빈 문자열로 녹화되는 문제를 보완합니다.** 부모의 빈 값만으로 선택값을 확정하지 않고, 같은 콤보에서 명시적으로 선택된 항목이나 하위 편집기 값의 근거를 확인합니다. 읽을 수 없으면 대상 이름을 유지한 보완 단계로 남깁니다. 기존 빈 콤보값은 입력 전에 차단하며, 실제 값이 반영되지 않은 실행은 성공 처리하거나 자동 반복하지 않습니다. 이미 저장된 잘못된 값은 자동 복원하지 않으므로 [콤보 값 보완 안내](사용가이드.html#combo-value-repair)에 따라 새 수정본으로 저장하세요.
 
 [별도 저장소](https://github.com/bongG-moon/agent-desktop-workflows) / [Windows ZIP과 사용 가이드 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/latest)
 

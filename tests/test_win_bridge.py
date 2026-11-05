@@ -39,6 +39,114 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(uia.value(Properties({30019: False, 30043: True, 30045: ''})), '')
         self.assertIsNone(uia.value(Properties({30019: False, 30043: False, 30045: ''})))
 
+    def _combo_tree(self, value='', children=None):
+        root = Properties({30003: 50003, 30002: 123, 30019: False, 30043: True, 30045: value})
+        tree = {root: children or []}
+        uia = object.__new__(w.UIA)
+        uia.children = lambda item: iter(tree.get(item, []))
+        return uia, root, tree
+
+    def _combo_child(self, role, **values):
+        return Properties({30003: role, 30002: 123, 30019: False,
+                           **{int(key): value for key, value in values.items()}})
+
+    def test_combo_blank_parent_and_option_names_are_unobserved(self):
+        option = self._combo_child(50007, **{'30005': 'N', '30036': True, '30079': False})
+        button = self._combo_child(50000, **{'30005': '[Editor] [valuelist] ValueListItem N'})
+        uia, combo, _ = self._combo_tree(children=[option, button])
+        self.assertEqual(uia.value_observation(combo), {
+            'value': None, 'value_evidence': {'status': 'unavailable', 'source': 'none'}})
+
+    def test_combo_blank_parent_uses_explicitly_selected_item(self):
+        options = [self._combo_child(50007, **{'30005': value, '30036': True, '30079': value == 'N'})
+                   for value in ('W', 'N', 'P')]
+        uia, combo, _ = self._combo_tree(children=options)
+        self.assertEqual(uia.value_observation(combo), {
+            'value': 'N', 'value_evidence': {'status': 'observed', 'source': 'selection'}})
+
+    def test_combo_blank_parent_uses_related_editor_but_not_editor_name(self):
+        edit = self._combo_child(50004, **{'30005': '[Editor] Edit Area', '30043': True, '30045': 'Hybrid'})
+        group = self._combo_child(50026)
+        uia, combo, tree = self._combo_tree(children=[group])
+        tree[group] = [edit]
+        self.assertEqual(uia.value_observation(combo), {
+            'value': 'Hybrid', 'value_evidence': {'status': 'observed', 'source': 'editor'}})
+        edit.values[30045] = ''
+        self.assertIsNone(uia.value(combo))
+
+    def test_combo_nonempty_parent_remains_readable_without_child_evidence(self):
+        option = self._combo_child(50007, **{'30005': 'Other', '30036': True, '30079': False})
+        uia, combo, _ = self._combo_tree('N', [option])
+        self.assertEqual(uia.value_observation(combo), {
+            'value': 'N', 'value_evidence': {'status': 'observed', 'source': 'parent'}})
+
+    def test_combo_conflicting_parent_editor_or_selection_is_unknown(self):
+        edit = self._combo_child(50004, **{'30043': True, '30045': 'N'})
+        selected = self._combo_child(50007, **{'30005': 'N', '30036': True, '30079': True})
+        uia, combo, _ = self._combo_tree('N', [edit, selected])
+        self.assertEqual(uia.value_observation(combo)['value_evidence']['source'], 'corroborated')
+        for changed in (combo, edit, selected):
+            key = 30005 if changed is selected else 30045
+            changed.values[key] = 'W'
+            self.assertEqual(uia.value_observation(combo), {
+                'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}})
+            changed.values[key] = 'N'
+
+    def test_combo_multiple_editors_or_selected_items_are_ambiguous_even_with_same_text(self):
+        for role, values in ((50004, {'30043': True, '30045': 'N'}),
+                             (50007, {'30005': 'N', '30036': True, '30079': True})):
+            uia, combo, _ = self._combo_tree(children=[self._combo_child(role, **values),
+                                                     self._combo_child(role, **values)])
+            self.assertEqual(uia.value_observation(combo)['value_evidence']['status'], 'conflict')
+
+    def test_combo_blank_editor_and_nonempty_editor_are_not_a_unique_editor(self):
+        blank = self._combo_child(50004, **{'30043': True, '30045': ''})
+        nonempty = self._combo_child(50004, **{'30043': True, '30045': 'N'})
+        uia, combo, _ = self._combo_tree(children=[blank, nonempty])
+        self.assertEqual(uia.value_observation(combo), {
+            'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}})
+
+    def test_combo_unreadable_editor_and_nonempty_editor_are_not_a_unique_editor(self):
+        for available in (True, False, None):
+            unreadable = self._combo_child(50004, **{'30043': available, '30045': None})
+            nonempty = self._combo_child(50004, **{'30043': True, '30045': 'N'})
+            uia, combo, _ = self._combo_tree(children=[unreadable, nonempty])
+            self.assertEqual(uia.value_observation(combo), {
+                'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}})
+
+    def test_combo_editor_ambiguity_is_not_hidden_by_agreeing_parent_or_selection(self):
+        blank = self._combo_child(50004, **{'30043': True, '30045': ''})
+        nonempty = self._combo_child(50004, **{'30043': True, '30045': 'N'})
+        selected = self._combo_child(50007, **{'30005': 'N', '30036': True, '30079': True})
+        uia, combo, _ = self._combo_tree('N', [blank, nonempty, selected])
+        self.assertEqual(uia.value_observation(combo)['value_evidence']['status'], 'conflict')
+
+    def test_combo_does_not_read_protected_or_foreign_editor(self):
+        for override in ({30019: True}, {30019: None}, {30002: 456}):
+            edit = self._combo_child(50004, **{'30043': True, '30045': 'private'})
+            edit.values.update(override)
+            uia, combo, _ = self._combo_tree(children=[edit])
+            self.assertIsNone(uia.value(combo))
+            self.assertNotIn(30045, edit.reads)
+
+    def test_combo_does_not_borrow_values_from_nested_combo_or_unselected_option(self):
+        for role in (50003, 50007):
+            unrelated = self._combo_child(role, **{'30043': True, '30045': 'Other', '30079': False})
+            edit = self._combo_child(50004, **{'30043': True, '30045': 'Other', '30046': True})
+            uia, combo, tree = self._combo_tree(children=[unrelated])
+            tree[unrelated] = [edit]
+            self.assertIsNone(uia.value(combo))
+            self.assertNotIn(30045, edit.reads)
+
+    def test_combo_partial_tree_does_not_claim_unique_value(self):
+        edit = self._combo_child(50004, **{'30043': True, '30045': 'N'})
+        uia, combo, _ = self._combo_tree(children=[edit] + [self._combo_child(50026) for _ in range(256)])
+        self.assertIsNone(uia.value(combo))
+
+    def test_regular_editor_clear_retains_explicit_empty_value(self):
+        uia = object.__new__(w.UIA)
+        self.assertEqual(uia.value(self._combo_child(50004, **{'30043': True, '30045': ''})), '')
+
     def test_toggle_unknown_is_not_unchecked(self):
         uia = object.__new__(w.UIA)
         self.assertIsNone(uia.checked(Properties({30041: True, 30086: None})))

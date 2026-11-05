@@ -285,6 +285,65 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(self.model.steps[0]['value'], 'N')
         self.assertEqual(self.model.steps[0]['target']['locator'], combo['node']['locator'])
 
+    def test_combo_missing_or_empty_readback_never_records_empty_set_value(self):
+        for value in (None, ''):
+            self.worker.uia.values['field'] = value
+            combo = observation()
+            self.worker.watch(combo)
+            self.assertIsNotNone(self.worker.watched)
+            self.worker.finalize_watch(True)
+            step = self.model.steps[-1]
+            self.assertEqual(step['action'], 'manual')
+            self.assertEqual(step['target'], {'kind': 'element', 'locator': combo['node']['locator']})
+            self.assertEqual(step['recognition']['target'], 'identified')
+            self.assertEqual(step['recognition']['reason'], 'combo_value_unobserved')
+            self.assertNotIn('value', step)
+            self.assertIn('Family', step['label'])
+        self.model.finish()
+        validate_workflow(json.loads(self.model.draft.read_text(encoding='utf-8')))
+
+    def test_combo_option_rerecord_does_not_bypass_missing_value_evidence(self):
+        combo = observation()
+        item = observation(role='listitem', actions=['Click', 'Select'], element='option')
+        item['node']['name'] = 'N'
+        self.worker.uia.values['field'] = None
+        self.worker.uia.combo_parents['option'] = combo
+        self.worker.capture_action({'action': 'click'}, item)
+        self.assertEqual(len(self.model.steps), 1)
+        self.assertEqual(self.model.steps[0]['action'], 'manual')
+        self.assertEqual(self.model.steps[0]['recognition']['reason'], 'combo_value_unobserved')
+        self.assertNotIn('value', self.model.steps[0])
+
+    def test_combo_can_become_readable_after_opening_unreadable_peer(self):
+        self.worker.uia.values['field'] = None
+        self.worker.watch(observation())
+        self.worker.uia.values['field'] = 'Hybrid'
+        self.worker.finalize_watch(True)
+        self.assertEqual(self.model.steps[0]['value'], 'Hybrid')
+        self.assertEqual(self.model.steps[0]['expect'], {'kind': 'value', 'value': 'Hybrid'})
+
+    def test_combo_lost_readback_replaces_provisional_value_with_review_same_id(self):
+        self.worker.watch(observation())
+        self.worker.uia.values['field'] = 'N'
+        self.worker.finalize_watch(False)
+        original = self.model.steps[0]['id']
+        self.worker.uia.values['field'] = None
+        self.worker.finalize_watch(False)
+        self.worker.freeze_watch()
+        self.assertEqual(len(self.model.steps), 1)
+        self.assertEqual(self.model.steps[0]['id'], original)
+        self.assertEqual(self.model.steps[0]['action'], 'manual')
+        self.assertNotIn('value', self.model.steps[0])
+        self.assertEqual(self.model.steps[0]['target']['locator'], observation()['node']['locator'])
+
+    def test_textfield_intentional_clear_still_records_empty_value(self):
+        self.worker.watch(observation(role='textfield'))
+        self.worker.uia.values['field'] = ''
+        self.worker.finalize_watch(True)
+        self.assertEqual(self.model.steps[0]['action'], 'set-value')
+        self.assertEqual(self.model.steps[0]['value'], '')
+        self.assertEqual(self.model.steps[0]['expect'], {'kind': 'value', 'value': ''})
+
     def test_independent_listitem_after_edit_is_not_swallowed(self):
         self.worker.watch(observation(role='textfield'))
         self.worker.uia.values['field'] = 'Lot-42'
