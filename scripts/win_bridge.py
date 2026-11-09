@@ -301,6 +301,57 @@ class _Com:
 
 
 class Element(_Com):
+    def element_property(self, property_id):
+        """Read a UIA element relation, excluding reserved NotSupported objects.
+
+        QueryInterface acquires our own reference before VariantClear releases
+        the property value. No raw VT_UNKNOWN pointer escapes as an element.
+        """
+        variant, pointer = VARIANT(), C.c_void_p()
+        try:
+            self.call(11, (C.c_int32, W.BOOL, C.POINTER(VARIANT)), property_id, True, C.byref(variant))
+            if variant.vt != 13 or not variant.pointer:
+                return None
+            iid = GUID.parse('d22108aa-8ac5-49a5-837b-37bbb3d7591e')
+            table = C.cast(variant.pointer, C.POINTER(C.POINTER(C.c_void_p))).contents
+            query = C.WINFUNCTYPE(C.c_int32, C.c_void_p, C.POINTER(GUID), C.POINTER(C.c_void_p))(table[0])
+            if query(variant.pointer, C.byref(iid), C.byref(pointer)) < 0:
+                return None
+            return Element(pointer, self.uia) if pointer.value else None
+        finally:
+            oleaut32.VariantClear(C.byref(variant))
+
+    def selected_items(self):
+        """SelectionPattern.GetCurrentSelection, bounded to a single-choice UI."""
+        pointer, array_pointer = C.c_void_p(), C.c_void_p()
+        iid = GUID.parse('5ed5202e-b2ac-47a6-b638-4b0bf140d78e')
+        self.call(14, (C.c_int32, C.POINTER(GUID), C.POINTER(C.c_void_p)),
+                  10001, C.byref(iid), C.byref(pointer))
+        if not pointer.value:
+            return None
+        pattern, array = _Com(pointer, self.uia), None
+        try:
+            pattern.call(3, (C.POINTER(C.c_void_p),), C.byref(array_pointer))
+            if not array_pointer.value:
+                return None
+            array = _Com(array_pointer, self.uia)
+            count = C.c_int32()
+            array.call(3, (C.POINTER(C.c_int32),), C.byref(count))
+            if not 0 <= count.value <= 2:
+                raise BridgeError('ambiguous_selection')
+            items = []
+            for index in range(count.value):
+                item = C.c_void_p()
+                array.call(4, (C.c_int32, C.POINTER(C.c_void_p)), index, C.byref(item))
+                if not item.value:
+                    raise BridgeError('selection_unavailable')
+                items.append(Element(item, self.uia))
+            return items
+        finally:
+            if array is not None:
+                array.close()
+            pattern.close()
+
     def property(self, property_id):
         variant = VARIANT()
         try:
@@ -463,6 +514,68 @@ class UIA:
             result['ancestors'] = ancestors
         return result
 
+    def related_element(self, element, property_id):
+        getter = getattr(element, 'element_property', None)
+        return getter(property_id) if getter is not None else None
+
+    def semantic_label(self, element, root):
+        """Display-only label association; never replace a replay locator.
+
+        Explicit LabeledBy wins. Geometry is accepted only for mutually unique,
+        visible direct siblings. Missing or ambiguous evidence has no label.
+        """
+        if self.secure(element) or element.property(30003) not in (50002, 50003, 50004, 50013, 50016):
+            return {}
+        try:
+            label = self.related_element(element, 30018)
+            if label is not None:
+                if (self.pid(label) != self.pid(element) or self.secure(label)
+                        or not self.within(label, root)):
+                    return {}
+                text = label.property(30005)
+                if isinstance(text, str) and text.strip() and len(text.encode('utf-8')) <= 1000 and '\0' not in text:
+                    return {'semantic_label': text, 'label_source': 'labeled_by'}
+                return {}
+            parent = self.parent(element)
+            if parent is None or not self.within(parent, root):
+                return {}
+            siblings = list(self.children(parent))
+            if len(siblings) > 80:
+                return {}
+            labels, fields = [], []
+            for sibling in siblings:
+                if self.pid(sibling) != self.pid(element):
+                    return {}
+                if self.secure(sibling) or sibling.property(30022) is not False:
+                    continue
+                role, bounds = sibling.property(30003), self.bounds(sibling)
+                if bounds['width'] <= 0 or bounds['height'] <= 0:
+                    continue
+                if role == 50020:
+                    text = sibling.property(30005)
+                    if isinstance(text, str) and text.strip() and len(text.encode('utf-8')) <= 1000 and '\0' not in text:
+                        labels.append((sibling, bounds, text))
+                elif role in (50002, 50003, 50004, 50013, 50016):
+                    fields.append((sibling, bounds))
+
+            def aligned(label_bounds, field_bounds):
+                overlap = min(label_bounds['y'] + label_bounds['height'], field_bounds['y'] + field_bounds['height']) - max(label_bounds['y'], field_bounds['y'])
+                height = min(label_bounds['height'], field_bounds['height'])
+                gap = field_bounds['x'] - label_bounds['x'] - label_bounds['width']
+                return overlap >= height * .65 and 0 <= gap <= height * 6
+
+            target = [bounds for candidate, bounds in fields if self.same(candidate, element)]
+            candidates = [(label, bounds, text) for label, bounds, text in labels
+                          if len(target) == 1 and aligned(bounds, target[0])]
+            if len(candidates) != 1:
+                return {}
+            label, bounds, text = candidates[0]
+            if sum(aligned(bounds, field_bounds) for _, field_bounds in fields) != 1:
+                return {}
+            return {'semantic_label': text, 'label_source': 'sibling_geometry'}
+        except BridgeError:
+            return {}  # A label failure must not discard an otherwise known target.
+
     def bounds(self, element):
         rect = RECT()
         element.call(43, (C.POINTER(RECT),), C.byref(rect))
@@ -496,7 +609,30 @@ class UIA:
         if type(owner_pid) is not int or owner_pid <= 0:
             return unavailable
         values = [('parent', parent_value)] if parent_value else []
-        editors, selections, visited = 0, 0, 0
+        selected_items = []
+        if element.property(30037) is True:
+            getter = getattr(element, 'selected_items', None)
+            if getter is not None:
+                try:
+                    selected_items = getter()
+                except BridgeError:
+                    return unavailable
+                if selected_items is None:
+                    return unavailable
+                if len(selected_items) > 1:
+                    return conflict
+                for item in selected_items:
+                    if self.pid(item) != owner_pid or self.secure(item):
+                        return unavailable
+                    container = self.related_element(item, 30080)
+                    if (container is not None and not self.same(container, element)) or (
+                            container is None and not self.within(item, element)):
+                        return unavailable
+                    name = item.property(30005)
+                    if not isinstance(name, str) or not name:
+                        return unavailable
+                    values.append(('selection', name))
+        editors, selections, visited = 0, len(selected_items), 0
         pending = deque((child, 1) for child in self.children(element))
         while pending:
             child, depth = pending.popleft()
@@ -510,6 +646,8 @@ class UIA:
                 continue  # An independently nested combo is not this combo's editor.
             if role == 50007:
                 if child.property(30036) is True and child.property(30079) is True:
+                    if any(self.same(child, selected) for selected in selected_items):
+                        continue
                     selections += 1
                     name = child.property(30005)
                     if not isinstance(name, str) or not name:
@@ -589,6 +727,7 @@ class UIA:
         hwnd = int(native_handle or 0) & 0xffffffff
         return {'name': element.property(30005) or '', 'role': ROLES.get(element.property(30003), 'unknown'),
                 'automation_id': element.property(30011) or '', **self.value_observation(element),
+                **self.semantic_label(element, root),
                 'checked': self.checked(element), 'enabled': element.property(30010) is True,
                 'offscreen': element.property(30022) is not False or not valid, 'secure': self.secure(element),
                 'states': states, 'available_actions': self.actions(element), 'locator': self.locator(element, root),
@@ -606,17 +745,27 @@ class UIA:
         if not binding.contains_window(hit) or not binding.contains_window(window):
             window = binding.hwnd
         root, element = self.from_handle(window), self.from_point(x, y)
-        if root is None or element is None or self.pid(element) != binding.pid or not self.within(element, root):
+        if root is None or element is None or self.pid(element) != binding.pid:
             raise BridgeError('point_identity_unproven')
         element = self.point_descendant(element, x, y, binding.pid)
+        scope_root = root if window == binding.hwnd else self.from_handle(binding.hwnd)
+        context = {'element': element, 'root': root, 'window': window, 'hit_window': hit,
+                   'scope_root': scope_root, 'scope_window': binding.hwnd}
+        # A detached list can explicitly name its selection container even when
+        # its UIA parent is a popup window. The container must still be inside a
+        # selected/owned root; same PID or proximity alone grants no scope.
+        if not self.within(element, root):
+            combo = self.combo_observation(context)
+            if combo is None:
+                raise BridgeError('point_identity_unproven')
+            context['combo'] = combo
         if element.property(30003) in (50009, 50010) and binding.contains_window(hit):
             semantic = self.menu_observation(binding, x, y, hit)
             if semantic is not None:
                 binding.check()
                 return semantic
         binding.check()
-        observed = {'element': element, 'root': root, 'window': window, 'hit_window': hit,
-                    'node': self.node(element, root)}
+        observed = dict(context, node=self.node(element, root))
         combo = self.combo_observation(observed)
         observed['combo'] = combo
         return observed
@@ -653,7 +802,7 @@ class UIA:
 
     def point_descendant(self, element, x, y, pid):
         """Resolve providers that hit-test a menu container instead of its item."""
-        if element.property(30003) not in (50009, 50010, 50032):
+        if element.property(30003) not in (50008, 50009, 50010, 50026, 50032):
             return element
         candidates, pending, visited = [], [(element, 0)], 0
         while pending:
@@ -675,17 +824,115 @@ class UIA:
         return candidates[0] if len(candidates) == 1 else element
 
     def combo_observation(self, observation):
-        """Find a writable combo only through this observation's proven ancestry."""
         if 'combo' in observation:
             return observation['combo']
-        root, current = observation['root'], observation['element']
-        for _ in range(16):
-            if current is None or self.same(current, root):
-                return None
-            if current.property(30003) == 50003 and 'SetValue' in self.actions(current):
-                return dict(observation, element=current, node=self.node(current, root))
-            current = self.parent(current)
-        return None
+        owner = self._combo_owner(observation)
+        return dict(owner, node=self.node(owner['element'], owner['root'])) if owner is not None else None
+
+    def _combo_owner(self, observation):
+        """Find a writable combo through ancestry or SelectionContainer.
+
+        The relation may cross a popup root, but its destination must be in a
+        proven selected/owned UIA root. Unrelated same-process windows never
+        become replay targets through a visual guess.
+        """
+        if 'combo' in observation:
+            return observation['combo']
+        root, element = observation['root'], observation['element']
+        roots = [(root, observation['window'])]
+        scope_root = observation.get('scope_root')
+        if scope_root is not None and not self.same(scope_root, root):
+            roots.append((scope_root, observation.get('scope_window', observation['window'])))
+
+        def find(start):
+            current = start
+            for _ in range(16):
+                if current is None or self.pid(current) != self.pid(element) or self.secure(current):
+                    return None
+                if current.property(30003) == 50003 and 'SetValue' in self.actions(current):
+                    for proven_root, window in roots:
+                        if self.within(current, proven_root):
+                            return dict(observation, element=current, root=proven_root, window=window)
+                    return None
+                if any(self.same(current, proven_root) for proven_root, _ in roots):
+                    return None
+                current = self.parent(current)
+            return None
+
+        ancestry = find(element)
+        if element.property(30036) is True and not self.secure(element):
+            container = self.related_element(element, 30080)
+            if container is not None:
+                related = find(container)
+                if related is None or (ancestry is not None and not self.same(related['element'], ancestry['element'])):
+                    return None
+                return related
+        return ancestry
+
+    def combo_options(self, observation, binding=None):
+        """Bounded, visible option metadata for pre-click recording caches.
+
+        Only a proved combo relationship admits an item. Popup ownership alone
+        does not decide which combo owns an option. These snapshots describe
+        candidates, never selection success or permission to dispatch input.
+        """
+        try:
+            combo = self.combo_observation(observation)
+            if combo is None:
+                return []
+            roots = [(combo['element'], combo['root'], combo['window'])]
+            if binding is not None:
+                binding.check()
+                for window in binding.scoped_windows():
+                    if window != combo['window']:
+                        root = self.from_handle(window)
+                        if root is not None:
+                            roots.append((root, root, window))
+            found, visited = [], 0
+            for start, root, window in roots:
+                pending = deque([(start, 0)])
+                while pending:
+                    item, depth = pending.popleft()
+                    visited += 1
+                    if visited > 512 or depth > 12 or self.pid(item) != self.pid(combo['element']):
+                        return []
+                    if self.secure(item):
+                        continue
+                    if item.property(30003) == 50007 and item.property(30022) is False:
+                        candidate = {'element': item, 'root': root, 'window': window,
+                                     'scope_root': combo['root'], 'scope_window': combo['window']}
+                        owner = self._combo_owner(candidate)
+                        if owner is not None and self.same(owner['element'], combo['element']):
+                            node = self.node(item, root)
+                            bounds = node['bounds']
+                            if node.get('bounds_valid') and node.get('name'):
+                                x, y = bounds['x'] + bounds['width'] / 2, bounds['y'] + bounds['height'] / 2
+                                hit = window_from_point(x, y)
+                                if not hit or (binding is not None and (
+                                        hwnd_pid(hit) != binding.pid or not binding.recording_candidate(hit))):
+                                    continue
+                                # A peer can remain visible in UIA while an
+                                # owned dialog covers it. Confirm the actual
+                                # hit, not merely a same-process HWND, before
+                                # attaching that HWND to cached option intent.
+                                actual = self.from_point(x, y)
+                                if actual is None or self.pid(actual) != self.pid(item) or self.secure(actual):
+                                    continue
+                                actual = self.point_descendant(actual, x, y, self.pid(item))
+                                if self.secure(actual) or not self.within(actual, item):
+                                    continue
+                                if window_from_point(x, y) != hit or self.bounds(item) != bounds:
+                                    continue
+                                if not any(self.same(item, prior['element']) for prior in found):
+                                    found.append(dict(candidate, node=node, combo=combo, hit_window=hit))
+                    # Other combos have independent options, even if nested.
+                    if item.property(30003) != 50003 or self.same(item, combo['element']):
+                        pending.extend((child, depth + 1) for child in self.children(item))
+            if binding is not None:
+                binding.check()
+            return found
+        except BridgeError:
+            return []
 
 
 def observe_point(binding, x, y, window=None, *, uia=None):

@@ -129,7 +129,7 @@ def validate_workflow(workflow):
     seen = set()
     for step in value["steps"]:
         _keys(step, {"id", "label", "action", "target", "value", "parameter", "headed", "expect",
-                     "recognition", "direction", "amount", "timeout_seconds"},
+                     "recognition", "direction", "amount", "timeout_seconds", "selection"},
               {"id", "label", "action", "target", "expect", "recognition"})
         identifier(step["id"])
         if step["id"] in seen:
@@ -183,6 +183,25 @@ def validate_workflow(workflow):
         _keys(recognition, {"target", "action", "result", "reason"}, {"target", "action", "result"})
         for item in recognition.values():
             _text(item, 1000)
+        if "selection" in step:
+            # Recording evidence describes the original user's choice. It is
+            # never a replay receipt or permission to skip result verification.
+            selection = step["selection"]
+            _keys(selection, {"source", "value", "result", "observed_value"},
+                  {"source", "value", "result"})
+            if (selection["source"] != "option_click" or not isinstance(selection["result"], str)
+                    or selection["result"] not in {"matched", "mismatch", "unavailable"}):
+                _fail("invalid_selection_evidence")
+            _text(selection["value"], 10000, empty=False)
+            if step["action"] != "set-value" or step["target"]["kind"] != "element":
+                _fail("selection_requires_value_action")
+            if selection["result"] == "unavailable":
+                if "observed_value" in selection:
+                    _fail("invalid_selection_evidence")
+            else:
+                _text(selection.get("observed_value"), 10000, empty=False)
+                if (selection["observed_value"] == selection["value"]) != (selection["result"] == "matched"):
+                    _fail("invalid_selection_evidence")
     if "recording_id" in value:
         identifier(value["recording_id"])
     for key in ("created_at", "updated_at"):
@@ -225,6 +244,7 @@ def _regular(path, *, missing=False):
         _fail("unsafe_local_file")
     if info.st_size > MAX_JSON_BYTES:
         _fail("local_file_too_large")
+    return info
 
 
 def _pairs(items):
@@ -267,16 +287,31 @@ def _write(path, value, *, exclusive=False):
         return
     _regular(path, missing=True)
     temporary = path.parent / ("." + uuid.uuid4().hex + ".tmp")
+    created = None
     try:
         with temporary.open("xb") as stream:
+            created = os.fstat(stream.fileno())
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        _regular(path, missing=True)
-        os.replace(temporary, path)
+        # A Windows reader can briefly deny replacement of the run journal.
+        # Retry only the rename of these already flushed bytes under the lock.
+        for attempt in range(6):
+            if not os.path.samestat(created, _regular(temporary)):
+                _fail("temporary_file_changed")
+            _regular(path, missing=True)
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as error:
+                if attempt == 5 or getattr(error, "winerror", None) not in (5, 32, 33):
+                    raise
+                time.sleep(0.025 * 2 ** attempt)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if created is not None:
+            remaining = _regular(temporary, missing=True)
+            if remaining is not None and os.path.samestat(created, remaining):
+                temporary.unlink()
 
 
 class Store:

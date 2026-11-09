@@ -17,6 +17,7 @@ from storage import validate_workflow
 def observation(role='combobox', actions=None, element='field', window=200):
     return {'element': element, 'root': 'root', 'window': window,
             'node': {'name': 'Family', 'automation_id': 'Family', 'role': role,
+                     'secure': False,
                      'available_actions': ['SetValue'] if actions is None else actions,
                      'locator': {'automation_id': 'Family', 'role': role},
                      'bounds': {'x': 100, 'y': 150, 'width': 200, 'height': 100}}}
@@ -276,6 +277,7 @@ class RecorderTests(unittest.TestCase):
         combo = observation()
         arrow = observation(role='button', actions=['Click'], element='arrow')
         item = observation(role='listitem', actions=['Click', 'Select'], element='option')
+        item['node']['name'] = 'N'
         self.worker.uia.combo_parents.update(arrow=combo, option=combo)
         self.worker.capture_action({'action': 'click'}, arrow)
         self.assertEqual(self.model.steps, [])
@@ -302,7 +304,7 @@ class RecorderTests(unittest.TestCase):
         self.model.finish()
         validate_workflow(json.loads(self.model.draft.read_text(encoding='utf-8')))
 
-    def test_combo_option_rerecord_does_not_bypass_missing_value_evidence(self):
+    def test_combo_option_intent_survives_missing_value_without_false_result(self):
         combo = observation()
         item = observation(role='listitem', actions=['Click', 'Select'], element='option')
         item['node']['name'] = 'N'
@@ -310,9 +312,183 @@ class RecorderTests(unittest.TestCase):
         self.worker.uia.combo_parents['option'] = combo
         self.worker.capture_action({'action': 'click'}, item)
         self.assertEqual(len(self.model.steps), 1)
-        self.assertEqual(self.model.steps[0]['action'], 'manual')
-        self.assertEqual(self.model.steps[0]['recognition']['reason'], 'combo_value_unobserved')
-        self.assertNotIn('value', self.model.steps[0])
+        self.assertEqual(self.model.steps[0]['action'], 'set-value')
+        self.assertEqual(self.model.steps[0]['recognition']['reason'], 'combo_selection_unverified')
+        self.assertEqual(self.model.steps[0]['value'], 'N')
+        self.assertEqual(self.model.steps[0]['expect'], {'kind': 'value', 'value': 'N'})
+        self.assertEqual(self.model.steps[0]['selection'],
+                         {'source': 'option_click', 'value': 'N', 'result': 'unavailable'})
+        self.assertEqual(self.model.snapshot()['warning_count'], 1)
+
+    def option(self, value='Choice B', combo=None, element='option'):
+        combo = combo or observation()
+        item = observation(role='listitem', actions=['Select'], element=element)
+        item['node']['name'] = value
+        item['hit_window'] = 300
+        item['combo'] = combo
+        self.worker.uia.combo_parents[element] = combo
+        return item
+
+    def test_option_intent_and_actual_value_mismatch_are_distinct(self):
+        self.worker.uia.values['field'] = 'Choice A'
+        self.worker.capture_action({'action': 'click'}, self.option())
+        step = self.model.steps[0]
+        self.assertEqual(step['value'], 'Choice B')
+        self.assertEqual(step['selection'], {'source': 'option_click', 'value': 'Choice B',
+                                             'result': 'mismatch', 'observed_value': 'Choice A'})
+        self.assertEqual(step['recognition']['reason'], 'combo_selection_mismatch')
+        self.assertEqual(self.model.snapshot()['warning_count'], 1)
+
+    def test_delayed_selection_readback_revises_evidence_without_changing_intent_or_id(self):
+        self.worker.uia.values['field'] = None
+        self.worker.capture_action({'action': 'click'}, self.option())
+        first = copy.deepcopy(self.model.steps[0])
+        self.worker.uia.values['field'] = 'Choice B'
+        self.worker.finalize_watch(False)
+        last = self.model.steps[0]
+        self.assertEqual((last['id'], last['value']), (first['id'], first['value']))
+        self.assertEqual(last['selection']['result'], 'matched')
+        self.assertEqual(self.model.snapshot()['warning_count'], 0)
+        events_before = len(self.recorded_events())
+        self.worker.finalize_watch(False)
+        self.assertEqual(len(self.recorded_events()), events_before)
+
+    def test_same_option_reselection_records_explicit_intent(self):
+        self.worker.uia.values['field'] = 'Choice B'
+        self.worker.capture_action({'action': 'click'}, self.option())
+        self.assertEqual(len(self.model.steps), 1)
+        self.assertEqual(self.model.steps[0]['value'], 'Choice B')
+        self.assertEqual(self.model.steps[0]['selection']['result'], 'matched')
+
+    def test_reopen_then_cancel_preserves_previous_explicit_selection_only(self):
+        combo = observation()
+        self.worker.uia.values['field'] = 'Choice B'
+        self.worker.capture_action({'action': 'click'}, self.option(combo=combo))
+        self.worker.capture_action({'action': 'click'}, combo)
+        self.worker.handle({'kind': 'escape'})
+        choices = [step for step in self.model.steps if step['action'] == 'set-value']
+        self.assertEqual(len(choices), 1)
+        self.assertEqual(choices[0]['value'], 'Choice B')
+        self.assertEqual(choices[0]['selection']['result'], 'matched')
+
+    def test_option_read_failure_keeps_recorded_intent(self):
+        self.worker.uia.value = Mock(side_effect=RuntimeError('provider disappeared'))
+        self.worker.capture_action({'action': 'click'}, self.option())
+        self.assertEqual(self.model.steps[0]['value'], 'Choice B')
+        self.assertEqual(self.model.steps[0]['selection']['result'], 'unavailable')
+        self.assertNotIn('provider disappeared', self.model.events_path.read_text(encoding='utf-8'))
+
+    def test_invalid_or_protected_option_name_never_becomes_action_value(self):
+        for value, secure in [('Secret', True), ('Secret', None), ('', False), ('x\0y', False),
+                              ('X' * (recorder.MAX_VALUE_BYTES + 1), False)]:
+            item = self.option(value)
+            item['node']['secure'] = secure
+            self.worker.capture_action({'action': 'click'}, item)
+            self.assertEqual(self.model.steps[-1]['action'], 'manual')
+            self.assertNotIn('selection', self.model.steps[-1])
+            self.assertNotIn('value', self.model.steps[-1])
+        self.assertNotIn('Secret', self.model.events_path.read_text(encoding='utf-8'))
+
+    def test_label_is_display_only_and_does_not_replace_actual_locator(self):
+        combo = observation()
+        combo['node']['semantic_label'] = 'Output format'
+        self.worker.capture_action({'action': 'click'}, self.option(combo=combo))
+        step = self.model.steps[0]
+        self.assertEqual(step['label'], 'Output format → Choice B')
+        self.assertEqual(step['target']['locator'], combo['node']['locator'])
+
+    def test_option_inventory_alone_never_creates_selection_intent(self):
+        combo = observation()
+        item = self.option(combo=combo)
+        self.worker.uia.combo_options = lambda *a, **kw: [item]
+        self.worker.capture_action({'action': 'click'}, combo)
+        self.assertTrue(self.worker.option_history)
+        self.assertEqual(self.model.steps, [])
+        self.worker.handle({'kind': 'escape'})
+        self.assertFalse(any('selection' in step or step['action'] == 'set-value' for step in self.model.steps))
+        self.assertFalse(self.worker.option_history)
+
+    def test_option_cache_captures_fast_click_without_hover_and_survives_closed_popup(self):
+        combo = observation()
+        item = self.option(combo=combo)
+        self.worker.uia.combo_options = lambda *a, **kw: [item]
+        self.worker.watch(combo)
+        with patch.object(recorder.time, 'monotonic', return_value=10):
+            self.worker.cache_options()
+        self.bridge.window_from_point.return_value = 200  # Popup has closed now.
+        event = {'x': 150, 'y': 175, 'window': 300, 'hit_window': 300, 'at': 10.02}
+        observed = self.worker.observe_down(event)
+        self.assertEqual(observed['node']['name'], 'Choice B')
+        self.assertEqual(observed['combo'], combo)
+        self.bridge.window_from_point.assert_not_called()
+
+    def test_option_cache_rejects_ambiguous_stale_and_wrong_window_points(self):
+        item = self.option()
+        duplicate = self.option(element='other-option')
+        event = {'x': 150, 'y': 175, 'window': 300, 'hit_window': 300, 'at': 10.02}
+        self.worker.option_history.append((10, [item, duplicate]))
+        self.assertIsNone(self.worker.observe_down(event))
+        self.worker.option_history.clear()
+        self.worker.option_history.append((8, [item]))
+        self.bridge.window_from_point.return_value = 200
+        self.assertIsNone(self.worker.observe_down(event))
+        self.worker.option_history.append((10, [item]))
+        self.assertIsNone(self.worker.observe_down({**event, 'window': 301, 'hit_window': 301}))
+
+    def test_new_empty_inventory_invalidates_stale_option_hover_for_later_click(self):
+        item = self.option()
+        self.worker.option_history.extend([(10, [item]), (10.1, [])])
+        self.worker.hovered, self.worker.hover_at = item, 10
+        self.bridge.window_from_point.return_value = 200
+        event = {'x': 150, 'y': 175, 'window': 300, 'hit_window': 300, 'at': 10.2}
+        self.assertIsNone(self.worker.observe_down(event))
+
+    def test_selection_intent_does_not_take_next_action_post_value_as_evidence(self):
+        with patch.object(recorder.time, 'monotonic', return_value=10):
+            self.worker.uia.values['field'] = None
+            self.worker.capture_action({'action': 'click', 'at': 10}, self.option())
+        self.worker.uia.values['field'] = 'Choice B'
+        with patch.object(recorder.time, 'monotonic', return_value=12.2):
+            self.worker.finalize_watch(False)
+        self.worker.freeze_watch(12)
+        self.assertEqual(self.model.steps[0]['value'], 'Choice B')
+        self.assertEqual(self.model.steps[0]['selection']['result'], 'unavailable')
+
+    def test_delayed_same_combo_opener_freezes_prior_selection_at_down_timestamp(self):
+        combo = observation()
+        with patch.object(recorder.time, 'monotonic', return_value=10):
+            self.worker.uia.values['field'] = None
+            self.worker.capture_action({'action': 'click', 'at': 10}, self.option(combo=combo))
+        original = self.model.steps[0]['id']
+        self.worker.observe_down = lambda event: combo
+        # By the time this queued down is handled, the provider has a value
+        # from later application activity and the old settle deadline expired.
+        self.worker.uia.values['field'] = 'Choice B'
+        with patch.object(recorder.time, 'monotonic', return_value=11):
+            self.worker.last_hover = self.worker.last_identity = 11
+            self.worker.handle({'kind': 'down', 'token': 1, 'action': 'click',
+                                'x': 150, 'y': 175, 'at': 10.2})
+            self.worker.tick()
+        prior = self.model.steps[0]
+        self.assertEqual((prior['id'], prior['value']), (original, 'Choice B'))
+        self.assertEqual(prior['selection']['result'], 'unavailable')
+        self.assertIsNone(self.worker.watched)
+        with patch.object(recorder.time, 'monotonic', return_value=11.1):
+            self.worker.handle({'kind': 'up', 'token': 1, 'inside': True,
+                                'x': 150, 'y': 175, 'at': 10.3})
+        self.worker.handle({'kind': 'escape'})
+        self.assertEqual(self.model.steps[0]['selection']['result'], 'unavailable')
+        self.assertEqual(len([step for step in self.model.steps if 'selection' in step]), 1)
+
+    def test_adjacent_combos_with_same_option_keep_their_own_identity(self):
+        first, second = observation(), observation(element='other')
+        second['node']['locator'] = {'automation_id': 'OtherField', 'role': 'combobox'}
+        self.worker.uia.values.update(field=None, other=None)
+        self.worker.capture_action({'action': 'click'}, self.option('Same', first, 'option1'))
+        self.worker.freeze_watch()
+        self.worker.capture_action({'action': 'click'}, self.option('Same', second, 'option2'))
+        self.assertEqual([s['target']['locator']['automation_id'] for s in self.model.steps], ['Family', 'OtherField'])
+        self.assertEqual([s['value'] for s in self.model.steps], ['Same', 'Same'])
 
     def test_combo_can_become_readable_after_opening_unreadable_peer(self):
         self.worker.uia.values['field'] = None

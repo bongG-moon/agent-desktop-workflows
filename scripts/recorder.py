@@ -23,6 +23,8 @@ import uuid
 
 MAX_STEPS = 300
 MAX_VALUE_BYTES = 10000
+COMBO_SETTLE_SECONDS = .8
+OPTION_CACHE_SECONDS = 1.2
 
 
 class RecorderError(RuntimeError):
@@ -166,7 +168,8 @@ class RecordingModel:
     def snapshot(self):
         with self.lock:
             warnings = sum(step['recognition'].get('action') != 'supported'
-                           or step['recognition'].get('result') == 'manual' for step in self.steps)
+                           or step['recognition'].get('result') in {'manual', 'unverified', 'mismatch'}
+                           for step in self.steps)
             data = {'state': self.state, 'event_count': len(self.steps),
                     'warning_count': warnings, 'partial': self.partial}
             if self.steps:
@@ -390,6 +393,10 @@ class CaptureWorker(threading.Thread):
         self.watched_value = None
         self.watched_step = None
         self.watched_samples = deque(maxlen=40)
+        self.watched_selection = None
+        self.selection_deadline = 0
+        self.option_history = deque(maxlen=12)
+        self.last_options = 0
         self.hovered = None
         self.hover_at = 0
         self.hover_history = deque(maxlen=12)
@@ -411,7 +418,8 @@ class CaptureWorker(threading.Thread):
         except Exception:
             self.invalidated = True
             self.enabled.clear()
-            self.watched = self.watched_step = self.hovered = None
+            self._drop_watch()
+            self.hovered = None
             self.hover_history.clear()
             self.captures.clear()
             self.notices.put(('fatal', 'target_lifetime_changed'))
@@ -454,12 +462,28 @@ class CaptureWorker(threading.Thread):
 
     def observe_down(self, event):
         x, y = event['x'], event['y']
+        option_barrier = 0
+        # A popup may close before the worker handles mouse-down. Use only a
+        # pre-event inventory whose provider proved each option's owning combo.
+        # The input hook's actual HWND/point pair chooses an item, never its name
+        # or a nearby same-process window. A newer ambiguous inventory wins.
+        for observed_at, options in reversed(self.option_history):
+            if not 0 <= event['at'] - observed_at < OPTION_CACHE_SECONDS:
+                continue
+            option_barrier = observed_at
+            matching = [item for item in options
+                        if item.get('hit_window') == event['hit_window']
+                        and _inside(item['node'].get('bounds'), x, y)]
+            if matching:
+                return matching[0] if len(matching) == 1 else None
+            break
         # A queued mouse event can predate the most recent poll. Retain prior
         # proven observations instead of substituting a post-click container.
         history = list(self.hover_history) + [(self.hover_at, self.hovered)]
         for observed_at, cached in reversed(history):
             if (cached and (cached['window'] == event['window'] or cached.get('hit_window') == event['hit_window'])
                     and 0 <= event['at'] - observed_at < 1.2
+                    and (cached['node'].get('role') != 'listitem' or observed_at >= option_barrier)
                     and _inside(cached['node'].get('bounds'), x, y)):
                 return cached
         try:
@@ -502,7 +526,7 @@ class CaptureWorker(threading.Thread):
     def step(self, action, observation, kind='element', point=None):
         node = observation['node']
         menu = node.get('role') == 'menuitem'
-        name = node.get('name') or node.get('automation_id') or node.get('role') or '동작'
+        name = node.get('semantic_label') or node.get('name') or node.get('automation_id') or node.get('role') or '동작'
         return {'id': uuid.uuid4().hex, 'label': _clip(name + ' / ' + action), 'action': action,
                 'target': self.target(observation, kind, point), 'headed': kind == 'region',
                 'expect': {'kind': 'none' if menu else 'manual'},
@@ -517,19 +541,29 @@ class CaptureWorker(threading.Thread):
             self.freeze_watch()
             self.model.manual('보호된 입력', 'protected_input_not_recorded')
             return
-        value = self.uia.value(observation['element'])
+        try:
+            value = self.uia.value(observation['element'])
+        except Exception:
+            if observation['node'].get('role') != 'combobox':
+                raise
+            value = None
         if value is None and observation['node'].get('role') != 'combobox':
             return
         if self.watched and self.uia.same(self.watched['element'], observation['element']):
             return
         self.freeze_watch()
         self.watched, self.watched_value, self.watched_step = observation, value, None
+        self.watched_selection = None
+        self.selection_deadline = 0
         self.watched_samples.clear()
         self.watched_samples.append((time.monotonic(), value))
 
     def _drop_watch(self):
         self.watched = self.watched_step = None
+        self.watched_selection = None
+        self.selection_deadline = 0
         self.watched_samples.clear()
+        self.option_history.clear()
 
     def _manual_watch(self, reason):
         step = {'id': self.watched_step['id'] if self.watched_step else uuid.uuid4().hex,
@@ -558,6 +592,8 @@ class CaptureWorker(threading.Thread):
         self._drop_watch()
 
     def _commit_value(self, current):
+        if self.watched_selection is not None:
+            return self._commit_selection(current)
         if self.watched['node'].get('role') == 'combobox' and (current is None or current == ''):
             self._unobserved_combo()
             return
@@ -576,6 +612,82 @@ class CaptureWorker(threading.Thread):
         self.model.add(step)
         self.watched_step, self.watched_value = step, current
 
+    def _commit_selection(self, current):
+        """Preserve a witnessed option click separately from its applied value."""
+        intended = self.watched_selection['value']
+        evidence = {'source': 'option_click', 'value': intended, 'result': 'unavailable'}
+        if (isinstance(current, str) and current and '\0' not in current
+                and len(current.encode('utf-8')) <= MAX_VALUE_BYTES):
+            evidence.update(observed_value=current, result='matched' if current == intended else 'mismatch')
+        try:
+            step = self.step('set-value', self.watched)
+        except RecorderError:
+            self._manual_watch('stable_locator_unavailable')
+            return
+        if self.watched_step:
+            step['id'] = self.watched_step['id']
+        step['label'] = _clip(step['label'].removesuffix(' / set-value') + ' → ' + intended)
+        step.update(value=intended, expect={'kind': 'value', 'value': intended}, selection=evidence)
+        result = evidence['result']
+        step['recognition'] = {'target': 'identified', 'action': 'supported',
+                               'result': 'checkable' if result == 'matched' else 'mismatch' if result == 'mismatch' else 'unverified',
+                               'reason': 'combo_selection_observed' if result == 'matched'
+                                         else 'combo_selection_mismatch' if result == 'mismatch'
+                                         else 'combo_selection_unverified'}
+        if step != self.watched_step:
+            self.model.add(step)
+        self.watched_step = step
+
+    def _select_option(self, event, observation, combo):
+        node = observation['node']
+        value = node.get('name')
+        # The immutable pre-click properties can survive a popup disappearing.
+        # Missing security metadata is never permission to retain option text.
+        if node.get('secure') is not False or combo['node'].get('secure') is not False:
+            self.freeze_watch(event.get('at'))
+            self.model.manual('보호 여부를 확인하지 못한 선택', 'protected_input_not_recorded')
+            return
+        if (not isinstance(value, str) or not value.strip() or '\0' in value
+                or len(value.encode('utf-8')) > MAX_VALUE_BYTES):
+            self.freeze_watch(event.get('at'))
+            self.model.manual('선택한 항목의 값 확인 필요', 'combo_option_value_unavailable')
+            return
+        self.watch(combo)
+        if not self.watched:
+            return
+        self.watched_selection = {'value': value, 'at': event.get('at', time.monotonic())}
+        self.selection_deadline = time.monotonic() + COMBO_SETTLE_SECONDS
+        self.watched_samples.clear()
+        self.option_history.clear()
+        # Write the intent first so a missing/late value read cannot discard it.
+        self._commit_selection(None)
+        self.finalize_watch(False)
+        return self.watched_step['id'] if self.watched_step else None
+
+    def cache_options(self):
+        """Bounded, in-memory inventory; never persists unselected option text."""
+        if not self.watched or self.watched['node'].get('role') != 'combobox':
+            return
+        reader = getattr(self.uia, 'combo_options', None)
+        if not callable(reader):
+            return
+        try:
+            options = reader(self.watched, binding=self.binding)
+        except Exception:
+            return
+        if not isinstance(options, list) or len(options) > 256:
+            return
+        # Keep empty observations too. They invalidate earlier inventories at
+        # later click timestamps without erasing evidence for a queued click.
+        cached = []
+        for option in options:
+            if (not isinstance(option, dict) or not isinstance(option.get('node'), dict)
+                    or option['node'].get('role') != 'listitem' or option['node'].get('secure') is not False
+                    or not isinstance(option.get('combo'), dict)):
+                return
+            cached.append(dict(option, node=copy.deepcopy(option['node'])))
+        self.option_history.append((time.monotonic(), cached))
+
     def freeze_watch(self, cutoff=None):
         """Commit only evidence observed before a subsequent user transition.
 
@@ -589,6 +701,10 @@ class CaptureWorker(threading.Thread):
         samples = [(at, value) for at, value in self.watched_samples
                    if at <= cutoff and (not self.last_key or at >= self.last_key + .05)]
         if not samples:
+            if self.watched_selection is not None:
+                self._commit_selection(None)
+                self._drop_watch()
+                return
             self._manual_watch('value_before_transition_unproven')
             return
         self._commit_value(samples[-1][1])
@@ -604,8 +720,20 @@ class CaptureWorker(threading.Thread):
                 return
             current = self.uia.value(observation['element'])
         except Exception:
+            if self.watched_selection is not None:
+                self.watched_samples.append((time.monotonic(), None))
+                self._commit_selection(None)
+                if force:
+                    self._drop_watch()
+                return
             if force:
                 self._manual_watch('value_readback_unavailable')
+            return
+        if self.watched_selection is not None:
+            self.watched_samples.append((time.monotonic(), current))
+            self._commit_selection(current)
+            if force:
+                self._drop_watch()
             return
         if observation['node'].get('role') == 'combobox' and (current is None or current == ''):
             # Retain missing evidence in the timeline too: otherwise an older
@@ -649,9 +777,14 @@ class CaptureWorker(threading.Thread):
         if combo:
             if not self.continues_watch(observation):
                 self.freeze_watch(event.get('at'))
-            self.watch(combo)
             if node.get('role') == 'listitem':
-                self.finalize_watch(True)
+                return self._select_option(event, observation, combo)
+            if self.watched_selection is not None:
+                # Opening the field again begins a new choice episode. Its
+                # cancelled popup must not erase the preceding selected value.
+                self.freeze_watch(event.get('at'))
+            self.watch(combo)
+            self.cache_options()
             return
         if self.uia.secure(observation['element']):
             self.freeze_watch(event.get('at'))
@@ -727,7 +860,11 @@ class CaptureWorker(threading.Thread):
             if self.enabled.is_set():
                 self.model.set_state('recording')
             observation = self.observe_down(event)
-            if not self.continues_watch(observation):
+            # A completed option click has its own result-observation window.
+            # Even another click inside the same combo starts a new user
+            # transition. Freeze at mouse-down's actual timestamp, before a
+            # delayed worker tick can attribute a later choice to the old one.
+            if self.watched_selection is not None or not self.continues_watch(observation):
                 self.freeze_watch(event.get('at'))
             if observation is None and event.get('scope_proven') is False:
                 # Metadata alone was a candidate, never permission to record
@@ -745,7 +882,10 @@ class CaptureWorker(threading.Thread):
                 self.freeze_watch(down.get('at'))
                 self.model.manual('드래그 또는 영역 밖 이동', 'drag_needs_review')
             else:
-                time.sleep(.12)
+                # Combo results settle on the worker's later observations. Do
+                # not block its option capture while a short-lived popup opens.
+                if self.combo_for(observation) is None:
+                    time.sleep(.12)
                 if not self.capture_double(down, observation):
                     step_id = self.capture_action(down, observation)
                     self.recent_click = {'token': down['token'], 'observation': observation, 'step_id': step_id,
@@ -769,7 +909,16 @@ class CaptureWorker(threading.Thread):
                 self.freeze_watch(event.get('at'))
                 self.model.manual('스크롤 동작', 'scroll_needs_review')
         elif kind in {'scroll', 'enter', 'tab', 'escape', 'shortcut', 'pause'}:
-            self.freeze_watch(event.get('at'))
+            if (kind == 'escape' and self.watched
+                    and self.watched['node'].get('role') == 'combobox'
+                    and self.watched_selection is None):
+                if self.watched_step:
+                    self._manual_watch('combo_selection_cancelled')
+                else:
+                    self._drop_watch()
+            else:
+                self.freeze_watch(event.get('at'))
+            self.option_history.clear()
             labels = {'scroll': ('스크롤 동작', 'scroll_needs_review'),
                       'enter': ('Enter 확정 동작', 'keyboard_transition_needs_review'),
                       'tab': ('Tab 이동 동작', 'keyboard_transition_needs_review'),
@@ -808,7 +957,11 @@ class CaptureWorker(threading.Thread):
             self.last_watch = now
             # Observe frequently into bounded memory, but only persist settled
             # ValuePattern values (never raw keyboard text or partial keystrokes).
-            self.finalize_watch(False, sample_only=now - self.last_key < .5)
+            self.finalize_watch(bool(self.selection_deadline and now >= self.selection_deadline),
+                                sample_only=now - self.last_key < .5)
+        if self.watched and not self.watched_selection and now - self.last_options > .05:
+            self.last_options = now
+            self.cache_options()
 
 
 def record(request):
@@ -921,8 +1074,10 @@ def record(request):
             rec = step['recognition']
             target = '요소 확인' if rec['target'] == 'identified' else '영역 확인' if rec['target'] == 'region_identified' else '보완 필요'
             action = '지원' if rec['action'] == 'supported' else '검토 필요'
-            expected = '값 확인 가능' if rec['result'] == 'checkable' else '전달 확인' if rec['result'] == 'delivery_only' else '완료 조건 필요'
-            tags = ('warning',) if action != '지원' or rec['result'] == 'manual' else ()
+            expected = ('값 확인 가능' if rec['result'] == 'checkable' else '전달 확인' if rec['result'] == 'delivery_only'
+                        else '선택 결과 불일치' if rec['result'] == 'mismatch'
+                        else '선택값 기록 / 적용 미확인' if rec['result'] == 'unverified' else '완료 조건 필요')
+            tags = ('warning',) if action != '지원' or rec['result'] in {'manual', 'unverified', 'mismatch'} else ()
             listing.insert('', 'end', iid=step['id'], values=(index + 1, step['label'], target, action, expected), tags=tags)
         if steps:
             listing.see(steps[-1]['id'])

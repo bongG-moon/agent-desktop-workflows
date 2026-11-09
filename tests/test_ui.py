@@ -139,6 +139,33 @@ class HiddenUiTests(unittest.TestCase):
         editor.save()
         self.assertEqual(editor.result[0]['expect'], {'kind': 'value', 'target': other, 'value': ''})
 
+    def test_recorded_selection_is_displayed_separately_and_invalidated_when_edited(self):
+        step = copy.deepcopy(self.saved['steps'][0])
+        step['target']['locator']['role'] = 'combobox'
+        step['selection'] = {'source': 'option_click', 'value': 'old', 'result': 'unavailable'}
+        self.assertIn('녹화 적용 미확인', ui.recognition_text(step))
+        editor = self.editor(step)
+        editor.vars['value'].set('new')
+        editor.save()
+        changed, _ = editor.result
+        self.assertNotIn('selection', changed)
+        self.assertEqual(changed['recognition']['result'], 'pending')
+        self.assertEqual(step['selection']['value'], 'old')
+
+    def test_parameterizing_same_choice_keeps_recording_evidence(self):
+        step = copy.deepcopy(self.saved['steps'][0])
+        step['target']['locator']['role'] = 'combobox'
+        step['selection'] = {'source': 'option_click', 'value': 'old', 'result': 'matched', 'observed_value': 'old'}
+        editor = self.editor(step)
+        editor.vars['parameter'].set('Choice')
+        editor.save()
+        changed, parameters = editor.result
+        self.assertEqual(changed['selection'], step['selection'])
+        self.assertEqual(parameters['Choice'], 'old')
+        candidate = copy.deepcopy(self.saved)
+        candidate.update(steps=[changed], parameters=parameters)
+        self.store.save(candidate, expected_revision=1)
+
     def test_changing_observation_kind_retains_independent_target(self):
         step = copy.deepcopy(self.saved['steps'][0])
         other = {'kind': 'element', 'locator': {'automation_id': 'Result'}}

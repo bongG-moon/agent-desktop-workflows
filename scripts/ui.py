@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Agent Desktop Workflows"
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 ACTION_LABELS = {"click": "클릭", "double-click": "두 번 클릭", "right-click": "우클릭",
     "set-value": "값 설정", "type": "입력", "select": "항목 선택", "expand": "펼치기",
     "collapse": "접기", "check": "체크", "uncheck": "체크 해제", "focus": "포커스",
@@ -40,6 +40,10 @@ def target_text(target):
 def recognition_text(step):
     rec = step.get("recognition", {})
     kind = step.get("target", {}).get("kind")
+    selection = step.get("selection")
+    if isinstance(selection, dict):
+        return {"matched": "선택값 기록 / 녹화 적용 확인", "mismatch": "선택값 기록 / 녹화 결과 다름",
+                "unavailable": "선택값 기록 / 녹화 적용 미확인"}.get(selection.get("result"), "선택값 보완 필요")
     if kind == "element" and rec.get("reason") == "combo_value_unobserved":
         return "요소 확인 / 선택값 보완 필요"
     if kind == "manual" or step.get("action") == "manual":
@@ -81,11 +85,16 @@ def _safe_reason(error):
         "target_identity_missing": "이전 실행에 대상 식별 근거가 없어 자동으로 이어갈 수 없습니다.",
         "selection_action_not_supported": "현재 콤보는 항목 선택 동작을 지원하지 않습니다. 실제 지원 동작을 확인해 이 단계를 보완하세요.",
         "combo_value_unobserved": "콤보 대상은 찾았지만 실제 선택값을 읽지 못했습니다. 단계 수정에서 실제 값이나 입력 변수와 기본값을 지정하세요. 같은 클릭을 다시 녹화하는 것만으로 해결되지 않을 수 있습니다.",
+        "combo_selection_unverified": "클릭한 옵션과 소속 콤보를 확인해 선택값을 기록했습니다. 녹화 때 적용 결과는 읽지 못했으며, 재생 시 실제 값을 별도로 확인합니다.",
+        "combo_option_value_unavailable": "클릭한 항목의 이름이나 소속 관계를 확인하지 못했습니다. 선택값을 추정하지 않고 보완 단계로 남깁니다.",
+        "combo_selection_cancelled": "목록 선택을 취소했습니다. 취소한 옵션을 입력값으로 추정하지 않습니다.",
+        "combo_selection_mismatch": "클릭한 옵션은 기록했지만 녹화 후 읽은 실제 값이 다릅니다. 선택값과 화면을 검토하세요. 재생 성공은 별도 결과 확인이 필요합니다.",
         "empty_combo_value_requires_review": "콤보 설정값이 비어 있어 입력을 보내지 않았습니다. 단계 수정에서 실제 값 또는 입력 변수와 기본값을 지정하고 새 수정본으로 저장하세요.",
         "combo_value_unavailable": "콤보의 실제 선택값을 확인할 근거가 부족합니다. 빈 값 비교로 성공 처리하지 않습니다. 현재 화면을 확인하세요.",
         "combo_value_conflict": "콤보에서 읽은 선택값 근거가 서로 다릅니다. 현재 화면과 선택 항목을 확인하세요.",
         "combo_value_mismatch": "입력은 전달됐지만 실제 콤보 선택값이 요청한 값과 다릅니다. 자동 반복하지 않고 현재 화면 확인을 기다립니다.",
         "combo_value_observed": "콤보의 실제 선택값 근거가 요청한 값과 일치합니다.",
+        "combo_engine_value_observed": "동일한 콤보를 새 관찰로 다시 찾아 실행 엔진의 읽기 전용 값 조회로 비교했습니다. 추가 입력은 보내지 않았습니다.",
         "combo_readback_interrupted": "입력 전달 후 선택값 확인이 중단됐습니다. 현재 화면을 확인하고 이어갈지 결정하세요. 입력을 자동 반복하지 않습니다.",
         "combo_parent_value_unavailable": "값 쓰기는 전달됐지만 부모 콤보의 값만으로는 결과를 확인할 수 없습니다.",
     }
@@ -446,6 +455,13 @@ class WorkflowApp(tk.Tk):
             lines.append(f"입력 변수: {step['parameter']} (현재 {_parameter_value(step, self.workflow)})")
         elif "value" in step:
             lines.append("설정값: " + (json.dumps(step["value"], ensure_ascii=False) if step["value"] != "" else "빈 문자열 (값 없음)"))
+        if isinstance(step.get("selection"), dict):
+            selection = step["selection"]
+            lines.append("녹화한 선택 의도: " + json.dumps(selection["value"], ensure_ascii=False))
+            lines.append("녹화 당시 결과: " + {"matched": "선택값 일치", "mismatch": "선택값 불일치",
+                         "unavailable": "관찰 불가"}.get(selection["result"], "미확인"))
+            if "observed_value" in selection:
+                lines.append("녹화 당시 관찰값: " + json.dumps(selection["observed_value"], ensure_ascii=False))
         if rec.get("reason"):
             lines.append("보완 안내: " + _safe_reason(rec["reason"]))
         if self.run:
@@ -887,6 +903,13 @@ class StepEditor(tk.Toplevel):
         elif step.get("recognition", {}).get("reason") == "combo_value_unobserved":
             step["recognition"] = {"target": "identified", "action": "configured", "result": "pending",
                                    "reason": "입력값을 보완했습니다. 실행 후 실제 선택값은 별도로 확인합니다."}
+        if "selection" in step and (step["action"] != "set-value" or value != step["selection"]["value"]):
+            # Keep history in the original recording/revision, not as evidence
+            # for a newly edited value or action.
+            step.pop("selection")
+            if step["action"] != "manual":
+                step["recognition"] = {"target": "identified", "action": "configured", "result": "pending",
+                                       "reason": "설정값을 수정했습니다. 실행 후 실제 값을 별도로 확인합니다."}
         self.result = (step, parameters)
         self.destroy()
 

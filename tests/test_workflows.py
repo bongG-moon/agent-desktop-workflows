@@ -388,6 +388,64 @@ class WorkflowTests(unittest.TestCase):
         run = self.runner(adapter).start(saved["id"], BINDING)
         self.assertTrue(run["task_verified"])
 
+    def test_transient_windows_journal_lock_after_dispatch_preserves_single_input(self):
+        saved, adapter = self.save(), Adapter()
+        replace = storage.os.replace
+        attempts = []
+        errors = iter((5, 32, 33))
+
+        def lock_final_journal(source, target):
+            if target.name == "run.json" and adapter.executions and len(attempts) < 4:
+                attempts.append((source, target, source.read_bytes()))
+                code = next(errors, None)
+                if code is not None:
+                    error = PermissionError("temporary lock")
+                    error.winerror = code
+                    raise error
+            return replace(source, target)
+
+        with patch.object(storage.os, "replace", side_effect=lock_final_journal), patch.object(storage.time, "sleep"):
+            run = self.runner(adapter).start(saved["id"], BINDING)
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(len(set(attempts)), 1)
+        self.assertEqual(len(adapter.executions), 1)
+        self.assertEqual(self.store.load_run(run["id"])["status"], "completed")
+
+    def test_unwritable_started_journal_stops_before_dispatch(self):
+        replace = storage.os.replace
+        for code, expected_attempts in ((5, 6), (112, 1)):
+            with self.subTest(code=code):
+                saved, adapter = self.save(), Adapter()
+                attempts = []
+
+                def block_start(source, target):
+                    if target.name == "run.json" and storage.read_json(source)["steps"][0]["status"] == "started":
+                        attempts.append((source, target))
+                        error = OSError("cannot publish journal")
+                        error.winerror = code
+                        raise error
+                    return replace(source, target)
+
+                with patch.object(storage.os, "replace", side_effect=block_start), patch.object(storage.time, "sleep"):
+                    with self.assertRaisesRegex(OSError, "cannot publish journal"):
+                        self.runner(adapter).start(saved["id"], BINDING)
+                self.assertEqual(len(attempts), expected_attempts)
+                self.assertEqual(adapter.executions, [])
+                source, target = attempts[0]
+                self.assertFalse(source.exists())
+                self.assertNotEqual(storage.read_json(target)["steps"][0]["status"], "started")
+
+    def test_journal_retry_rechecks_destination_before_second_replace(self):
+        journal = self.folder / "run.json"
+        error = PermissionError("temporary lock")
+        error.winerror = 32
+        with patch.object(storage.os, "replace", side_effect=error) as replace, \
+             patch.object(storage.time, "sleep", side_effect=lambda _: journal.mkdir()):
+            with self.assertRaisesRegex(StoreError, "unsafe_local_file"):
+                storage._write(journal, {"state": "started"})
+        self.assertEqual(replace.call_count, 1)
+        self.assertTrue(journal.is_dir())
+
     def test_click_delivery_only_continues_without_business_success(self):
         saved = self.save(workflow([step("click", "none"), step("click", "none")]))
         adapter = Adapter([result("executed_unverified", True, "unavailable")])

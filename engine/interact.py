@@ -321,6 +321,36 @@ def read_missing_value(verification, after, session, run, action, value):
                 scope="control_value", node=dict(node, value=data["value"]), evidence="fresh_get_value")
 
 
+def read_current_value(run, ref):
+    """Read one fresh inspect ref without dispatching or consuming an action.
+
+    Uses the same ref-map, protected-element and window checks as run_act.
+    This is observation evidence, never a delivery receipt.
+    """
+    run = validate_local_directory(run)
+    session, _, node = _load_session(run, ref)
+    observe.verify_binary()
+    _environment(run)
+    live = _call(["get", ref, "--property", "states"], run)
+    data = live.get("data")
+    if (live.get("ok") is not True or not isinstance(data, dict) or data.get("ref") != ref
+            or data.get("property") != "states" or not isinstance(data.get("value"), (list, dict))):
+        raise EngineError("ref_preflight_failed")
+    if _secure({"states": data["value"]}):
+        raise EngineError("secure_target")
+    _same_identity(session)
+    raw = _call(["get", ref, "--property", "value"], run)
+    _same_identity(session)
+    _write(run, "current-value.json", raw)
+    data = raw.get("data")
+    if (raw.get("ok") is not True or not isinstance(data, dict)
+            or data.get("ref") != ref or data.get("property") != "value"
+            or not isinstance(data.get("value"), str) or "\0" in data["value"]
+            or len(data["value"].encode("utf-8")) > 10000):
+        raise EngineError("value_observation_unavailable")
+    return {"value": data["value"], "input_dispatched": False}
+
+
 def _combo_postcondition_only_failure(raw, node, after, verification, action, value, dispatched, delivery):
     """Recognize one completed semantic write whose raw combo readback was empty.
 

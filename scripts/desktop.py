@@ -86,7 +86,7 @@ def write_json(path, value, *, replace=False):
 
 def _bridge_script():
     manifest = read_json(ROOT / 'engine' / 'bridge-manifest.json')
-    if manifest.get('version') != '0.1.4' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
+    if manifest.get('version') != '0.1.5' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
         raise EngineError('bridge_manifest_invalid')
     for name in BRIDGE_SOURCES:
         path = ROOT / name
@@ -442,7 +442,7 @@ class DesktopAdapter:
         if kind in {'exists', 'value', 'checked'} and isinstance(expected.get('target'), dict):
             check_step['target'] = expected['target']
         try:
-            _, observed = self._window(check_step)
+            binding, observed = self._window(check_step)
             node = resolve(observed['nodes'], check_step['target']['locator'])
         except EngineError as error:
             if str(error) == 'target_missing':
@@ -462,6 +462,8 @@ class DesktopAdapter:
                 state = evidence.get('status') if isinstance(evidence, dict) else None
                 if (state != 'observed' or evidence.get('source') not in {'parent', 'editor', 'selection', 'corroborated'}
                         or not isinstance(actual, str) or not actual or not isinstance(wanted, str) or not wanted):
+                    if state == 'unavailable' and isinstance(wanted, str) and wanted and binding and node.get('secure') is False:
+                        return self._engine_combo_check(check_step, binding, wanted)
                     return {'matched': None, 'diagnostic': 'combo_value_conflict' if state == 'conflict' else 'combo_value_unavailable'}
                 return {'matched': actual == wanted, 'diagnostic': 'combo_value_observed'}
             return {'matched': actual == wanted if isinstance(actual, str) and isinstance(wanted, str) else None}
@@ -469,3 +471,50 @@ class DesktopAdapter:
             checked = node.get('checked')
             return {'matched': checked == expected.get('value') if type(checked) is bool else None}
         return {'matched': None, 'diagnostic': 'unsupported_completion_condition'}
+
+    def _engine_combo_check(self, step, binding, wanted):
+        """One read-only fallback, only after complete native unknown evidence.
+
+        A second backend may expose a value unavailable to the Python provider.
+        Resolve the stable target again; never trust an old action receipt or
+        treat a conflict, an incomplete tree, or an unknown delivery as success.
+        """
+        unknown = {'matched': None, 'diagnostic': 'combo_value_unavailable'}
+        try:
+            result = interact.run_inspect(SimpleNamespace(**_binding(binding), output=str(self.run_dir)))
+            if result.get('status') != 'ready' or not re.fullmatch('[a-f0-9]{32}', result.get('receipt', '')):
+                return unknown
+            session = self.run_dir / result['receipt']
+            observed = read_json(session / 'inspection.json')
+            if observed.get('complete') is not True:
+                return unknown
+            node = resolve(observed['nodes'], step['target']['locator'])
+            if role(node.get('role')) != 'combobox' or not node.get('ref'):
+                return unknown
+            actual = interact.read_current_value(session, node['ref'])['value']
+            # Revalidate process lifetime, window scope and uniqueness after the
+            # backend call. A late native conflict/mismatch must not be hidden.
+            current_binding, current = self._window(step)
+            if current_binding != binding or current.get('complete') is not True:
+                return unknown
+            current_node = resolve(current['nodes'], step['target']['locator'])
+            if current_node.get('secure') is not False or role(current_node.get('role')) != 'combobox':
+                return unknown
+            evidence = current_node.get('value_evidence') or {}
+            if evidence.get('status') == 'conflict':
+                return {'matched': None, 'diagnostic': 'combo_value_conflict'}
+            latest = current_node.get('value')
+            if evidence.get('status') == 'observed':
+                if (evidence.get('source') not in {'parent', 'editor', 'selection', 'corroborated'}
+                        or not isinstance(latest, str) or not latest):
+                    return unknown
+                if latest != actual:
+                    return {'matched': None, 'diagnostic': 'combo_value_conflict'}
+            elif evidence.get('status') != 'unavailable':
+                return unknown
+            if not isinstance(actual, str) or not actual:
+                return unknown
+            return {'matched': actual == wanted, 'diagnostic': 'combo_engine_value_observed',
+                    'source': 'fresh_engine_get_value', 'input_dispatched': False}
+        except EngineError:
+            return unknown

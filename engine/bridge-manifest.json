@@ -1,8 +1,8 @@
 {
-  "version": "0.1.4",
+  "version": "0.1.5",
   "files": {
     "scripts/py_helper.py": "df443338aa9ce8bd15d835c63f06eefd80299ef9d5b8f905857c4a5f83352dfa",
-    "scripts/win_bridge.py": "8321266ba1af7df591c54f9de88f6eb0d79977cc5517a99ae17e0a16241bd4d6",
-    "scripts/recorder.py": "d4e82bd308b7598326bd61e03e4f3289bfcff5db26c375642aa922a50e05bee4"
+    "scripts/win_bridge.py": "c9e3b106d6261f1d3129cce081349ebcd0f24193843fb8079465495bb810293a",
+    "scripts/recorder.py": "de2967000d2ef7347622b9d9c862a70de7d631095bb3f070167c2d753d47d15e"
   }
 }

@@ -71,7 +71,7 @@ class PythonProtocolTests(unittest.TestCase):
             for name in desktop.BRIDGE_SOURCES:
                 (root / name).write_text('# transparent source\n', encoding='utf-8')
                 hashes[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
-            (root / 'engine/bridge-manifest.json').write_text(json.dumps({'version': '0.1.4', 'files': hashes}))
+            (root / 'engine/bridge-manifest.json').write_text(json.dumps({'version': '0.1.5', 'files': hashes}))
             with patch.object(desktop, 'ROOT', root), patch.object(desktop, 'BRIDGE', root / 'scripts/py_helper.py'):
                 self.assertEqual(desktop._bridge_script(), root / 'scripts/py_helper.py')
                 (root / 'scripts/win_bridge.py').write_text('# altered\n', encoding='utf-8')

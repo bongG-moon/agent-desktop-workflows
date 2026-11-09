@@ -16,6 +16,9 @@ class Properties:
     def property(self, key):
         self.reads.append(key)
         return self.values.get(key)
+    def element_property(self, key):
+        self.reads.append(key)
+        return self.values.get(key)
 
 
 class BridgeTests(unittest.TestCase):
@@ -146,6 +149,166 @@ class BridgeTests(unittest.TestCase):
     def test_regular_editor_clear_retains_explicit_empty_value(self):
         uia = object.__new__(w.UIA)
         self.assertEqual(uia.value(self._combo_child(50004, **{'30043': True, '30045': ''})), '')
+
+    def _relation_tree(self):
+        def item(role, name='', **values):
+            return Properties({30003: role, 30002: 123, 30019: False, 30022: False,
+                               30005: name, **{int(k): v for k, v in values.items()}})
+        root, popup = item(50032), item(50032)
+        combo = item(50003, '', **{'30043': True, '30046': False, '30045': ''})
+        label = item(50020, 'Shipping method')
+        option = item(50007, 'Express', **{'30036': True, '30080': combo})
+        tree = {root: [label, combo], popup: [option]}
+        parents = {label: root, combo: root, option: popup}
+        rectangles = {label: {'x': 10, 'y': 10, 'width': 80, 'height': 20},
+                      combo: {'x': 100, 'y': 10, 'width': 160, 'height': 24},
+                      option: {'x': 100, 'y': 40, 'width': 160, 'height': 24}}
+        uia = object.__new__(w.UIA)
+        uia.children = lambda element: iter(tree.get(element, []))
+        uia.parent = lambda element: parents.get(element)
+        uia.same = lambda a, b: a is b
+        uia.bounds = lambda element: rectangles.get(element, {'x': 0, 'y': 0, 'width': 300, 'height': 200})
+        uia.locator = lambda element, scope: {'automation_id': 'GenericField', 'role': 'combobox'}
+        return uia, root, popup, combo, label, option, tree, parents, rectangles
+
+    def test_selection_container_connects_owned_popup_to_proven_combo_root(self):
+        uia, root, popup, combo, _, option, *_ = self._relation_tree()
+        result = uia.combo_observation({'element': option, 'root': popup, 'window': 901,
+                                       'scope_root': root, 'scope_window': 900})
+        self.assertIs(result['element'], combo)
+        self.assertIs(result['root'], root)
+        self.assertEqual(result['window'], 900)
+        self.assertEqual(result['node']['semantic_label'], 'Shipping method')
+
+    def test_selection_container_cannot_escape_selected_or_owned_root(self):
+        uia, root, popup, combo, _, option, tree, parents, _ = self._relation_tree()
+        unrelated = Properties({30003: 50032, 30002: 123, 30019: False})
+        parents[combo] = unrelated
+        self.assertIsNone(uia.combo_observation({'element': option, 'root': popup, 'window': 901,
+                                               'scope_root': root, 'scope_window': 900}))
+        combo.values[30002] = 456
+        self.assertIsNone(uia.combo_observation({'element': option, 'root': popup, 'window': 901,
+                                               'scope_root': root, 'scope_window': 900}))
+
+    def test_labeled_by_is_display_only_and_preferred_to_geometry(self):
+        uia, root, _, combo, label, _, tree, parents, _ = self._relation_tree()
+        explicit = Properties({30003: 50020, 30002: 123, 30019: False, 30005: 'Delivery preference'})
+        combo.values[30018] = explicit
+        tree[root].append(explicit); parents[explicit] = root
+        node = uia.node(combo, root)
+        self.assertEqual(node['semantic_label'], 'Delivery preference')
+        self.assertEqual(node['label_source'], 'labeled_by')
+        self.assertEqual(node['name'], '')
+        self.assertEqual(node['locator']['automation_id'], 'GenericField')
+
+    def test_labeled_by_protected_or_foreign_text_is_not_read(self):
+        for overrides in ({30019: True}, {30019: None}, {30002: 456}):
+            uia, root, _, combo, label, *_ = self._relation_tree()
+            combo.values[30018] = label
+            label.values.update(overrides)
+            self.assertEqual(uia.semantic_label(combo, root), {})
+            self.assertNotIn(30005, label.reads)
+
+    def test_geometry_label_requires_mutually_unique_visible_siblings(self):
+        uia, root, _, combo, label, _, tree, parents, rects = self._relation_tree()
+        self.assertEqual(uia.semantic_label(combo, root)['label_source'], 'sibling_geometry')
+        other = Properties(dict(label.values))
+        parents[other] = root; tree[root].append(other); rects[other] = rects[label]
+        self.assertEqual(uia.semantic_label(combo, root), {})
+        tree[root].remove(other)
+        other = Properties(dict(combo.values))
+        parents[other] = root; tree[root].append(other); rects[other] = dict(rects[combo], x=270)
+        self.assertEqual(uia.semantic_label(combo, root)['semantic_label'], 'Shipping method')
+        rects[other]['x'] = 120
+        self.assertEqual(uia.semantic_label(combo, root), {})
+
+    def test_selection_pattern_reads_detached_selected_item_and_rejects_conflict(self):
+        uia, root, popup, combo, _, option, tree, parents, _ = self._relation_tree()
+        combo.values[30037] = True
+        combo.selected_items = lambda: [option]
+        self.assertEqual(uia.value_observation(combo), {
+            'value': 'Express', 'value_evidence': {'status': 'observed', 'source': 'selection'}})
+        combo.values[30045] = 'Economy'
+        self.assertEqual(uia.value_observation(combo)['value_evidence']['status'], 'conflict')
+
+    def test_selection_pattern_deduplicates_child_and_array_evidence(self):
+        uia, root, popup, combo, _, option, tree, parents, _ = self._relation_tree()
+        combo.values[30037] = True
+        combo.selected_items = lambda: [option]
+        option.values[30079] = True
+        tree[combo] = [option]; parents[option] = combo
+        self.assertEqual(uia.value(combo), 'Express')
+        combo.selected_items = lambda: [option, option]
+        self.assertEqual(uia.value_observation(combo)['value_evidence']['status'], 'conflict')
+
+    def test_selection_pattern_foreign_or_unrelated_item_is_unknown(self):
+        uia, root, popup, combo, _, option, tree, parents, _ = self._relation_tree()
+        combo.values[30037] = True
+        combo.selected_items = lambda: [option]
+        option.values[30002] = 456
+        self.assertIsNone(uia.value(combo))
+        self.assertNotIn(30005, option.reads)
+        option.values[30002] = 123
+        option.values[30080] = None
+        self.assertIsNone(uia.value(combo))
+
+    def test_option_cache_contains_only_visible_items_of_the_same_combo(self):
+        uia, root, popup, combo, _, option, tree, parents, rects = self._relation_tree()
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.scoped_windows.return_value = [900, 901]
+        uia.from_handle = lambda hwnd: root if hwnd == 900 else popup
+        uia.from_point = lambda x, y: option
+        observation = {'element': combo, 'root': root, 'window': 900, 'node': uia.node(combo, root)}
+        with patch.object(w, 'window_from_point', return_value=901), patch.object(w, 'hwnd_pid', return_value=123):
+            options = uia.combo_options(observation, binding)
+            self.assertEqual(len(options), 1)
+            self.assertEqual(options[0]['node']['name'], 'Express')
+            self.assertIs(options[0]['combo']['element'], combo)
+            self.assertEqual(options[0]['hit_window'], 901)
+            option.values[30022] = True
+            self.assertEqual(uia.combo_options(observation, binding), [])
+
+    def test_option_cache_rejects_same_pid_owned_dialog_covering_an_option(self):
+        uia, root, popup, combo, _, option, *_ = self._relation_tree()
+        dialog = Properties({30003: 50032, 30002: 123, 30019: False, 30022: False})
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.scoped_windows.return_value = [900, 901]
+        binding.recording_candidate.return_value = True
+        uia.from_handle = lambda hwnd: root if hwnd == 900 else popup
+        uia.from_point = lambda x, y: dialog
+        observation = {'element': combo, 'root': root, 'window': 900, 'node': uia.node(combo, root)}
+        with patch.object(w, 'window_from_point', return_value=902), patch.object(w, 'hwnd_pid', return_value=123):
+            self.assertEqual(uia.combo_options(observation, binding), [])
+            binding.recording_candidate.assert_called_with(902)
+
+    def test_option_cache_rejects_unscoped_hwnd_and_hit_changes(self):
+        uia, root, popup, combo, _, option, *_ = self._relation_tree()
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.scoped_windows.return_value = [900, 901]
+        uia.from_handle = lambda hwnd: root if hwnd == 900 else popup
+        uia.from_point = MagicMock(return_value=option)
+        observation = {'element': combo, 'root': root, 'window': 900, 'node': uia.node(combo, root)}
+        binding.recording_candidate.return_value = False
+        with patch.object(w, 'window_from_point', return_value=901), patch.object(w, 'hwnd_pid', return_value=123):
+            self.assertEqual(uia.combo_options(observation, binding), [])
+            uia.from_point.assert_not_called()
+        binding.recording_candidate.return_value = True
+        with patch.object(w, 'window_from_point', side_effect=[901, 902]), patch.object(w, 'hwnd_pid', return_value=123):
+            self.assertEqual(uia.combo_options(observation, binding), [])
+
+    def test_option_cache_accepts_actual_option_descendant_and_reads_combo_metadata_once(self):
+        uia, root, popup, combo, _, option, tree, parents, rects = self._relation_tree()
+        child = Properties({30003: 50020, 30002: 123, 30019: False, 30022: False})
+        tree[option] = [child]; parents[child] = option; rects[child] = rects[option]
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.scoped_windows.return_value = [900, 901]
+        uia.from_handle = lambda hwnd: root if hwnd == 900 else popup
+        uia.from_point = lambda x, y: child
+        observation = {'element': combo, 'root': root, 'window': 900, 'node': uia.node(combo, root)}
+        uia.node = MagicMock(wraps=uia.node)
+        with patch.object(w, 'window_from_point', return_value=901), patch.object(w, 'hwnd_pid', return_value=123):
+            self.assertEqual(len(uia.combo_options(observation, binding)), 1)
+        self.assertEqual(sum(call.args[0] is combo for call in uia.node.call_args_list), 1)
 
     def test_toggle_unknown_is_not_unchecked(self):
         uia = object.__new__(w.UIA)
