@@ -26,11 +26,17 @@ sealed class PopupCombo : UserControl {
     internal readonly List<PopupOption> CachedOptions = new List<PopupOption>();
     readonly TextBlock display;
 
-    internal PopupCombo(string key, bool readable, bool reject) {
+    internal PopupCombo(string key, bool readable, bool reject, bool compact) {
         Key=key; Readable=readable; RejectChoice=reject;
         AutomationProperties.SetAutomationId(this,key);
         Focusable=true; Width=205; Height=36;
-        var row=new DockPanel();
+        var row=new DockPanel { LastChildFill=!compact };
+        // Hidden peers must not displace the fill child. The compact variant
+        // deliberately leaves empty client area between the editor and arrow.
+        foreach(string choice in new[]{"Y","N","P"}) {
+            var stale=new PopupOption(this,choice,true) { Visibility=Visibility.Collapsed };
+            CachedOptions.Add(stale); row.Children.Add(stale);
+        }
         Arrow=new Button { Content="v", Width=34, Height=32 };
         AutomationProperties.SetAutomationId(Arrow,key+"Open");
         AutomationProperties.SetName(Arrow,"Open choices");
@@ -45,10 +51,6 @@ sealed class PopupCombo : UserControl {
             display=new TextBlock { Text=Current, IsHitTestVisible=false,
                 VerticalAlignment=VerticalAlignment.Center, Margin=new Thickness(8,0,0,0) };
             content.Children.Add(Editor); content.Children.Add(display); row.Children.Add(content);
-        }
-        foreach(string choice in new[]{"Y","N","P"}) {
-            var stale=new PopupOption(this,choice,true) { Visibility=Visibility.Collapsed };
-            CachedOptions.Add(stale); row.Children.Add(stale);
         }
         Content=row;
     }
@@ -220,7 +222,7 @@ sealed class ComboPopupFixture : Window {
         panel.Children.Add(new TextBlock { Text="Synthetic custom combos: blank parent name/value", FontSize=17, Margin=new Thickness(0,0,0,18) });
         Add(panel,"ComboAlpha","Processing mode",true,false);
         Add(panel,"ComboBeta","Release state",false,false);
-        Add(panel,"ComboGamma","Secondary state",false,false);
+        Add(panel,"ComboGamma","Secondary state",false,false,true);
         Add(panel,"ComboReject","Rejected change",true,true);
         Content=panel;
         Loaded+=delegate {
@@ -228,11 +230,11 @@ sealed class ComboPopupFixture : Window {
             new Thread(Read) { IsBackground=true }.Start();
         };
     }
-    void Add(StackPanel panel,string key,string text,bool readable,bool reject) {
+    void Add(StackPanel panel,string key,string text,bool readable,bool reject,bool compact=false) {
         var row=new StackPanel { Orientation=Orientation.Horizontal, Margin=new Thickness(0,0,0,14) };
         var label=new Label { Content=text, Width=180, VerticalAlignment=VerticalAlignment.Center };
         AutomationProperties.SetAutomationId(label,key+"Label");
-        var combo=new PopupCombo(key,readable,reject);
+        var combo=new PopupCombo(key,readable,reject,compact);
         AutomationProperties.SetLabeledBy(combo,label);
         label.Target=combo;
         row.Children.Add(label); row.Children.Add(combo); panel.Children.Add(row); controls.Add(key,combo);
@@ -259,7 +261,8 @@ sealed class ComboPopupFixture : Window {
                 else if(providerOnly && command.StartsWith("provider-hit|")) {
                     var combo=controls[command.Split('|')[1]];
                     var peer=(FixtureWindowPeer)UIElementAutomationPeer.CreatePeerForElement(this);
-                    Console.WriteLine(json.Serialize(new { editor=peer.ProviderHitId(combo.Editor), arrow=peer.ProviderHitId(combo.Arrow) }));
+                    Console.WriteLine(json.Serialize(new { editor=peer.ProviderHitId(combo.Editor), arrow=peer.ProviderHitId(combo.Arrow),
+                        center_editor=peer.ProviderHitId(combo)==combo.Key+"Current" }));
                     Console.Out.Flush(); return;
                 }
                 else if(providerOnly && command.StartsWith("provider-open|"))controls[command.Split('|')[1]].Open(false);

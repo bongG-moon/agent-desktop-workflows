@@ -1254,30 +1254,78 @@ def _combo_surface(binding):
         raise BridgeError('physical_input_busy')
 
 
-def _hit_center(binding, uia, element, *, option=False):
+def _hit_center(binding, uia, element, *, option=False, combo=None):
     rect = uia.bounds(element)
     if rect['width'] < 2 or rect['height'] < 2:
         raise BridgeError('target_bounds_unavailable')
     x = rect['x'] + rect['width'] // 2
     y = rect['y'] + rect['height'] // 2
     hit = window_from_point(x, y)
-    if not binding.contains_window(hit):
+    if not binding.contains_window(hit) or (combo is not None and root_window(hit) != binding.hwnd):
         raise BridgeError('point_occluded')
     actual = uia.from_point(x, y)
     if actual is None or uia.pid(actual) != binding.pid or uia.secure(actual):
         raise BridgeError('point_element_mismatch')
-    actual = uia.point_descendant(actual, x, y, binding.pid)
-    if uia.secure(actual):
-        raise BridgeError('point_element_mismatch')
     if option:
+        actual = uia.point_descendant(actual, x, y, binding.pid)
+        if uia.secure(actual):
+            raise BridgeError('point_element_mismatch')
         matches = uia.same(uia._option_hit(actual, x, y, binding.pid), element)
     else:
-        matches = uia.within(actual, element)
+        # ElementFromPoint must identify this field or a real child of it. A
+        # second combo nested inside the field cannot stand in for its parent.
+        owner = uia._combo_owner(dict(combo, element=actual))
+        matches = (owner is not None and uia.same(owner['element'], combo['element'])
+                   and uia.within(actual, element))
     if not matches:
         raise BridgeError('point_element_mismatch')
     if uia.bounds(element) != rect or window_from_point(x, y) != hit:
         raise BridgeError('target_moved')
     return x, y, hit
+
+
+def _expansion_anchor(binding, uia, combo):
+    field = combo['element']
+    rect = uia.bounds(field)
+    try:
+        return _hit_center(binding, uia, field, combo=combo)
+    except BridgeError as error:
+        if error.code != 'point_element_mismatch':
+            raise
+    # A custom field can have a blank midpoint but an identifiable editor
+    # or dropdown button at an edge. These probes never dispatch input.
+    candidates = {50004: [], 50000: []}
+    pending = deque((child, 1) for child in uia.children(field))
+    visited = 0
+    while pending:
+        child, depth = pending.popleft()
+        visited += 1
+        if visited > 96 or depth > 6 or uia.pid(child) != binding.pid:
+            raise BridgeError('combo_anchor_incomplete')
+        if uia.secure(child):
+            continue
+        role = child.property(30003)
+        if role in (50025, 50026, 50033) and not uia.actions(child):
+            pending.extend((nested, depth + 1) for nested in uia.children(child))
+        elif role in candidates and child.property(30022) is False and child.property(30010) is True:
+            child_rect = uia.bounds(child)
+            if (child_rect['width'] >= 2 and child_rect['height'] >= 2
+                    and rect['x'] <= child_rect['x'] and rect['y'] <= child_rect['y']
+                    and child_rect['x'] + child_rect['width'] <= rect['x'] + rect['width']
+                    and child_rect['y'] + child_rect['height'] <= rect['y'] + rect['height']):
+                candidates[role].append(child)
+    for matches in candidates.values():
+        if len(matches) == 1:
+            try:
+                anchor = _hit_center(binding, uia, matches[0], combo=combo)
+            except BridgeError as error:
+                if error.code != 'point_element_mismatch':
+                    raise
+                continue
+            if uia.bounds(field) != rect:
+                raise BridgeError('target_moved')
+            return anchor
+    raise BridgeError('point_element_mismatch')
 
 
 def _expand_combo(binding, uia, combo):
@@ -1294,10 +1342,14 @@ def _expand_combo(binding, uia, combo):
     try:
         # Some visible combos report the parent offscreen but correctly hit-test
         # to their on-screen editor. Prove this field is under the pointer first.
-        _hit_center(binding, uia, element)
+        if root_window(foreground()) != binding.hwnd:
+            raise BridgeError('target_not_foreground')
+        x, y, hit = _expansion_anchor(binding, uia, combo)
         _combo_surface(binding)
         if uia.secure(element) or element.property(30010) is not True or element.property(30070) != 0:
             raise BridgeError('combo_not_actionable')
+        if root_window(foreground()) != binding.hwnd or window_from_point(x, y) != hit:
+            raise BridgeError('point_occluded')
         try:
             pattern.call(3, ())
         except BaseException as error:

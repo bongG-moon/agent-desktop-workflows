@@ -35,7 +35,7 @@ def read_json(path, timeout=3):
 
 
 class Fixture:
-    def __init__(self, exe, *args):
+    def __init__(self, exe, *args, ready_timeout=15):
         self.proc = subprocess.Popen([str(exe), *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
         self.lines = queue.Queue()
@@ -43,8 +43,16 @@ class Fixture:
             for line in self.proc.stdout:
                 self.lines.put(json.loads(line))
         threading.Thread(target=reader, daemon=True).start()
-        self.ready = self.lines.get(timeout=15)
-        assert self.ready["kind"] == "ready" and self.ready["pid"] == self.proc.pid
+        try:
+            self.ready = self.lines.get(timeout=ready_timeout)
+            assert self.ready["kind"] == "ready" and self.ready["pid"] == self.proc.pid, 'fixture_startup_identity_mismatch'
+        except BaseException as error:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            if isinstance(error, queue.Empty):
+                raise RuntimeError('fixture_startup_timeout') from error
+            raise
     def command(self, text):
         self.proc.stdin.write(text + "\n"); self.proc.stdin.flush()
         if text != "quit":

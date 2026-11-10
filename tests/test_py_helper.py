@@ -114,6 +114,8 @@ class VisibleOptionTests(unittest.TestCase):
         self.uia.from_point.side_effect = lambda x, y: self.editor if y == 20 else self.item
         self.uia.point_descendant.side_effect = lambda element, *args: element
         self.uia._option_hit.side_effect = lambda element, *args: element
+        self.uia._combo_owner.side_effect = lambda observation: ({'element': self.combo}
+            if observation['element'] is self.editor else None)
         self.uia.within.side_effect = lambda a, b: (a is self.editor and b is self.combo) or a is b
         self.uia.same.side_effect = lambda a, b: a is b
         self.uia.combo_options.side_effect = lambda *args, **kwargs: [self.choice] if self.open else []
@@ -125,7 +127,8 @@ class VisibleOptionTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         for attr, replacement in [('Binding', Mock(return_value=self.binding)), ('UIA', MagicMock()),
                  ('_Com', Mock(return_value=self.pattern)), ('_send_point', self.send),
-                 ('window_from_point', lambda x, y: 11 if y == 20 else 12), ('foreground', lambda: 11)]:
+                 ('window_from_point', lambda x, y: 11 if y == 20 else 12), ('foreground', lambda: 11),
+                 ('root_window', lambda hwnd: hwnd)]:
             self.stack.enter_context(patch.object(bridge, attr, replacement))
         bridge.UIA.return_value.__enter__.return_value = self.uia
         windows = self.stack.enter_context(patch.object(bridge, 'user32', create=True))
@@ -154,6 +157,35 @@ class VisibleOptionTests(unittest.TestCase):
                 self.assertTrue(result['input_dispatched'])  # Only Expand happened.
                 self.assertIs(result['option_dispatched'], False)
                 self.send.assert_not_called()
+
+    def _blank_center(self):
+        self.editor.property.side_effect = lambda k: {30003: 50004, 30010: True, 30022: False}.get(k)
+        self.edge_children = [self.editor]
+        self.uia.children.side_effect = lambda e: ([self.combo] if e is self.root else
+                                                   self.edge_children if e is self.combo else [])
+        self.uia.bounds.side_effect = lambda e: (self.combo_rect if e is self.combo else
+            {'x': 30, 'y': 10, 'width': 12, 'height': 20} if e is self.editor else self.item_rect)
+        self.uia.from_point.side_effect = lambda x, y: (self.root if (x, y) == (50, 20) else
+                                                        self.editor if (x, y) == (36, 20) else self.item)
+
+    def test_blank_center_can_prove_same_field_through_visible_editor_at_edge(self):
+        self._blank_center()
+        result = bridge.combo_option(self.request)
+        self.assertTrue(result['option_dispatched'])
+        self.pattern.call.assert_called_once_with(3, ())
+        self.send.assert_called_once_with(50, 50, 'click')  # No synthesized click to open the field.
+
+    def test_ambiguous_editor_or_foreign_foreground_cannot_open_field(self):
+        self._blank_center()
+        self.edge_children.append(self.editor)
+        result = bridge.combo_option(self.request)
+        self.assertEqual(result['diagnostic'], 'point_element_mismatch')
+        self.edge_children.pop()
+        with patch.object(bridge, 'foreground', return_value=12):
+            result = bridge.combo_option(self.request)
+        self.assertEqual(result['diagnostic'], 'target_not_foreground')
+        self.pattern.call.assert_not_called()
+        self.send.assert_not_called()
 
     def test_open_popup_uses_runtime_value_and_rechecks_identity(self):
         self.open = True

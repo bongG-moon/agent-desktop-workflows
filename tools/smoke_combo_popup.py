@@ -301,7 +301,8 @@ def provider_case(work, key, expected, actor, fixture, report):
                and parent['value'] is None and not editor['offscreen'] and editor['value'] == '')
         hit = fixture.command('provider-hit|' + key)
         report(key + '_offscreen_field_provider_hits_real_children',
-               hit == {'editor': key + 'Current', 'arrow': key + 'Open'})
+               hit['editor'] == key + 'Current' and hit['arrow'] == key + 'Open')
+        report(key + '_parent_center_has_expected_visual_hit', hit['center_editor'] is (key != 'ComboGamma'))
     stale = [node for node in closed if node['automation_id'] == key + 'CachedOptionN']
     report(key + '_collapsed_peer_has_value_but_no_bounds',
            len(stale) == 1 and stale[0]['offscreen'] and not stale[0]['bounds_valid']
@@ -351,29 +352,32 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--compile-only', action='store_true')
     mode.add_argument('--provider-only', action='store_true', help='Exercise real peers without moving the mouse')
-    mode.add_argument('--case', choices=('readable', 'opaque', 'adjacent', 'reselect', 'fast', 'cancel', 'rejected'),
+    mode.add_argument('--case', choices=('readable', 'opaque', 'gap', 'adjacent', 'reselect', 'fast', 'cancel', 'rejected'),
                         help='Run a single recording case for diagnosis; default runs all and replay')
     args = parser.parse_args()
     if os.name != 'nt' or not args.work_dir.is_absolute() or args.work_dir.exists():
         parser.error('Windows and a new absolute local test directory are required')
     work = args.work_dir
     work.mkdir(parents=True)
-    exe = compile_fixture(work)
-    if args.compile_only:
-        print(json.dumps({'compiled': True, 'fixture_only': True}))
-        return 0
-    bridge.configure_dpi()
     results, recordings, hints = [], {}, []
     suite_completed = False
-    active_case, diagnostic = 'initial_inspection', None
-    actor = None
+    active_case, diagnostic = 'fixture_compile', None
+    actor = fixture = None
     def report(case, passed):
         results.append({'case': case, 'passed': bool(passed)})
         if not passed:
             results[-1]['hints'] = hints[:]
         print(json.dumps(results[-1]), flush=True)
-    fixture = Fixture(exe, '--provider-only') if args.provider_only else Fixture(exe)
     try:
+        exe = compile_fixture(work)
+        if args.compile_only:
+            suite_completed = True
+            print(json.dumps({'compiled': True, 'fixture_only': True}))
+            return 0
+        active_case = 'fixture_startup'
+        bridge.configure_dpi()
+        fixture = Fixture(exe, *(['--provider-only'] if args.provider_only else []), ready_timeout=40)
+        active_case = 'initial_inspection'
         actor = Actor(fixture, exe)
         initial = actor.nodes()
         save(work / 'initial.json', {'nodes': initial})
@@ -385,6 +389,7 @@ def main():
         cases = {
             'readable': lambda: actor.select('ComboAlpha'),
             'opaque': lambda: actor.select('ComboBeta'),
+            'gap': lambda: actor.select('ComboGamma'),
             'adjacent': lambda: (actor.select('ComboBeta'), actor.select('ComboGamma')),
             'reselect': lambda: (actor.select('ComboBeta'), actor.select('ComboBeta')),
             'fast': lambda: actor.select('ComboBeta', fast=True),
@@ -411,7 +416,7 @@ def main():
                        and not any(s.get('selection', {}).get('source') == 'option_click' for s in draft['steps'])
                        and not any(s.get('value') == 'N' for s in value_steps(draft, 'ComboBeta')))
             else:
-                key = 'ComboAlpha' if name == 'readable' else 'ComboReject' if name == 'rejected' else 'ComboBeta'
+                key = {'readable': 'ComboAlpha', 'rejected': 'ComboReject', 'gap': 'ComboGamma'}.get(name, 'ComboBeta')
                 steps = value_steps(draft, key)
                 selected = [s for s in steps if s.get('value') == 'N']
                 wanted = 'Y' if name == 'rejected' else 'N'
@@ -427,7 +432,7 @@ def main():
                 s['action'] == 'set-value' and s['target'].get('locator', {}).get('role') == 'combobox'
                 and not s.get('value') for s in draft['steps']))
 
-            if name in ('readable', 'opaque'):
+            if name in ('readable', 'opaque', 'gap'):
                 active_case = 'replay_' + name
                 store = Store(work / 'store')
                 original = (directory / 'draft.json').read_bytes()
@@ -459,7 +464,8 @@ def main():
                 report(name + '_original_recording_preserved', (directory / 'draft.json').read_bytes() == original
                        and selected[-1]['id'] == saved['steps'][0]['id'])
         if args.provider_only:
-            for key, expected in (('ComboAlpha', 'matched'), ('ComboBeta', 'unavailable'), ('ComboReject', 'mismatch')):
+            for key, expected in (('ComboAlpha', 'matched'), ('ComboBeta', 'unavailable'),
+                                  ('ComboGamma', 'unavailable'), ('ComboReject', 'mismatch')):
                 active_case = 'provider_' + key
                 provider_case(work, key, expected, actor, fixture, report)
         suite_completed = True
@@ -479,7 +485,8 @@ def main():
                 pass
         raise
     finally:
-        fixture.close()
+        if fixture is not None:
+            fixture.close()
         summary = {'synthetic_only': True, 'company_fx_tested': False,
                    'provider_only': bool(args.provider_only),
                    'interrupted_case': None if suite_completed else active_case, 'diagnostic': diagnostic,
