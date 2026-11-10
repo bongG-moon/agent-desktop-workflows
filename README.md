@@ -1,4 +1,10 @@
-# Agent Desktop Workflows 0.1.6
+# Desktop Select 0.1.0
+
+Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Desktop Select가 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 회사 PC에는 64비트 Python 3.10 이상이 필요합니다. ZIP의 `desktop-select` 폴더를 프로젝트의 `.claude/skills/` 아래에 복사하세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.1.0/desktop-select-0.1.0-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.1.0/skills/desktop-select/사용가이드.md)
+
+Desktop Select 0.1.0은 창 확인, 필드 선택, 메뉴 실행을 지원합니다. 사용자 동작을 녹화하고 재생하는 기능은 이 저장소의 Agent Desktop Workflows에 있습니다. Desktop Select ZIP은 `python tools/build_desktop_select.py`로 빌드할 수 있습니다.
+
+## Agent Desktop Workflows 0.1.6 녹화 도구
 
 **0.1.6부터는 콤보 항목의 접근성 이름과 실제 값이 달라도 선택값을 기록합니다.** 예를 들어 사용자가 누른 항목의 내부 이름이 `Item 1`이고 값이 `N`이면 녹화에는 `N`이 남습니다. 목록 펼치기를 지원하는 콤보의 새 마우스 선택 단계는 재생할 때 현재 콤보의 목록에서 이번 입력값과 일치하는 보이는 항목을 찾아 한 번 클릭합니다. 항목의 소속이나 위치가 불확실하면 클릭하지 않고, 클릭 후 값을 읽지 못하면 자동 확인하지 않습니다. 이전 녹화는 [두 콤보 단계만 보완하는 방법](사용가이드.html#combo-value-repair)을 참고하세요.
 
@@ -6,7 +12,7 @@
 
 **0.1.4는 콤보의 이름은 인식하지만 선택값이 빈 문자열로 녹화되는 문제를 보완합니다.** 부모의 빈 값만으로 선택값을 확정하지 않고, 같은 콤보에서 명시적으로 선택된 항목이나 하위 편집기 값의 근거를 확인합니다. 읽을 수 없으면 대상 이름을 유지한 보완 단계로 남깁니다. 기존 빈 콤보값은 입력 전에 차단하며, 실제 값이 반영되지 않은 실행은 성공 처리하거나 자동 반복하지 않습니다. 이미 저장된 잘못된 값은 자동 복원하지 않으므로 [콤보 값 보완 안내](사용가이드.html#combo-value-repair)에 따라 새 수정본으로 저장하세요.
 
-[별도 저장소](https://github.com/bongG-moon/agent-desktop-workflows) / [Windows ZIP과 사용 가이드 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/latest)
+[Agent Desktop Workflows 0.1.6 소스와 녹화 가이드](https://github.com/bongG-moon/agent-desktop-workflows/tree/v0.1.6)
 
 Windows 업무를 한 번 직접 녹화하고, 인식되지 않은 단계만 보완한 뒤 작업 이름과 조건으로 실행하는 독립 시스템입니다. **기존 CUA MCP와 별도 실행 파일, 설정, 작업 저장소를 사용합니다.** CUA MCP 서버나 CUA Driver를 설치/실행하지 않습니다.
 

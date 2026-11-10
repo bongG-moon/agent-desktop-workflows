@@ -22,20 +22,27 @@ jobs:
         run: python -X utf8 -B -m unittest discover -s tests -v
       - name: Source publication preflight
         run: python -X utf8 -B tools/build.py --source-only
+      - name: Build the Desktop Select skill ZIP
+        run: python -X utf8 -B tools/build_desktop_select.py
       - name: Restore the pinned engine for the manual fixture test
         if: github.event_name == 'workflow_dispatch' && inputs.combo_smoke
         shell: python
         run: |
-          import hashlib, io, json, urllib.request, zipfile
+          import hashlib, io, json, tarfile, urllib.request
           from pathlib import Path
-          url = 'https://github.com/bongG-moon/agent-desktop-workflows/releases/download/v0.1.5/agent-desktop-workflows-0.1.5-windows-x64.zip'
+          upstream = json.loads(Path('UPSTREAM.json').read_text(encoding='utf-8'))
+          url = f"{upstream['repository']}/releases/download/v{upstream['version']}/{upstream['asset']}"
           with urllib.request.urlopen(url, timeout=60) as response:
               payload = response.read(2_000_001)
-          if hashlib.sha256(payload).hexdigest() != 'ebf787518ce816442b131e862da06948ff4a779a40b29462d943f59c4ab0275c':
-              raise RuntimeError('fixture_source_zip_hash_mismatch')
-          with zipfile.ZipFile(io.BytesIO(payload)) as source:
-              engine = source.read('agent-desktop-workflows/bin/agent-desktop.exe')
-          if hashlib.sha256(engine).hexdigest() != json.loads(Path('UPSTREAM.json').read_text())['binary_sha256']:
+          if hashlib.sha256(payload).hexdigest() != upstream['asset_sha256']:
+              raise RuntimeError('fixture_archive_hash_mismatch')
+          with tarfile.open(fileobj=io.BytesIO(payload), mode='r:gz') as source:
+              member = source.getmember('agent-desktop.exe')
+              if not member.isfile():
+                  raise RuntimeError('fixture_engine_missing')
+              with source.extractfile(member) as binary:
+                  engine = binary.read()
+          if hashlib.sha256(engine).hexdigest() != upstream['binary_sha256']:
               raise RuntimeError('fixture_engine_hash_mismatch')
           path = Path('bin/agent-desktop.exe')
           path.parent.mkdir(exist_ok=True)
