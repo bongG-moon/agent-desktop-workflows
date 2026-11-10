@@ -61,6 +61,8 @@ jobs:
                   failures.append(mode)
                   failed += [data.get('interrupted_case'), data.get('diagnostic')]
               safe = [s for s in failed if isinstance(s, str) and re.fullmatch(r'[A-Za-z0-9_]{1,100}', s)]
+              hints = data.get('interrupted_hints', []) + [h for c in data.get('results', []) if not c['passed'] for h in c.get('hints', [])]
+              safe += list(dict.fromkeys(s for s in hints if isinstance(s, str) and re.fullmatch(r'[A-Za-z0-9_]{1,100}', s)))[:60]
               line = f"{mode}: {int(data.get('passed', 0))}/{int(data.get('total', 0))}, completed={bool(data.get('suite_completed'))}"
               if safe:
                   line += ', ' + ', '.join(safe)

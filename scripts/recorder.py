@@ -1003,6 +1003,7 @@ def record(request):
     ttk.Label(root, textvariable=detail, padding=(14, 3, 14, 8), wraplength=710).pack(fill='x')
     controls = ttk.Frame(root, padding=10)
     controls.pack(side='bottom', fill='x')
+    pin_recording = tk.BooleanVar(master=root, value=False)
     frame = ttk.Frame(root, padding=(12, 0, 12, 0))
     frame.pack(fill='both', expand=True)
     listing = ttk.Treeview(frame, columns=('step', 'name', 'target', 'action', 'result'), show='headings', style='Recorder.Treeview', height=6)
@@ -1033,6 +1034,9 @@ def record(request):
             return
         try:
             binding.check()
+            # A pinned recorder can cover a transient popup on smaller screens.
+            # Leave the target in front by default; the recorder stays on the taskbar.
+            root.attributes('-topmost', pin_recording.get())
             pump = HookPump(binding, bridge, events, notices)
             pump.start()
             worker.enabled.set()
@@ -1157,6 +1161,8 @@ def record(request):
     cancel_button = ttk.Button(controls, text='취소', command=lambda: finish(True))
     for button in (start_button, pause_button, finish_button, cancel_button):
         button.pack(side='left', padx=4, ipady=3)
+    ttk.Checkbutton(controls, text='녹화 창을 항상 위에', variable=pin_recording,
+                    command=lambda: root.attributes('-topmost', pin_recording.get())).pack(side='right', padx=4)
     root.protocol('WM_DELETE_WINDOW', finish)
     root.after(100, tick)
     if request.get('auto_start') is True:

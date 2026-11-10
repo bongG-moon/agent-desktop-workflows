@@ -80,24 +80,29 @@ class Actor:
         raise AssertionError('fixture_activation_unverified')
 
     def prepare_recording_foreground(self, recorder_process):
-        """Minimize only this test's own recorder UI when it owns foreground."""
+        """Allow the normal background UI; minimize only our obstructing recorder."""
         foreground = bridge.foreground()
         root = bridge.root_window(foreground)
         foreground_pid = bridge.hwnd_pid(foreground)
         print(json.dumps({'recording_focus': {'foreground_pid': foreground_pid,
                          'fixture_pid': self.fixture.proc.pid, 'recorder_pid': recorder_process.pid}}), flush=True)
-        if foreground_pid == recorder_process.pid:
-            assert recorder_process.poll() is None, 'recorder_exited_before_activation'
-            assert bridge.hwnd_pid(root) == recorder_process.pid, 'recorder_window_identity_changed'
-            # The HookPump/CaptureWorker continue recording while their own Tk
-            # test window is minimized. Never minimize a different application.
-            bridge.user32.ShowWindow(root, 6)
-            time.sleep(.15)
-            assert bridge.user32.IsIconic(root), 'recorder_ui_minimize_unverified'
-            self.minimized_recorder_pids.append(recorder_process.pid)
-        else:
-            assert (foreground_pid == self.fixture.proc.pid
-                    and self.binding.contains_window(root)), 'unexpected_foreground_process'
+        assert (foreground_pid == recorder_process.pid or
+                (foreground_pid == self.fixture.proc.pid and self.binding.contains_window(root))), 'unexpected_foreground_process'
+        assert recorder_process.poll() is None, 'recorder_exited_before_activation'
+        find = bridge.user32.FindWindowW
+        find.argtypes, find.restype = (C.c_wchar_p, C.c_wchar_p), C.c_void_p
+        recorder_window = find(None, 'Agent Desktop Workflows / 작업 녹화')
+        assert recorder_window and bridge.hwnd_pid(recorder_window) == recorder_process.pid, 'recorder_window_identity_changed'
+        style = bridge.user32.GetWindowLongW
+        style.argtypes, style.restype = (C.c_void_p, C.c_int), C.c_long
+        topmost = bool(style(recorder_window, -20) & 0x8)
+        if not topmost and foreground_pid != recorder_process.pid:
+            return
+        assert recorder_process.poll() is None and bridge.hwnd_pid(recorder_window) == recorder_process.pid, 'recorder_window_identity_changed'
+        bridge.user32.ShowWindow(recorder_window, 7)  # SW_SHOWMINNOACTIVE
+        time.sleep(.15)
+        assert bridge.user32.IsIconic(recorder_window), 'recorder_ui_minimize_unverified'
+        self.minimized_recorder_pids.append(recorder_process.pid)
 
     def nodes(self):
         result = []
@@ -129,18 +134,20 @@ class Actor:
 
     def _send(self, values):
         inputs = (bridge.INPUT * len(values))(*values)
-        assert bridge.user32.SendInput(len(inputs), inputs, C.sizeof(bridge.INPUT)) == len(inputs)
+        assert bridge.user32.SendInput(len(inputs), inputs, C.sizeof(bridge.INPUT)) == len(inputs), 'fixture_sendinput_incomplete'
         self.input_batches += 1
 
     def click(self, node, *, hover=.30, press=.045, settle=.35):
         self.ready()
         rect = node['bounds']
+        key = node['automation_id']
+        safe_key = key if re.fullmatch(r'Combo(Alpha|Beta|Gamma|Reject)(Open|OptionN)', key) else 'control'
         x, y = round(rect['x'] + rect['width'] / 2), round(rect['y'] + rect['height'] / 2)
         hit = bridge.window_from_point(x, y)
-        assert bridge.hwnd_pid(hit) == self.fixture.proc.pid and self.binding.contains_window(hit)
+        assert bridge.hwnd_pid(hit) == self.fixture.proc.pid and self.binding.contains_window(hit), 'fixture_hwnd_occluded_' + safe_key
         with bridge.UIA() as uia:
             actual = uia.from_point(x, y)
-            assert actual is not None and uia.pid(actual) == self.fixture.proc.pid
+            assert actual is not None and uia.pid(actual) == self.fixture.proc.pid, 'fixture_uia_point_scope_' + safe_key
             scoped_root = uia.from_handle(bridge.root_window(hit))
             assert scoped_root is not None and uia.within(actual, scoped_root), 'fixture_point_scope_changed'
             # A WPF button may hit-test its TextBlock/content peer. Accept only
@@ -162,11 +169,9 @@ class Actor:
                 current = uia.parent(current)
             # Report only known synthetic control identifiers and enum roles.
             if not matched:
-                key = node['automation_id']
-                safe_key = key if re.fullmatch(r'Combo(Alpha|Beta|Gamma|Reject)(Open|OptionN)', key) else 'control'
                 raw_role = bridge.ROLES.get(actual.property(30003), 'unknown')
                 raise AssertionError('fixture_target_moved_' + safe_key + '_hit_' + raw_role)
-        bridge.user32.SetCursorPos(x, y)
+        assert bridge.user32.SetCursorPos(x, y), 'fixture_cursor_unavailable_' + safe_key
         if hover:
             time.sleep(hover)
         self.ready()
@@ -238,6 +243,49 @@ def record_case(work, name, fixture, actor, action):
 def value_steps(draft, key):
     return [step for step in draft['steps'] if step['target'].get('locator', {}).get('automation_id') == key
             and step['action'] == 'set-value']
+
+
+def fixture_hints(controls, draft, run=None):
+    """Bounded CI diagnostics. Emit only fixture constants, counters and known enums."""
+    hints = []
+    targets = ('ComboAlpha', 'ComboBeta', 'ComboGamma', 'ComboReject')
+    values = {'Y','N','P'}
+    for key in targets:
+        state = controls.get(key, {})
+        if state.get('opens') or state.get('clicks') or state.get('writes'):
+            value = state['value'] if state.get('value') in values else 'unknown'
+            counts = '_'.join(str(min(99, int(state.get(k, 0)))) for k in ('opens','clicks','writes','selects','stale_selects'))
+            hints.append(key + '_state_' + value + '_opens_clicks_writes_selects_stale_' + counts)
+    for step in draft.get('steps', [])[:8]:
+        key = step.get('target', {}).get('locator', {}).get('automation_id')
+        key = key if key in targets else 'other'
+        choice = step.get('selection', {})
+        value = step.get('value') if step.get('value') in values else 'unknown'
+        result = choice.get('result') if choice.get('result') in {'matched','mismatch','unavailable'} else 'none'
+        hints.append(key + '_record_' + value + '_' + result)
+        reason = step.get('recognition', {}).get('reason')
+        if reason in {'combo_option_value_unavailable','combo_value_unobserved','capture_target_unavailable',
+                      'accessibility_unavailable','popup_scope_unproven','value_before_transition_unproven',
+                      'stable_locator_unavailable','pending_capture_requires_review','empty_recording_requires_review'}:
+            hints.append(reason)
+    if run:
+        entry = run['steps'][0]
+        result = entry.get('result', {})
+        approved = {'completed','completed_unverified','verified','needs_review','blocked','not_delivered','uncertain',
+                    'executed_unverified','verification_failed','interrupted','combo_option_not_clicked',
+                    'postcondition_unverified','action_not_completed','execution_interrupted','combo_value_unavailable',
+                    'combo_option_not_visible','combo_option_not_actionable','combo_value_observed','combo_value_mismatch',
+                    'combo_expansion_unavailable','combo_expansion_unknown','combo_option_changed','combo_identity_changed',
+                    'combo_option_ambiguous','point_element_mismatch','point_occluded','target_moved','physical_input_busy',
+                    'target_not_foreground','target_activation_unavailable','combo_option_delivery_unknown','incomplete_tree',
+                    'target_not_found','target_bounds_unavailable','target_unproven','accessibility_unavailable'}
+        for field, item in [('run',run.get('status')),('step',entry.get('status')),('reason',entry.get('reason')),
+                            ('delivery',result.get('status')),('diagnostic',result.get('diagnostic'))]:
+            hints.append(field + '_' + (item if item in approved else 'other'))
+        for field in ('input_dispatched','popup_expanded','option_dispatched'):
+            state = result.get(field)
+            hints.append(field + '_' + ('yes' if state is True else 'no' if state is False else 'unknown'))
+    return hints[:24]
 
 
 def provider_case(work, key, expected, actor, fixture, report):
@@ -315,12 +363,14 @@ def main():
         print(json.dumps({'compiled': True, 'fixture_only': True}))
         return 0
     bridge.configure_dpi()
-    results, recordings = [], {}
+    results, recordings, hints = [], {}, []
     suite_completed = False
     active_case, diagnostic = 'initial_inspection', None
     actor = None
     def report(case, passed):
         results.append({'case': case, 'passed': bool(passed)})
+        if not passed:
+            results[-1]['hints'] = hints[:]
         print(json.dumps(results[-1]), flush=True)
     fixture = Fixture(exe, '--provider-only') if args.provider_only else Fixture(exe)
     try:
@@ -345,9 +395,11 @@ def main():
             if args.case and name != args.case:
                 continue
             active_case = 'record_' + name
+            hints = []
             directory, draft, truth = record_case(work, name, fixture, actor, action)
             recordings[name] = (directory, draft)
             controls = truth['controls']
+            hints = fixture_hints(controls, draft)
             if name == 'adjacent':
                 report('same_option_names_preserve_two_field_identities', all(
                     controls[key]['value'] == 'N' and controls[key]['clicks'] == 1
@@ -375,15 +427,9 @@ def main():
                 s['action'] == 'set-value' and s['target'].get('locator', {}).get('role') == 'combobox'
                 and not s.get('value') for s in draft['steps']))
 
-        if args.provider_only:
-            for key, expected in (('ComboAlpha', 'matched'), ('ComboBeta', 'unavailable'), ('ComboReject', 'mismatch')):
-                active_case = 'provider_' + key
-                provider_case(work, key, expected, actor, fixture, report)
-        elif not args.case:
-            store = Store(work / 'store')
-            for name, key in (('readable', 'ComboAlpha'), ('opaque', 'ComboBeta')):
+            if name in ('readable', 'opaque'):
                 active_case = 'replay_' + name
-                directory, draft = recordings[name]
+                store = Store(work / 'store')
                 original = (directory / 'draft.json').read_bytes()
                 imported = store.import_recording(directory / 'draft.json')
                 selected = [s for s in value_steps(imported, key) if s.get('value') == 'N']
@@ -399,6 +445,7 @@ def main():
                 actor.activate()
                 run = Runner(store, desktop.DesktopAdapter).start(saved['id'], actor.request)
                 state = fixture.command('state')['controls'][key]
+                hints = fixture_hints({key: state}, reviewed, run)
                 save(work / ('replay-' + name + '.json'), {'run': run, 'ground_truth': state})
                 report(name + '_recording_replays', state['value'] == 'N' and state['clicks'] == 1
                        and state['opens'] == 1 and state['writes'] == state['selects'] == 0)
@@ -411,6 +458,10 @@ def main():
                     report('unverified_replay_never_repeats_input', resumed['status'] == 'needs_review' and after == state)
                 report(name + '_original_recording_preserved', (directory / 'draft.json').read_bytes() == original
                        and selected[-1]['id'] == saved['steps'][0]['id'])
+        if args.provider_only:
+            for key, expected in (('ComboAlpha', 'matched'), ('ComboBeta', 'unavailable'), ('ComboReject', 'mismatch')):
+                active_case = 'provider_' + key
+                provider_case(work, key, expected, actor, fixture, report)
         suite_completed = True
     except Exception as error:
         # Only a fixed diagnostic identifier leaves the hosted runner. Local
@@ -419,12 +470,20 @@ def main():
         if isinstance(message, tuple) and message:
             message = message[0]
         diagnostic = message if isinstance(message, str) and re.fullmatch(r'[a-zA-Z0-9_]{1,100}', message) else type(error).__name__
+        if active_case.startswith(('record_', 'replay_')) and fixture.proc.poll() is None:
+            try:
+                directory = work / ('record-' + active_case.split('_', 1)[1])
+                draft = read_json(directory / 'draft.json') if (directory / 'draft.json').is_file() else {}
+                hints = fixture_hints(fixture.command('state')['controls'], draft)
+            except (RuntimeError, OSError, queue.Empty):
+                pass
         raise
     finally:
         fixture.close()
         summary = {'synthetic_only': True, 'company_fx_tested': False,
                    'provider_only': bool(args.provider_only),
                    'interrupted_case': None if suite_completed else active_case, 'diagnostic': diagnostic,
+                   'interrupted_hints': [] if suite_completed else hints,
                    'suite_completed': suite_completed, 'completed_recording_cases': list(recordings),
                    'physical_recording_tested': bool(recordings),
                    'injected_mouse_keyboard': bool(actor and actor.input_batches),

@@ -3,6 +3,6 @@
   "files": {
     "scripts/py_helper.py": "b15842a9d52360e3ce50c04c6810b28717e57869bb9ff2922df11633d708a28e",
     "scripts/win_bridge.py": "51fecec191aa2b3e8737c5ec1e8163512ce1473854c75eb4434073e13518a9ae",
-    "scripts/recorder.py": "d51f360457d92edb1427ed773fde0b20af03bc9b36b6dfdfd5ade13c1f5d725c"
+    "scripts/recorder.py": "c26af522a42426988a7fcefdfb4c48366164d7dccca7a5e88796ed6246654086"
   }
 }
