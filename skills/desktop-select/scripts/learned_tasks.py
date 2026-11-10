@@ -244,6 +244,10 @@ def _check_instruction(step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    if raw.get('action') == 'result-menu':
+        step = {'action': 'result-menu', 'label': raw.get('label'), 'context': raw.get('context'), **_annotations(raw)}
+        _validate_context(step)
+        return step
     if raw.get('action') == 'row-action':
         step = {'action': 'row-action', 'label': raw.get('label'), 'row': raw.get('row'), **_annotations(raw)}
         _validate_row(step)
@@ -289,9 +293,18 @@ def _validate_row(step):
         raise TaskError(error.code) from error
 
 
+def _validate_context(step):
+    import result_menu
+    if not _text(step.get('label'), 200) or set(step) - {'action', 'label', 'alias', 'description', 'context'}:
+        raise TaskError('invalid_result_menu_step')
+    result_menu.validate_spec(step.get('context'))
+
+
 def summary(plan):
     """The local row patches are used by the player and stay out of CLI responses."""
-    return dict(plan, steps=[{k: v for k, v in step.items() if k != 'row'} for step in plan['steps']])
+    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'context')},
+                              **({'menu_path': step['context']['menu']['path']} if 'context' in step else {})}
+                             for step in plan['steps']])
 
 
 def _validate(plan):
@@ -311,6 +324,9 @@ def _validate(plan):
             raise TaskError('invalid_step_annotation')
         if s.get('action') == 'row-action':
             _validate_row(s)
+            continue
+        if s.get('action') == 'result-menu':
+            _validate_context(s)
             continue
         if s.get('action') == 'manual':
             if set(s) - set(annotation) != {'action', 'reason'} or s['reason'] != _reason(s['reason']):

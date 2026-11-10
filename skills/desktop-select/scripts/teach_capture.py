@@ -35,7 +35,8 @@ recorder = _load_recorder()
 
 
 def manual(reason, step_id=None):
-    return {'id': step_id or uuid.uuid4().hex, 'label': '직접 확인할 단계',
+    label = '일반 녹화에서 감지한 우클릭' if reason == 'right_click_requires_menu_teaching' else '직접 확인할 단계'
+    return {'id': step_id or uuid.uuid4().hex, 'label': label,
             'action': 'manual', 'target': {'kind': 'manual', 'locator': {}},
             'recognition': {'action': 'manual', 'result': 'manual', 'reason': reason}}
 
@@ -54,6 +55,8 @@ def capture_step(step):
                  or (action == 'expand' and role in {'treeitem', 'menuitem', 'splitbutton'}))
     if not supported or target.get('kind') != 'element':
         reason = step.get('recognition', {}).get('reason') if action == 'manual' else None
+        if action == 'right-click':
+            reason = 'right_click_requires_menu_teaching'
         return manual(reason or 'unsupported_recorded_action', step['id'])
     result = {'id': step['id'], 'action': action, 'label': (step.get('field_label')
               or locator.get('automation_id') or locator.get('name') or role),
@@ -105,7 +108,7 @@ class CaptureNotes:
 
 
 def default_text(step):
-    if step['action'] == 'row-action':
+    if step['action'] in ('row-action', 'result-menu'):
         return step['label']
     command = learned_tasks.recorded_step(step)
     field = command.get('label') or command.get('target') or step['label']
@@ -119,6 +122,13 @@ def default_text(step):
 
 
 def instruction_view(step, instruction):
+    if step.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching':
+        return '새 작업에서 일반 우클릭 전에 ‘조회 후 우클릭 메뉴 가르치기’를 선택하세요.'
+    if step['action'] == 'result-menu':
+        spec = step['context']
+        route = (['조회 완료 확인'] if spec['trigger'] else []) + ['표 우클릭', *spec['menu']['path']]
+        route.append('Excel 파일 확인' if spec['output'] else '메뉴 전달까지만 확인')
+        return ' → '.join(route)
     if step['action'] == 'row-action':
         return step['label'] + ' (버튼 선택 후 같은 행의 완료 표시 확인)'
     if instruction and instruction['mode'] == 'fixed':
@@ -139,6 +149,8 @@ class StepEdits:
     def identity(step):
         if step['action'] == 'row-action':
             return step['action'], step['row'], step['label']
+        if step['action'] == 'result-menu':
+            return step['action'], step['context'], step['label']
         return (step['action'], step['target'], step.get('recognition', {}).get('reason') if
                 step['action'] == 'manual' else None)
 
@@ -284,6 +296,10 @@ class _Worker(recorder.CaptureWorker):
 
     def capture_action(self, event, observation):
         pointed = None
+        if event['action'] == 'right-click':
+            self.freeze_watch(event.get('at'))
+            self.model.manual('', 'right_click_requires_menu_teaching')
+            return
         if observation:
             observation = self._command_owner(event, observation)
             node = observation['node']
@@ -448,7 +464,7 @@ def capture(binding, *, title):
         return review['steps'] if review is not None else completed_steps + session.notes.snapshot()
 
     def fields():
-        if editing is not None and editing['action'] == 'row-action':
+        if editing is not None and editing['action'] in ('row-action', 'result-menu'):
             return alias.get(), '', None, None
         chosen = modes[mode.get()]
         return alias.get(), instruction.get(), chosen, argument.get() if chosen else None
@@ -484,11 +500,11 @@ def capture(binding, *, title):
 
     def load(step):
         sentence, chosen, arg = edits.form(step)
-        is_row = step['action'] == 'row-action'
-        form.children['instruction'].configure(state='readonly' if is_row else 'normal')
-        mode_box.configure(state='disabled' if is_row else 'readonly')
+        configured = step['action'] in ('row-action', 'result-menu')
+        form.children['instruction'].configure(state='readonly' if configured else 'normal')
+        mode_box.configure(state='disabled' if configured else 'readonly')
         alias.set(edits.get(step).get('alias', ''))
-        instruction.set(step['label'] if is_row else sentence)
+        instruction.set(step['label'] if configured else sentence)
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
         refresh_preview()
@@ -570,8 +586,8 @@ def capture(binding, *, title):
         save.configure(state='normal')
         message.set('단계를 선택하고 실행할 동작을 입력하세요. 예: 이 항목을 N으로 설정')
 
-    def teach_row():
-        nonlocal session, previous_columns
+    def teach_extra(kind):
+        nonlocal session, previous_columns, editing
         if not flush():
             return
         if review is None and session.started:
@@ -583,17 +599,35 @@ def capture(binding, *, title):
         if len(steps) >= learned_tasks.MAX_STEPS:
             message.set(f'작업에는 최대 {learned_tasks.MAX_STEPS}단계를 저장할 수 있습니다.')
             return
-        from row_teach import teach_row_dialog
-        new_step = teach_row_dialog(root, session.binding, previous_columns)
-        if new_step is not None:
-            step, previous_columns = new_step
+        if kind == 'row':
+            from row_teach import teach_row_dialog
+            answer = teach_row_dialog(root, session.binding, previous_columns)
+            step = None
+            if answer:
+                step, previous_columns = answer
+        else:
+            from context_teach import previous_trigger, teach_context_dialog
+            from tkinter import messagebox
+            step = teach_context_dialog(root, session.binding)
+            if step and steps and previous_trigger(steps[-1], step['context']):
+                if messagebox.askyesno('조회 한 번으로 합치기',
+                        '바로 앞 단계에서 같은 조회 버튼을 눌렀습니다. 기존 조회 단계를 이번 조회와 우클릭 단계로 교체할까요?',
+                        parent=root):
+                    previous = steps.pop()
+                    if editing is not None and editing['id'] == previous['id']:
+                        editing = None
+                    if listing.exists(previous['id']):
+                        listing.delete(previous['id'])
+                else:
+                    step = None
+        if step is not None:
             steps.append(step)
             render(steps)
             listing.selection_set(step['id'])
             listing.see(step['id'])
         if review is None:
             end.configure(state='normal' if steps else 'disabled')
-            message.set('행 버튼을 더 가르치거나 시작을 눌러 이어서 녹화하세요. 끝나면 마치고 검토를 누르세요.')
+            message.set('단계를 더 가르치거나 시작을 눌러 이어서 녹화하세요. 끝나면 마치고 검토를 누르세요.')
 
     def save_review():
         nonlocal result
@@ -627,7 +661,8 @@ def capture(binding, *, title):
     begin = ttk.Button(controls, text='시작', command=start)
     end = ttk.Button(controls, text='마치고 검토', command=finish, state='disabled')
     save = ttk.Button(controls, text='저장', command=save_review, state='disabled')
-    for button in (begin, ttk.Button(controls, text='행 버튼 가르치기', command=teach_row), end, save,
+    for button in (begin, ttk.Button(controls, text='행 버튼 가르치기', command=lambda: teach_extra('row')),
+                   ttk.Button(controls, text='조회 후 우클릭 메뉴 가르치기', command=lambda: teach_extra('menu')), end, save,
                    ttk.Button(controls, text='취소', command=cancel)):
         button.pack(side='left', padx=3)
     root.bind('<Alt-s>', start)

@@ -37,12 +37,12 @@ def _read_sample(sender, target, title, op, args):
 
 class SampleJob:
     """Only a completed read may replace the user's previously reviewed sample."""
-    def __init__(self, binding, op, args):
+    def __init__(self, binding, op, args, *, reader=_read_sample):
         ctx = mp.get_context('spawn')
         target = dict(pid=binding.pid, hwnd=binding.hwnd, exe_name=binding.exe,
                       process_started_utc_ticks=binding.created)
         self.receiver, sender = ctx.Pipe(duplex=False)
-        self.process = ctx.Process(target=_read_sample, args=(sender, target, binding.title, op, args), daemon=True)
+        self.process = ctx.Process(target=reader, args=(sender, target, binding.title, op, args), daemon=True)
         self.started = time.monotonic()
         try:
             self.process.start()

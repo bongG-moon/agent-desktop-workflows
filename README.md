@@ -1,8 +1,8 @@
-# Desktop Select 0.3.0
+# Desktop Select 0.4.0
 
-Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Desktop Select가 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 반복할 작업은 한 번 시연한 다음 각 단계 옆에 실행할 동작을 적어 저장하세요. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Python의 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더를 프로젝트의 `.claude/skills/` 아래에 복사하세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.3.0/desktop-select-0.3.0-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.3.0/skills/desktop-select/사용가이드.md)
+Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Desktop Select가 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 반복할 작업은 한 번 시연한 다음 각 단계 옆에 실행할 동작을 적어 저장하세요. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Python의 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더를 프로젝트의 `.claude/skills/` 아래에 복사하세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.0/desktop-select-0.4.0-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.0/skills/desktop-select/사용가이드.md)
 
-예를 들어 첫 단계에 “MES SETUP조건을 N으로 해줘”, 둘째 단계에 “입력받은 변수를 FAMILY조건에 입력해줘”라고 적습니다. 이후 “이 작업을 Family=Hybrid로 실행해 줘”라고 요청하면 첫 단계는 N을, 둘째 단계는 이번에 전달한 Hybrid를 사용합니다. Desktop Select ZIP은 `python tools/build_desktop_select.py`로 빌드할 수 있습니다.
+예를 들어 첫 단계에 “MES SETUP조건을 N으로 해줘”, 둘째 단계에 “입력받은 변수를 FAMILY조건에 입력해줘”라고 적습니다. 이후 “이 작업을 Family=Hybrid로 실행해 줘”라고 요청하면 첫 단계는 N을, 둘째 단계는 이번에 전달한 Hybrid를 사용합니다. 조회 후 표의 우클릭 메뉴를 이어서 실행하려면 녹화 창에서 **조회 후 우클릭 메뉴 가르치기**를 사용하세요. 조회가 끝났다는 표시를 다시 확인한 후에만 표 내부에서 메뉴를 열며, 지정한 로컬 Excel 파일 생성까지 확인할 수 있습니다. Desktop Select ZIP은 `python tools/build_desktop_select.py`로 빌드할 수 있습니다.
 
 목록 안의 버튼은 행 번호나 이름, 버튼 모양, 실행 전후 상태를 한 번 가르치면 재생할 수 있습니다. 실행 중에는 실제 마우스를 사용하고 같은 행에서 완료 표시를 다시 읽습니다.
 

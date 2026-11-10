@@ -167,7 +167,7 @@ def task_directory():
 
 def near_region(nodes, anchor):
     """Return the nearest grouping of a freshly resolved demonstrated control."""
-    if anchor.get('action') in ('manual', 'row-action'):
+    if anchor.get('action') in ('manual', 'row-action', 'result-menu'):
         raise SelectionError('anchor_requires_review')
     anchor_idx, _ = tasks.locate_target(nodes, anchor)
     ancestors = anchor.get('ancestors', [])
@@ -325,6 +325,12 @@ def replay_step():
     binding, step = request['binding'], request['step']
     bridge.set_dpi_awareness()
     owner = bridge.Binding(binding)
+    if step['action'] == 'result-menu':
+        from result_menu import execute as execute_result
+        tasks._validate_context(step)
+        receipt = execute_result(owner, step['context'], lambda: guard(owner, owner, binding['title'], mutate=True),
+                                 binding['title'], observe_guard=lambda: guard(owner, owner, binding['title']))
+        return dict(receipt, target=step['label'])
     if step['action'] == 'row-action':
         from row_action import execute as execute_row
         tasks._validate_row(step)
@@ -397,7 +403,8 @@ def worker_receipt(argv, mutating, payload=None):
     # A third-party accessibility provider can hang inside a COM call. Terminate
     # our helper only; never assume a timed-out mutation failed or repeat it.
     try:
-        timeout = 120 if payload and payload.get('step', {}).get('action') == 'row-action' else 90
+        kind = (payload or {}).get('step', {}).get('action')
+        timeout = {'row-action': 120, 'result-menu': 160}.get(kind, 90)
         child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
                                input=json.dumps(payload) if payload is not None else None,
                                capture_output=True, encoding='utf-8', timeout=timeout)
