@@ -7,15 +7,18 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'skills' / 'desktop-select'
+VERSION = '0.2.0'
 FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'scripts/desktop_select.py',
-                                         'scripts/live_action.py', 'scripts/targeting.py')}
-FILES.update({'scripts/win_bridge.py': ROOT / 'scripts/win_bridge.py', 'LICENSE': ROOT / 'LICENSE',
+                                         'scripts/live_action.py', 'scripts/targeting.py',
+                                         'scripts/teach_capture.py', 'scripts/learned_tasks.py')}
+FILES.update({'scripts/win_bridge.py': ROOT / 'scripts/win_bridge.py', 'scripts/recorder.py': ROOT / 'scripts/recorder.py',
+              'LICENSE': ROOT / 'LICENSE',
               'NOTICE.txt': SKILL / 'NOTICE.txt'})
 
 
 def build(destination):
     destination.mkdir(parents=True, exist_ok=True)
-    out = destination / 'desktop-select-0.1.0-windows-x64.zip'
+    out = destination / f'desktop-select-{VERSION}-windows-x64.zip'
     # The distribution contains only text. Match committed bytes on both
     # Windows checkouts with autocrlf and on checkouts that preserve LF.
     contents = {name: path.read_bytes().replace(b'\r\n', b'\n') for name, path in FILES.items()}
@@ -28,7 +31,7 @@ def build(destination):
         if archive.testzip() is not None or any(archive.read('desktop-select/' + name) != data
                                                 for name, data in contents.items()):
             raise ValueError('archive_verification_failed')
-    guide = destination / 'desktop-select-0.1.0-guide.md'
+    guide = destination / f'desktop-select-{VERSION}-guide.md'
     guide.write_bytes(contents['사용가이드.md'])
     digest = sha256(out.read_bytes()).hexdigest()
     out.with_suffix('.zip.sha256').write_text(digest + '  ' + out.name + '\n', encoding='ascii')

@@ -1,7 +1,7 @@
-Desktop Select 0.1.0 (2026)
+Desktop Select 0.2.0 (2026)
 
 Distributed under the Apache License 2.0, see LICENSE in the ZIP.
-The Windows UI Automation bridge is reused from Agent Desktop Workflows.
+The Windows UI Automation bridge and scoped event recorder are reused from Agent Desktop Workflows.
 Region and label resolution use observed desktop structures as in Computer Use MCP.
 This distribution contains Python source and documentation. It has no agent-desktop
-binary, MCP server, recorder, third-party driver or application-specific capture.
+binary, MCP server, third-party driver or application-specific capture data.

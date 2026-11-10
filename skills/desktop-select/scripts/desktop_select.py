@@ -1,4 +1,4 @@
-"""One request, one live target. No recorder, desktop driver or saved handles."""
+"""Direct Windows actions and named demonstrations using the same live targets."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ from ctypes import wintypes as W
 from hashlib import sha256
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -36,6 +37,7 @@ def load_bridge():
 bridge = load_bridge()
 from targeting import SelectionError, field_labels, resolve, scope_map
 from live_action import execute
+import learned_tasks as tasks
 
 
 def windows(exe):
@@ -105,7 +107,22 @@ def bind_surface(owner, selected):
                            'process_started_utc_ticks': owner.created})
 
 
-def observe(binding, uia):
+def add_display_properties(node, element, binding, uia, root):
+    bounds = uia.bounds(element)
+    valid = bounds['width'] > 0 and bounds['height'] > 0
+    node.update(class_name=element.property(30012) or '', bounds=bounds, bounds_valid=valid,
+                offscreen=element.property(30022) is not False or not valid)
+    if node['role'] in {'combobox', 'textfield', 'checkbox', 'radiobutton', 'spinner'}:
+        label = uia.related_element(element, 30018)
+        if label is not None:
+            if (uia.pid(label) != binding.pid or not uia.within(label, root) or uia.secure(label)
+                    or label.property(30022) is not False):
+                node['label_source'] = 'invalid_labeled_by'
+            else:
+                node.update(semantic_label=label.property(30005) or '', label_source='labeled_by')
+
+
+def observe(binding, uia, *, identities_only=False):
     """Read structural properties only. Never read values of unrelated fields/rows."""
     binding.check()
     root = uia.from_handle(binding.hwnd)
@@ -122,18 +139,9 @@ def observe(binding, uia):
         node = {'path': path, 'parent_path': parent, 'secure': secure}
         if not secure:
             basic = uia.basic(element)
-            bounds = uia.bounds(element)
-            valid = bounds['width'] > 0 and bounds['height'] > 0
-            node.update(basic, class_name=element.property(30012) or '', bounds=bounds, bounds_valid=valid,
-                        enabled=element.property(30010) is True, offscreen=element.property(30022) is not False or not valid)
-            if basic['role'] in {'combobox', 'textfield', 'checkbox', 'radiobutton', 'spinner'}:
-                label = uia.related_element(element, 30018)
-                if label is not None:
-                    if (uia.pid(label) != binding.pid or not uia.within(label, root) or uia.secure(label)
-                            or label.property(30022) is not False):
-                        node['label_source'] = 'invalid_labeled_by'
-                    else:
-                        node.update(semantic_label=label.property(30005) or '', label_source='labeled_by')
+            node.update(basic, enabled=element.property(30010) is True)
+            if not identities_only:
+                add_display_properties(node, element, binding, uia, root)
             for i, child in enumerate(uia.children(element)):
                 queue.append((child, path + '/' + str(i), path, depth + 1))
         elements.append(element)
@@ -153,29 +161,68 @@ def describe(node, regions, label):
     return result
 
 
-def run(args):
-    bridge.set_dpi_awareness()
-    rows = windows(args.exe)
-    if args.command == 'windows':
-        return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
-    owner = bridge.Binding(pick_window(rows, args.window, args.hwnd))
+def task_directory():
+    return os.environ.get('DESKTOP_SELECT_TASK_DIR')
+
+
+def near_region(nodes, anchor):
+    """Return the nearest grouping of a freshly resolved demonstrated control."""
+    if anchor.get('action') == 'manual':
+        raise SelectionError('anchor_requires_review')
+    anchor_idx, _ = tasks.locate_target(nodes, anchor)
+    ancestors = anchor.get('ancestors', [])
+    by_path = {n['path']: n for n in nodes}
+    path = nodes[anchor_idx]['parent_path']
+    while path:
+        group = by_path[path]
+        # A business window alone doesn't establish which portion was demonstrated.
+        if not group['parent_path'] or group['secure']:
+            break
+        witnessed = any(all(group.get(k) == v for k, v in item.items())
+                        for item in ancestors if item.get('automation_id') or item.get('name'))
+        if witnessed and group.get('role') in {'group', 'toolbar', 'tab', 'menu', 'table', 'list', 'tree'}:
+            indexes = [i for i, n in enumerate(nodes) if n['path'] == path or n['path'].startswith(path + '/')]
+            scoped = [dict(nodes[i], parent_path='') if nodes[i]['path'] == path else nodes[i] for i in indexes]
+            return scoped, indexes, anchor_idx
+        path = group['parent_path']
+    raise SelectionError('demonstrated_region_unavailable')
+
+
+def action(args, owner, *, learned=None, anchor=None):
     surface = bind_surface(owner, args.popup)
     mutate = args.command in {'select', 'open'}
     check = lambda: guard(owner, surface, args.window, mutate)
     check()
     with bridge.UIA() as uia:
-        nodes, elements = observe(surface, uia)
-        grouped, labels = scope_map(nodes), field_labels(nodes)
+        def read_view():
+            nodes, elements = observe(surface, uia, identities_only=learned is not None or anchor is not None)
+            if anchor is None:
+                return nodes, elements, None
+            scoped, indexes, a = near_region(nodes, anchor)
+            if anchor.get('label'):
+                tasks.check_display(anchor, uia.semantic_label(elements[a], elements[0]))
+            region = [elements[i] for i in indexes]
+            for n, e in zip(scoped, region):
+                if not n['secure']:
+                    add_display_properties(n, e, surface, uia, region[0])
+            return scoped, region, elements[a]
+        nodes, elements, anchor_element = read_view()
+        grouped, labels = (None, {}) if learned is not None else (scope_map(nodes), field_labels(nodes))
         if args.command == 'inspect' and not args.target:
             items = [describe(n, grouped[i], labels.get(i, {})) for i, n in enumerate(nodes) if not n['secure']
                      and n.get('role') in LIST_ROLES and (n.get('automation_id') or n.get('name') or i in labels)]
             return {'status': 'observed', 'targets': items, 'owned_popups': owned_popups(owner), 'input_dispatched': False}
         role = 'combobox' if args.command == 'select' else args.role
-        def locate(tree):
+        def locate(tree, available):
+            if learned is not None:
+                index, evidence = tasks.locate_target(tree, learned)
+                if learned.get('label'):
+                    tasks.check_display(learned, uia.semantic_label(available[index], available[0]))
+                return index, evidence
             return resolve(tree, args.target, role=role, within=args.within)
-        i, evidence = locate(nodes)
+        i, evidence = locate(nodes, elements)
         element, node = elements[i], nodes[i]
-        detail = describe(node, grouped[i], labels.get(i, {}))
+        detail = describe(node, grouped[i] if grouped is not None else [], labels.get(i, {}))
         if args.command == 'inspect':
             result = {'status': 'resolved', 'target': detail, 'matched_by': evidence,
                       'actions': uia.actions(element), 'input_dispatched': False}
@@ -193,8 +240,11 @@ def run(args):
 
         def still_valid():
             check()
-            current, live = observe(surface, uia)
-            j, basis = locate(current)
+            current, live, current_anchor = read_view()
+            if anchor is not None:
+                if not uia.same(anchor_element, current_anchor) or not uia.same(elements[0], live[0]):
+                    raise SelectionError('demonstrated_anchor_changed')
+            j, basis = locate(current, live)
             if basis != evidence or not uia.same(element, live[j]):
                 raise SelectionError('target_changed')
             check()
@@ -205,18 +255,83 @@ def run(args):
         return dict(result, target=detail, matched_by=evidence, business_commit='not_verified')
 
 
+def run(args):
+    bridge.set_dpi_awareness()
+    if args.command in ('tasks', 'show'):
+        if args.command == 'tasks':
+            return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
+        return {'status': 'observed', 'task': tasks.load_task(args.task, task_directory()), 'input_dispatched': False}
+    if args.command == 'replay':
+        plan = tasks.load_task(args.task, task_directory())
+        overrides = tasks.parse_overrides(args.set)
+        binding = None
+        def invoke(step):
+            nonlocal binding
+            if binding is None:
+                try:
+                    binding = pick_window(windows(args.exe), args.window, args.hwnd)
+                except (SelectionError, bridge.BridgeError) as error:
+                    return {'status': 'blocked', 'diagnostic': error.code, 'input_dispatched': False}
+            return worker_receipt(['_step'], mutating=True, payload={'binding': binding, 'step': step})
+        return tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only)
+    rows = windows(args.exe)
+    if args.command == 'windows':
+        return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
+    binding = pick_window(rows, args.window, args.hwnd)
+    owner = bridge.Binding(binding)
+    if args.command == 'record':
+        from teach_capture import capture
+        tasks.check_new_task(args.task, task_directory())
+        guard(owner, owner, args.window)
+        capture_result = capture(owner, title=args.window)
+        if capture_result['status'] != 'recorded':
+            return capture_result
+        plan = tasks.from_recording(args.task, args.exe, args.window, capture_result['steps'])
+        tasks.save_task(plan, task_directory())
+        return {'status': 'recorded', 'task': plan, 'input_dispatched': False}
+    anchor = None
+    if getattr(args, 'near', None) is not None:
+        plan = tasks.load_task(args.task, task_directory())
+        tasks.check_binding(plan, args.exe, args.window)
+        anchor = tasks.get_step(plan, args.near)
+    return action(args, owner, anchor=anchor)
+
+
+def replay_step():
+    request = json.load(sys.stdin)
+    binding, step = request['binding'], request['step']
+    bridge.set_dpi_awareness()
+    owner = bridge.Binding(binding)
+    args = argparse.Namespace(command=step['action'], role=step['role'], window=binding['title'],
+                              target=step['target'], value=step.get('value'), expand=step.get('expand', False),
+                              within=step.get('within'), popup=None)
+    if args.command not in ('select', 'open'):
+        raise SelectionError('step_requires_review')
+    return action(args, owner, learned=step)
+
+
 def parser():
     p = argparse.ArgumentParser(description='Select an exact field or command in one Windows business window.')
     commands = p.add_subparsers(dest='command', required=True)
-    for verb in ('windows', 'inspect', 'select', 'open'):
+    commands.add_parser('tasks', help='list local named demonstrations')
+    commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
+    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
         if verb != 'windows':
             s.add_argument('--window', required=True, help='exact business window title from windows')
             s.add_argument('--hwnd', type=int, help='disambiguate windows with identical titles')
+        if verb in ('record', 'replay'):
+            s.add_argument('--task', required=True, help='local task name')
+        if verb == 'replay':
+            s.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
+            s.add_argument('--only', help='run just one named step or step number')
+        if verb in ('inspect', 'open', 'select'):
             s.add_argument('--popup', type=int, help='owned popup from current inspect output')
             s.add_argument('--target', required=verb != 'inspect', help='field label, name or automation ID')
             s.add_argument('--within', help='observed region, ancestor ID or name')
+            s.add_argument('--task', help='demonstration that contains the anchor')
+            s.add_argument('--near', help='limit search to this demonstrated step’s current container')
         if verb in ('inspect', 'open'):
             s.add_argument('--role', help='e.g. combobox, button, menuitem, treeitem')
         if verb == 'select':
@@ -228,47 +343,65 @@ def parser():
 
 def worker(args):
     try:
-        result = run(args)
-    except (SelectionError, bridge.BridgeError) as error:
+        result = replay_step() if args is None else run(args)
+    except (SelectionError, bridge.BridgeError, tasks.TaskError) as error:
         dispatched = getattr(error, 'input_dispatched', False)
         result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': error.code,
                   'input_dispatched': dispatched}
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result['status'] in ('verified', 'resolved', 'observed') else (2 if result['status'] == 'blocked' else 3)
+    return result_code(result)
 
 
-def supervise(args, argv):
+def result_code(result):
+    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed'):
+        return 0
+    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review') else 3
+
+
+def worker_receipt(argv, mutating, payload=None):
     # A third-party accessibility provider can hang inside a COM call. Terminate
     # our helper only; never assume a timed-out mutation failed or repeat it.
-    mutating = args.command in ('open', 'select')
     try:
-        child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),
-                                '_worker', *argv], capture_output=True, encoding='utf-8', timeout=90)
+        child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
+                               input=json.dumps(payload) if payload is not None else None,
+                               capture_output=True, encoding='utf-8', timeout=90)
         receipt = json.loads(child.stdout)
         if not isinstance(receipt, dict) or 'status' not in receipt or child.returncode not in (0, 2, 3):
             raise ValueError()
-        print(json.dumps(receipt, ensure_ascii=False))
-        return child.returncode
+        return receipt
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         diagnostic = 'provider_timeout_or_interrupted'
     except (OSError, ValueError):
         diagnostic = 'provider_unavailable'
-    print(json.dumps({'status': 'uncertain' if mutating else 'blocked', 'diagnostic': diagnostic,
-                      'input_dispatched': None if mutating else False}))
-    return 3 if mutating else 2
+    return {'status': 'uncertain' if mutating else 'blocked', 'diagnostic': diagnostic,
+            'input_dispatched': None if mutating else False}
+
+
+def supervise(args, argv):
+    receipt = worker_receipt(['_worker', *argv], mutating=args.command in ('open', 'select'))
+    print(json.dumps(receipt, ensure_ascii=False))
+    return result_code(receipt)
 
 
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
     argv = sys.argv[1:]
+    if argv == ['_step']:
+        return worker(None)
     is_worker = argv[:1] == ['_worker']
     if is_worker:
         argv = argv[1:]
     args = parser().parse_args(argv)
+    if args.command in ('inspect', 'select', 'open') and (
+            bool(args.task) != bool(args.near) or (args.popup is not None and args.near)):
+        print(json.dumps({'status': 'blocked', 'diagnostic': 'near_requires_task_and_main_window', 'input_dispatched': False}))
+        return 2
     if args.command == 'inspect' and not args.target and (args.within or args.role):
         print(json.dumps({'status': 'blocked', 'diagnostic': 'specify_target_with_filter', 'input_dispatched': False}))
         return 2
-    return worker(args) if is_worker else supervise(args, argv)
+    # Recording lasts as long as the user demonstrates. Replay has one timeout
+    # per direct step, with the original window lifetime pinned throughout.
+    return worker(args) if is_worker or args.command in ('record', 'replay', 'tasks', 'show') else supervise(args, argv)
 
 
 if __name__ == '__main__':
