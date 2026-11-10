@@ -2,6 +2,8 @@
 
 이 제품의 시험은 소스에 포함된 합성 Windows 앱과 로컬 저장소를 대상으로 한다. 회사 FX, FxMenuAgent, FarPoint 셀 인식, 실제 조회 결과 또는 Excel 내보내기 업무를 검증했다는 뜻이 아니다.
 
+0.1.6에서는 서로 다른 접근성 이름과 값을 가진 Windows WPF 팝업을 시험한다. 같은 값의 숨은 옵션이 닫힌 목록에도 남고, 화면에 보이는 콤보의 부모만 `offscreen`을 보고하는 경우를 포함한다. 전체 단위 및 복구 검사 252개와 별도로, 실제 Windows 접근성 공급자를 사용하는 검사 24개에서 클릭 의도 `N`, 적용값 일치, 읽기 불가, 불일치를 구분했다. 이 검사와 별도로 [전용 Windows 러너의 물리 녹화 및 재생 시험](https://github.com/bongG-moon/agent-desktop-workflows/actions/runs/42752140657) 34/34건이 통과했다. 8가지 실제 마우스 녹화 시나리오에 이어, 값이 읽히는 콤보와 값이 읽히지 않는 두 콤보에서는 초기화 후 녹화본을 재생했다. 세 콤보 모두 실제 선택값이 바뀌고 옵션 클릭은 한 번이었다. 읽기 불가인 두 콤보는 성공 대신 확인 대기에 머물렀다. 실제 회사 FX에서 같은 결과가 확인됐다는 뜻은 아니다.
+
 0.1.5의 단위 및 복구 검사 **225개**가 전체 실행에서 통과했다. 클릭한 옵션과 소속 콤보의 연결, 라벨 판독, 가림과 다음 클릭으로 인한 오인 방지, 재생 시 실제 값 확인을 검사했다. Windows에서 실행 기록 파일 교체가 일시적으로 거부되는 경우에는 같은 임시 파일의 교체만 재시도하고, 지속 오류가 발생하면 입력을 중복 전달하지 않는지 확인했다. 합성 팝업 시험에서는 이름이 빈 콤보 구분과 명시적 라벨 연결을 확인했다. 마우스 선택부터 재생까지는 테스트 창을 전면에 확보하지 못해 미완료이며, 실제 회사 FX의 동작은 현장 확인이 필요하다.
 
 0.1.4는 단위 및 복구 테스트 **184개**, 빈 부모 값을 노출하는 실제 합성 UIA provider 검증 **15개**, 기존 마우스/키보드 녹화부터 조회와 내보내기까지의 전체 흐름 **10개**가 통과했다. 부모 ValuePattern이 빈 문자열인 선택 항목형/하위 편집기형 콤보에서 값 녹화와 실제 1회 쓰기를 확인했다. 값 쓰기가 무시되는 경우, 선택값 미관찰/충돌, 빈 기존 작업은 성공 처리하지 않고 입력을 반복하지 않는다. UIA provider 검증의 녹화 부분은 실제 UIA 요소에 녹화기의 값 관찰 경로를 적용한 시험이며, 해당 커스텀 콤보의 물리 클릭 녹화 전체를 시험한 것은 아니다.
@@ -23,11 +25,14 @@ python -X utf8 -B tools/smoke_native.py --work-dir C:\LocalReview\NativeTest
 python -X utf8 -B tools/smoke_workflows.py --work-dir C:\LocalReview\WorkflowTest --recording C:\LocalReview\NativeTest\recording\draft.json
 python -X utf8 -B tools/smoke_userflow.py --work-dir C:\LocalReview\UserFlowTest
 python -X utf8 -B tools/smoke_combo_evidence.py --work-dir C:\LocalReview\ComboEvidenceTest
+python -X utf8 -B tools/smoke_combo_popup.py --provider-only --work-dir C:\LocalReview\ComboProviderTest
 python -X utf8 -B tools/smoke_combo_popup.py --work-dir C:\LocalReview\ComboPopupTest
 python -X utf8 -B tools/build.py
 ```
 
 테스트마다 새로운 빈 작업 폴더를 지정한다. `smoke` 명령은 개발자 검증용으로 제공된 C# 합성 앱을 로컬 .NET Framework 컴파일러로 빌드하고, 그 앱만 열어 조작한 뒤 닫는다. 이 시험용 EXE는 제품 ZIP에 포함되지 않으며 일반 녹화/실행 중 생성되지 않는다. 물리 입력을 사용하는 동안 다른 자동화나 사용자의 마우스 입력을 함께 실행하지 않는다. 결과는 지정한 폴더의 `summary.json`에 기록된다.
+
+저장소 유지보수자는 GitHub Actions의 **Standalone checks → Run workflow**에서 `combo_smoke`를 선택해 GitHub의 일회용 Windows 러너에서 같은 테스트를 실행할 수 있다. 여기에는 합성 컨트롤만 사용한다. 회사 PC의 작업 파일이나 관찰 로그는 필요하지 않다.
 
 ## 확인 항목
 
