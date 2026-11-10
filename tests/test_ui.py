@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import desktop
-from storage import Store
+from storage import Store, StoreError, validate_workflow
 import ui
 
 
@@ -138,6 +138,36 @@ class HiddenUiTests(unittest.TestCase):
         editor.expect_input_value.set(True)
         editor.save()
         self.assertEqual(editor.result[0]['expect'], {'kind': 'value', 'target': other, 'value': ''})
+
+    def test_visible_option_repair_is_explicit_and_independent_of_historical_evidence(self):
+        original = copy.deepcopy(self.saved['steps'][0])
+        original.update(action='manual', expect={'kind': 'manual'})
+        original.pop('value')
+        original['target']['locator']['role'] = 'combobox'
+        editor = self.editor(original)
+        self.assertFalse(editor.visible_option.get())
+        editor.vars['action'].set('set-value')
+        editor.vars['value'].set('B')
+        editor.vars['parameter'].set('Choice')
+        editor.vars['expect'].set('value')
+        editor.visible_option.set(True)
+        editor.headed.set(True)
+        editor.save()
+        step, parameters = editor.result
+        validated = validate_workflow(dict(self.saved, steps=[step], parameters=parameters))
+        self.assertEqual((step['combo_replay'], step['headed'], parameters['Choice']), ('visible_option', True, 'B'))
+        self.assertEqual((step['id'], step['target']), (original['id'], original['target']))
+        self.assertNotIn('selection', step)
+        self.assertNotIn('combo_replay', original)
+        for override in [{'headed': False}, {'combo_replay': 'arbitrary_point'}, {'action': 'click'},
+                         {'target': {'kind': 'element', 'locator': {'automation_id': 'X', 'role': 'button'}}}]:
+            with self.subTest(override=override), self.assertRaisesRegex(StoreError, 'invalid_combo_replay'):
+                validate_workflow(dict(validated, steps=[dict(step, **override)]))
+        self.saved = validated
+        editor = self.editor(step)
+        editor.make_manual()
+        editor.save()
+        self.assertNotIn('combo_replay', editor.result[0])
 
     def test_recorded_selection_is_displayed_separately_and_invalidated_when_edited(self):
         step = copy.deepcopy(self.saved['steps'][0])

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
-<title>Agent Desktop Workflows 0.1.5 사용 가이드</title>
+<title>Agent Desktop Workflows 0.1.6 사용 가이드</title>
 <style>
 :root{--ink:#17364b;--muted:#5f7483;--line:#d9e5ec;--paper:#f0f5f8;--green:#087b74;--navy:#113a4e;--soft:#e9f5ef;--amber:#fff3dc}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Malgun Gothic","맑은 고딕","Segoe UI",sans-serif;line-height:1.85;font-size:16px;word-break:keep-all}main{max-width:1080px;margin:auto;padding:34px 25px 50px}.hero{background:var(--navy);color:white;padding:36px 42px;border-radius:22px}.eyebrow{color:#a9dfd6;font-size:13px;font-weight:bold}.hero h1{font-size:36px;line-height:1.42;letter-spacing:-.035em;margin:12px 0 18px}.hero p{color:#d7e7ef;max-width:850px;margin:0}.tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}.tag{font-size:13px;padding:3px 12px;border:1px solid #567c8a;border-radius:30px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin:22px 0}.card{background:white;border:1px solid var(--line);border-radius:15px;padding:22px}.card small{color:var(--muted)}.card strong{display:block;font-size:21px;line-height:1.5;margin-top:6px}.card p{color:var(--muted);font-size:14px;margin:9px 0 0}.section{margin:20px 0;background:#fff;border:1px solid var(--line);border-radius:17px;padding:28px 33px}.section h2{font-size:23px;line-height:1.5;letter-spacing:-.03em;margin:0 0 18px}.section h3{font-size:18px;margin:24px 0 9px}.section p{margin:10px 0}.section li{margin:7px 0}.section ol,.section ul{padding-left:24px}.num{display:inline-grid;place-items:center;width:34px;height:34px;background:var(--soft);color:var(--green);border-radius:10px;margin-right:11px;font-size:18px}.note{background:var(--soft);padding:15px 19px;margin:18px 0;border-left:4px solid var(--green);border-radius:0 10px 10px 0}.note.warn{background:var(--amber);border-color:#b98a25}.request{background:#eff6fb;border:1px solid #cddfe9;border-radius:11px;padding:19px 22px;margin:15px 0}.small{font-size:14px;color:var(--muted)}code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.94em}p code,li code,td code{background:#edf3f6;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{background:#173348;color:#f2f7fb;border-radius:11px;padding:17px 20px;line-height:1.7;overflow-x:auto;font-size:14px;word-break:normal;white-space:pre}.tree{background:#f4f8fa;color:var(--ink);border:1px solid var(--line)}.table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px;margin:15px 0}th,td{text-align:left;vertical-align:top;padding:12px 13px;border-bottom:1px solid var(--line)}th{background:#eef4f7}td:first-child{font-weight:bold;min-width:125px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}.flow div{padding:16px 12px;border:1px solid var(--line);border-radius:10px;text-align:center}.flow b{display:block;color:var(--green);font-size:12px}.flow span{font-size:14px}a{color:#006f91;text-underline-offset:4px}details{border:1px solid var(--line);border-radius:10px;padding:12px 17px;margin:15px 0}summary{font-weight:bold;cursor:pointer}.footer{text-align:center;color:var(--muted);font-size:13px;padding:17px 0}.footer a{margin:0 7px}.step-preview{border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:16px 0}.step-preview .head{background:#163e51;color:#fff;padding:14px 17px;font-weight:bold}.step-preview .row{display:grid;grid-template-columns:45px 1.25fr 1.1fr 1.4fr;gap:12px;align-items:start;padding:12px 16px;font-size:14px;border-bottom:1px solid var(--line)}.step-preview .row:last-child{border-bottom:0}.step-preview .attention{background:var(--amber)}.status{color:#0b756b;font-weight:bold}.status.warn{color:#8e6518}.section,.card,.note,pre{break-inside:avoid}
 .fx-steps th:nth-child(2),.fx-steps td:nth-child(2){min-width:110px;white-space:nowrap}
@@ -14,7 +14,7 @@
 </head>
 <body><main>
 <header class="hero">
-<div class="eyebrow">Agent Desktop Workflows 0.1.5 | Python 기반 Windows 작업 녹화</div>
+<div class="eyebrow">Agent Desktop Workflows 0.1.6 | Python 기반 Windows 작업 녹화</div>
 <h1>업무를 한 번 보여주고,<br>다음부터 이름과 조건으로 실행하세요.</h1>
 <p>Family 선택, 조회, 표 우클릭, Excel 내보내기를 직접 한 번 수행합니다. 인식되지 않은 단계만 보완하면, 이후에는 저장한 작업 이름과 입력값으로 실행할 수 있습니다. 기존 CUA MCP와 별도 시스템입니다.</p>
 <div class="tags"><span class="tag">별도 작업 저장소</span><span class="tag">녹화 중 인식 상태 안내</span><span class="tag">한 단계만 보완</span><span class="tag">사내 모델 연계</span></div>
@@ -92,7 +92,7 @@ python -c "import struct, tkinter; print('Python bits:', struct.calcsize('P') * 
 <h2><span class="num">5</span>작업 이름과 조건으로 실행합니다</h2>
 <p>UI에서는 대상 창과 변수 값을 확인하고 <strong>작업 실행</strong>을 누릅니다. Claude Code에서는 이 제품의 <code>SKILL.md</code> 전체 경로를 알려 준 뒤 요청합니다.</p>
 <p>과거 실행 기록을 보고 있을 때는 새 작업 실행이 비활성화됩니다. <strong>최신 수정본 보기</strong>로 전환해 단계와 입력 조건을 확인한 뒤 실행하세요. 표시된 수정본이 실행 직전에 바뀌면 입력을 보내기 전에 멈춥니다.</p>
-<div class="request">아래 경로의 <strong>Agent Desktop Workflows 0.1.5 SKILL.md</strong>를 읽고 따라 줘.<br><code>D:\LocalTools\agent-desktop-workflows\SKILL.md</code><br><br>저장한 ‘Device 조회 후 Excel 내보내기’를 Family=Hybrid, Status=N으로 실행해 줘. 대상 업무 창을 먼저 확인하고, 결과가 불명확한 단계는 멈춰서 알려 줘.</div>
+<div class="request">아래 경로의 <strong>Agent Desktop Workflows 0.1.6 SKILL.md</strong>를 읽고 따라 줘.<br><code>D:\LocalTools\agent-desktop-workflows\SKILL.md</code><br><br>저장한 ‘Device 조회 후 Excel 내보내기’를 Family=Hybrid, Status=N으로 실행해 줘. 대상 업무 창을 먼저 확인하고, 결과가 불명확한 단계는 멈춰서 알려 줘.</div>
 <p>경로는 실제 설치 위치로 바꿉니다. 사내 모델이 로컬 파일과 명령을 실행할 수 있는 Claude Code 환경이어야 합니다. 채팅 전용 모델에 ZIP을 첨부하는 것만으로 PC 실행 도구가 생기지는 않습니다.</p>
 <details><summary>프로젝트 스킬로 등록하려면</summary><p>프로젝트의 <code>.claude/skills/agent-desktop-workflows/</code>에 제품 폴더 내용 전체를 복사합니다. 최종 경로가 <code>.claude/skills/agent-desktop-workflows/SKILL.md</code>가 되게 합니다. 새 대화에서 <code>/agent-desktop-workflows</code>를 호출할 수 있습니다.</p><p>기존 CUA 스킬이나 개인 Claude 설정을 덮어쓰지 않습니다. 스킬 설치 방식은 <a href="https://code.claude.com/docs/en/skills">Claude Code 공식 문서</a>를 따릅니다.</p></details>
 <div class="note">이전 <code>agent-desktop-local</code>과 다른 제품입니다. 녹화와 작업 단위 실행을 요청할 때는 <strong>agent-desktop-workflows</strong>의 새 경로를 사용하세요. 모델 주소, API 키, MCP와 전역 권한을 이 제품 때문에 바꿀 필요는 없습니다.</div>
@@ -122,7 +122,7 @@ python -c "import struct, tkinter; print('Python bits:', struct.calcsize('P') * 
 <section class="section">
 <h2><span class="num">8</span>파일과 실행 환경은 로컬에 유지합니다</h2>
 <p>이 제품은 외부 모델/API, JEV, 원격 로그, 자동 업데이트, npm 설치와 상시 감시 서비스를 포함하지 않습니다. 기존 CUA 파일, 계정, 모델 설정과 보안 정책을 변경하지 않습니다. 기존 실행 엔진과 Python 녹화 도우미가 회사에서 승인한 사용자 세션에서 동작합니다.</p>
-<p>0.1.5도 자체 도우미 EXE 없이 Python 소스로 동작합니다. 실행 중 EXE/DLL을 빌드하거나 다운로드하지 않으며 Python 표준 라이브러리로 Windows 기본 API를 호출합니다. 녹화와 지역 입력의 기능은 유지하므로 회사의 Python 실행 및 입력 관찰 정책은 그대로 적용됩니다. 다운로드 차단 해제를 보장하는 변경은 아닙니다.</p>
+<p>0.1.6도 자체 도우미 EXE 없이 Python 소스로 동작합니다. 실행 중 EXE/DLL을 빌드하거나 다운로드하지 않으며 Python 표준 라이브러리로 Windows 기본 API를 호출합니다. 녹화와 지역 입력의 기능은 유지하므로 회사의 Python 실행 및 입력 관찰 정책은 그대로 적용됩니다. 다운로드 차단 해제를 보장하는 변경은 아닙니다.</p>
 <p>녹화와 실행 기록에는 창 제목, 입력값과 업무 화면 구조가 포함될 수 있습니다. 저장소 전체를 업무 자료로 취급하고, 회사가 승인한 사내 모델 환경에서만 읽으세요. OS 네트워크 차단 도구는 아니며 호스트 모델의 전송 경로와 폴더 동기화 정책은 별도 관리 대상입니다.</p>
 <p>실제 회사 FX/FxMenuAgent, 컨트롤 버전과 DPI별 동작은 현장 검증이 필요합니다. 합성 화면에서의 검사를 실제 업무 인수 시험으로 표현하지 않습니다. 메뉴나 셀을 현재 읽을 수 없으면 해당 단계의 한계를 표시하며, 회사 보안 정책을 우회하지 않습니다.</p>
 <details><summary>처음 실행할 때 자주 확인할 부분</summary><ul><li><strong>화면이 열리지 않음:</strong> <code>Start.cmd</code>의 Python/tkinter 안내를 확인합니다. 승인된 Python 경로로 <code>scripts/cli.py ui</code>를 실행할 수 있습니다.</li><li><strong>목록에 업무 창이 없음:</strong> 실제 앱이 현재 사용자 세션에 열려 있는지 확인하고 창 새로고침을 누릅니다.</li><li><strong>녹화된 단계가 미인식:</strong> 해당 단계만 다시 녹화하거나 수동 단계로 남깁니다. 단순히 녹화 시간이 길다고 해결되지는 않습니다.</li><li><strong>영역 우클릭이 차단됨:</strong> 대상 창의 복원/전경/가림과 현재 영역을 확인합니다. 임의 좌표로 대체하지 않습니다.</li><li><strong>계속 읽기 전용이라고 답함:</strong> 이전 Agent Desktop Local 스킬을 읽고 있지 않은지 확인하고 새 제품의 전체 경로를 명시합니다.</li><li><strong>실행이 회사 정책에 의해 차단됨:</strong> UAC, 백신, 방화벽과 관리자 권한을 임의로 변경하지 않습니다.</li></ul></details>
@@ -134,7 +134,7 @@ python -c "import struct, tkinter; print('Python bits:', struct.calcsize('P') * 
 <p class="small">실제 회사 FX는 아직 현장 검증하지 않았습니다. 메뉴 이름, 저장 대화상자와 완료 신호는 현재 FX 화면에서 확인하세요. 처음에는 조회 결과를 사람이 확인하는 흐름으로 시작합니다.</p>
 
 <h3>① 프로그램과 FX를 준비합니다</h3>
-<ol><li>0.1.5 Windows x64 ZIP 전체를 새 로컬 폴더에 풀고 <code>Start.cmd</code>를 실행합니다. 64비트 Python 3.10 이상과 tkinter가 필요하며 CUA Driver는 필요하지 않습니다. 소스 ZIP을 받았다면 <a href="#source-zip">1번의 실행 엔진 복사 안내</a>를 먼저 확인합니다.</li><li>FX에 로그인하고 Family와 Status가 있는 업무 화면을 엽니다. 창은 최소화하지 않고 복원해 둡니다.</li><li>Workflows의 <strong>대상 업무 창</strong>에서 현재 업무 화면의 제목과 실행파일을 확인해 선택합니다. 다른 FX 화면과 구분하세요.</li></ol>
+<ol><li>0.1.6 Windows x64 ZIP 전체를 새 로컬 폴더에 풀고 <code>Start.cmd</code>를 실행합니다. 64비트 Python 3.10 이상과 tkinter가 필요하며 CUA Driver는 필요하지 않습니다. 소스 ZIP을 받았다면 <a href="#source-zip">1번의 실행 엔진 복사 안내</a>를 먼저 확인합니다.</li><li>FX에 로그인하고 Family와 Status가 있는 업무 화면을 엽니다. 창은 최소화하지 않고 복원해 둡니다.</li><li>Workflows의 <strong>대상 업무 창</strong>에서 현재 업무 화면의 제목과 실행파일을 확인해 선택합니다. 다른 FX 화면과 구분하세요.</li></ol>
 
 <h3>② 실제 업무를 한 번 녹화합니다</h3>
 <p><strong>새 작업 녹화 → 녹화 시작</strong>을 누르고 아래 순서대로 직접 조작합니다. 각 동작이 화면에 반영된 것을 확인한 뒤 다음 동작을 진행하세요.</p>
@@ -157,12 +157,16 @@ python -c "import struct, tkinter; print('Python bits:', struct.calcsize('P') * 
 <p class="small">표 영역 우클릭을 인식했다고 특정 행이나 내보내기 범위까지 확인된 것은 아닙니다. 메뉴나 저장 대화상자가 미인식 단계로 남았으면 그 단계를 보완하거나 직접 수행 단계로 설정합니다. 단계 자체가 없으면 필요한 흐름을 포함해 새로 녹화합니다. <strong>이 단계 다시 녹화</strong>는 기존 한 단계를 대체하며 없는 단계를 추가하는 기능은 아닙니다.</p>
 
 <h3 id="combo-value-repair">콤보 이름은 맞는데 선택값이 비어 있다면</h3>
+<p><strong>0.1.6에서 기존 녹화의 콤보 두 단계만 고칠 수 있습니다.</strong> 새 폴더의 <code>Start.cmd</code>를 열어 창 제목이 0.1.6인지 확인하세요. 기존 작업에서 <strong>이 단계 다시 녹화</strong>를 선택하고, FX에서 콤보를 펼쳐 실제 옵션을 마우스로 클릭합니다. Status 단계와 Family 단계를 각각 바꾸면 조회와 내보내기 단계는 그대로 남습니다.</p>
+<p>단계 상세의 <strong>녹화한 선택 의도</strong>가 각각 <code>N</code>, <code>Hybrid</code>인지 확인하세요. 내부 이름이 <code>Item 1</code>이어도 클릭한 항목이 노출한 값이 <code>N</code>이면 <code>N</code>을 기록합니다. <strong>녹화 당시 결과: 관찰 불가</strong>는 클릭한 값은 알지만 적용 결과를 화면에서 다시 읽지 못했다는 뜻입니다.</p>
+<p>다시 녹화하기 어렵다면 아래 단계 수정 절차에서 <strong>값 설정 시 목록에서 보이는 옵션 클릭 (물리 입력)</strong>을 선택하세요. 재생 시 FX 창을 복원해 두면 해당 콤보 목록에서 이번 실행값과 일치하는 항목을 찾습니다. 클릭 대상이 없거나 둘 이상이면 멈춥니다. 목록만 열렸거나 클릭 후 실제 값을 읽지 못하면 성공으로 간주하지 않습니다. 현재 화면에서 원하는 값이 적용됐는지 확인한 뒤 이어가세요.</p>
 <p>0.1.3까지는 부모 값이 빈 커스텀 콤보가 <code>set-value ""</code>로 저장될 수 있었고, 0.1.4는 빈 값 오판을 막았습니다. 0.1.5는 <strong>실제로 클릭한 옵션과 소속 콤보</strong>를 연결해 선택 의도도 보존합니다. <code>MES Setup → N</code> 같은 표시 이름은 라벨 관계를 읽어 만들며 FX 전용 필드명 규칙은 사용하지 않습니다. <strong>기존에 저장된 빈 값은 업데이트만으로 N이나 Hybrid로 복원되지 않습니다.</strong></p>
 <table><thead><tr><th>녹화 표시</th><th>의미와 다음 행동</th></tr></thead><tbody><tr><td>선택값 기록 / 녹화 적용 확인</td><td>선택 의도와 당시 값이 일치했습니다. 재생할 때는 다시 확인합니다.</td></tr><tr><td>선택값 기록 / 녹화 적용 미확인</td><td>입력값은 보존됐습니다. 완료 조건을 값 일치로 두고 첫 재생 결과를 확인합니다.</td></tr><tr><td>선택값 기록 / 녹화 결과 다름</td><td>클릭한 항목과 관찰값이 다릅니다. 단계 상세의 두 값을 검토하세요.</td></tr><tr><td>요소 확인 / 선택값 보완 필요</td><td>대상만 확인됐습니다. 해당 단계의 값/변수를 보완하거나 다시 녹화합니다.</td></tr></tbody></table>
 <p>목록이 너무 빨리 사라져 클릭 전에 항목을 한 번도 읽지 못한 경우, 소속 관계 없는 팝업, 선택값을 노출하지 않는 키보드 조작은 보완이 필요할 수 있습니다. 읽을 수 없는 값을 추정하거나 결과 미확인을 성공으로 표시하지 않습니다.</p>
 <ol><li>작업을 선택해 <strong>최신 수정본 보기</strong>로 현재 수정본을 확인합니다.</li><li>실제 Status 콤보의 <strong>단계 수정</strong>에서 동작 <code>set-value</code>, <strong>입력 변수 이름</strong> <code>Status</code>, <strong>값 / 변수 기본값</strong> <code>N</code>, 완료 조건 <code>value</code>로 정하고 <strong>새 수정본 저장</strong>을 누릅니다.</li><li>실제 Family 콤보도 같은 방법으로 입력 변수 이름 <code>Family</code>, 기본값 <code>Hybrid</code>를 지정합니다. 녹화 순서에 따라 단계 번호가 다를 수 있으므로 대상 이름으로 구분하세요.</li><li>이전 실행이 있다면 먼저 입력 전달 여부를 확인합니다. 입력하지 않은 단계는 보완한 수정본으로 이어갈 수 있습니다. 이미 전달됐거나 불명확한 단계는 현재 결과부터 확인하고, 조회나 내보내기를 처음부터 반복하지 않습니다.</li></ol>
 <div class="note"><strong><code>{Status}</code>나 <code>{Family}</code>를 값 칸에 쓰지 마세요.</strong> 이 제품은 그 문자열을 변수로 치환하지 않습니다. 변수 이름과 실제 기본값을 각각의 칸에 입력합니다. 입력 변수를 지정하면 이번 실행의 변수값으로 완료 여부를 확인하므로 추가 확인란은 필수가 아닙니다.</div>
-<p>콤보 값이 비어 있으면 편집 저장과 실행 전에 보완 안내가 표시됩니다. 일반 텍스트 입력창을 의도적으로 비우는 동작은 계속 사용할 수 있습니다. 콤보 목록의 항목을 다시 클릭해 녹화해도 부모 콤보 값으로 합쳐질 수 있으므로, <strong>같은 조작의 재녹화만으로 값 판독 문제가 해결되지는 않습니다.</strong></p>
+<p><strong>화면에서는 매번 값이 바뀌는데 자동 판독만 안 된다면</strong> 다음 실행용 수정본에서 해당 콤보의 동작은 <code>set-value</code>로 유지하고 완료 조건만 <code>manual</code>로 정하세요. 그러면 목록 선택은 도구가 하고 사람은 화면의 최종값만 확인합니다. 실행 중 전달 여부가 불확실한 클릭은 반복하지 마세요.</p>
+<p>콤보 값이 비어 있으면 편집 저장과 실행 전에 보완 안내가 표시됩니다. 콤보 내부의 빈 편집창을 클릭하는 것만으로는 옵션 선택이 녹화되지 않습니다. 목록을 펼친 뒤 원하는 항목을 눌러 주세요. 일반 텍스트 입력창을 의도적으로 비우는 동작은 계속 사용할 수 있습니다.</p>
 <p>실제 값을 지정한 뒤에도 반영되지 않으면 실행 기록의 선택값 확인 결과를 보세요. 설정 호출이 성공해도 실제 선택값이 다르거나 읽히지 않으면 멈추며 자동 반복하지 않습니다. 값 미관찰을 빈 값과 같다고 판정하지 않습니다. 이 보완은 모든 FX 커스텀 콤보의 자동 실행을 보장하지 않으므로 첫 실행에서 화면 결과를 확인하세요.</p>
 
 <h3>④ Excel 내보내기의 실제 결과에 맞춰 완료 조건을 정합니다</h3>
@@ -179,11 +183,11 @@ python -c "import struct, tkinter; print('Python bits:', struct.calcsize('P') * 
 
 <h3>⑥ 다음부터 Claude Code에 작업 단위로 요청합니다</h3>
 <p>UI와 Claude Code는 같은 Windows 사용자와 작업 저장소를 사용해야 합니다. 기본 저장소는 <code>%LOCALAPPDATA%\AgentDesktopWorkflows</code>이며, 별도 <code>--store</code> 경로를 사용했다면 그 경로도 알려 주세요. 사내 모델에 로컬 파일 읽기와 명령 실행 도구가 연결된 Claude Code 환경에서 다음 요청을 사용합니다.</p>
-<div class="request"><code>D:\LocalTools\agent-desktop-workflows\SKILL.md</code>를 읽고<br>Agent Desktop Workflows 0.1.5으로 진행해 줘.<br><br>저장된 작업 ‘FX 조건조회_엑셀내보내기’를<br>Family=Hybrid, Status=N으로 실행해 줘.<br><br>현재 FX 업무 창과 저장된 작업을 확인해서 작업 단위로 실행해.<br>조회나 Excel 결과에 사람 확인이 필요하면<br>어느 단계에서 무엇을 확인해야 하는지 알려주고 기다려 줘.<br>전달 여부가 불명확한 동작은 자동으로 반복하지 마.</div>
+<div class="request"><code>D:\LocalTools\agent-desktop-workflows\SKILL.md</code>를 읽고<br>Agent Desktop Workflows 0.1.6을 사용해 줘.<br><br>저장된 작업 ‘FX 조건조회_엑셀내보내기’를<br>Family=Hybrid, Status=N으로 실행해 줘.<br><br>현재 FX 업무 창과 저장된 작업을 확인해서 작업 단위로 실행해.<br>조회나 Excel 결과에 사람 확인이 필요하면<br>어느 단계에서 무엇을 확인해야 하는지 알려주고 기다려 줘.<br>전달 여부가 불명확한 동작은 자동으로 반복하지 마.</div>
 <p>첫 줄의 경로는 실제 설치 위치로 바꿉니다. 기존 <code>agent-desktop-local</code> 경로가 아닌 새 <code>agent-desktop-workflows</code> 경로입니다. 사용자가 ref, PID와 HWND를 복사할 필요 없이 도구가 현재 창과 요소를 확인합니다.</p>
 <p>조회 결과를 직접 확인한 다음에는 아래처럼 답합니다.</p>
 <div class="request">조회 결과를 확인했어. 현재 확인 대기 단계를 완료로 확인하고,<br>조회 버튼을 다시 누르지 말고 이어서 진행해 줘.</div>
 <p>Excel 결과도 사람 확인으로 설정했다면 해당 결과를 실제 확인한 뒤 그 단계를 명시해 이어가도록 요청합니다. Claude Code는 같은 실행 기록을 사용해 재개해야 하며, 사용자 확인을 추정하거나 새 실행으로 앞 단계를 반복하면 안 됩니다. 기존 도구 권한과 회사 정책은 그대로 따릅니다.</p>
 </section>
-<footer class="footer">Agent Desktop Workflows 0.1.5 / 기존 CUA MCP와 독립된 로컬 작업 시스템<br><a href="README.md">제품 설명</a><a href="references/usage.md">CLI와 실행 절차</a><a href="SKILL.md">스킬</a></footer>
+<footer class="footer">Agent Desktop Workflows 0.1.6 / 기존 CUA MCP와 독립된 로컬 작업 시스템<br><a href="README.md">제품 설명</a><a href="references/usage.md">CLI와 실행 절차</a><a href="SKILL.md">스킬</a></footer>
 </main></body></html>

@@ -28,7 +28,7 @@ DIAGNOSTICS = {"invalid_arguments", "invalid_action", "headed_required", "invali
     "window_process_mismatch", "process_executable_mismatch", "different_windows_session",
     "reparse_directory_rejected", "reparse_file_rejected", "local_absolute_directory_required",
     "local_fixed_drive_required", "existing_output_directory_required", "windows_required",
-    "empty_combo_value_requires_review", "combo_parent_value_unavailable"}
+    "empty_combo_value_requires_review", "combo_parent_value_unavailable", "list_option_not_visible"}
 
 
 def _read(path):
@@ -411,6 +411,18 @@ def run_act(args):
             raise EngineError("ref_preflight_failed")
         if _secure({"states": live.get("data", {}).get("value", [])}):
             raise EngineError("secure_target")
+        if args.action == "select" and str(node.get("role", "")).replace("ControlType.", "").lower() in {"option", "listitem", "list item"}:
+            states = live["data"].get("value")
+            if not isinstance(states, list) or any(state in {"offscreen", "disabled", "hidden"} for state in states):
+                raise EngineError("list_option_not_visible")
+            current = _call(["get", args.ref, "--property", "bounds"], run)
+            _write(run, "option-bounds.json", current)
+            data = current.get("data", {})
+            bounds = data.get("value")
+            if (current.get("ok") is not True or data.get("ref") != args.ref or data.get("property") != "bounds"
+                    or not isinstance(bounds, dict) or any(type(bounds.get(key)) not in (int, float)
+                    or not 0 < bounds[key] < float("inf") for key in ("width", "height"))):
+                raise EngineError("list_option_not_visible")
         _same_identity(session)
         # Validate executable/environment before recording the potential mutation boundary.
         observe.verify_binary()

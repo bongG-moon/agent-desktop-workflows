@@ -249,9 +249,11 @@ class Binding:
                 handles.append(int(hwnd))
             return len(handles) < 64
         callback = callback_type(visit)
-        _sig(user32, 'EnumWindows', W.BOOL, callback_type, W.LPARAM)(callback, 0)
+        complete = _sig(user32, 'EnumWindows', W.BOOL, callback_type, W.LPARAM)(callback, 0)
         if len(handles) >= 64:
             raise BridgeError('too_many_related_windows')
+        if not complete:
+            raise BridgeError('related_window_enumeration_failed')
         return handles
 
     def info(self):
@@ -385,6 +387,22 @@ ROLES = {50000: 'button', 50001: 'calendar', 50002: 'checkbox', 50003: 'combobox
          50026: 'group', 50027: 'thumb', 50028: 'table', 50029: 'row', 50030: 'document', 50031: 'splitbutton',
          50032: 'window', 50033: 'group', 50034: 'header', 50035: 'headeritem', 50036: 'table',
          50037: 'titlebar', 50038: 'separator'}
+
+
+def option_value(node):
+    """Exact text of an identified option, independently of its selected state."""
+    if (node.get('role') != 'listitem' or node.get('secure') is not False
+            or node.get('value_evidence', {}).get('status') == 'conflict'):
+        return None
+    text = node.get('value')
+    if text in (None, ''):
+        text = node.get('name')
+    if not isinstance(text, str) or not text.strip() or '\0' in text:
+        return None
+    try:
+        return text if len(text.encode('utf-8')) <= 10000 else None
+    except UnicodeEncodeError:
+        return None
 
 
 class UIA:
@@ -590,6 +608,29 @@ class UIA:
         value = element.property(30045)
         return value if isinstance(value, str) else None
 
+    def _accessible_value(self, element):
+        # A custom option, combo or embedded editor may expose its value
+        # through MSAA alone. Neither API overrides a contradictory value.
+        if self.secure(element):
+            return {'value': None}
+        pattern_value = self._pattern_value(element)
+        legacy = element.property(30093) if element.property(30090) is True else None
+        if isinstance(legacy, str) and legacy:
+            if pattern_value and pattern_value != legacy:
+                return {'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}}
+            return {'value': legacy}
+        return {'value': pattern_value}
+
+    def _selected_option_observation(self, item):
+        unavailable = {'value': None, 'value_evidence': {'status': 'unavailable', 'source': 'none'}}
+        if self.secure(item) or item.property(30003) != 50007:
+            return unavailable
+        raw = self._accessible_value(item)
+        if raw.get('value_evidence', {}).get('status') == 'conflict':
+            return raw
+        value = option_value({'role': 'listitem', 'secure': False, 'name': item.property(30005), **raw})
+        return {'value': value} if value is not None else unavailable
+
     def value_observation(self, element):
         """Read a combo's selected value, never infer it from its option inventory.
 
@@ -602,12 +643,18 @@ class UIA:
         conflict = {'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}}
         if self.secure(element):
             return unavailable
-        parent_value = self._pattern_value(element)
-        if element.property(30003) != 50003:
-            return {'value': parent_value}
+        role = element.property(30003)
+        if role == 50007:
+            return self._accessible_value(element)
+        if role != 50003:
+            return {'value': self._pattern_value(element)}
         owner_pid = self.pid(element)
         if type(owner_pid) is not int or owner_pid <= 0:
             return unavailable
+        own = self._accessible_value(element)
+        if own.get('value_evidence', {}).get('status') == 'conflict':
+            return conflict
+        parent_value = own['value']
         values = [('parent', parent_value)] if parent_value else []
         selected_items = []
         if element.property(30037) is True:
@@ -628,10 +675,10 @@ class UIA:
                     if (container is not None and not self.same(container, element)) or (
                             container is None and not self.within(item, element)):
                         return unavailable
-                    name = item.property(30005)
-                    if not isinstance(name, str) or not name:
-                        return unavailable
-                    values.append(('selection', name))
+                    observed = self._selected_option_observation(item)
+                    if observed['value'] is None:
+                        return observed
+                    values.append(('selection', observed['value']))
         editors, selections, visited = 0, len(selected_items), 0
         pending = deque((child, 1) for child in self.children(element))
         while pending:
@@ -649,17 +696,20 @@ class UIA:
                     if any(self.same(child, selected) for selected in selected_items):
                         continue
                     selections += 1
-                    name = child.property(30005)
-                    if not isinstance(name, str) or not name:
-                        return unavailable
-                    values.append(('selection', name))
+                    observed = self._selected_option_observation(child)
+                    if observed['value'] is None:
+                        return observed
+                    values.append(('selection', observed['value']))
                 continue  # Text inside an unselected option is not an editor value.
             if role == 50004:
                 # Uniqueness concerns editor candidates, not just readable
                 # nonempty values. A blank or unavailable sibling may be the
                 # real editor; do not pick another editor because it has text.
                 editors += 1
-                edit_value = self._pattern_value(child)
+                observed = self._accessible_value(child)
+                if observed.get('value_evidence', {}).get('status') == 'conflict':
+                    return conflict
+                edit_value = observed['value']
                 if edit_value:
                     values.append(('editor', edit_value))
                 continue
@@ -748,6 +798,7 @@ class UIA:
         if root is None or element is None or self.pid(element) != binding.pid:
             raise BridgeError('point_identity_unproven')
         element = self.point_descendant(element, x, y, binding.pid)
+        element = self._option_hit(element, x, y, binding.pid)
         scope_root = root if window == binding.hwnd else self.from_handle(binding.hwnd)
         context = {'element': element, 'root': root, 'window': window, 'hit_window': hit,
                    'scope_root': scope_root, 'scope_window': binding.hwnd}
@@ -829,8 +880,27 @@ class UIA:
         owner = self._combo_owner(observation)
         return dict(owner, node=self.node(owner['element'], owner['root'])) if owner is not None else None
 
+    def _option_hit(self, element, x, y, pid):
+        """A rendered caption/image may be the UIA hit inside a list item."""
+        current = element
+        for _ in range(8):
+            if current is None or self.pid(current) != pid or self.secure(current):
+                break
+            role = current.property(30003)
+            if role == 50007:
+                rect = self.bounds(current)
+                if (current.property(30022) is False
+                        and rect['x'] <= x < rect['x'] + rect['width']
+                        and rect['y'] <= y < rect['y'] + rect['height']):
+                    return current
+                break
+            if role not in (50006, 50020, 50025, 50026) or self.actions(current):
+                break
+            current = self.parent(current)
+        return element
+
     def _combo_owner(self, observation):
-        """Find a writable combo through ancestry or SelectionContainer.
+        """Find a writable or expandable combo through ancestry or SelectionContainer.
 
         The relation may cross a popup root, but its destination must be in a
         proven selected/owned UIA root. Unrelated same-process windows never
@@ -849,7 +919,9 @@ class UIA:
             for _ in range(16):
                 if current is None or self.pid(current) != self.pid(element) or self.secure(current):
                     return None
-                if current.property(30003) == 50003 and 'SetValue' in self.actions(current):
+                if current.property(30003) == 50003:
+                    if not {'SetValue', 'Expand'}.intersection(self.actions(current)):
+                        return None
                     for proven_root, window in roots:
                         if self.within(current, proven_root):
                             return dict(observation, element=current, root=proven_root, window=window)
@@ -869,25 +941,27 @@ class UIA:
                 return related
         return ancestry
 
-    def combo_options(self, observation, binding=None):
+    def combo_options(self, observation, binding=None, *, strict=False):
         """Bounded, visible option metadata for pre-click recording caches.
 
         Only a proved combo relationship admits an item. Popup ownership alone
         does not decide which combo owns an option. These snapshots describe
-        candidates, never selection success or permission to dispatch input.
+        candidates, never selection success. Replay must distinguish an empty
+        popup inventory from a scan that could not cover every scoped root.
         """
         try:
             combo = self.combo_observation(observation)
             if combo is None:
-                return []
+                raise BridgeError('combo_options_incomplete')
             roots = [(combo['element'], combo['root'], combo['window'])]
             if binding is not None:
                 binding.check()
                 for window in binding.scoped_windows():
                     if window != combo['window']:
                         root = self.from_handle(window)
-                        if root is not None:
-                            roots.append((root, root, window))
+                        if root is None:
+                            raise BridgeError('combo_options_incomplete')
+                        roots.append((root, root, window))
             found, visited = [], 0
             for start, root, window in roots:
                 pending = deque([(start, 0)])
@@ -895,7 +969,7 @@ class UIA:
                     item, depth = pending.popleft()
                     visited += 1
                     if visited > 512 or depth > 12 or self.pid(item) != self.pid(combo['element']):
-                        return []
+                        raise BridgeError('combo_options_incomplete')
                     if self.secure(item):
                         continue
                     if item.property(30003) == 50007 and item.property(30022) is False:
@@ -905,7 +979,7 @@ class UIA:
                         if owner is not None and self.same(owner['element'], combo['element']):
                             node = self.node(item, root)
                             bounds = node['bounds']
-                            if node.get('bounds_valid') and node.get('name'):
+                            if node.get('bounds_valid') and option_value(node) is not None:
                                 x, y = bounds['x'] + bounds['width'] / 2, bounds['y'] + bounds['height'] / 2
                                 hit = window_from_point(x, y)
                                 if not hit or (binding is not None and (
@@ -919,7 +993,8 @@ class UIA:
                                 if actual is None or self.pid(actual) != self.pid(item) or self.secure(actual):
                                     continue
                                 actual = self.point_descendant(actual, x, y, self.pid(item))
-                                if self.secure(actual) or not self.within(actual, item):
+                                actual = self._option_hit(actual, x, y, self.pid(item))
+                                if self.secure(actual) or not self.same(actual, item):
                                     continue
                                 if window_from_point(x, y) != hit or self.bounds(item) != bounds:
                                     continue
@@ -931,7 +1006,9 @@ class UIA:
             if binding is not None:
                 binding.check()
             return found
-        except BridgeError:
+        except BridgeError as error:
+            if strict:
+                raise BridgeError('combo_options_incomplete') from error
             return []
 
 
@@ -1117,24 +1194,188 @@ def point(request):
         binding.check()
         if uia.bounds(element) != rect or window_from_point(x, y) != hit:
             raise BridgeError('target_moved')
-        sx, sy, sw, sh = [user32.GetSystemMetrics(index) for index in (76, 77, 78, 79)]
-        if sw < 2 or sh < 2:
-            raise BridgeError('desktop_bounds_unavailable')
-        if not sx <= x < sx + sw or not sy <= y < sy + sh:
-            raise BridgeError('point_outside_desktop')
-        down, up = (0x0008, 0x0010) if action == 'right-click' else (0x0002, 0x0004)
-        values = [_mouse(round((x - sx) * 65535 / (sw - 1)), round((y - sy) * 65535 / (sh - 1)), 0x8000 | 0x4000 | 0x0001),
-                  _mouse(flags=down), _mouse(flags=up)]
-        if action == 'double-click':
-            values.extend([_mouse(flags=down), _mouse(flags=up)])
-        inputs = (INPUT * len(values))(*values)
-        # One dispatch boundary. No retry after SendInput, even if its return is partial.
+        return _send_point(x, y, action)
+
+
+def _send_point(x, y, action):
+    sx, sy, sw, sh = [user32.GetSystemMetrics(index) for index in (76, 77, 78, 79)]
+    if sw < 2 or sh < 2:
+        raise BridgeError('desktop_bounds_unavailable')
+    if not sx <= x < sx + sw or not sy <= y < sy + sh:
+        raise BridgeError('point_outside_desktop')
+    down, up = (0x0008, 0x0010) if action == 'right-click' else (0x0002, 0x0004)
+    values = [_mouse(round((x - sx) * 65535 / (sw - 1)), round((y - sy) * 65535 / (sh - 1)), 0x8000 | 0x4000 | 0x0001),
+              _mouse(flags=down), _mouse(flags=up)]
+    if action == 'double-click':
+        values.extend([_mouse(flags=down), _mouse(flags=up)])
+    inputs = (INPUT * len(values))(*values)
+    try:
+        sent = user32.SendInput(len(inputs), inputs, C.sizeof(INPUT))
+    except BaseException as error:
+        raise BridgeError('point_delivery_unknown', dispatched=None) from error
+    if sent != len(inputs):
+        return {'ok': False, 'status': 'uncertain', 'input_dispatched': None, 'delivery': 'possibly_dispatched',
+                'diagnostic': 'partial_input', 'retry': 'unsafe'}
+    return {'ok': True, 'status': 'executed_unverified', 'input_dispatched': True,
+            'delivery': 'delivered_unverified', 'retry': 'unsafe', 'business_commit': 'not_verified'}
+
+
+def _current_combo(binding, uia, locator):
+    """Resolve just the combo locator without reading unrelated field values."""
+    binding.check()
+    root = uia.from_handle(binding.hwnd)
+    if root is None:
+        raise BridgeError('root_unavailable')
+    hits, pending, visited = [], deque([(root, 0)]), 0
+    while pending:
+        element, depth = pending.popleft()
+        visited += 1
+        if visited > 2500 or depth > 18 or uia.pid(element) != binding.pid:
+            raise BridgeError('incomplete_tree')
+        if element.property(30003) == 50003 and match_locator(uia.locator(element, root), locator):
+            hits.append(element)
+            if len(hits) > 1:
+                raise BridgeError('ambiguous_target')
+        pending.extend((child, depth + 1) for child in uia.children(element))
+    if not hits:
+        raise BridgeError('target_not_found')
+    if uia.secure(hits[0]) or hits[0].property(30010) is not True:
+        raise BridgeError('combo_not_actionable')
+    return {'element': hits[0], 'root': root, 'window': binding.hwnd}
+
+
+def _combo_surface(binding):
+    binding.check()
+    if not user32.IsWindowVisible(binding.hwnd) or user32.IsIconic(binding.hwnd):
+        raise BridgeError('window_not_visible')
+    if not binding.contains_window(foreground()):
+        raise BridgeError('target_not_foreground')
+    if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12, 0x5b, 0x5c, 1, 2, 4, 5, 6)):
+        raise BridgeError('physical_input_busy')
+
+
+def _hit_center(binding, uia, element, *, option=False):
+    rect = uia.bounds(element)
+    if rect['width'] < 2 or rect['height'] < 2:
+        raise BridgeError('target_bounds_unavailable')
+    x = rect['x'] + rect['width'] // 2
+    y = rect['y'] + rect['height'] // 2
+    hit = window_from_point(x, y)
+    if not binding.contains_window(hit):
+        raise BridgeError('point_occluded')
+    actual = uia.from_point(x, y)
+    if actual is None or uia.pid(actual) != binding.pid or uia.secure(actual):
+        raise BridgeError('point_element_mismatch')
+    actual = uia.point_descendant(actual, x, y, binding.pid)
+    if uia.secure(actual):
+        raise BridgeError('point_element_mismatch')
+    if option:
+        matches = uia.same(uia._option_hit(actual, x, y, binding.pid), element)
+    else:
+        matches = uia.within(actual, element)
+    if not matches:
+        raise BridgeError('point_element_mismatch')
+    if uia.bounds(element) != rect or window_from_point(x, y) != hit:
+        raise BridgeError('target_moved')
+    return x, y, hit
+
+
+def _expand_combo(binding, uia, combo):
+    element = combo['element']
+    if element.property(30028) is not True or element.property(30070) != 0:
+        raise BridgeError('combo_expansion_unavailable')
+    pointer = C.c_void_p()
+    iid = GUID.parse('619be086-1f4e-4ee4-bafa-210128738730')
+    element.call(14, (C.c_int32, C.POINTER(GUID), C.POINTER(C.c_void_p)),
+                 10005, C.byref(iid), C.byref(pointer))
+    if not pointer.value:
+        raise BridgeError('combo_expansion_unavailable')
+    pattern = _Com(pointer, uia)
+    try:
+        # Some visible combos report the parent offscreen but correctly hit-test
+        # to their on-screen editor. Prove this field is under the pointer first.
+        _hit_center(binding, uia, element)
+        _combo_surface(binding)
+        if uia.secure(element) or element.property(30010) is not True or element.property(30070) != 0:
+            raise BridgeError('combo_not_actionable')
         try:
-            sent = user32.SendInput(len(inputs), inputs, C.sizeof(INPUT))
+            pattern.call(3, ())
         except BaseException as error:
-            raise BridgeError('point_delivery_unknown', dispatched=None) from error
-        if sent != len(inputs):
-            return {'ok': False, 'status': 'uncertain', 'input_dispatched': None, 'delivery': 'possibly_dispatched',
-                    'diagnostic': 'partial_input', 'retry': 'unsafe'}
-        return {'ok': True, 'status': 'executed_unverified', 'input_dispatched': True,
-                'delivery': 'delivered_unverified', 'retry': 'unsafe', 'business_commit': 'not_verified'}
+            raise BridgeError('combo_expansion_unknown', dispatched=None) from error
+    finally:
+        pattern.close()
+
+
+def _matching_option(options, wanted):
+    matches = [item for item in options if option_value(item['node']) == wanted]
+    if len(matches) > 1:
+        raise BridgeError('combo_option_ambiguous')
+    if matches:
+        node = matches[0]['node']
+        if node.get('enabled') is not True or node.get('offscreen') is not False or node.get('bounds_valid') is not True:
+            raise BridgeError('combo_option_not_actionable')
+        return matches[0]
+    return None
+
+
+def combo_option(request):
+    """Open a uniquely bound combo at most once and click its visible option once."""
+    binding = Binding(request)
+    if not request.get('process_started_utc_ticks'):
+        raise BridgeError('lifetime_required')
+    value, locator = request.get('value'), request.get('locator')
+    if not isinstance(value, str) or not value.strip() or '\x00' in value or len(value.encode('utf-8')) > 10000:
+        raise BridgeError('invalid_combo_option_value')
+    expanded = activated = False
+    clicking = False
+    try:
+        with UIA() as uia:
+            combo = _current_combo(binding, uia, locator)
+            if not binding.contains_window(foreground()) or user32.IsIconic(binding.hwnd):
+                activation = activate(request)
+                activated = activation.get('input_dispatched') is True
+                if activation.get('foreground_verified') is not True:
+                    raise BridgeError('target_activation_unavailable')
+                combo = _current_combo(binding, uia, locator)
+            _combo_surface(binding)
+            options = uia.combo_options(combo, binding, strict=True)
+            if not options and combo['element'].property(30070) == 0:
+                _expand_combo(binding, uia, combo)
+                expanded = True
+            deadline = time.monotonic() + 1.5
+            while (choice := _matching_option(options, value)) is None:
+                if time.monotonic() >= deadline:
+                    raise BridgeError('combo_option_not_visible')
+                time.sleep(.05)
+                _combo_surface(binding)
+                options = uia.combo_options(combo, binding, strict=True)
+            # The form or popup can be replaced while it opens. Re-resolve both
+            # identities and uniqueness before taking a fresh hit-tested point.
+            current = _current_combo(binding, uia, locator)
+            if not uia.same(current['element'], combo['element']):
+                raise BridgeError('combo_identity_changed')
+            fresh = _matching_option(uia.combo_options(current, binding, strict=True), value)
+            if fresh is None or not uia.same(fresh['element'], choice['element']):
+                raise BridgeError('combo_option_changed')
+            element = fresh['element']
+            if (uia.secure(element) or element.property(30010) is not True
+                    or element.property(30022) is not False or option_value(uia.node(element, fresh['root'])) != value):
+                raise BridgeError('combo_option_changed')
+            _combo_surface(binding)
+            x, y, hit = _hit_center(binding, uia, element, option=True)
+            if hit != fresh['hit_window'] or uia.bounds(element) != fresh['node']['bounds']:
+                raise BridgeError('target_moved')
+            if not binding.contains_window(foreground()) or window_from_point(x, y) != hit:
+                raise BridgeError('point_occluded')
+            clicking = True
+            result = _send_point(x, y, 'click')
+            return dict(result, option_dispatched=result['input_dispatched'], popup_expanded=expanded)
+    except BridgeError as error:
+        uncertain = error.input_dispatched is None
+        any_input = None if uncertain else expanded or activated
+        return {'ok': False, 'status': 'uncertain' if uncertain else 'blocked',
+                'input_dispatched': any_input, 'option_dispatched': None if uncertain and clicking else False,
+                'popup_expanded': None if error.code == 'combo_expansion_unknown' else expanded,
+                'diagnostic': error.code, 'effect_verification': 'unavailable',
+                'delivery': 'possibly_dispatched' if uncertain else 'delivered_unverified' if any_input else 'not_delivered',
+                'retry': 'unsafe' if any_input is not False else 'inspect_again'}

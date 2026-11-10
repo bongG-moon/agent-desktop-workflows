@@ -67,6 +67,37 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(uia.value_observation(combo), {
             'value': 'N', 'value_evidence': {'status': 'observed', 'source': 'selection'}})
 
+    def test_selected_item_uses_payload_from_value_or_legacy_accessible_pattern(self):
+        for values in ({30043: True, 30045: 'Parcel'}, {30090: True, 30093: 'Parcel'},
+                       {30043: True, 30045: '', 30090: True, 30093: 'Parcel'}):
+            with self.subTest(values=values):
+                option = self._combo_child(50007, **{'30036': True, '30079': False, '30005': '[Provider] Item 1'})
+                option.values.update(values)
+                uia, combo, tree = self._combo_tree(children=[option])
+                self.assertIsNone(uia.value(combo))
+                option.values[30079] = True
+                self.assertEqual(uia.value(combo), 'Parcel')
+                # Also exercise SelectionPattern for a detached, explicitly selected item.
+                tree[combo] = []
+                uia.same = lambda left, right: left is right
+                combo.values[30037] = True
+                option.values[30080] = combo
+                combo.selected_items = lambda: [option]
+                self.assertEqual(uia.value(combo), 'Parcel')
+
+    def test_conflicting_value_patterns_block_item_and_combo_readback(self):
+        option = self._combo_child(50007, **{'30005': 'Choice 1', '30036': True, '30079': True,
+                                             '30043': True, '30045': 'Box', '30090': True, '30093': 'Bag'})
+        uia, combo, _ = self._combo_tree(children=[option])
+        for element in (option, combo):
+            self.assertEqual(uia.value_observation(element), {
+                'value': None, 'value_evidence': {'status': 'conflict', 'source': 'none'}})
+        option.values[30019] = True
+        option.reads.clear()
+        self.assertIsNone(uia.value(combo))
+        self.assertNotIn(30093, option.reads)
+        self.assertNotIn(30045, option.reads)
+
     def test_combo_blank_parent_uses_related_editor_but_not_editor_name(self):
         edit = self._combo_child(50004, **{'30005': '[Editor] Edit Area', '30043': True, '30045': 'Hybrid'})
         group = self._combo_child(50026)
@@ -76,6 +107,35 @@ class BridgeTests(unittest.TestCase):
             'value': 'Hybrid', 'value_evidence': {'status': 'observed', 'source': 'editor'}})
         edit.values[30045] = ''
         self.assertIsNone(uia.value(combo))
+
+    def test_combo_or_unique_editor_can_expose_legacy_value_without_value_pattern_text(self):
+        for source in ('parent', 'editor'):
+            for value_pattern in (True, False):
+                with self.subTest(source=source, value_pattern=value_pattern):
+                    edit = self._combo_child(50004, **{'30005': 'editor metadata'})
+                    uia, combo, _ = self._combo_tree(children=[edit])
+                    observed = combo if source == 'parent' else edit
+                    observed.values.update({30043: value_pattern, 30045: '', 30090: True, 30093: 'Parcel'})
+                    self.assertEqual(uia.value_observation(combo), {'value': 'Parcel',
+                        'value_evidence': {'status': 'observed', 'source': source}})
+                    observed.values.update({30043: True, 30045: 'Freight'})
+                    self.assertEqual(uia.value_observation(combo), {'value': None,
+                        'value_evidence': {'status': 'conflict', 'source': 'none'}})
+
+    def test_legacy_editor_evidence_requires_one_unprotected_same_process_editor(self):
+        for override in ({30019: True}, {30019: None}, {30002: 456}):
+            edit = self._combo_child(50004, **{'30090': True, '30093': 'Private'})
+            edit.values.update(override)
+            uia, combo, _ = self._combo_tree(children=[edit])
+            self.assertIsNone(uia.value(combo))
+            self.assertNotIn(30093, edit.reads)
+        first = self._combo_child(50004, **{'30090': True, '30093': 'Parcel'})
+        other = self._combo_child(50004)
+        uia, combo, _ = self._combo_tree(children=[first, other])
+        self.assertEqual(uia.value_observation(combo)['value_evidence']['status'], 'conflict')
+        # Ordinary non-combo text fields keep their explicit clear operation.
+        first.values.update({30043: True, 30045: ''})
+        self.assertEqual(uia.value(first), '')
 
     def test_combo_nonempty_parent_remains_readable_without_child_evidence(self):
         option = self._combo_child(50007, **{'30005': 'Other', '30036': True, '30079': False})
@@ -281,6 +341,31 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(uia.combo_options(observation, binding), [])
             binding.recording_candidate.assert_called_with(902)
 
+    def test_popup_caption_hit_records_unnamed_option_on_expand_only_combo(self):
+        uia, root, popup, combo, _, option, tree, parents, rects = self._relation_tree()
+        combo.values.update({30043: False, 30028: True, 30022: True})
+        option.values.update({30005: '', 30090: True, 30093: 'Bulk', 30010: True})
+        caption = self._combo_child(50020, **{'30005': 'Decorative caption'})
+        parents[caption] = option
+        tree[option] = [caption]
+        rects[caption] = rects[option]
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.contains_window.return_value = True
+        binding.scoped_windows.return_value = [900, 901]
+        uia.from_handle = lambda hwnd: root if hwnd == 900 else popup
+        uia.from_point = lambda x, y: caption
+        with patch.object(w, 'window_from_point', return_value=901), patch.object(w, 'hwnd_pid', return_value=123):
+            observed = uia.observe_point(binding, 110, 47, 901)
+            self.assertIs(observed['element'], option)
+            self.assertIs(observed['combo']['element'], combo)
+            self.assertEqual(w.option_value(observed['node']), 'Bulk')
+            cached, = uia.combo_options(observed['combo'], binding)
+            self.assertEqual(w.option_value(cached['node']), 'Bulk')
+            for overrides in ({30019: True}, {30019: None}, {30019: False, 30031: True}):
+                caption.values.update(overrides)
+                self.assertIs(uia._option_hit(caption, 110, 47, 123), caption)
+                self.assertEqual(uia.combo_options(observed['combo'], binding), [])
+
     def test_option_cache_rejects_unscoped_hwnd_and_hit_changes(self):
         uia, root, popup, combo, _, option, *_ = self._relation_tree()
         binding = MagicMock(pid=123, hwnd=900)
@@ -295,6 +380,27 @@ class BridgeTests(unittest.TestCase):
         binding.recording_candidate.return_value = True
         with patch.object(w, 'window_from_point', side_effect=[901, 902]), patch.object(w, 'hwnd_pid', return_value=123):
             self.assertEqual(uia.combo_options(observation, binding), [])
+
+    def test_replay_rejects_partial_popup_scans_even_after_finding_matching_visible_option(self):
+        uia, root, popup, combo, _, option, tree, parents, _ = self._relation_tree()
+        binding = MagicMock(pid=123, hwnd=900)
+        binding.scoped_windows.return_value = [900, 901, 902]
+        uia.from_point = lambda x, y: option
+        observation = {'element': combo, 'root': root, 'window': 900, 'node': uia.node(combo, root)}
+        other = self._combo_child(50032)
+        tree[other] = [self._combo_child(50026)] * 513
+        for unresolved_root in (None, other, self._combo_child(50032, **{'30002': 321})):
+            uia.from_handle = lambda hwnd: {900: root, 901: popup, 902: unresolved_root}[hwnd]
+            with self.subTest(root=unresolved_root), patch.object(w, 'window_from_point', return_value=901), \
+                    patch.object(w, 'hwnd_pid', return_value=123):
+                self.assertEqual(uia.combo_options(observation, binding), [])
+                with self.assertRaisesRegex(w.BridgeError, 'combo_options_incomplete'):
+                    uia.combo_options(observation, binding, strict=True)
+        binding.scoped_windows.return_value = [900]
+        self.assertEqual(uia.combo_options(observation, binding, strict=True), [])
+        binding.scoped_windows.side_effect = w.BridgeError('too_many_related_windows')
+        with self.assertRaisesRegex(w.BridgeError, 'combo_options_incomplete'):
+            uia.combo_options(observation, binding, strict=True)
 
     def test_option_cache_accepts_actual_option_descendant_and_reads_combo_metadata_once(self):
         uia, root, popup, combo, _, option, tree, parents, rects = self._relation_tree()
@@ -366,6 +472,12 @@ class BridgeTests(unittest.TestCase):
         with patch.object(w, 'user32', user), patch.object(w, 'hwnd_pid', return_value=123), \
              patch.object(w, 'root_window', return_value=901), patch.object(w, 'owned', return_value=False):
             self.assertFalse(binding.contains_window(901))
+
+    def test_failed_native_enumeration_never_returns_a_complete_empty_popup_list(self):
+        binding = object.__new__(w.Binding)
+        with patch.object(w, '_sig', return_value=lambda *args: False):
+            with self.assertRaisesRegex(w.BridgeError, 'related_window_enumeration_failed'):
+                binding.scoped_windows()
 
     def test_detached_combo_candidate_needs_worker_proof_and_not_sibling_scope(self):
         binding = object.__new__(w.Binding)

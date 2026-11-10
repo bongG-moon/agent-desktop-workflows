@@ -21,6 +21,8 @@ import threading
 import time
 import uuid
 
+from win_bridge import option_value
+
 MAX_STEPS = 300
 MAX_VALUE_BYTES = 10000
 COMBO_SETTLE_SECONDS = .8
@@ -574,18 +576,19 @@ class CaptureWorker(threading.Thread):
         self.model.add(step)
         self._drop_watch()
 
-    def _unobserved_combo(self):
+    def _unobserved_combo(self, reason='combo_value_unobserved'):
         # Preserve the known field so users can repair its input without losing
         # the original step ID or having to identify the combo again.
         try:
             step = self.step('manual', self.watched)
         except RecorderError:
-            self._manual_watch('combo_value_unobserved')
+            self._manual_watch(reason)
             return
-        step['label'] = _clip(step['label'].removesuffix(' / manual') + ' / 선택값 확인 필요')
+        suffix = ' / 항목 클릭 녹화 필요' if reason == 'combo_option_click_required' else ' / 선택값 확인 필요'
+        step['label'] = _clip(step['label'].removesuffix(' / manual') + suffix)
         step['expect'] = {'kind': 'manual'}
         step['recognition'] = {'target': 'identified', 'action': 'manual',
-                               'result': 'manual', 'reason': 'combo_value_unobserved'}
+                               'result': 'manual', 'reason': reason}
         if self.watched_step:
             step['id'] = self.watched_step['id']
         self.model.add(step)
@@ -596,6 +599,10 @@ class CaptureWorker(threading.Thread):
             return self._commit_selection(current)
         if self.watched['node'].get('role') == 'combobox' and (current is None or current == ''):
             self._unobserved_combo()
+            return
+        if (self.watched['node'].get('role') == 'combobox'
+                and 'SetValue' not in self.watched['node'].get('available_actions', [])):
+            self._unobserved_combo('combo_option_click_required')
             return
         if not isinstance(current, str) or '\0' in current or len(current.encode('utf-8')) > MAX_VALUE_BYTES:
             self._manual_watch('value_readback_unavailable')
@@ -628,6 +635,8 @@ class CaptureWorker(threading.Thread):
             step['id'] = self.watched_step['id']
         step['label'] = _clip(step['label'].removesuffix(' / set-value') + ' → ' + intended)
         step.update(value=intended, expect={'kind': 'value', 'value': intended}, selection=evidence)
+        if 'Expand' in self.watched['node'].get('available_actions', []):
+            step.update(headed=True, combo_replay='visible_option')
         result = evidence['result']
         step['recognition'] = {'target': 'identified', 'action': 'supported',
                                'result': 'checkable' if result == 'matched' else 'mismatch' if result == 'mismatch' else 'unverified',
@@ -640,17 +649,19 @@ class CaptureWorker(threading.Thread):
 
     def _select_option(self, event, observation, combo):
         node = observation['node']
-        value = node.get('name')
         # The immutable pre-click properties can survive a popup disappearing.
         # Missing security metadata is never permission to retain option text.
         if node.get('secure') is not False or combo['node'].get('secure') is not False:
             self.freeze_watch(event.get('at'))
             self.model.manual('보호 여부를 확인하지 못한 선택', 'protected_input_not_recorded')
             return
-        if (not isinstance(value, str) or not value.strip() or '\0' in value
-                or len(value.encode('utf-8')) > MAX_VALUE_BYTES):
-            self.freeze_watch(event.get('at'))
-            self.model.manual('선택한 항목의 값 확인 필요', 'combo_option_value_unavailable')
+        value = option_value(node)
+        if (value is None or node.get('enabled') is not True or node.get('offscreen') is not False
+                or node.get('bounds_valid') is not True
+                or ('x' in event and not _inside(node.get('bounds'), event['x'], event.get('y')))):
+            self.watch(combo)
+            if self.watched:
+                self._unobserved_combo('combo_option_value_unavailable')
             return
         self.watch(combo)
         if not self.watched:

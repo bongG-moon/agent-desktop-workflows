@@ -35,8 +35,8 @@ def read_json(path, timeout=3):
 
 
 class Fixture:
-    def __init__(self, exe):
-        self.proc = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    def __init__(self, exe, *args):
+        self.proc = subprocess.Popen([str(exe), *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
         self.lines = queue.Queue()
         def reader():

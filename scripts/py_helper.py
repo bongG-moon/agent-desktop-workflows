@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'engine'))
 from local_core import EngineError, validate_local_directory
 
-COMMANDS = {'windows', 'inspect', 'probe', 'activate', 'point', 'record'}
+COMMANDS = {'windows', 'inspect', 'probe', 'activate', 'point', 'record', 'combo-option'}
 MAX_REQUEST = 2 * 1024 * 1024
 MAX_RESPONSE = 16 * 1024 * 1024
 
@@ -96,7 +96,7 @@ def dispatch(command, request):
     if command == 'windows':
         return win_bridge.inventory()
     return {'inspect': win_bridge.inspect, 'probe': win_bridge.probe,
-            'activate': win_bridge.activate, 'point': win_bridge.point}[command](request)
+            'activate': win_bridge.activate, 'point': win_bridge.point, 'combo-option': win_bridge.combo_option}[command](request)
 
 
 def main(argv=None):
@@ -128,7 +128,7 @@ def main(argv=None):
         dispatched = getattr(error, 'input_dispatched', None)
         if not isinstance(code, str):
             code = str(error) if isinstance(error, (ValueError, EngineError)) else 'python_backend_failed'
-            dispatched = None if backend_entered and command in {'point', 'activate'} else False
+            dispatched = None if backend_entered and command in {'point', 'activate', 'combo-option'} else False
         if not re.fullmatch('[a-z_]{1,80}', code):
             code = 'python_backend_failed'
         if type(dispatched) not in (bool, type(None)):

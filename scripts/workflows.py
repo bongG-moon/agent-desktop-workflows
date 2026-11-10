@@ -41,6 +41,9 @@ def _action_result(value):
         return {"status": "uncertain", "input_dispatched": None, "effect_verification": "unavailable"}
     result = {key: copy.deepcopy(value[key]) for key in ("status", "input_dispatched", "effect_verification", "receipt",
         "diagnostic", "delivery", "after_snapshot_available", "engine_status", "value_readback") if key in value}
+    for key in ("popup_expanded", "option_dispatched"):
+        if key in value and type(value[key]) in (bool, type(None)):
+            result[key] = value[key]
     result.setdefault("input_dispatched", None)
     result.setdefault("effect_verification", "unavailable")
     if result.get("status") not in {"completed", "executed_unverified", "not_delivered", "uncertain", "blocked",
@@ -49,6 +52,11 @@ def _action_result(value):
     if result.get("status") == "completed" and result.get("input_dispatched") is False and result.get("effect_verification") != "matched":
         result.update(status="uncertain", input_dispatched=None)
     return result
+
+
+def _no_option_click(step, receipt):
+    return step.get("combo_replay") == "visible_option" and (
+        receipt.get("option_dispatched") is False or receipt.get("input_dispatched") is False)
 
 
 class Runner:
@@ -357,6 +365,10 @@ class Runner:
             runtime, value = self._runtime_step(run, step, entry)
             if entry["status"] in ATTEMPTED:
                 # A prior process may have died after dispatch. Only read or ask about this step.
+                if _no_option_click(step, entry.get("result", {})):
+                    # The old value may already match while the popup is still
+                    # open. That is not evidence of the requested option click.
+                    return self._review(run, entry, "combo_option_not_clicked")
                 result = self._check(adapter, runtime, value)
                 entry["check"] = result
                 if result["matched"] is True:
@@ -418,6 +430,8 @@ class Runner:
                           "effect_verification": "unavailable", "diagnostic": "execution_interrupted"}
             entry.update(result=result, input_dispatched=result["input_dispatched"])
             self._publish(run)  # The dispatch result survives a later failed or interrupted readback.
+            if _no_option_click(step, result):
+                return self._review(run, entry, "combo_option_not_clicked")
             if (result["input_dispatched"] is True and result.get("status") == "uncertain"
                     and result.get("delivery") in {"delivered_verified", "delivered_unverified"}
                     and result.get("diagnostic") == "snapshot_unavailable"

@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Agent Desktop Workflows"
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 ACTION_LABELS = {"click": "클릭", "double-click": "두 번 클릭", "right-click": "우클릭",
     "set-value": "값 설정", "type": "입력", "select": "항목 선택", "expand": "펼치기",
     "collapse": "접기", "check": "체크", "uncheck": "체크 해제", "focus": "포커스",
@@ -44,7 +44,7 @@ def recognition_text(step):
     if isinstance(selection, dict):
         return {"matched": "선택값 기록 / 녹화 적용 확인", "mismatch": "선택값 기록 / 녹화 결과 다름",
                 "unavailable": "선택값 기록 / 녹화 적용 미확인"}.get(selection.get("result"), "선택값 보완 필요")
-    if kind == "element" and rec.get("reason") == "combo_value_unobserved":
+    if kind == "element" and rec.get("reason") in {"combo_value_unobserved", "combo_option_click_required"}:
         return "요소 확인 / 선택값 보완 필요"
     if kind == "manual" or step.get("action") == "manual":
         return "보완 필요"
@@ -86,7 +86,12 @@ def _safe_reason(error):
         "selection_action_not_supported": "현재 콤보는 항목 선택 동작을 지원하지 않습니다. 실제 지원 동작을 확인해 이 단계를 보완하세요.",
         "combo_value_unobserved": "콤보 대상은 찾았지만 실제 선택값을 읽지 못했습니다. 단계 수정에서 실제 값이나 입력 변수와 기본값을 지정하세요. 같은 클릭을 다시 녹화하는 것만으로 해결되지 않을 수 있습니다.",
         "combo_selection_unverified": "클릭한 옵션과 소속 콤보를 확인해 선택값을 기록했습니다. 녹화 때 적용 결과는 읽지 못했으며, 재생 시 실제 값을 별도로 확인합니다.",
-        "combo_option_value_unavailable": "클릭한 항목의 이름이나 소속 관계를 확인하지 못했습니다. 선택값을 추정하지 않고 보완 단계로 남깁니다.",
+        "combo_option_value_unavailable": "클릭한 항목의 값이나 소속을 확인하지 못했습니다. 해당 옵션을 다시 녹화하거나 실제 값을 지정하세요.",
+        "combo_option_click_required": "이 콤보에는 직접 값을 쓰는 동작이 없습니다. 목록을 펼쳐 원하는 항목을 마우스로 클릭해 녹화하세요.",
+        "combo_option_not_clicked": "이 단계에서는 옵션 클릭을 보내지 않았습니다. 현재 목록과 값을 확인하세요. 이미 목록이 열렸다면 원하는 항목을 직접 선택해 확인한 뒤 이어갈 수 있습니다.",
+        "combo_option_ambiguous": "현재 목록에 입력값이 같은 항목이 둘 이상 있어 선택하지 않았습니다.",
+        "combo_option_not_visible": "현재 콤보에서 요청한 값과 일치하는 보이는 항목을 찾지 못했습니다.",
+        "combo_option_changed": "검사하는 동안 옵션이나 위치가 바뀌어 클릭하지 않았습니다.",
         "combo_selection_cancelled": "목록 선택을 취소했습니다. 취소한 옵션을 입력값으로 추정하지 않습니다.",
         "combo_selection_mismatch": "클릭한 옵션은 기록했지만 녹화 후 읽은 실제 값이 다릅니다. 선택값과 화면을 검토하세요. 재생 성공은 별도 결과 확인이 필요합니다.",
         "empty_combo_value_requires_review": "콤보 설정값이 비어 있어 입력을 보내지 않았습니다. 단계 수정에서 실제 값 또는 입력 변수와 기본값을 지정하고 새 수정본으로 저장하세요.",
@@ -462,6 +467,8 @@ class WorkflowApp(tk.Tk):
                          "unavailable": "관찰 불가"}.get(selection["result"], "미확인"))
             if "observed_value" in selection:
                 lines.append("녹화 당시 관찰값: " + json.dumps(selection["observed_value"], ensure_ascii=False))
+        if step.get("combo_replay") == "visible_option":
+            lines.append("재생 방법: 현재 콤보 목록에서 지정한 값의 항목을 찾아 클릭")
         if rec.get("reason"):
             lines.append("보완 안내: " + _safe_reason(rec["reason"]))
         if self.run:
@@ -470,6 +477,9 @@ class WorkflowApp(tk.Tk):
                 lines.append("실행 상태: " + _safe_reason(result["reason"]))
             if result.get("result", {}).get("diagnostic"):
                 lines.append("실행 근거: " + _safe_reason(result["result"]["diagnostic"]))
+            receipt = result.get("result") or {}
+            if "option_dispatched" in receipt:
+                lines.append("옵션 클릭 전달: " + {True: "전달됨", False: "보내지 않음", None: "미확인"}[receipt["option_dispatched"]])
         self._detail("\n".join(lines))
 
     def record(self, repair=False):
@@ -809,7 +819,18 @@ class StepEditor(tk.Toplevel):
         flags = ttk.Frame(frame)
         flags.grid(row=7, column=1, sticky="w", pady=8)
         ttk.Checkbutton(flags, text="입력값을 완료 기대값으로 사용 (입력 변수 사용 시 자동 적용)", variable=self.expect_input_value).pack(anchor="w")
-        ttk.Checkbutton(flags, text="대상에 필요한 포커스 / 물리 입력 허용", variable=self.headed).pack(anchor="w")
+        self.visible_option = tk.BooleanVar(value=step.get("combo_replay") == "visible_option")
+        ttk.Checkbutton(flags, text="대상에 필요한 포커스 / 물리 입력 허용", variable=self.headed,
+                        command=lambda: None if self.headed.get() else self.visible_option.set(False)).pack(anchor="w")
+        if step["target"].get("kind") == "element" and step["target"]["locator"].get("role") == "combobox":
+            option = ttk.Checkbutton(flags, text="값 설정 시 목록에서 보이는 옵션 클릭 (물리 입력)",
+                                     variable=self.visible_option,
+                                     command=lambda: self.headed.set(True) if self.visible_option.get() else None)
+            option.pack(anchor="w")
+            def update_option(*_):
+                option.configure(state="normal" if self.vars["action"].get() == "set-value" else "disabled")
+            self.vars["action"].trace_add("write", update_option)
+            update_option()
         ttk.Label(frame, text="현재 대상", font=("맑은 고딕", 10, "bold")).grid(row=8, column=0, sticky="nw", pady=10)
         target = step.get("target", {})
         detail = target_text(target)
@@ -870,6 +891,12 @@ class StepEditor(tk.Toplevel):
             messagebox.showinfo(APP_NAME, "입력 변수는 값 설정, 입력, 항목 선택 동작에 지정하세요.", parent=self)
             return
         step["headed"] = bool(self.headed.get())
+        step.pop("combo_replay", None)
+        if step["action"] == "set-value" and self.visible_option.get():
+            if not step["headed"]:
+                messagebox.showinfo(APP_NAME, "보이는 옵션을 클릭하려면 물리 입력을 허용하세요.", parent=self)
+                return
+            step["combo_replay"] = "visible_option"
         if step.get("target", {}).get("kind") == "region":
             step["target"]["reviewed"] = bool(self.region_reviewed.get())
         kind = self.vars["expect"].get()
@@ -897,10 +924,10 @@ class StepEditor(tk.Toplevel):
             if step.get("target", {}).get("kind") != "element":
                 step["target"] = {"kind": "manual", "locator": {}}
             step["expect"] = {"kind": "manual"}
-            if step.get("recognition", {}).get("reason") != "combo_value_unobserved":
+            if step.get("recognition", {}).get("reason") not in {"combo_value_unobserved", "combo_option_click_required"}:
                 step["recognition"] = {"target": "identified" if step["target"]["kind"] == "element" else "manual",
                                        "action": "manual", "result": "manual", "reason": "사용자가 직접 수행하고 확인하는 단계입니다."}
-        elif step.get("recognition", {}).get("reason") == "combo_value_unobserved":
+        elif step.get("recognition", {}).get("reason") in {"combo_value_unobserved", "combo_option_click_required"}:
             step["recognition"] = {"target": "identified", "action": "configured", "result": "pending",
                                    "reason": "입력값을 보완했습니다. 실행 후 실제 선택값은 별도로 확인합니다."}
         if "selection" in step and (step["action"] != "set-value" or value != step["selection"]["value"]):

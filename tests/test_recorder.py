@@ -17,7 +17,7 @@ from storage import validate_workflow
 def observation(role='combobox', actions=None, element='field', window=200):
     return {'element': element, 'root': 'root', 'window': window,
             'node': {'name': 'Family', 'automation_id': 'Family', 'role': role,
-                     'secure': False,
+                     'secure': False, 'enabled': True, 'offscreen': False, 'bounds_valid': True,
                      'available_actions': ['SetValue'] if actions is None else actions,
                      'locator': {'automation_id': 'Family', 'role': role},
                      'bounds': {'x': 100, 'y': 150, 'width': 200, 'height': 100}}}
@@ -338,6 +338,62 @@ class RecorderTests(unittest.TestCase):
                                              'result': 'mismatch', 'observed_value': 'Choice A'})
         self.assertEqual(step['recognition']['reason'], 'combo_selection_mismatch')
         self.assertEqual(self.model.snapshot()['warning_count'], 1)
+
+    def test_cached_clicked_option_records_payload_when_name_is_provider_metadata(self):
+        combo = observation(actions=['SetValue', 'Expand'])
+        item = self.option('[Provider] Option 2', combo)
+        item['node']['value'] = 'Parcel'
+        self.worker.uia.values['field'] = None
+        self.worker.watch(combo)
+        self.worker.option_history.append((10, [item]))
+        self.worker.handle({'kind': 'down', 'action': 'click', 'at': 10.05, 'token': 4,
+                            'x': 130, 'y': 170, 'hit_window': 300, 'window': 300})
+        self.worker.handle({'kind': 'up', 'token': 4, 'inside': True, 'x': 131, 'y': 171})
+        step, = self.model.steps
+        self.assertEqual(step['value'], 'Parcel')
+        self.assertEqual(step['expect'], {'kind': 'value', 'value': 'Parcel'})
+        self.assertEqual(step['selection'], {'source': 'option_click', 'value': 'Parcel',
+                                             'result': 'unavailable'})
+        self.assertIs(step['headed'], True)
+        self.assertEqual(step['combo_replay'], 'visible_option')
+        self.assertNotIn('[Provider]', self.model.events_path.read_text(encoding='utf-8'))
+
+    def test_hidden_or_invalid_option_payload_never_records_display_name(self):
+        for extra in [{'enabled': False}, {'offscreen': True}, {'bounds_valid': False},
+                      {'value': 'bad\0value'}, {'value': '\ud800'},
+                      {'value': None, 'value_evidence': {'status': 'conflict'}}]:
+            with self.subTest(extra=extra):
+                item = self.option('Option 1')
+                item['node'].update(extra)
+                self.worker.capture_action({'action': 'click'}, item)
+                self.assertEqual(self.model.steps[-1]['recognition']['reason'], 'combo_option_value_unavailable')
+                self.assertEqual(self.model.steps[-1]['target']['locator'], item['combo']['node']['locator'])
+                self.assertNotIn('value', self.model.steps[-1])
+
+    def test_unwitnessed_point_keeps_known_field_once_without_replacing_recorded_value(self):
+        combo = observation()
+        self.worker.watch(combo)
+        self.worker.capture_action({'action': 'click', 'x': 10, 'y': 20}, self.option(combo=combo))
+        step, = self.model.steps
+        self.assertEqual(step['recognition']['reason'], 'combo_option_value_unavailable')
+        self.assertEqual(step['target']['locator'], combo['node']['locator'])
+        self.assertNotIn('value', step)
+
+    def test_writable_provider_without_opener_keeps_set_value_replay(self):
+        self.worker.capture_action({'action': 'click'}, self.option())
+        step, = self.model.steps
+        self.assertEqual(step['value'], 'Choice B')
+        self.assertNotIn('combo_replay', step)
+        self.assertFalse(step['headed'])
+
+    def test_expand_only_combo_requires_a_witnessed_choice_for_automatic_replay(self):
+        combo = observation(actions=['Expand', 'Collapse'])
+        self.worker.watch(combo)
+        self.worker.finalize_watch(True)
+        self.assertEqual(self.model.steps[0]['recognition']['reason'], 'combo_option_click_required')
+        self.assertEqual(self.model.steps[0]['target']['locator'], combo['node']['locator'])
+        self.worker.capture_action({'action': 'click'}, self.option(combo=combo))
+        self.assertEqual(self.model.steps[1]['combo_replay'], 'visible_option')
 
     def test_delayed_selection_readback_revises_evidence_without_changing_intent_or_id(self):
         self.worker.uia.values['field'] = None

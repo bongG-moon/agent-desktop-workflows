@@ -469,6 +469,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(adapter.executions), 2)
         self.assertEqual(final["steps"][0]["confirmation"], "user_confirmed_current_result")
 
+    def test_popup_open_without_option_click_stays_in_journal_without_resend(self):
+        saved = self.save(workflow([step(combo_replay="visible_option", headed=True), step("click", "none")]))
+        adapter = Adapter([dict(result("blocked", True, "unavailable"), popup_expanded=True,
+                                option_dispatched=False)])
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["status"], "needs_review")
+        self.assertEqual(len(adapter.executions), 1)
+        receipt = self.store.load_run(paused["id"])["steps"][0]["result"]
+        self.assertIs(receipt["popup_expanded"], True)
+        self.assertIs(receipt["option_dispatched"], False)
+        self.assertEqual(resumed["steps"][1]["attempts"], 0)
+
+    def test_combo_preflight_failure_is_not_verified_by_existing_value_on_resume(self):
+        saved = self.save(workflow([step(combo_replay="visible_option", headed=True)]))
+        adapter = Adapter([result("not_delivered", False, "unavailable")], [{"matched": True}])
+        runner = self.runner(adapter)
+        paused = runner.start(saved["id"], BINDING)
+        resumed = runner.resume(paused["id"], BINDING)
+        self.assertEqual(resumed["status"], "needs_review")
+        self.assertEqual(resumed["steps"][0]["reason"], "combo_option_not_clicked")
+        self.assertEqual(len(adapter.executions), 1)
+        self.assertFalse(adapter.reads)
+
     def test_manual_step_never_calls_mutating_adapter(self):
         saved = self.save(workflow([step("manual", "manual", target={"kind": "manual"})]))
         adapter = Adapter()

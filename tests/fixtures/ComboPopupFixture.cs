@@ -20,9 +20,10 @@ sealed class PopupCombo : UserControl {
     internal readonly Button Arrow;
     internal readonly TextBox Editor;
     internal string Current = "Y";
-    internal int WriteCount, ClickCount, OpenCount, CancelCount;
+    internal int WriteCount, ClickCount, OpenCount, CancelCount, SelectCount, StaleSelectCount;
     internal Window Popup;
     internal readonly List<PopupOption> Options = new List<PopupOption>();
+    internal readonly List<PopupOption> CachedOptions = new List<PopupOption>();
     readonly TextBlock display;
 
     internal PopupCombo(string key, bool readable, bool reject) {
@@ -35,22 +36,28 @@ sealed class PopupCombo : UserControl {
         AutomationProperties.SetName(Arrow,"Open choices");
         DockPanel.SetDock(Arrow,Dock.Right); row.Children.Add(Arrow);
         Arrow.Click+=delegate { Open(); };
+        Editor=new TextBox { Text=readable?Current:"", IsReadOnly=true, Height=32, Focusable=false };
+        AutomationProperties.SetAutomationId(Editor,key+"Current");
         if(readable) {
-            Editor=new TextBox { Text=Current, IsReadOnly=true, Height=32, Focusable=false };
-            AutomationProperties.SetAutomationId(Editor,key+"Current");
             row.Children.Add(Editor);
         } else {
-            display=new TextBlock { Text=Current, VerticalAlignment=VerticalAlignment.Center, Margin=new Thickness(8,0,0,0) };
-            row.Children.Add(display);
+            var content=new Grid();
+            display=new TextBlock { Text=Current, IsHitTestVisible=false,
+                VerticalAlignment=VerticalAlignment.Center, Margin=new Thickness(8,0,0,0) };
+            content.Children.Add(Editor); content.Children.Add(display); row.Children.Add(content);
+        }
+        foreach(string choice in new[]{"Y","N","P"}) {
+            var stale=new PopupOption(this,choice,true) { Visibility=Visibility.Collapsed };
+            CachedOptions.Add(stale); row.Children.Add(stale);
         }
         Content=row;
     }
 
-    internal void Open() {
+    internal void Open(bool activate=true) {
         if(Popup!=null)return;
         var owner=Window.GetWindow(this);
         Popup=new Window { Owner=owner, WindowStyle=WindowStyle.None, ResizeMode=ResizeMode.NoResize,
-            ShowInTaskbar=false, ShowActivated=true, Width=205, Height=104,
+            ShowInTaskbar=false, ShowActivated=activate, Width=205, Height=104,
             Background=Brushes.White, Title=Key+" choices" };
         AutomationProperties.SetAutomationId(Popup,Key+"Popup");
         var origin=PointToScreen(new Point(0,ActualHeight));
@@ -69,7 +76,7 @@ sealed class PopupCombo : UserControl {
         };
         OpenCount++; Popup.Show();
         // Keyboard navigation is native button focus; no fixture command selects values.
-        Options[0].Focus();
+        if(activate)Options[0].Focus();
     }
 
     internal void ClosePopup() {
@@ -84,11 +91,11 @@ sealed class PopupCombo : UserControl {
     internal void Change(string value) {
         if(value!="Y"&&value!="N"&&value!="P")throw new ArgumentException("fixture_value_not_allowed");
         Current=value;
-        if(Editor!=null)Editor.Text=value;
+        if(Readable)Editor.Text=value;
         if(display!=null)display.Text=value;
     }
     internal void Write(string value) { WriteCount++; Change(value); }
-    internal void Reset() { ClosePopup(); Change("Y"); WriteCount=ClickCount=OpenCount=CancelCount=0; }
+    internal void Reset() { ClosePopup(); Change("Y"); WriteCount=ClickCount=OpenCount=CancelCount=SelectCount=StaleSelectCount=0; }
     protected override AutomationPeer OnCreateAutomationPeer() { return new PopupComboPeer(this); }
 }
 
@@ -98,14 +105,18 @@ sealed class PopupComboPeer : FrameworkElementAutomationPeer, IValueProvider, IE
     protected override AutomationControlType GetAutomationControlTypeCore() { return AutomationControlType.ComboBox; }
     protected override string GetClassNameCore() { return "SyntheticTransientPopupCombo"; }
     protected override string GetNameCore() { return ""; }
+    // Some visible custom fields mark the parent peer offscreen while their
+    // editor/arrow still have real screen rectangles and can be hit-tested.
+    protected override bool IsOffscreenCore() { return !Combo.Readable || base.IsOffscreenCore(); }
     protected override bool IsControlElementCore() { return true; }
     protected override bool IsContentElementCore() { return true; }
     protected override List<AutomationPeer> GetChildrenCore() {
         var peers=new List<AutomationPeer>();
-        if(Combo.Editor!=null)peers.Add(UIElementAutomationPeer.CreatePeerForElement(Combo.Editor));
+        peers.Add(UIElementAutomationPeer.CreatePeerForElement(Combo.Editor));
         peers.Add(UIElementAutomationPeer.CreatePeerForElement(Combo.Arrow));
-        // Deliberately do not attach popup items as combo children. Ownership must
-        // be proven through SelectionItem.SelectionContainer, not UIA ancestry.
+        // These virtual rows stay enumerable when closed, including a duplicate
+        // of every live value. Only the owned popup contains actionable rows.
+        foreach(var stale in Combo.CachedOptions)peers.Add(UIElementAutomationPeer.CreatePeerForElement(stale));
         return peers;
     }
     public override object GetPattern(PatternInterface pattern) {
@@ -125,39 +136,56 @@ sealed class PopupComboPeer : FrameworkElementAutomationPeer, IValueProvider, IE
 sealed class PopupOption : Button {
     internal readonly PopupCombo Combo;
     internal readonly string Choice;
-    internal PopupOption(PopupCombo combo,string choice) {
-        Combo=combo; Choice=choice; Content=choice;
-        AutomationProperties.SetAutomationId(this,combo.Key+"Option"+choice);
-        AutomationProperties.SetName(this,choice);
+    internal readonly bool Cached;
+    internal PopupOption(PopupCombo combo,string choice,bool cached=false) {
+        Combo=combo; Choice=choice; Cached=cached; Content=choice;
+        AutomationProperties.SetAutomationId(this,combo.Key+(cached?"CachedOption":"Option")+choice);
+        AutomationProperties.SetName(this,"[Editor] [valuelist] ValueListItem "+Array.IndexOf(new[]{"Y","N","P"},choice));
         Click+=delegate { Combo.Choose(Choice); };
     }
     protected override AutomationPeer OnCreateAutomationPeer() { return new PopupOptionPeer(this); }
 }
 
-sealed class PopupOptionPeer : ButtonAutomationPeer, ISelectionItemProvider {
+sealed class PopupOptionPeer : ButtonAutomationPeer, ISelectionItemProvider, IValueProvider {
     PopupOption Option { get { return (PopupOption)Owner; } }
     internal PopupOptionPeer(PopupOption option) : base(option) {}
     protected override AutomationControlType GetAutomationControlTypeCore() { return AutomationControlType.ListItem; }
+    protected override bool IsControlElementCore() { return true; }
+    protected override bool IsOffscreenCore() { return Option.Cached || base.IsOffscreenCore(); }
+    protected override Rect GetBoundingRectangleCore() { return Option.Cached ? Rect.Empty : base.GetBoundingRectangleCore(); }
     public override object GetPattern(PatternInterface pattern) {
-        if(pattern==PatternInterface.SelectionItem)return this;
+        if(pattern==PatternInterface.SelectionItem||pattern==PatternInterface.Value)return this;
         return base.GetPattern(pattern);
     }
     // Opaque controls expose relation but no useful current selection evidence.
-    bool ISelectionItemProvider.IsSelected { get { return Option.Combo.Readable&&Option.Combo.Current==Option.Choice; } }
+    bool ISelectionItemProvider.IsSelected { get { return !Option.Cached&&Option.Combo.Readable&&Option.Combo.Current==Option.Choice; } }
     IRawElementProviderSimple ISelectionItemProvider.SelectionContainer {
         get { return ProviderFromPeer(UIElementAutomationPeer.CreatePeerForElement(Option.Combo)); }
     }
-    void ISelectionItemProvider.Select() { Option.Combo.Choose(Option.Choice); }
-    void ISelectionItemProvider.AddToSelection() { Option.Combo.Choose(Option.Choice); }
+    string IValueProvider.Value { get { return Option.Choice; } }
+    bool IValueProvider.IsReadOnly { get { return true; } }
+    void IValueProvider.SetValue(string value) { throw new InvalidOperationException("read_only_option"); }
+    void SelectVisible() {
+        Option.Combo.SelectCount++;
+        if(Option.Cached || !Option.IsVisible) {
+            Option.Combo.StaleSelectCount++;
+            throw new NotSupportedException("selection_on_stale_option");
+        }
+        Option.Combo.Choose(Option.Choice);
+    }
+    void ISelectionItemProvider.Select() { SelectVisible(); }
+    void ISelectionItemProvider.AddToSelection() { SelectVisible(); }
     void ISelectionItemProvider.RemoveFromSelection() { throw new InvalidOperationException("selection_required"); }
 }
 
 sealed class ComboPopupFixture : Window {
     readonly JavaScriptSerializer json=new JavaScriptSerializer();
     readonly Dictionary<string,PopupCombo> controls=new Dictionary<string,PopupCombo>();
-    internal ComboPopupFixture() {
+    readonly bool providerOnly;
+    internal ComboPopupFixture(bool passive) {
+        providerOnly=passive;
         Title="Agent Desktop Workflows Synthetic Popup Combos";
-        Width=680; Height=410; Left=60; Top=60; ShowInTaskbar=false;
+        Width=680; Height=410; Left=60; Top=60; ShowInTaskbar=false; ShowActivated=!passive;
         WindowStartupLocation=WindowStartupLocation.Manual;
         var panel=new StackPanel { Margin=new Thickness(22) };
         panel.Children.Add(new TextBlock { Text="Synthetic custom combos: blank parent name/value", FontSize=17, Margin=new Thickness(0,0,0,18) });
@@ -183,7 +211,8 @@ sealed class ComboPopupFixture : Window {
     void Emit(string kind) {
         var values=new Dictionary<string,object>();
         foreach(var item in controls)values.Add(item.Key,new { value=item.Value.Current,writes=item.Value.WriteCount,
-            clicks=item.Value.ClickCount,opens=item.Value.OpenCount,cancels=item.Value.CancelCount,popup=item.Value.Popup!=null });
+            clicks=item.Value.ClickCount,opens=item.Value.OpenCount,cancels=item.Value.CancelCount,
+            selects=item.Value.SelectCount,stale_selects=item.Value.StaleSelectCount,popup=item.Value.Popup!=null });
         Console.WriteLine(json.Serialize(new { kind=kind,pid=Process.GetCurrentProcess().Id,
             hwnd=new WindowInteropHelper(this).Handle.ToInt64(),controls=values }));
         Console.Out.Flush();
@@ -196,10 +225,20 @@ sealed class ComboPopupFixture : Window {
                 if(command=="quit") { foreach(var combo in controls.Values)combo.ClosePopup(); Close(); return; }
                 if(command=="reset")foreach(var combo in controls.Values)combo.Reset();
                 else if(command=="activate")Activate();
-                // No select/open/set test command: recorded interaction must use actual input.
+                // Used only by --provider-only to exercise real UIA peers while
+                // another application owns foreground. No desktop input is sent.
+                else if(providerOnly && command.StartsWith("provider-open|"))controls[command.Split('|')[1]].Open(false);
+                else if(providerOnly && command.StartsWith("provider-click|")) {
+                    var parts=command.Split('|'); var combo=controls[parts[1]];
+                    if(combo.Popup==null)throw new InvalidOperationException("popup_closed");
+                    var option=combo.Options.Find(item=>item.Choice==parts[2]);
+                    option.RaiseEvent(new RoutedEventArgs(Button.ClickEvent,option));
+                }
                 Emit(command=="state"?"state":"updated");
             })); } catch { return; }
         }
     }
-    [STAThread] static void Main() { new Application().Run(new ComboPopupFixture()); }
+    [STAThread] static void Main(string[] args) {
+        new Application().Run(new ComboPopupFixture(args.Length==1 && args[0]=="--provider-only"));
+    }
 }

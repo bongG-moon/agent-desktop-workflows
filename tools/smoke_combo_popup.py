@@ -1,11 +1,12 @@
 """Record actual mouse input on transient synthetic custom-combo popups.
 
 This development harness compiles only the bundled fixture into a new test
-directory. It uses the production recorder process, HookPump and CaptureWorker;
-it never calls capture_action or writes a selected value into the fixture during
-recording. Ground-truth counters come from fixture stdin, independently of UIA.
+directory. Physical recording uses the production recorder process, HookPump
+and CaptureWorker. Ground-truth counters come from fixture stdin, independently of UIA.
 Input is confined to fresh, visible elements in this fixture's PID and owned
-windows. This is synthetic acceptance, not company FX acceptance.
+windows. The separate --provider-only mode exercises recorder interpretation of
+real UIA observations and fixture-internal WPF events without hooks or mouse
+input. This is synthetic acceptance, not company FX acceptance.
 """
 from __future__ import annotations
 
@@ -15,6 +16,8 @@ import ctypes as C
 import json
 import os
 from pathlib import Path
+import queue
+import re
 import subprocess
 import sys
 import time
@@ -22,6 +25,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import desktop
+import recorder
 import win_bridge as bridge
 from smoke_native import Fixture, read_json, save
 from storage import Store
@@ -97,11 +101,10 @@ class Actor:
 
     def nodes(self):
         result = []
-        for window in bridge.inventory()['data']:
-            if window['pid'] == self.fixture.proc.pid and self.binding.contains_window(window['hwnd']):
-                observed = bridge.inspect(dict(self.request, hwnd=window['hwnd']))
-                assert observed['ok'] and observed['data']['complete'], 'fixture_inspect_incomplete'
-                result += [dict(node, observation_hwnd=window['hwnd']) for node in observed['data']['nodes']]
+        for hwnd in self.binding.scoped_windows():
+            observed = bridge.inspect(dict(self.request, hwnd=hwnd))
+            assert observed['ok'] and observed['data']['complete'], 'fixture_inspect_incomplete'
+            result += [dict(node, observation_hwnd=hwnd) for node in observed['data']['nodes']]
         return result
 
     def choose(self, key, role=None):
@@ -232,11 +235,67 @@ def value_steps(draft, key):
             and step['action'] == 'set-value']
 
 
+def provider_case(work, key, expected, actor, fixture, report):
+    """Exercise real cross-HWND peers without claiming a low-level hook test."""
+    directory = work / ('provider-' + key)
+    directory.mkdir()
+    fixture.command('reset')
+    closed = actor.nodes()
+    if expected == 'unavailable':
+        [parent] = [n for n in closed if n['automation_id'] == key]
+        [editor] = [n for n in closed if n['automation_id'] == key + 'Current']
+        report(key + '_offscreen_parent_has_visible_empty_editor', parent['offscreen'] and parent['bounds_valid']
+               and parent['value'] is None and not editor['offscreen'] and editor['value'] == '')
+    stale = [node for node in closed if node['automation_id'] == key + 'CachedOptionN']
+    report(key + '_collapsed_peer_has_value_but_no_bounds',
+           len(stale) == 1 and stale[0]['offscreen'] and not stale[0]['bounds_valid']
+           and stale[0]['value'] == 'N' and 'Select' in stale[0]['available_actions'])
+    request = dict(actor.request, output_dir=str(directory), draft_path=str(directory / 'draft.json'),
+                   progress_path=str(directory / 'progress.json'))
+    model = recorder.RecordingModel(request, actor.binding.info())
+    worker = recorder.CaptureWorker(actor.binding, bridge, model, queue.Queue(), queue.Queue())
+    fixture.command('provider-open|' + key)
+    with bridge.UIA() as uia:
+        worker.uia = uia
+        [popup] = [hwnd for hwnd in actor.binding.scoped_windows() if hwnd != actor.binding.hwnd]
+        popup_binding = bridge.Binding(dict(actor.request, hwnd=popup))
+        nodes, elements, complete = bridge.read_tree(popup_binding, uia)
+        assert complete, 'incomplete_fixture_popup_tree'
+        [(node, element)] = [(n, e) for n, e in zip(nodes, elements) if n['automation_id'] == key + 'OptionN']
+        observation = {'root': uia.from_handle(popup), 'window': popup,
+                       'scope_root': uia.from_handle(actor.binding.hwnd), 'scope_window': actor.binding.hwnd,
+                       'element': element, 'node': node}
+        combo = uia.combo_observation(observation)
+        assert combo is not None and combo['node']['automation_id'] == key, 'fixture_option_owner_unproven'
+        report(key + '_visible_option_has_distinct_name_and_value', node['name'] != node['value']
+               and node['value'] == 'N' and node['bounds_valid'] and not node['offscreen'])
+        observation['combo'] = combo
+        # Freeze what the UIA worker saw before the transient HWND disappears.
+        r = node['bounds']
+        event = {'action': 'click', 'at': time.monotonic(), 'x': r['x'] + r['width']//2,
+                 'y': r['y'] + r['height']//2}
+        fixture.command('provider-click|' + key + '|N')
+        worker.capture_action(event, observation)
+        worker.finalize_watch(True)
+    model.finish()
+    truth = fixture.command('state')['controls'][key]
+    save(directory / 'ground-truth.json', truth)
+    steps = value_steps(read_json(model.draft), key)
+    intended = steps[0] if len(steps) == 1 else {}
+    report(key + '_business_value_selected_in_recording', intended.get('value') == 'N'
+           and intended.get('headed') is True and intended.get('combo_replay') == 'visible_option')
+    report(key + '_effect_independent_of_option_inventory', intended.get('selection', {}).get('result') == expected
+           and truth['clicks'] == 1 and truth['stale_selects'] == 0
+           and truth['value'] == ('Y' if expected == 'mismatch' else 'N'))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work-dir', required=True, type=Path)
-    parser.add_argument('--compile-only', action='store_true')
-    parser.add_argument('--case', choices=('readable', 'opaque', 'adjacent', 'reselect', 'fast', 'cancel', 'rejected'),
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--compile-only', action='store_true')
+    mode.add_argument('--provider-only', action='store_true', help='Exercise real peers without moving the mouse')
+    mode.add_argument('--case', choices=('readable', 'opaque', 'adjacent', 'reselect', 'fast', 'cancel', 'rejected'),
                         help='Run a single recording case for diagnosis; default runs all and replay')
     args = parser.parse_args()
     if os.name != 'nt' or not args.work_dir.is_absolute() or args.work_dir.exists():
@@ -250,11 +309,12 @@ def main():
     bridge.configure_dpi()
     results, recordings = [], {}
     suite_completed = False
+    active_case, diagnostic = 'initial_inspection', None
     actor = None
     def report(case, passed):
         results.append({'case': case, 'passed': bool(passed)})
         print(json.dumps(results[-1]), flush=True)
-    fixture = Fixture(exe)
+    fixture = Fixture(exe, '--provider-only') if args.provider_only else Fixture(exe)
     try:
         actor = Actor(fixture, exe)
         initial = actor.nodes()
@@ -273,9 +333,10 @@ def main():
             'cancel': lambda: (actor.click(actor.choose('ComboBetaOpen', 'button')), actor.escape()),
             'rejected': lambda: actor.select('ComboReject'),
         }
-        for name, action in cases.items():
+        for name, action in ({} if args.provider_only else cases).items():
             if args.case and name != args.case:
                 continue
+            active_case = 'record_' + name
             directory, draft, truth = record_case(work, name, fixture, actor, action)
             recordings[name] = (directory, draft)
             controls = truth['controls']
@@ -306,9 +367,14 @@ def main():
                 s['action'] == 'set-value' and s['target'].get('locator', {}).get('role') == 'combobox'
                 and not s.get('value') for s in draft['steps']))
 
-        if not args.case:
+        if args.provider_only:
+            for key, expected in (('ComboAlpha', 'matched'), ('ComboBeta', 'unavailable'), ('ComboReject', 'mismatch')):
+                active_case = 'provider_' + key
+                provider_case(work, key, expected, actor, fixture, report)
+        elif not args.case:
             store = Store(work / 'store')
             for name, key in (('readable', 'ComboAlpha'), ('opaque', 'ComboBeta')):
+                active_case = 'replay_' + name
                 directory, draft = recordings[name]
                 original = (directory / 'draft.json').read_bytes()
                 imported = store.import_recording(directory / 'draft.json')
@@ -326,7 +392,8 @@ def main():
                 run = Runner(store, desktop.DesktopAdapter).start(saved['id'], actor.request)
                 state = fixture.command('state')['controls'][key]
                 save(work / ('replay-' + name + '.json'), {'run': run, 'ground_truth': state})
-                report(name + '_recording_replays', state['value'] == 'N' and state['writes'] == 1)
+                report(name + '_recording_replays', state['value'] == 'N' and state['clicks'] == 1
+                       and state['opens'] == 1 and state['writes'] == state['selects'] == 0)
                 report(name + '_runtime_effect_not_inferred_from_recording',
                        (run['status'] == 'completed' and run['task_verified']) if name == 'readable'
                        else (run['status'] == 'needs_review' and not run['task_verified']))
@@ -337,9 +404,19 @@ def main():
                 report(name + '_original_recording_preserved', (directory / 'draft.json').read_bytes() == original
                        and selected[-1]['id'] == saved['steps'][0]['id'])
         suite_completed = True
+    except Exception as error:
+        # Only a fixed diagnostic identifier leaves the hosted runner. Local
+        # developers retain the usual traceback and their own fixture files.
+        message = error.args[0] if error.args else None
+        if isinstance(message, tuple) and message:
+            message = message[0]
+        diagnostic = message if isinstance(message, str) and re.fullmatch(r'[a-z_]{1,80}', message) else type(error).__name__
+        raise
     finally:
         fixture.close()
         summary = {'synthetic_only': True, 'company_fx_tested': False,
+                   'provider_only': bool(args.provider_only),
+                   'interrupted_case': None if suite_completed else active_case, 'diagnostic': diagnostic,
                    'suite_completed': suite_completed, 'completed_recording_cases': list(recordings),
                    'physical_recording_tested': bool(recordings),
                    'injected_mouse_keyboard': bool(actor and actor.input_batches),

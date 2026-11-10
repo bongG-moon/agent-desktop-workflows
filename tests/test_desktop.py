@@ -226,6 +226,49 @@ class TargetResolutionTests(unittest.TestCase):
             {'role': 'list', 'automation_id': 'ResultsList', 'name': 'Results'}]}
         self.assertEqual(desktop.resolve(nodes, locator)['ref'], '@snew:e2')
 
+    def test_direct_list_select_blocks_offscreen_or_empty_current_bounds_before_dispatch(self):
+        args = SimpleNamespace(session='a'*32, ref='@snew:e1', action='select', value='N', headed=False)
+        def response(prop, value):
+            return {'ok': True, 'data': {'ref': args.ref, 'property': prop, 'value': value}}
+        for live in [[response('states', ['offscreen'])],
+                     [response('states', []), response('bounds', {'width': 0, 'height': 12})]]:
+            with self.subTest(live=live), \
+                 patch.object(desktop.interact, 'validate_local_directory', return_value=Path('a'*32)), \
+                 patch.object(desktop.interact, '_load_session', return_value=({}, {}, {'role': 'option'})), \
+                 patch.object(desktop.interact, '_write'), patch.object(desktop.interact, '_call', side_effect=live) as call:
+                result = desktop.interact.run_act(args)
+            self.assertEqual(result['diagnostic'], 'list_option_not_visible')
+            self.assertIs(result['input_dispatched'], False)
+            self.assertTrue(all(entry.args[0][0] == 'get' for entry in call.call_args_list))
+
+    def test_visible_replay_uses_runtime_parameter_and_independent_readback(self):
+        adapter = object.__new__(desktop.DesktopAdapter)
+        adapter.binding, adapter.lifetime, adapter.run_dir = {'pid': 8, 'hwnd': 19, 'exe_name': 'Test.exe'}, '23', Path('run')
+        node = {'role': 'combobox', 'automation_id': 'Choice', 'secure': False, 'enabled': True, 'offscreen': True}
+        step = {'action': 'set-value', 'target': {'kind': 'element', 'locator': {'automation_id': 'Choice', 'role': 'combobox'}},
+                'combo_replay': 'visible_option', 'headed': True,
+                'selection': {'source': 'option_click', 'value': 'Old', 'result': 'matched', 'observed_value': 'Old'}}
+        with patch.object(adapter, '_window', return_value=(adapter.binding, {'complete': True, 'nodes': [node]})), \
+             patch.object(desktop, '_native') as native, patch.object(desktop.interact, 'run_act') as act, \
+             patch.object(adapter, 'check', return_value={'matched': None, 'diagnostic': 'combo_value_unavailable'}) as check:
+            native.return_value = {'ok': True, 'status': 'executed_unverified', 'input_dispatched': True, 'option_dispatched': True}
+            result = adapter.execute(step, 'New')
+            self.assertEqual(native.call_args.args[0], 'combo-option')
+            self.assertEqual(native.call_args.args[1]['value'], 'New')
+            self.assertEqual(result['status'], 'executed_unverified')
+            self.assertEqual(result['effect_verification'], 'unavailable')
+            check.assert_called_once()
+            check.reset_mock()
+            native.return_value = {'ok': False, 'status': 'blocked', 'input_dispatched': True, 'option_dispatched': False}
+            self.assertEqual(adapter.execute(step, 'New'), native.return_value)
+            self.assertEqual(native.call_count, 2)
+            check.assert_not_called()
+            act.assert_not_called()
+            native.reset_mock()
+            self.assertFalse(adapter.execute(dict(step, headed=False), 'New')['input_dispatched'])
+            self.assertFalse(adapter.execute(step, '')['input_dispatched'])
+            native.assert_not_called()
+
     def test_nested_owned_menus_use_unique_current_contents(self):
         adapter = object.__new__(desktop.DesktopAdapter)
         adapter.binding = {'pid': 11, 'hwnd': 22, 'exe_name': 'App.exe'}

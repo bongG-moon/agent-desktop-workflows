@@ -3,7 +3,7 @@ name: agent-desktop-workflows
 description: Windows 업무 작업을 사용자의 시연으로 녹화하고, 단계별 인식 상태를 보완한 뒤 작업 이름과 입력 조건으로 재생한다. 로컬 명령과 파일 도구가 있는 사내 모델 환경에서 사용하며 기존 CUA MCP와 독립적으로 동작한다.
 ---
 
-# Agent Desktop Workflows 0.1.5
+# Agent Desktop Workflows 0.1.6
 
 이 스킬은 별도 제품이다. 기존 CUA MCP 또는 Agent Desktop Local을 실행하거나 그 설정, 저장소, 녹화 파일을 변경하지 않는다. Windows ZIP에 포함된 기존 `bin/agent-desktop.exe`와 64비트 Python 3.10 이상을 사용한다. 창 조회, 녹화와 영역 입력은 `scripts/py_helper.py`, `scripts/win_bridge.py`, `scripts/recorder.py`에서 실행한다. 녹화/편집 화면에는 tkinter가 필요하다. 설치와 첫 사용은 [사용가이드.html](사용가이드.html)을 안내한다.
 
@@ -21,6 +21,8 @@ FX의 Family/Status 조회와 우클릭 Excel 내보내기를 처음 구성할 �
 사용자가 이미 요청한 작업 범위의 각 클릭마다 재승인을 요구하지 않는다. 대상 업무 창이 모호하거나 요청 밖의 저장/삭제/전송이 필요하면 해당 지점만 확인한다. 기존 Claude Code의 파일/명령 권한과 회사 정책은 그대로 따른다.
 
 ## 대상과 결과
+
+0.1.6에서 펼치기를 지원하는 콤보의 새 목록 클릭 또는 사용자가 이 방식을 지정한 단계는 `combo_replay=visible_option`과 `headed=true`를 사용한다. 해당 창을 복원하고 목록의 실제 값으로 선택한다. 구버전 녹화의 `manual` 단계에는 원래 선택값이 없으므로 필요한 단계만 다시 녹화하거나 사용자가 알고 있는 값으로 새 수정본을 만든다. 재생이 멈추면 실행 기록의 `option_dispatched`와 현재 화면을 확인한다. 목록이 펼쳐진 사실만으로 옵션을 눌렀다고 보고하지 않는다. 이미 전달됐거나 전달 여부가 불명확하면 다른 방식으로 다시 보내지 않는다.
 
 콤보의 대상, 선택 의도, 실제 적용값은 별도 증거다. `selection.source=option_click`은 소속이 확인된 실제 옵션 클릭을 기록한 것이며 `selection.result`는 녹화 당시의 적용 관찰이다. 이 기록만으로 재생 성공을 판정하거나 완료 조건을 생략하지 않는다. 빈 부모 ValuePattern이나 옵션 목록, `[Editor]` 이름 문자열만으로 현재 선택값을 확정하지 않는다. `combo_selection_unverified`이면 입력값은 보존됐지만 적용 확인이 필요하다. `combo_value_unobserved`는 선택 의도도 확보하지 못한 값 보완 단계다. `empty_combo_value_requires_review`이면 실제 입력값을 지정해 새 수정본으로 저장한다. 입력 변수 이름과 기본값은 각각의 필드에 지정하며 값 칸의 `{Status}`는 변수 참조로 해석되지 않는다. [콤보 보완 절차](references/usage.md#콤보-이름만-읽히고-값이-비는-경우)를 따른다.
 

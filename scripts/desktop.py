@@ -86,7 +86,7 @@ def write_json(path, value, *, replace=False):
 
 def _bridge_script():
     manifest = read_json(ROOT / 'engine' / 'bridge-manifest.json')
-    if manifest.get('version') != '0.1.5' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
+    if manifest.get('version') != '0.1.6' or set(manifest.get('files', {})) != set(BRIDGE_SOURCES):
         raise EngineError('bridge_manifest_invalid')
     for name in BRIDGE_SOURCES:
         path = ROOT / name
@@ -100,7 +100,7 @@ def _bridge_script():
 
 
 def _native(command, payload, run_dir, *, timeout=15, on_progress=None, stop_event=None):
-    if command not in {'windows', 'inspect', 'probe', 'point', 'activate', 'record'}:
+    if command not in {'windows', 'inspect', 'probe', 'point', 'activate', 'record', 'combo-option'}:
         raise EngineError('native_command_not_allowed')
     run = local_dir(Path(run_dir) / ('native-' + uuid.uuid4().hex), True)
     request, response = run / 'request.json', run / 'response.json'
@@ -367,6 +367,27 @@ class DesktopAdapter:
             return receipt
         if target['kind'] != 'element':
             raise EngineError('unknown_target_kind')
+        if step.get('combo_replay') == 'visible_option':
+            if action != 'set-value' or step.get('headed') is not True:
+                raise EngineError('visible_option_requires_headed_combo')
+            if not isinstance(value, str) or not value.strip() or '\x00' in value or len(value.encode('utf-8')) > 10000:
+                raise EngineError('invalid_combo_option_value')
+            if current.get('complete') is not True:
+                raise EngineError('incomplete_tree')
+            combo = resolve(current['nodes'], target['locator'])
+            if role(combo.get('role')) != 'combobox' or combo.get('secure') is not False or combo.get('enabled') is not True:
+                raise EngineError('combo_not_actionable')
+            # The helper resolves the stable locator again inside the process lifetime
+            # and chooses only a currently visible, hit-tested item of this combo.
+            request = dict(binding, process_started_utc_ticks=self.lifetime, locator=target['locator'], value=value)
+            try:
+                result = _native('combo-option', request, self.run_dir, timeout=40)
+            except (Exception, KeyboardInterrupt):
+                return {'status': 'uncertain', 'input_dispatched': None, 'option_dispatched': None,
+                        'effect_verification': 'unavailable', 'diagnostic': 'combo_option_delivery_unknown'}
+            if result.get('option_dispatched') is True and result.get('ok') is True:
+                return self._combo_readback(result, step, value)
+            return result
         result = interact.run_inspect(SimpleNamespace(**binding, output=str(self.run_dir)))
         if result.get('status') != 'ready':
             raise EngineError('action_inspection_unavailable')

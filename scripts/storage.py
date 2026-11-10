@@ -129,7 +129,7 @@ def validate_workflow(workflow):
     seen = set()
     for step in value["steps"]:
         _keys(step, {"id", "label", "action", "target", "value", "parameter", "headed", "expect",
-                     "recognition", "direction", "amount", "timeout_seconds", "selection"},
+                     "recognition", "direction", "amount", "timeout_seconds", "selection", "combo_replay"},
               {"id", "label", "action", "target", "expect", "recognition"})
         identifier(step["id"])
         if step["id"] in seen:
@@ -152,6 +152,11 @@ def validate_workflow(workflow):
             _fail("missing_action_value")
         if "headed" in step and type(step["headed"]) is not bool:
             _fail("invalid_headed")
+        if "combo_replay" in step:
+            if (step["combo_replay"] != "visible_option" or step.get("headed") is not True
+                    or step["action"] != "set-value" or step["target"]["kind"] != "element"
+                    or step["target"]["locator"].get("role") != "combobox"):
+                _fail("invalid_combo_replay")
         if "timeout_seconds" in step:
             _number(step["timeout_seconds"], 0.1, 300)
         if "direction" in step and (not isinstance(step["direction"], str) or step["direction"] not in {"up", "down", "left", "right"}):

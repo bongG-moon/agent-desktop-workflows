@@ -1,5 +1,13 @@
 name: Standalone checks
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      combo_smoke:
+        description: Run physical recording and replay on the hosted Windows fixture
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -14,3 +22,50 @@ jobs:
         run: python -X utf8 -B -m unittest discover -s tests -v
       - name: Source publication preflight
         run: python -X utf8 -B tools/build.py --source-only
+      - name: Restore the pinned engine for the manual fixture test
+        if: github.event_name == 'workflow_dispatch' && inputs.combo_smoke
+        shell: python
+        run: |
+          import hashlib, io, json, urllib.request, zipfile
+          from pathlib import Path
+          url = 'https://github.com/bongG-moon/agent-desktop-workflows/releases/download/v0.1.5/agent-desktop-workflows-0.1.5-windows-x64.zip'
+          with urllib.request.urlopen(url, timeout=60) as response:
+              payload = response.read(2_000_001)
+          if hashlib.sha256(payload).hexdigest() != 'ebf787518ce816442b131e862da06948ff4a779a40b29462d943f59c4ab0275c':
+              raise RuntimeError('fixture_source_zip_hash_mismatch')
+          with zipfile.ZipFile(io.BytesIO(payload)) as source:
+              engine = source.read('agent-desktop-workflows/bin/agent-desktop.exe')
+          if hashlib.sha256(engine).hexdigest() != json.loads(Path('UPSTREAM.json').read_text())['binary_sha256']:
+              raise RuntimeError('fixture_engine_hash_mismatch')
+          path = Path('bin/agent-desktop.exe')
+          path.parent.mkdir(exist_ok=True)
+          path.write_bytes(engine)
+      - name: Test recording and replay on synthetic Windows controls
+        if: github.event_name == 'workflow_dispatch' && inputs.combo_smoke
+        shell: python
+        timeout-minutes: 12
+        run: |
+          import json, os, re, subprocess, sys, tempfile
+          from pathlib import Path
+          work = Path(tempfile.mkdtemp(prefix='combo-fixture-', dir=os.environ['RUNNER_TEMP']))
+          failures = []
+          for mode, flags in [('provider', ['--provider-only']), ('physical', [])]:
+              directory = work / mode
+              with (work / (mode + '.log')).open('wb') as log:
+                  result = subprocess.run([sys.executable, '-X', 'utf8', '-B', 'tools/smoke_combo_popup.py',
+                                           '--work-dir', str(directory), *flags], stdout=log, stderr=subprocess.STDOUT)
+              summary = directory / 'summary.json'
+              data = json.loads(summary.read_text(encoding='utf-8')) if summary.is_file() else {}
+              failed = [c['case'] for c in data.get('results', []) if not c['passed']]
+              if result.returncode or not data.get('suite_completed'):
+                  failures.append(mode)
+                  failed += [data.get('interrupted_case'), data.get('diagnostic')]
+              safe = [s for s in failed if isinstance(s, str) and re.fullmatch(r'[A-Za-z0-9_]{1,100}', s)]
+              line = f"{mode}: {int(data.get('passed', 0))}/{int(data.get('total', 0))}, completed={bool(data.get('suite_completed'))}"
+              if safe:
+                  line += ', ' + ', '.join(safe)
+              print(line)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+                  print('- ' + line, file=output)
+          if failures:
+              raise SystemExit('fixture_checks_failed: ' + ', '.join(failures))

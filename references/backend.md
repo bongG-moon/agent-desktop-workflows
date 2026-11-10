@@ -1,6 +1,6 @@
 # Python helper protocol v1
 
-Agent Desktop Workflows 0.1.5 uses three inspectable Python files instead of its own compiled helper: `scripts/py_helper.py`, `scripts/win_bridge.py`, and `scripts/recorder.py`. The supported runtime is x64 Python 3.10 or later on x64 Windows; the recorder UI also needs tkinter. Python's standard library calls Windows' built-in UI Automation COM and Win32 APIs. No CUA runtime, driver, model, third-party Python package, helper compiler, or runtime download is required.
+Agent Desktop Workflows 0.1.6 uses three inspectable Python files instead of its own compiled helper: `scripts/py_helper.py`, `scripts/win_bridge.py`, and `scripts/recorder.py`. The supported runtime is x64 Python 3.10 or later on x64 Windows; the recorder UI also needs tkinter. Python's standard library calls Windows' built-in UI Automation COM and Win32 APIs. No CUA runtime, driver, model, third-party Python package, helper compiler, or runtime download is required.
 
 The Windows ZIP still includes the unchanged upstream `bin/agent-desktop.exe` for semantic element actions. The source ZIP includes no EXE. A user can manually copy the previously obtained Agent Desktop Local 0.2.0 copy into this separate product's `bin` directory after checking its SHA-256 against `UPSTREAM.json`. The product does not search or import another installation. Removing the additional helper EXE changes the distribution; it does not override company rules governing Python, hooks, or desktop input.
 
@@ -12,7 +12,7 @@ The desktop adapter invokes the current Python interpreter with an isolated modu
 python -I -X utf8 -B scripts/py_helper.py COMMAND --request ABSOLUTE_JSON --response ABSOLUTE_JSON
 ```
 
-Use the public workflow CLI rather than invoking the helper to bypass workflow checks. The adapter checks all three source hashes against `engine/bridge-manifest.json` before every helper process. The manifest is `{version:"0.1.5",files:{"scripts/py_helper.py":"SHA256","scripts/win_bridge.py":"SHA256","scripts/recorder.py":"SHA256"}}`. `tools/build.py` refreshes it from source when producing release archives; it does not compile source or create executables. These files use LF line endings so Git checkout conversion does not invalidate their hashes. A hash mismatch fails closed; the runtime does not regenerate the manifest.
+Use the public workflow CLI rather than invoking the helper to bypass workflow checks. The adapter checks all three source hashes against `engine/bridge-manifest.json` before every helper process. The manifest carries the installed product version and SHA-256 of each bridge source. `tools/build.py` refreshes it from source when producing release archives; it does not compile source or create executables. These files use LF line endings so Git checkout conversion does not invalidate their hashes. A hash mismatch fails closed; the runtime does not regenerate the manifest.
 
 Release archives also contain `PACKAGE-MANIFEST.json` with the product, version, distribution and hashes of all allowlisted files. The build verifier rejects extra files and enforces exactly one pinned EXE in the Windows archive and none in the source archive. Hashes detect mismatch or corruption; they are not a digital signature or a sandbox against a party able to replace both source and manifests.
 
@@ -20,7 +20,7 @@ JSON uses UTF-8. Requests are limited to 2 MiB and responses to 16 MiB. Files an
 
 ## Target binding
 
-Targeted operations require `pid` integer, `hwnd` integer and exact `exe_name` basename. Windows session, HWND ownership, executable basename and process creation time are checked. `process_started_utc_ticks` is a decimal string returned by inventory or inspection. It is required for `activate` and `point`; when present on other commands it is checked too.
+Targeted operations require `pid` integer, `hwnd` integer and exact `exe_name` basename. Windows session, HWND ownership, executable basename and process creation time are checked. `process_started_utc_ticks` is a decimal string returned by inventory or inspection. It is required for `activate`, `point` and `combo-option`; when present on other commands it is checked too.
 
 ## windows
 
@@ -51,6 +51,12 @@ Request complete target binding plus `locator`, `point:{x_ratio,y_ratio}` and ac
 Before one SendInput call, the helper checks a complete scoped tree, unique locator, nonpassword enabled onscreen target, visible nonminimized window, expected foreground, matching window and PID at the point, UIA hit-test within the selected element, absence of held modifiers/mouse buttons, and unchanged process lifetime and bounds. Current DPI-aware virtual desktop geometry is used. There are no retries or alternate-target fallbacks.
 
 Success is `{ok:true,status:"executed_unverified",input_dispatched:true,delivery:"delivered_unverified",retry:"unsafe",business_commit:"not_verified"}`. Partial SendInput or an exception after the dispatch boundary is uncertain with nullable input_dispatched. Physical delivery never proves business completion.
+
+## combo-option (0.1.6)
+
+For an element combo with `action:"set-value"`, the optional `combo_replay:"visible_option"` requires `headed:true`. The recorder uses this strategy for clicked choices on expandable combos; existing steps without it retain their original behavior. Editing the workflow can also request this strategy without inventing historical selection evidence. The `combo-option` helper requires a bound window, process lifetime, locator and the exact runtime option value. It inspects the live combo and its scoped visible options, expanding at most once when needed. A clickable option must uniquely match the value and pass a fresh identity, visibility, foreground and hit test. A stale or unclassified action is never retried with a second mechanism.
+
+Option identity uses the clicked item's accessible value (UIA Value or LegacyIAccessible.Value) before its accessible name. A disagreement between value providers cannot identify a choice. An option that is merely present in the inventory is never evidence of a current selection. The run receipt distinguishes opening the popup (`popup_expanded`), dispatching the option click (`option_dispatched`), and observing the selected value after delivery. A nonempty LegacyIAccessible.Value on the combo or its unique editor can supply independent evidence; conflicting value providers block verification. If the app exposes no independent current value, the workflow requires review when the completion condition is a value check.
 
 ## record
 
