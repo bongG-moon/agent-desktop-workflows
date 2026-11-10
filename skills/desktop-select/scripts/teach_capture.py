@@ -78,6 +78,7 @@ class CaptureNotes:
         self.state = 'ready'
         self.partial = False
         self.limit = False
+        self.max_steps = recorder.MAX_STEPS
         self.closed = False
         self.hover_target = None
 
@@ -90,7 +91,7 @@ class CaptureNotes:
         with self.lock:
             if self.closed or self.limit:
                 return
-            if step['id'] not in self.steps and len(self.steps) >= recorder.MAX_STEPS - 1:
+            if step['id'] not in self.steps and len(self.steps) >= self.max_steps - 1:
                 self.limit = self.partial = True
                 step = manual('recording_step_limit')
             self.steps[step['id']] = capture_step(step)
@@ -104,6 +105,8 @@ class CaptureNotes:
 
 
 def default_text(step):
+    if step['action'] == 'row-action':
+        return step['label']
     command = learned_tasks.recorded_step(step)
     field = command.get('label') or command.get('target') or step['label']
     if step['action'] == 'teach-target':
@@ -116,6 +119,8 @@ def default_text(step):
 
 
 def instruction_view(step, instruction):
+    if step['action'] == 'row-action':
+        return step['label'] + ' (버튼 선택 후 같은 행의 완료 표시 확인)'
     if instruction and instruction['mode'] == 'fixed':
         return '지정한 값으로 선택: ' + instruction['value']
     if instruction and instruction['mode'] == 'required':
@@ -132,6 +137,8 @@ class StepEdits:
 
     @staticmethod
     def identity(step):
+        if step['action'] == 'row-action':
+            return step['action'], step['row'], step['label']
         return (step['action'], step['target'], step.get('recognition', {}).get('reason') if
                 step['action'] == 'manual' else None)
 
@@ -347,7 +354,7 @@ class CaptureSession:
             self.worker.enabled.clear()
             self.pump.stop()
 
-    def finish(self):
+    def finish(self, *, report_empty=True):
         if not self.started or self.ended:
             raise bridge.BridgeError('recording_not_active')
         self.poll()
@@ -363,7 +370,7 @@ class CaptureSession:
                 self.notes.manual('', 'pending_capture_requires_review')
             self.poll()
             with self.notes.lock:
-                if not self.notes.steps:
+                if report_empty and not self.notes.steps:
                     self.notes.manual('', 'empty_recording_requires_review')
                 self.notes.closed = True
                 return {'status': 'recorded', 'steps': self.notes.snapshot(), 'input_dispatched': False}
@@ -394,6 +401,8 @@ def capture(binding, *, title):
     review = None
     editing = None
     edits = StepEdits()
+    completed_steps = []
+    previous_columns = None
     message = tk.StringVar(value='시작을 누르고 업무 창에서 작업하세요. 끝나면 이 창으로 돌아오세요.')
     frame = ttk.Frame(root, padding=14)
     frame.pack(fill='both', expand=True)
@@ -423,8 +432,8 @@ def capture(binding, *, title):
     ttk.Label(form, text='콤보 값 지정').grid(row=2, column=0, padx=(0, 6), sticky='w')
     choices = ttk.Frame(form)
     choices.grid(row=2, column=1, sticky='w')
-    ttk.Combobox(choices, name='mode', values=list(modes), state='readonly', textvariable=mode,
-                 width=11).pack(side='left')
+    mode_box = ttk.Combobox(choices, name='mode', values=list(modes), state='readonly', textvariable=mode, width=11)
+    mode_box.pack(side='left')
     arg_label = ttk.Label(choices, text='값 또는 변수 이름')
     arg_label.pack(side='left', padx=(6, 2))
     arg_box = ttk.Entry(choices, name='argument', textvariable=argument, width=22)
@@ -436,9 +445,11 @@ def capture(binding, *, title):
     controls.pack(anchor='w')
 
     def steps_now():
-        return review['steps'] if review is not None else session.notes.snapshot()
+        return review['steps'] if review is not None else completed_steps + session.notes.snapshot()
 
     def fields():
+        if editing is not None and editing['action'] == 'row-action':
+            return alias.get(), '', None, None
         chosen = modes[mode.get()]
         return alias.get(), instruction.get(), chosen, argument.get() if chosen else None
 
@@ -473,8 +484,11 @@ def capture(binding, *, title):
 
     def load(step):
         sentence, chosen, arg = edits.form(step)
+        is_row = step['action'] == 'row-action'
+        form.children['instruction'].configure(state='readonly' if is_row else 'normal')
+        mode_box.configure(state='disabled' if is_row else 'readonly')
         alias.set(edits.get(step).get('alias', ''))
-        instruction.set(sentence)
+        instruction.set(step['label'] if is_row else sentence)
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
         refresh_preview()
@@ -528,6 +542,11 @@ def capture(binding, *, title):
         nonlocal result
         if session.started:
             return
+        remaining = learned_tasks.MAX_STEPS - len(completed_steps)
+        if remaining < 1:
+            message.set(f'최대 {learned_tasks.MAX_STEPS}단계에 도달했습니다. 마치고 검토를 누르세요.')
+            return
+        session.notes.max_steps = remaining
         try:
             session.start()
         except Exception as exc:
@@ -540,13 +559,41 @@ def capture(binding, *, title):
 
     def finish(*_):
         nonlocal review
-        if not session.started or review is not None:
+        if review is not None or not (session.started or completed_steps):
             return
-        review = session.finish()
+        review = {'status': 'recorded', 'steps': completed_steps.copy(), 'input_dispatched': False}
+        if session.started:
+            review['steps'].extend(session.finish(report_empty=not completed_steps)['steps'])
         render(review['steps'])
+        begin.configure(state='disabled')
         end.configure(state='disabled')
         save.configure(state='normal')
         message.set('단계를 선택하고 실행할 동작을 입력하세요. 예: 이 항목을 N으로 설정')
+
+    def teach_row():
+        nonlocal session, previous_columns
+        if not flush():
+            return
+        if review is None and session.started:
+            completed_steps.extend(session.finish(report_empty=False)['steps'])
+            session = CaptureSession(binding, title)
+            begin.configure(state='normal')
+            render(completed_steps)
+        steps = review['steps'] if review is not None else completed_steps
+        if len(steps) >= learned_tasks.MAX_STEPS:
+            message.set(f'작업에는 최대 {learned_tasks.MAX_STEPS}단계를 저장할 수 있습니다.')
+            return
+        from row_teach import teach_row_dialog
+        new_step = teach_row_dialog(root, session.binding, previous_columns)
+        if new_step is not None:
+            step, previous_columns = new_step
+            steps.append(step)
+            render(steps)
+            listing.selection_set(step['id'])
+            listing.see(step['id'])
+        if review is None:
+            end.configure(state='normal' if steps else 'disabled')
+            message.set('행 버튼을 더 가르치거나 시작을 눌러 이어서 녹화하세요. 끝나면 마치고 검토를 누르세요.')
 
     def save_review():
         nonlocal result
@@ -568,10 +615,10 @@ def capture(binding, *, title):
     def tick():
         if session.started and review is None:
             session.poll()
-            steps = session.notes.snapshot()
+            steps = steps_now()
             render(steps)
             warnings = sum((s['action'] == 'teach-target' and not edits.get(s).get('instruction'))
-                           or s['action'] == 'manual' or s['recognition'].get('result') == 'mismatch' for s in steps)
+                           or s['action'] == 'manual' or s.get('recognition', {}).get('result') == 'mismatch' for s in steps)
             state = '녹화가 멈췄습니다. 마치고 검토하세요' if session.notes.state == 'paused' or session.notes.limit else '녹화 중'
             message.set(f'{state} / {len(steps)}단계 / 확인 필요 {warnings}개'
                         + ('\n최근 단계: ' + steps[-1]['label'] if steps else ''))
@@ -580,7 +627,8 @@ def capture(binding, *, title):
     begin = ttk.Button(controls, text='시작', command=start)
     end = ttk.Button(controls, text='마치고 검토', command=finish, state='disabled')
     save = ttk.Button(controls, text='저장', command=save_review, state='disabled')
-    for button in (begin, end, save, ttk.Button(controls, text='취소', command=cancel)):
+    for button in (begin, ttk.Button(controls, text='행 버튼 가르치기', command=teach_row), end, save,
+                   ttk.Button(controls, text='취소', command=cancel)):
         button.pack(side='left', padx=3)
     root.bind('<Alt-s>', start)
     root.bind('<Alt-f>', finish)

@@ -244,6 +244,10 @@ def _check_instruction(step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    if raw.get('action') == 'row-action':
+        step = {'action': 'row-action', 'label': raw.get('label'), 'row': raw.get('row'), **_annotations(raw)}
+        _validate_row(step)
+        return step
     spec = raw.get('instruction')
     step = _convert(raw, allow_point=spec is not None)
     step.update(_annotations(raw))
@@ -274,6 +278,22 @@ def from_recording(name, exe, window, steps):
     return {'schema': 1, 'name': name, 'exe': exe, 'window': window, 'steps': converted}
 
 
+def _validate_row(step):
+    from row_vision import validate_spec
+    from win_bridge import BridgeError
+    if not _text(step.get('label'), 200) or set(step) - {'action', 'label', 'alias', 'description', 'row'}:
+        raise TaskError('invalid_row_step')
+    try:
+        validate_spec(step.get('row'))
+    except BridgeError as error:
+        raise TaskError(error.code) from error
+
+
+def summary(plan):
+    """The local row patches are used by the player and stay out of CLI responses."""
+    return dict(plan, steps=[{k: v for k, v in step.items() if k != 'row'} for step in plan['steps']])
+
+
 def _validate(plan):
     if (not isinstance(plan, dict) or set(plan) != {'schema', 'name', 'exe', 'window', 'steps'}
             or type(plan['schema']) is not int or plan['schema'] != 1):
@@ -289,6 +309,9 @@ def _validate(plan):
         annotation = _annotations(s)
         if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
             raise TaskError('invalid_step_annotation')
+        if s.get('action') == 'row-action':
+            _validate_row(s)
+            continue
         if s.get('action') == 'manual':
             if set(s) - set(annotation) != {'action', 'reason'} or s['reason'] != _reason(s['reason']):
                 raise TaskError('invalid_task_step')

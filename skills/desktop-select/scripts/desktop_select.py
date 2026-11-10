@@ -167,7 +167,7 @@ def task_directory():
 
 def near_region(nodes, anchor):
     """Return the nearest grouping of a freshly resolved demonstrated control."""
-    if anchor.get('action') == 'manual':
+    if anchor.get('action') in ('manual', 'row-action'):
         raise SelectionError('anchor_requires_review')
     anchor_idx, _ = tasks.locate_target(nodes, anchor)
     ancestors = anchor.get('ancestors', [])
@@ -260,7 +260,8 @@ def run(args):
     if args.command in ('tasks', 'show'):
         if args.command == 'tasks':
             return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
-        return {'status': 'observed', 'task': tasks.load_task(args.task, task_directory()), 'input_dispatched': False}
+        return {'status': 'observed', 'task': tasks.summary(tasks.load_task(args.task, task_directory())),
+                'input_dispatched': False}
     if args.command == 'replay':
         plan = tasks.load_task(args.task, task_directory())
         overrides = tasks.parse_overrides(args.set)
@@ -279,6 +280,28 @@ def run(args):
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
     binding = pick_window(rows, args.window, args.hwnd)
     owner = bridge.Binding(binding)
+    if args.command == 'record-rows':
+        from row_action import teach_rows
+        guard(owner, owner, args.window)
+        return teach_rows(owner, args.window, args, task_directory())
+    if args.command == 'row-status':
+        from row_vision import observe_row
+        plan = tasks.load_task(args.task, task_directory())
+        tasks.check_binding(plan, args.exe, args.window)
+        numbers = [tasks._step_number(plan, args.only)] if args.only is not None else [
+            n for n, step in enumerate(plan['steps'], 1) if step['action'] == 'row-action']
+        if not numbers:
+            raise SelectionError('task_has_no_row_steps')
+        result = []
+        for number in numbers:
+            step = plan['steps'][number - 1]
+            if step['action'] != 'row-action':
+                raise SelectionError('not_a_row_step')
+            guard(owner, owner, args.window)
+            state = observe_row(owner, step['row'])['kind']
+            guard(owner, owner, args.window)
+            result.append({'number': number, 'label': step['label'], 'observed_state': state})
+        return {'status': 'observed', 'steps': result, 'input_dispatched': False}
     if args.command == 'record':
         from teach_capture import capture
         tasks.check_new_task(args.task, task_directory())
@@ -288,7 +311,7 @@ def run(args):
             return capture_result
         plan = tasks.from_recording(args.task, args.exe, args.window, capture_result['steps'])
         tasks.save_task(plan, task_directory())
-        return {'status': 'recorded', 'task': plan, 'input_dispatched': False}
+        return {'status': 'recorded', 'task': tasks.summary(plan), 'input_dispatched': False}
     anchor = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
@@ -302,6 +325,11 @@ def replay_step():
     binding, step = request['binding'], request['step']
     bridge.set_dpi_awareness()
     owner = bridge.Binding(binding)
+    if step['action'] == 'row-action':
+        from row_action import execute as execute_row
+        tasks._validate_row(step)
+        receipt = execute_row(owner, step['row'], lambda: guard(owner, owner, binding['title'], mutate=True))
+        return dict(receipt, target=step['label'])
     args = argparse.Namespace(command=step['action'], role=step['role'], window=binding['title'],
                               target=step['target'], value=step.get('value'), expand=step.get('expand', False),
                               within=step.get('within'), popup=None)
@@ -315,16 +343,23 @@ def parser():
     commands = p.add_subparsers(dest='command', required=True)
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
-    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay'):
+    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay', 'record-rows', 'row-status'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
         if verb != 'windows':
             s.add_argument('--window', required=True, help='exact business window title from windows')
             s.add_argument('--hwnd', type=int, help='disambiguate windows with identical titles')
-        if verb in ('record', 'replay'):
+        if verb in ('record', 'replay', 'record-rows', 'row-status'):
             s.add_argument('--task', required=True, help='local task name')
+        if verb == 'record-rows':
+            s.add_argument('--row', nargs=3, action='append', required=True, metavar=('LABEL', 'X', 'Y'),
+                           help='one demonstrated row label and physical screen point per occurrence')
+            for field in ('key', 'button', 'state'):
+                s.add_argument('--' + field + '-box', nargs=4, type=int, required=True, metavar=('X', 'Y', 'W', 'H'),
+                               help='physical pixel rectangle relative to the row')
         if verb == 'replay':
             s.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
+        if verb in ('replay', 'row-status'):
             s.add_argument('--only', help='run just one named step or step number')
         if verb in ('inspect', 'open', 'select'):
             s.add_argument('--popup', type=int, help='owned popup from current inspect output')
@@ -362,9 +397,10 @@ def worker_receipt(argv, mutating, payload=None):
     # A third-party accessibility provider can hang inside a COM call. Terminate
     # our helper only; never assume a timed-out mutation failed or repeat it.
     try:
+        timeout = 120 if payload and payload.get('step', {}).get('action') == 'row-action' else 90
         child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
                                input=json.dumps(payload) if payload is not None else None,
-                               capture_output=True, encoding='utf-8', timeout=90)
+                               capture_output=True, encoding='utf-8', timeout=timeout)
         receipt = json.loads(child.stdout)
         if not isinstance(receipt, dict) or 'status' not in receipt or child.returncode not in (0, 2, 3):
             raise ValueError()
@@ -401,7 +437,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'replay', 'tasks', 'show') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show') else supervise(args, argv)
 
 
 if __name__ == '__main__':
