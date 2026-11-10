@@ -44,7 +44,7 @@ def recognition_text(step):
     if isinstance(selection, dict):
         return {"matched": "선택값 기록 / 녹화 적용 확인", "mismatch": "선택값 기록 / 녹화 결과 다름",
                 "unavailable": "선택값 기록 / 녹화 적용 미확인"}.get(selection.get("result"), "선택값 보완 필요")
-    if kind == "element" and rec.get("reason") in {"combo_value_unobserved", "combo_option_click_required"}:
+    if kind == "element" and rec.get("reason") in {"combo_value_unobserved", "combo_option_click_required", "combo_option_value_unavailable"}:
         return "요소 확인 / 선택값 보완 필요"
     if kind == "manual" or step.get("action") == "manual":
         return "보완 필요"
@@ -92,6 +92,10 @@ def _safe_reason(error):
         "combo_option_ambiguous": "현재 목록에 입력값이 같은 항목이 둘 이상 있어 선택하지 않았습니다.",
         "combo_option_not_visible": "현재 콤보에서 요청한 값과 일치하는 보이는 항목을 찾지 못했습니다.",
         "combo_option_changed": "검사하는 동안 옵션이나 위치가 바뀌어 클릭하지 않았습니다.",
+        "combo_options_incomplete": "현재 목록을 끝까지 확인할 수 없어 옵션을 선택하지 않았습니다. 다른 팝업이 열려 있는지 확인하세요.",
+        "list_option_not_visible": "현재 화면에서 항목의 위치를 확인할 수 없습니다. 목록을 펼친 뒤 보이는 항목을 확인하세요.",
+        "point_occluded": "입력 지점이 다른 창에 가려졌습니다. 대상 창과 목록이 보이는지 확인하세요.",
+        "physical_input_busy": "마우스 버튼이나 보조 키가 눌려 있어 물리 입력을 중단했습니다.",
         "combo_selection_cancelled": "목록 선택을 취소했습니다. 취소한 옵션을 입력값으로 추정하지 않습니다.",
         "combo_selection_mismatch": "클릭한 옵션은 기록했지만 녹화 후 읽은 실제 값이 다릅니다. 선택값과 화면을 검토하세요. 재생 성공은 별도 결과 확인이 필요합니다.",
         "empty_combo_value_requires_review": "콤보 설정값이 비어 있어 입력을 보내지 않았습니다. 단계 수정에서 실제 값 또는 입력 변수와 기본값을 지정하고 새 수정본으로 저장하세요.",
@@ -924,10 +928,10 @@ class StepEditor(tk.Toplevel):
             if step.get("target", {}).get("kind") != "element":
                 step["target"] = {"kind": "manual", "locator": {}}
             step["expect"] = {"kind": "manual"}
-            if step.get("recognition", {}).get("reason") not in {"combo_value_unobserved", "combo_option_click_required"}:
+            if step.get("recognition", {}).get("reason") not in {"combo_value_unobserved", "combo_option_click_required", "combo_option_value_unavailable"}:
                 step["recognition"] = {"target": "identified" if step["target"]["kind"] == "element" else "manual",
                                        "action": "manual", "result": "manual", "reason": "사용자가 직접 수행하고 확인하는 단계입니다."}
-        elif step.get("recognition", {}).get("reason") in {"combo_value_unobserved", "combo_option_click_required"}:
+        elif step.get("recognition", {}).get("reason") in {"combo_value_unobserved", "combo_option_click_required", "combo_option_value_unavailable"}:
             step["recognition"] = {"target": "identified", "action": "configured", "result": "pending",
                                    "reason": "입력값을 보완했습니다. 실행 후 실제 선택값은 별도로 확인합니다."}
         if "selection" in step and (step["action"] != "set-value" or value != step["selection"]["value"]):

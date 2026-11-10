@@ -229,7 +229,10 @@ class TargetResolutionTests(unittest.TestCase):
     def test_direct_list_select_blocks_offscreen_or_empty_current_bounds_before_dispatch(self):
         args = SimpleNamespace(session='a'*32, ref='@snew:e1', action='select', value='N', headed=False)
         def response(prop, value):
-            return {'ok': True, 'data': {'ref': args.ref, 'property': prop, 'value': value}}
+            data = {'ref': args.ref, 'property': prop, 'value': value}
+            if prop == 'bounds':
+                data['live'] = True
+            return {'ok': True, 'data': data}
         for live in [[response('states', ['offscreen'])],
                      [response('states', []), response('bounds', {'width': 0, 'height': 12})]]:
             with self.subTest(live=live), \
@@ -240,6 +243,22 @@ class TargetResolutionTests(unittest.TestCase):
             self.assertEqual(result['diagnostic'], 'list_option_not_visible')
             self.assertIs(result['input_dispatched'], False)
             self.assertTrue(all(entry.args[0][0] == 'get' for entry in call.call_args_list))
+
+    def test_visible_option_accepts_pinned_engine_live_bounds_only(self):
+        # Shape observed on a real, passive WPF option with the bundled binary.
+        ref = '@sreadonly:e1'
+        states = {'property': 'states', 'ref': ref, 'value': ['selected', 'readonly']}
+        bounds = {'property': 'bounds', 'ref': ref, 'value': {'x': 537.0, 'y': 375.0, 'width': 410.0, 'height': 64.0}}
+        for live in [True, False, None]:
+            data = dict(bounds) if live is None else dict(bounds, live=live)
+            with self.subTest(live=live), patch.object(desktop.interact, '_write'), \
+                 patch.object(desktop.interact, '_call', return_value={'version': '2.6', 'ok': True, 'command': 'get', 'data': data}) as call:
+                if live is True:
+                    desktop.interact._check_visible_option(ref, states, Path('local'))
+                else:
+                    with self.assertRaisesRegex(desktop.EngineError, 'list_option_not_visible'):
+                        desktop.interact._check_visible_option(ref, states, Path('local'))
+                call.assert_called_once_with(['get', ref, '--property', 'bounds'], Path('local'))
 
     def test_visible_replay_uses_runtime_parameter_and_independent_readback(self):
         adapter = object.__new__(desktop.DesktopAdapter)

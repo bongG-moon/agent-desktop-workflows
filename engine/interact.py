@@ -158,6 +158,27 @@ def _secure(node):
     return bool(tokens & {"secure", "password", "protected"}) or node.get("role") == "password"
 
 
+def _check_visible_option(ref, state_data, run):
+    # The pinned get-states result omits a live marker. Its get-bounds result
+    # explicitly identifies a live UIA read, which a cached rectangle cannot prove.
+    states = state_data.get("value")
+    if (state_data.get("property") != "states" or state_data.get("ref") != ref
+            or state_data.get("live", True) is not True or not isinstance(states, list)
+            or not all(isinstance(state, str) for state in states)
+            or any(state in {"offscreen", "disabled", "hidden"} for state in states)):
+        raise EngineError("list_option_not_visible")
+    current = _call(["get", ref, "--property", "bounds"], run)
+    _write(run, "option-bounds.json", current)
+    data = current.get("data")
+    if (current.get("ok") is not True or not isinstance(data, dict) or data.get("ref") != ref
+            or data.get("property") != "bounds" or data.get("live") is not True):
+        raise EngineError("list_option_not_visible")
+    bounds = data.get("value")
+    if not isinstance(bounds, dict) or any(type(bounds.get(key)) not in (int, float)
+            or not 0 < bounds[key] < float("inf") for key in ("width", "height")):
+        raise EngineError("list_option_not_visible")
+
+
 def receipt(run, status, *, input_dispatched=False, delivery="not_delivered", read_only=False, diagnostic=None):
     result = {"version": VERSION, "status": status, "read_only": read_only,
         "input_dispatched": input_dispatched, "delivery": delivery,
@@ -412,17 +433,7 @@ def run_act(args):
         if _secure({"states": live.get("data", {}).get("value", [])}):
             raise EngineError("secure_target")
         if args.action == "select" and str(node.get("role", "")).replace("ControlType.", "").lower() in {"option", "listitem", "list item"}:
-            states = live["data"].get("value")
-            if not isinstance(states, list) or any(state in {"offscreen", "disabled", "hidden"} for state in states):
-                raise EngineError("list_option_not_visible")
-            current = _call(["get", args.ref, "--property", "bounds"], run)
-            _write(run, "option-bounds.json", current)
-            data = current.get("data", {})
-            bounds = data.get("value")
-            if (current.get("ok") is not True or data.get("ref") != args.ref or data.get("property") != "bounds"
-                    or not isinstance(bounds, dict) or any(type(bounds.get(key)) not in (int, float)
-                    or not 0 < bounds[key] < float("inf") for key in ("width", "height"))):
-                raise EngineError("list_option_not_visible")
+            _check_visible_option(args.ref, live["data"], run)
         _same_identity(session)
         # Validate executable/environment before recording the potential mutation boundary.
         observe.verify_binary()

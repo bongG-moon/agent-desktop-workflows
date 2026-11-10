@@ -178,10 +178,39 @@ sealed class PopupOptionPeer : ButtonAutomationPeer, ISelectionItemProvider, IVa
     void ISelectionItemProvider.RemoveFromSelection() { throw new InvalidOperationException("selection_required"); }
 }
 
+// WPF normally prunes an offscreen peer's entire subtree during hit testing.
+// Model a custom HWND provider that still returns the visible editor or arrow
+// at the pointer even when the parent reports IsOffscreen. The actual WPF
+// visual hit (including clipping and z-order) must be a child of that control.
+sealed class FixtureWindowPeer : WindowAutomationPeer {
+    internal FixtureWindowPeer(ComboPopupFixture owner) : base(owner) {}
+    internal string ProviderHitId(UIElement child) {
+        Rect bounds=UIElementAutomationPeer.CreatePeerForElement(child).GetBoundingRectangle();
+        var root=(IRawElementProviderFragmentRoot)ProviderFromPeer(this);
+        var hit=root.ElementProviderFromPoint(bounds.Left+bounds.Width/2,bounds.Top+bounds.Height/2);
+        return hit==null ? "" : ((IRawElementProviderSimple)hit).GetPropertyValue(AutomationElementIdentifiers.AutomationIdProperty.Id) as string;
+    }
+    protected override AutomationPeer GetPeerFromPointCore(Point screen) {
+        UIElement child=((ComboPopupFixture)Owner).HitVisibleChild(screen);
+        return child==null ? base.GetPeerFromPointCore(screen) : UIElementAutomationPeer.CreatePeerForElement(child);
+    }
+}
+
 sealed class ComboPopupFixture : Window {
     readonly JavaScriptSerializer json=new JavaScriptSerializer();
     readonly Dictionary<string,PopupCombo> controls=new Dictionary<string,PopupCombo>();
     readonly bool providerOnly;
+    protected override AutomationPeer OnCreateAutomationPeer() { return new FixtureWindowPeer(this); }
+    internal UIElement HitVisibleChild(Point screen) {
+        DependencyObject hit=InputHitTest(PointFromScreen(screen)) as DependencyObject;
+        while(hit!=null && hit!=this) {
+            foreach(var combo in controls.Values) {
+                if(!combo.Readable && (hit==combo.Editor || hit==combo.Arrow))return (UIElement)hit;
+            }
+            hit=hit is Visual ? VisualTreeHelper.GetParent(hit) : LogicalTreeHelper.GetParent(hit);
+        }
+        return null;
+    }
     internal ComboPopupFixture(bool passive) {
         providerOnly=passive;
         Title="Agent Desktop Workflows Synthetic Popup Combos";
@@ -227,6 +256,12 @@ sealed class ComboPopupFixture : Window {
                 else if(command=="activate")Activate();
                 // Used only by --provider-only to exercise real UIA peers while
                 // another application owns foreground. No desktop input is sent.
+                else if(providerOnly && command.StartsWith("provider-hit|")) {
+                    var combo=controls[command.Split('|')[1]];
+                    var peer=(FixtureWindowPeer)UIElementAutomationPeer.CreatePeerForElement(this);
+                    Console.WriteLine(json.Serialize(new { editor=peer.ProviderHitId(combo.Editor), arrow=peer.ProviderHitId(combo.Arrow) }));
+                    Console.Out.Flush(); return;
+                }
                 else if(providerOnly && command.StartsWith("provider-open|"))controls[command.Split('|')[1]].Open(false);
                 else if(providerOnly && command.StartsWith("provider-click|")) {
                     var parts=command.Split('|'); var combo=controls[parts[1]];

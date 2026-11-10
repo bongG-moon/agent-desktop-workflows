@@ -160,7 +160,12 @@ class Actor:
                 if uia.same(current, scoped_root):
                     break
                 current = uia.parent(current)
-            assert matched, 'fixture_target_moved'
+            # Report only known synthetic control identifiers and enum roles.
+            if not matched:
+                key = node['automation_id']
+                safe_key = key if re.fullmatch(r'Combo(Alpha|Beta|Gamma|Reject)(Open|OptionN)', key) else 'control'
+                raw_role = bridge.ROLES.get(actual.property(30003), 'unknown')
+                raise AssertionError('fixture_target_moved_' + safe_key + '_hit_' + raw_role)
         bridge.user32.SetCursorPos(x, y)
         if hover:
             time.sleep(hover)
@@ -246,6 +251,9 @@ def provider_case(work, key, expected, actor, fixture, report):
         [editor] = [n for n in closed if n['automation_id'] == key + 'Current']
         report(key + '_offscreen_parent_has_visible_empty_editor', parent['offscreen'] and parent['bounds_valid']
                and parent['value'] is None and not editor['offscreen'] and editor['value'] == '')
+        hit = fixture.command('provider-hit|' + key)
+        report(key + '_offscreen_field_provider_hits_real_children',
+               hit == {'editor': key + 'Current', 'arrow': key + 'Open'})
     stale = [node for node in closed if node['automation_id'] == key + 'CachedOptionN']
     report(key + '_collapsed_peer_has_value_but_no_bounds',
            len(stale) == 1 and stale[0]['offscreen'] and not stale[0]['bounds_valid']
@@ -410,7 +418,7 @@ def main():
         message = error.args[0] if error.args else None
         if isinstance(message, tuple) and message:
             message = message[0]
-        diagnostic = message if isinstance(message, str) and re.fullmatch(r'[a-z_]{1,80}', message) else type(error).__name__
+        diagnostic = message if isinstance(message, str) and re.fullmatch(r'[a-zA-Z0-9_]{1,100}', message) else type(error).__name__
         raise
     finally:
         fixture.close()
