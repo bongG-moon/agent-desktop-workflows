@@ -1,11 +1,14 @@
-# Desktop Select 0.5.2
+# Desktop Select 0.6.0
 
-Windows 화면에서 작업할 위치를 가리키고, 각 단계에 실행할 동작을 자유문장으로 적습니다. Claude Code가 설명과 현재 주변 요소를 해석해 콤보 설정, 버튼 실행, 표 우클릭 메뉴를 진행합니다.
+Windows 업무의 콤보와 버튼을 처음 한 번 확인해 재사용 Python 스킬로 만듭니다. 이후에는 실행 변수만 받아 같은 순서를 바로 실행합니다. 위치 녹화와 자유문장 편집, 표 우클릭 메뉴 재생도 유지합니다.
 
-[Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/tag/desktop-select-v0.5.2) | [사용 가이드](skills/desktop-select/사용가이드.md)
+[Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/tag/desktop-select-v0.6.0) | [사용 가이드](skills/desktop-select/사용가이드.md)
 
 ## 이번 버전에서 달라진 점
 
+- 반복 업무는 최초 등록 후 Python 실행 스킬로 저장합니다. 한 프로세스와 UIA 세션에서 필요한 ID만 직접 찾으며 매 단계 전체 화면 조사와 프로세스 시작을 없앴습니다.
+- 처음 등록할 때도 discover로 콤보/버튼/라벨만 읽습니다. 안정 ID가 있는 녹화 위치의 고유성 확인도 전체 트리 순회 대신 native UIA 조회를 사용합니다.
+- 등록된 콤보는 옵션 조사 없이 SetValue 1회와 값 읽기를 사용합니다. 버튼 Invoke와 명시적 대기를 순서대로 처리하고, 조회 실패 시 뒤의 엑셀 버튼을 누르지 않습니다.
 - 쓰기 가능한 콤보는 SetValue 1회와 실제 값 확인을 우선합니다. 옵션 미노출이나 불안정한 펼침/Select 때문에 이 경로를 막던 문제를 수정했습니다.
 - 자연어 실행안은 첫 전체 실행 성공 후 재사용합니다. 반복 실행마다 모델 해석과 JSON 작성을 요구하지 않으며 실행 변수와 실제 대상은 매번 새로 확인합니다.
 - 작은 라벨 그룹 근처를 가리켜도 상위 업무 영역의 콤보를 찾을 수 있게 했습니다. 기존 작업을 내용 변경 없이 편집·저장해도 원래 실행 방식을 유지합니다.
@@ -20,9 +23,9 @@ Windows 화면에서 작업할 위치를 가리키고, 각 단계에 실행할 �
 
 1. ZIP의 desktop-select 폴더 전체를 프로젝트의 `.claude/skills/`에 설치합니다. 64비트 Python 3.10 이상과 Tkinter가 필요합니다.
 2. Claude Code에 “desktop-select의 doctor로 설치 버전과 경로를 확인해 줘”라고 요청합니다.
-3. “FX 조회 내보내기 작업을 녹화해 줘”라고 요청하고 **대상 추가 (3초)**로 각 위치를 가리킵니다.
-4. 각 단계에 “MES SETUP 조건을 N으로 설정해 줘”, “실행할 때 입력받은 변수를 FAMILY 조건에 넣어 줘”처럼 적습니다. Family를 변수 칸에도 지정할 수 있습니다.
-5. **전체 저장** 후 “FX 조회 내보내기를 Family=Hybrid로 실행해 줘”라고 요청합니다. 수정할 때는 “그 작업을 편집해 줘”라고 요청합니다.
+3. “MES SETUP은 N으로 고정하고 FAMILY는 실행할 때 받아서 조회한 뒤, 5초 대기하고 엑셀 버튼을 누르는 Python 스킬로 등록해 줘”라고 요청합니다. 모델이 현재 화면과 ID를 한 번 확인합니다.
+4. 생성된 스킬 이름으로 “Family=Hybrid로 실행해 줘”라고 요청합니다. 또는 그 스킬 폴더에서 `python -X utf8 -B scripts/run.py --set "Family=Hybrid"`를 실행합니다.
+5. 위치를 가리켜 알려주거나 표 우클릭 메뉴가 필요한 작업은 기존 녹화를 사용합니다. 콤보와 버튼으로 된 기존 녹화도 원본을 보존하며 Python 스킬로 내보낼 수 있습니다.
 
 CUA MCP와 별도 시스템이며 CUA 드라이버나 추가 EXE를 설치하지 않습니다. 배포 ZIP은 Python 소스와 문서입니다. 별도 외부 모델 호출이나 정보 전송 기능은 없고, 자연어 해석은 현재 사용하는 Claude Code 모델이 담당합니다. 일반 Python 명령만으로 임의 자연어를 해석하는 내장 모델은 없습니다.
 

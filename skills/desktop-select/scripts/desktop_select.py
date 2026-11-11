@@ -267,6 +267,9 @@ def action(args, owner, *, learned=None, anchor=None):
 
 def run(args):
     bridge.set_dpi_awareness()
+    if args.command == 'register':
+        from registered_setup import register
+        return register(args)
     if args.command == 'doctor':
         from runtime_integrity import checked_path
         checked_path('win_bridge.py')
@@ -276,7 +279,8 @@ def run(args):
         return dict(status='observed', version=version, skill_path=str(here),
                     runtime_integrity='matched', input_dispatched=False,
                     capabilities=['position_recording', 'free_text_instructions', 'edit_delete_steps',
-                                  'model_resolution', 'provider_compatibility', 'auto_instruction_drafts'])
+                                  'model_resolution', 'provider_compatibility', 'auto_instruction_drafts',
+                                  'native_target_discovery', 'registered_python_workflows'])
     if args.command in ('tasks', 'show'):
         if args.command == 'tasks':
             return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
@@ -321,6 +325,9 @@ def run(args):
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
     binding = pick_window(rows, args.window, args.hwnd)
     owner = bridge.Binding(binding)
+    if args.command == 'discover':
+        from registered_setup import discover
+        return discover(owner, args.window, args.id)
     if args.command == 'record-rows':
         from row_action import teach_rows
         restore_for_action(owner, args.window)
@@ -435,12 +442,21 @@ def parser():
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('doctor', help='show installed version, path and compatibility capabilities')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
-    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'edit', 'replay', 'record-rows', 'row-status'):
+    register = commands.add_parser('register', help='verify IDs once and create a local Python workflow skill')
+    source = register.add_mutually_exclusive_group(required=True)
+    source.add_argument('--recipe', help='local registered workflow JSON')
+    source.add_argument('--task', help='existing recorded task to export without modifying it')
+    register.add_argument('--resolution', help='one-time interpreted actions for the recorded task')
+    register.add_argument('--out', required=True, help='new local skill folder beside desktop-select')
+    register.add_argument('--hwnd', type=int)
+    for verb in ('windows', 'discover', 'inspect', 'select', 'open', 'record', 'edit', 'replay', 'record-rows', 'row-status'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
         if verb != 'windows':
             s.add_argument('--window', required=True, help='exact business window title from windows')
             s.add_argument('--hwnd', type=int, help='disambiguate windows with identical titles')
+        if verb == 'discover':
+            s.add_argument('--id', action='append', default=[], help='query only these automation IDs')
         if verb in ('record', 'edit', 'replay', 'record-rows', 'row-status'):
             s.add_argument('--task', required=True, help='local task name')
         if verb == 'record-rows':
@@ -483,7 +499,7 @@ def worker(args):
 
 
 def result_code(result):
-    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed', 'completed_unverified'):
+    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'registered', 'completed', 'completed_unverified'):
         return 0
     return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review', 'needs_target', 'needs_instruction',
                                    'needs_interpretation') else 3

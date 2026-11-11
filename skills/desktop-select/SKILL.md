@@ -1,13 +1,21 @@
 ---
 name: desktop-select
-description: Windows 업무 창에서 위치를 가리키고 자유문장으로 작업을 가르친다. Claude Code가 저장된 설명과 현재 주변 요소를 해석해 콤보와 버튼, 표 우클릭 메뉴를 실행하며 작업을 편집하거나 삭제할 수 있다.
+description: Windows 업무 창의 콤보와 버튼을 처음 한 번 등록해 빠른 Python 실행 스킬로 만든다. 위치 녹화와 자유문장 편집, 표 우클릭 메뉴 재생도 지원한다.
 ---
 
 # Desktop Select
 
 선택한 Windows 업무 창만 로컬 Python으로 조작한다. CUA Driver, 별도 모델 서버 또는 외부 전송 서비스를 연결하지 않는다. 자연어 해석은 지금 사용 중인 Claude Code의 모델이 담당한다.
 
-먼저 `python -X utf8 -B scripts/desktop_select.py doctor`로 실제 실행 경로와 버전을 확인한다. 0.5.2은 위치 기록과 자유문장 편집을 지원한다. doctor 명령이 없는 설치본은 이전 버전이다. 업무 조작 요청을 처리하다가 스킬 코드를 현장에서 수정하는 방식으로 우회하지 않는다.
+처음 설치할 때 `python -X utf8 -B scripts/desktop_select.py doctor`로 실행 경로와 0.6.0 버전을 확인한다. 업무 조작 요청을 처리하다가 스킬 코드를 현장에서 수정하는 방식으로 우회하지 않는다.
+
+## 반복 업무는 한 번 등록하고 Python으로 실행
+
+사용자가 조회 조건과 버튼을 반복 실행하거나 실행 스킬로 저장하려는 경우 [등록형 Python 작업](references/registered-workflows.md)을 따른다. `discover`로 필요한 콤보/버튼/라벨만 읽고 사용자의 설명을 실제 ID와 한 번 연결한다. 모델이 로컬 recipe를 작성하고 `register --recipe <JSON> --out <새스킬폴더>`로 대상을 읽기 전용 확인한 뒤 재사용 스킬을 생성한다. 기존 녹화에서 가져올 때는 `register --task <작업명> --out <새스킬폴더>`를 쓴다.
+
+다음 실행부터는 생성된 스킬의 `scripts/run.py --set "Family=Hybrid"`를 한 번 호출한다. 매 실행 전에 doctor, discover, inspect, read-only를 반복하지 않는다. 한 실행 프로세스에서 ID로 대상을 직접 찾고 SetValue/Invoke를 한 번씩 전달한다. 쓰기 뒤 부모값/편집기/선택 항목을 다시 읽으며, 읽기 실패 후 다른 방식으로 입력을 반복하지 않는다. 작업의 고정값, 실행 변수와 요청한 순서를 보존한다. 조회 후 고정 대기가 필요하면 등록할 때 명시하고, 대기만으로 조회 완료를 주장하지 않는다.
+
+이 경로는 SetValue가 있는 콤보와 Invoke 버튼용이다. 표 우클릭 메뉴나 행 상태 확인은 아래 기존 녹화 기능을 사용한다. 사용자 요청 없이 우클릭 내보내기를 다른 엑셀 버튼으로 대체하지 않는다. 사용자에게 JSON이나 Python 작성을 요구하지 않는다.
 
 ## 위치와 설명을 가르치기
 

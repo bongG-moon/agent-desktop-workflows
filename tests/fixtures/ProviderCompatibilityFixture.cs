@@ -4,7 +4,11 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.IO.Packaging;
 using System.Runtime.InteropServices;
+using System.Security;
+using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows;
@@ -19,6 +23,8 @@ sealed class ProviderCompatibilityFixture : Form {
     internal Rectangle ScreenBounds;
     internal bool Minimized;
     internal int Opens;
+    internal int Exports, PropertyReads, Navigations, PatternReads, BoundsReads;
+    internal string HiddenKey, WorkbookPath, ResultState, ResultFamily;
     internal ProviderCompatibilityFixture() {
         Text = "Synthetic provider compatibility"; ClientSize = new System.Drawing.Size(660, 250);
         StartPosition = FormStartPosition.Manual; Location = new System.Drawing.Point(45, 45);
@@ -59,6 +65,50 @@ sealed class ProviderCompatibilityFixture : Form {
         Invalidate();
     }
     internal void RefreshDisplay() { if (!IsDisposed) BeginInvoke(new Action(Invalidate)); }
+    internal void CountPattern() { Interlocked.Increment(ref PatternReads); }
+    internal void CountProperty() { Interlocked.Increment(ref PropertyReads); }
+    internal void CountNavigation() { Interlocked.Increment(ref Navigations); }
+    internal void CountBounds() { Interlocked.Increment(ref BoundsReads); }
+    internal void Query() {
+        Interlocked.Increment(ref Opens);
+        ResultState=Combos["conditionState"].Current; ResultFamily=Combos["conditionFamily"].Current;
+    }
+    internal void Export() {
+        Interlocked.Increment(ref Exports);
+        if(String.IsNullOrEmpty(WorkbookPath))throw new InvalidOperationException("fixture_output_required");
+        const string ss="http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        const string rel="http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        using(var package=Package.Open(WorkbookPath,FileMode.Create,FileAccess.ReadWrite)) {
+            package.CreateRelationship(new Uri("xl/workbook.xml",UriKind.Relative),TargetMode.Internal,rel+"/officeDocument","rId1");
+            var book=package.CreatePart(new Uri("/xl/workbook.xml",UriKind.Relative),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml");
+            book.CreateRelationship(new Uri("worksheets/sheet1.xml",UriKind.Relative),TargetMode.Internal,rel+"/worksheet","rId1");
+            WritePart(book,"<workbook xmlns='"+ss+"' xmlns:r='"+rel+"'><sheets><sheet name='Results' sheetId='1' r:id='rId1'/></sheets></workbook>");
+            var sheet=package.CreatePart(new Uri("/xl/worksheets/sheet1.xml",UriKind.Relative),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml");
+            WritePart(sheet,"<worksheet xmlns='"+ss+"'><sheetData><row r='1'>"+Cell("A1","MES Setup")+
+                Cell("B1","Family")+Cell("C1","Generation")+"</row><row r='2'>"+Cell("A2",ResultState)+
+                Cell("B2",ResultFamily)+Cell("C2",Opens.ToString())+"</row></sheetData></worksheet>");
+        }
+    }
+    static void WritePart(PackagePart part,string text) {
+        using(var writer=new StreamWriter(part.GetStream(),new UTF8Encoding(false)))writer.Write(text);
+    }
+    static string Cell(string key,string value) {
+        return "<c r='"+key+"' t='inlineStr'><is><t>"+SecurityElement.Escape(value??"")+"</t></is></c>";
+    }
+    void ClearExtras() {
+        Root.Children.RemoveAll(delegate(RawPeer peer) { return peer.Id>=900; }); HiddenKey=null;
+    }
+    void AddClutter(int count) {
+        ClearExtras();
+        for(int group=0,number=0;number<count;group++) {
+            var peer=new RawPeer(this,Root,1000+group*400,"noiseGroup"+group,"Unrelated group",50026,new Rectangle(5,5,10,10));
+            for(int child=0;child<100 && number<count;child++,number++)
+                peer.Children.Add(new RawPeer(this,peer,1001+group*400+child,"noise"+number,"Unrelated field",50020,new Rectangle(5,5,5,5)));
+            Root.Children.Insert(group,peer);
+        }
+    }
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e);
         foreach (var peer in Root.Children) {
@@ -91,7 +141,8 @@ sealed class ProviderCompatibilityFixture : Form {
                 selects=model.Selects, mode=model.Mode, parent_value=model.Writes==0?"":model.Current };
         }
         Console.WriteLine(json.Serialize(new { kind=kind, title=Text, pid=Process.GetCurrentProcess().Id,
-            hwnd=Handle.ToInt64(), minimized=Minimized, opens=Opens, controls=values }));
+            hwnd=Handle.ToInt64(), minimized=Minimized, opens=Opens, exports=Exports, controls=values,
+            result_state=ResultState, result_family=ResultFamily }));
         Console.Out.Flush();
     }
     void Read() {
@@ -100,9 +151,29 @@ sealed class ProviderCompatibilityFixture : Form {
             string command=line;
             try { Invoke(new Action(delegate {
                 if(command=="quit") { Close(); return; }
-                if(command=="reset") { foreach(var model in Combos.Values)model.Reset(); Opens=0; }
+                if(command=="metrics") {
+                    Console.WriteLine(json.Serialize(new {kind="metrics",properties=PropertyReads,
+                        navigations=Navigations,patterns=PatternReads,bounds=BoundsReads}));
+                    Console.Out.Flush(); return;
+                }
+                if(command=="reset") { foreach(var model in Combos.Values)model.Reset(); Opens=Exports=0; ResultState=ResultFamily=""; HiddenKey=null; }
                 else if(command=="minimize")WindowState=FormWindowState.Minimized;
                 else if(command=="restore") { WindowState=FormWindowState.Normal; Activate(); }
+                else if(command.StartsWith("title|"))Text=command.Substring(6);
+                else if(command=="reset-metrics")PropertyReads=Navigations=PatternReads=BoundsReads=0;
+                else if(command=="clear-extra")ClearExtras();
+                else if(command.StartsWith("clutter|"))AddClutter(Int32.Parse(command.Substring(8)));
+                else if(command.StartsWith("hide|"))HiddenKey=command.Substring(5);
+                else if(command.StartsWith("duplicate|")) {
+                    string key=command.Substring(10); var original=Root.Children.Find(delegate(RawPeer p) { return p.Key==key; });
+                    var duplicate=new RawPeer(this,Root,900,key,original.Name,original.Role,original.Relative);
+                    duplicate.Combo=original.Combo; duplicate.Label=original.Label; Root.Children.Add(duplicate);
+                }
+                else if(command.StartsWith("export-path|")) {
+                    WorkbookPath=command.Substring(12);
+                    if(!Root.Children.Exists(delegate(RawPeer p) { return p.Key=="ExportCommand"; }))
+                        Root.Children.Add(new RawPeer(this,Root,60,"ExportCommand","Excel",50000,new Rectangle(360,165,150,34)));
+                }
                 else if(command.StartsWith("mode|")) { var parts=command.Split('|'); Combos[parts[1]].Mode=parts[2]; }
                 RefreshBounds(); Emit(command=="state"?"state":"updated");
             })); } catch { return; }
@@ -160,6 +231,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         get { return Parent==null ? AutomationInteropProvider.HostProviderFromHandle(Host.Handle) : null; }
     }
     public object GetPatternProvider(int id) {
+        Host.CountPattern();
         if (id==10002 && ValueSupported)return this;
         if (id==10001 && Role==50003 && SelectionAvailable)return this;
         if (id==10005 && Role==50003)return this;
@@ -175,6 +247,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     bool LegacyEnabled { get { return Combo!=null && (Combo.Mode=="legacy-all" ||
         (Role==50007 && Combo.Mode=="legacy-option")); } }
     public object GetPropertyValue(int id) {
+        Host.CountProperty();
         switch(id) {
             case 30002: return Process.GetCurrentProcess().Id;
             case 30003: return Role;
@@ -209,6 +282,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         return null;
     }
     public IRawElementProviderFragment Navigate(NavigateDirection dir) {
+        Host.CountNavigation();
         if(dir==NavigateDirection.Parent)return Parent;
         var children=NavigableChildren();
         if(dir==NavigateDirection.FirstChild)return children.Count==0?null:children[0];
@@ -221,12 +295,13 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     List<RawPeer> NavigableChildren() {
         var result=new List<RawPeer>();
         foreach(var child in Children)
-            if(!(Combo!=null && Combo.Mode=="no-options-blank-before" && child.Role==50007))result.Add(child);
+            if(child.Key!=Host.HiddenKey && !(Combo!=null && Combo.Mode=="no-options-blank-before" && child.Role==50007))result.Add(child);
         return result;
     }
     public int[] GetRuntimeId() { return Parent==null ? null : new[] { AutomationInteropProvider.AppendRuntimeId, Id }; }
     public Rect BoundingRectangle {
         get {
+            Host.CountBounds();
             var host=Host.ScreenBounds;
             if(host.Width==0 || host.Height==0)return Rect.Empty;
             if(Parent==null)return new Rect(host.X,host.Y,host.Width,host.Height);
@@ -289,7 +364,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     }
     void ISelectionItemProvider.AddToSelection() { ((ISelectionItemProvider)this).Select(); }
     void ISelectionItemProvider.RemoveFromSelection() { throw new InvalidOperationException(); }
-    void IInvokeProvider.Invoke() { Host.Opens++; }
+    void IInvokeProvider.Invoke() { if(Key=="ExportCommand")Host.Export(); else Host.Query(); }
     void IFixtureLegacyProvider.Select(int flags) { throw new InvalidOperationException("legacy_readonly"); }
     void IFixtureLegacyProvider.DoDefaultAction() { throw new InvalidOperationException("legacy_readonly"); }
     void IFixtureLegacyProvider.SetValue(string value) { throw new InvalidOperationException("legacy_readonly"); }

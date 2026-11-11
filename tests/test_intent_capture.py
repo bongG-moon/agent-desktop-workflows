@@ -11,9 +11,66 @@ import desktop_select
 import intent_capture as capture
 import intent_tasks
 import learned_tasks as tasks
+import native_targets
 
 
 class IntentCaptureTests(unittest.TestCase):
+    def anchor_context(self, identifier=True):
+        root, target, binding, uia = Mock(), Mock(), Mock(pid=7), Mock()
+        target.property.side_effect = lambda key: {30003: 50000, 30010: True, 30005: '조회'}.get(key)
+        uia.combo_observation.return_value = None
+        uia.from_handle.return_value = root
+        uia.within.return_value = True
+        uia.same.side_effect = lambda a, b: a is b
+        uia.pid.return_value = 7
+        uia.secure.return_value = False
+        uia.semantic_label.return_value = {}
+        uia.parent.side_effect = lambda item: root if item is target else None
+        selector = {'role': 'button', 'automation_id': 'Query'} if identifier else {'role': 'button', 'name': '조회'}
+        uia.locator.side_effect = lambda item, _: selector if item is target else {'role': 'window', 'name': 'Business'}
+        return binding, uia, root, target
+
+    def test_stable_id_anchor_uses_native_query_without_full_tree_walk(self):
+        binding, uia, root, target = self.anchor_context()
+        uia.children.side_effect = AssertionError('whole-window walk')
+        with patch.object(capture, 'visible', return_value=True), \
+                patch.object(native_targets, 'ancestry', return_value=[target, root]), \
+                patch.object(native_targets, 'resolve', return_value=target) as resolve:
+            result = capture.anchor_from_observation(binding, uia, {'element': target}, (10, 10))
+        self.assertEqual(result, {'anchor': {'role': 'button', 'automation_id': 'Query'}, 'label': '조회'})
+        resolve.assert_called_once_with(binding, uia, {'role': 'button', 'automation_id': 'Query'}, root=root)
+        uia.children.assert_not_called()
+
+    def test_duplicate_or_changed_native_anchor_is_not_saved(self):
+        for result in ('duplicate', 'changed'):
+            binding, uia, root, target = self.anchor_context()
+            native = {'side_effect': capture.bridge.BridgeError('target_ambiguous')} if result == 'duplicate' else {
+                'return_value': Mock()}
+            with patch.object(capture, 'visible', return_value=True), \
+                    patch.object(native_targets, 'ancestry', return_value=[target, root]), \
+                    patch.object(native_targets, 'resolve', **native), \
+                    self.assertRaisesRegex(capture.bridge.BridgeError, '^target_position_ambiguous$'):
+                capture.anchor_from_observation(binding, uia, {'element': target}, (10, 10))
+
+    def test_name_only_anchor_retains_bounded_identity_walk(self):
+        binding, uia, root, target = self.anchor_context(identifier=False)
+        root.property.side_effect = lambda key: {30003: 50032}.get(key)
+        uia.children.side_effect = lambda item: iter([target] if item is root else [])
+        with patch.object(capture, 'visible', return_value=True), \
+                patch.object(native_targets, 'ancestry', return_value=[target, root]), \
+                patch.object(native_targets, 'resolve', side_effect=AssertionError('ID required')):
+            result = capture.anchor_from_observation(binding, uia, {'element': target}, (10, 10))
+        self.assertEqual(result['anchor'], {'role': 'button', 'name': '조회'})
+        self.assertEqual(uia.children.call_count, 2)
+
+    def test_raw_protected_ancestor_blocks_before_locator_or_label_read(self):
+        binding, uia, root, target = self.anchor_context()
+        with patch.object(native_targets, 'ancestry', side_effect=capture.bridge.BridgeError('target_protected')), \
+                self.assertRaisesRegex(capture.bridge.BridgeError, '^protected_target_position$'):
+            capture.anchor_from_observation(binding, uia, {'element': target}, (10, 10))
+        uia.locator.assert_not_called()
+        uia.semantic_label.assert_not_called()
+
     def executable_steps(self):
         return [
             {'action': 'select', 'role': 'combobox', 'match': 'automation_id', 'target': 'state',

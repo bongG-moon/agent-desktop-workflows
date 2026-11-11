@@ -203,15 +203,13 @@ def anchor_from_observation(binding, uia, observation, point):
     if root is None or not uia.within(current, root):
         raise bridge.BridgeError('target_position_outside_window')
     # Do not collect a label below a protected or foreign ancestor.
-    ancestor = current
-    for _ in range(32):
-        if ancestor is None or uia.pid(ancestor) != binding.pid or uia.secure(ancestor):
-            raise bridge.BridgeError('protected_target_position')
-        if uia.same(ancestor, root):
-            break
-        ancestor = uia.parent(ancestor)
-    else:
-        raise bridge.BridgeError('target_position_unavailable')
+    from native_targets import ancestry
+    try:
+        ancestry(uia, current, root, pid=binding.pid)
+    except bridge.BridgeError as error:
+        if error.code in {'target_protected', 'target_owner_mismatch', 'target_outside_window'}:
+            raise bridge.BridgeError('protected_target_position') from error
+        raise
     for _ in range(24):
         if current is None or uia.same(current, root):
             break
@@ -225,20 +223,31 @@ def anchor_from_observation(binding, uia, observation, point):
                 shown = visible(binding, uia, current, root)
             if not shown or current.property(30010) is not True:
                 raise bridge.BridgeError('target_position_not_visible')
-            # A complete identity-only traversal ensures that the anchor is
-            # unique. No recorded path/handle or chosen option is persisted.
-            hits, pending, visited = [], deque([(root, 0)]), 0
-            while pending:
-                item, depth = pending.popleft()
-                visited += 1
-                if visited > 2500 or depth > 18 or uia.pid(item) != binding.pid:
-                    raise bridge.BridgeError('target_position_tree_incomplete')
-                if uia.secure(item):
-                    continue
-                if (bridge.ROLES.get(item.property(30003)) == selector['role']
-                        and bridge.match_locator(uia.locator(item, root), selector)):
-                    hits.append(item)
-                pending.extend((child, depth + 1) for child in uia.children(item))
+            # Known IDs need only a native property query. Name-only anchors
+            # retain the existing bounded traversal; no path/handle is saved.
+            if selector.get('automation_id'):
+                from native_targets import resolve as resolve_native
+                native_selector = {key: selector[key] for key in ('automation_id', 'role', 'ancestors')
+                                   if key in selector}
+                try:
+                    hits = [resolve_native(binding, uia, native_selector, root=root)]
+                except bridge.BridgeError as error:
+                    if error.code in {'target_ambiguous', 'target_missing'}:
+                        raise bridge.BridgeError('target_position_ambiguous') from error
+                    raise
+            else:
+                hits, pending, visited = [], deque([(root, 0)]), 0
+                while pending:
+                    item, depth = pending.popleft()
+                    visited += 1
+                    if visited > 2500 or depth > 18 or uia.pid(item) != binding.pid:
+                        raise bridge.BridgeError('target_position_tree_incomplete')
+                    if uia.secure(item):
+                        continue
+                    if (bridge.ROLES.get(item.property(30003)) == selector['role']
+                            and bridge.match_locator(uia.locator(item, root), selector)):
+                        hits.append(item)
+                    pending.extend((child, depth + 1) for child in uia.children(item))
             if len(hits) != 1 or not uia.same(hits[0], current):
                 raise bridge.BridgeError('target_position_ambiguous')
             if role in REGIONS:
