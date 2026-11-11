@@ -58,6 +58,7 @@ class NearbyTests(unittest.TestCase):
                 sent.append(True)
             with self.subTest(nearby=nearby), patch.object(app, 'guard'), patch.object(app, 'observe',
                     return_value=(self.screen, elements)), patch.object(app.bridge, 'UIA', return_value=uia), \
+                    patch.object(app.visibility, 'restore_for_action'), \
                     patch.object(app, 'add_display_properties'), patch.object(app, 'execute', side_effect=execute):
                 with self.assertRaisesRegex(app.tasks.TaskError, 'recorded_label_changed'):
                     app.action(args, owner, learned=None if nearby else step, anchor=step if nearby else None)

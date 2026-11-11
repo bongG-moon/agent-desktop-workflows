@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import importlib.util
-from pathlib import Path
 import queue
 import threading
 import time
@@ -14,17 +12,11 @@ import uuid
 import win_bridge as bridge
 from live_action import combo_readback
 import learned_tasks
+from runtime_integrity import checked_path
 
 
 def _load_recorder():
-    here = Path(__file__).resolve()
-    path = here.with_name('recorder.py')
-    if (not path.exists() and here.parents[2].name == 'skills'
-            and (here.parents[3] / 'engine/bridge-manifest.json').is_file()):
-        path = here.parents[3] / 'scripts/recorder.py'
-    expected = 'c26af522a42426988a7fcefdfb4c48366164d7dccca7a5e88796ed6246654086'
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-        raise bridge.BridgeError('recorder_incomplete')
+    path = checked_path('recorder.py')
     spec = importlib.util.spec_from_file_location('_desktop_select_recorder', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -46,6 +38,17 @@ def capture_step(step):
     target = step['target']
     locator = target.get('locator', {})
     action, role = step['action'], locator.get('role')
+    # A known combo with an unreadable value still teaches its location. Its
+    # intended value is supplied later by the user's instruction, not guessed.
+    if (action == 'manual' and role == 'combobox' and target.get('kind') == 'element'
+            and 'window' not in target and recorder._locator_valid(locator)
+            and step.get('recognition', {}).get('target') == 'identified'
+            and step.get('recognition', {}).get('reason') in {
+                'combo_value_unobserved', 'combo_choice_unproven', 'combo_option_click_required',
+                'value_readback_unavailable', 'value_before_transition_unproven'}):
+        step = dict(step, action='teach-target', recognition={'target': 'identified',
+                    'action': 'requires_instruction', 'result': 'manual', 'reason': 'combo_choice_unproven'})
+        action = 'teach-target'
     pointed = (action == 'teach-target' and role == 'combobox' and 'window' not in target
                and step.get('recognition') == {'target': 'identified', 'action': 'requires_instruction',
                                                'result': 'manual', 'reason': 'combo_choice_unproven'})
@@ -115,9 +118,9 @@ def default_text(step):
     if step['action'] == 'teach-target':
         return ''
     if command['action'] == 'select':
-        return f"{field} 값 {command['value']} 선택"
+        return f"이 항목을 {command['value']}로 설정"
     if command['action'] == 'open':
-        return field + (' 펼치기' if command.get('expand') else ' 선택')
+        return '이 항목을 ' + ('펼쳐줘' if command.get('expand') else '선택해줘')
     return ''
 
 
@@ -144,6 +147,7 @@ class StepEdits:
     """Bind compiler-checked instructions to demonstrated identities across revisions."""
     def __init__(self):
         self.edits = {}
+        self.drafts = {}
 
     @staticmethod
     def identity(step):
@@ -151,8 +155,16 @@ class StepEdits:
             return step['action'], step['row'], step['label']
         if step['action'] == 'result-menu':
             return step['action'], step['context'], step['label']
-        return (step['action'], step['target'], step.get('recognition', {}).get('reason') if
-                step['action'] == 'manual' else None)
+        target = step['target']
+        locator = target.get('locator', {})
+        identity = learned_tasks._selector(locator)
+        if identity is None:
+            return step['action'], target, step.get('recognition', {}).get('reason')
+        # Runtime handles, screen coordinates and duplicated peer names vary
+        # while one clicked field settles. They are not the recorded identity.
+        action = 'combo' if identity['role'] == 'combobox' else step['action']
+        return (action, identity, [learned_tasks._selector(p) for p in locator.get('ancestors', [])],
+                target.get('window'))
 
     def compile(self, step, alias, sentence, mode=None, argument=None):
         alias = alias.strip()
@@ -168,6 +180,7 @@ class StepEdits:
         return data
 
     def store(self, step, alias, sentence, mode=None, argument=None):
+        self.drafts[step['id']] = (self.identity(step), (alias, sentence, mode, argument))
         data = self.compile(step, alias, sentence, mode, argument)
         self.edits[step['id']] = (self.identity(step), data, (sentence, mode, argument))
 
@@ -176,16 +189,33 @@ class StepEdits:
         return saved[1] if saved and saved[0] == self.identity(step) else {}
 
     def form(self, step):
+        draft = self.drafts.get(step['id'])
+        if draft and draft[0] == self.identity(step):
+            return draft[1][1:]
         saved = self.edits.get(step['id'])
-        return saved[2] if saved and saved[0] == self.identity(step) else ('', None, '')
+        return saved[2] if saved and saved[0] == self.identity(step) else (default_text(step), None, '')
+
+    def forget(self, step_id):
+        self.edits.pop(step_id, None)
+        self.drafts.pop(step_id, None)
+
+    def alias(self, step):
+        draft = self.drafts.get(step['id'])
+        return draft[1][0] if draft and draft[0] == self.identity(step) else self.get(step).get('alias', '')
 
     def apply(self, steps):
         result = []
+        self.failed_step = None
         for step in steps:
             saved = self.get(step)
-            if saved:
+            draft = self.drafts.get(step['id'])
+            if saved or (draft and draft[0] == self.identity(step)):
                 sentence, mode, argument = self.form(step)
-                saved = self.compile(step, saved.get('alias', ''), sentence, mode, argument)
+                try:
+                    saved = self.compile(step, self.alias(step), sentence, mode, argument)
+                except ValueError:
+                    self.failed_step = step['id']
+                    raise
             result.append(dict(step, **saved))
         return result
 
@@ -203,6 +233,41 @@ class _BoundWindow:
             raise bridge.BridgeError('business_window_changed')
 
 
+class _CaptureUIA(bridge.UIA):
+    """Compatibility reads local to this recorder, leaving the pinned core intact."""
+    def __init__(self, binding):
+        super().__init__()
+        self.binding = binding
+
+    def value_observation(self, element):
+        from provider_values import value_observation
+        return value_observation(self, element)
+
+    def node(self, element, root, path='0', parent=''):
+        from provider_visibility import visible
+        node = super().node(element, root, path, parent)
+        node['offscreen'] = not visible(self.binding, self, element, root)
+        return node
+
+    def semantic_label(self, element, root):
+        from desktop_select import field_label
+        try:
+            return field_label(self.binding, self, element, root)
+        except (bridge.BridgeError, ValueError):
+            return {}  # A missing display label does not discard a known locator.
+
+
+class _CaptureBridge:
+    def __init__(self, binding):
+        self.binding = binding
+
+    def __getattr__(self, name):
+        return getattr(bridge, name)
+
+    def UIA(self):
+        return _CaptureUIA(self.binding)
+
+
 class _Worker(recorder.CaptureWorker):
     pointed = None
 
@@ -212,7 +277,8 @@ class _Worker(recorder.CaptureWorker):
 
     def _emit_point(self):
         obs = self.watched
-        if (not self.pointed or obs is not self.pointed or self.watched_step or self.watched_selection
+        if (not self.pointed or obs is not self.pointed
+                or (self.watched_step and self.watched_step['action'] != 'teach-target') or self.watched_selection
                 or obs['window'] != self.binding.hwnd or obs['node'].get('role') != 'combobox'
                 or obs['node'].get('secure') is not False or obs['node'].get('enabled') is not True):
             return False
@@ -220,13 +286,16 @@ class _Worker(recorder.CaptureWorker):
         locator = obs['node'].get('locator')
         if self.uia.secure(obs['element']) or not recorder._locator_valid(locator):
             return False
-        try:
-            current = bridge._current_combo(self.binding, self.uia, locator)
-        except bridge.BridgeError:
-            return False
-        if not self.uia.same(current['element'], obs['element']):
-            return False
+        if not self.watched_step:
+            try:
+                current = bridge._current_combo(self.binding, self.uia, locator)
+            except bridge.BridgeError:
+                return False
+            if not self.uia.same(current['element'], obs['element']):
+                return False
         step = self.step('teach-target', obs)
+        if self.watched_step:
+            step['id'] = self.watched_step['id']
         step['recognition'] = {'target': 'identified', 'action': 'requires_instruction',
                                'result': 'manual', 'reason': 'combo_choice_unproven'}
         self.model.add(step)
@@ -263,7 +332,7 @@ class _Worker(recorder.CaptureWorker):
     def _commit_value(self, current):
         # An unchanged or unreadable collapsed value after a mere field click
         # cannot teach a selection. A witnessed option click retains its intent.
-        if self.watched_selection is None and not self.watched_step:
+        if self.watched_selection is None and (not self.watched_step or self.watched_step['action'] == 'teach-target'):
             if not current or current == self.watched_value:
                 return self._unobserved_combo('combo_choice_unproven')
             observed = combo_readback(self.binding, self.uia, self.watched['element'])
@@ -285,7 +354,8 @@ class _Worker(recorder.CaptureWorker):
                 break
             role = bridge.ROLES.get(item.property(30003))
             if role in {'button', 'splitbutton', 'menuitem', 'treeitem', 'tab', 'hyperlink'}:
-                if (item.property(30010) is not True or item.property(30022) is not False
+                from provider_visibility import visible
+                if (item.property(30010) is not True or not visible(self.binding, self.uia, item, root)
                         or not self.uia.within(item, root)
                         or not recorder._inside(self.uia.bounds(item), event.get('x'), event.get('y'))):
                     break
@@ -321,6 +391,19 @@ class _Worker(recorder.CaptureWorker):
         step = super().capture_action(event, observation)
         if pointed and self.watched and self.uia.same(pointed['element'], self.watched['element']):
             self.pointed = self.watched
+            # Store the clicked field immediately. Reading the selected value
+            # can later refine this same step, but is not a prerequisite to
+            # teaching a location for an explicit instruction.
+            if (self.watched_step is None and self.watched['window'] == self.binding.hwnd
+                    and self.watched['node'].get('secure') is False
+                    and self.watched['node'].get('enabled') is True
+                    and recorder._locator_valid(self.watched['node'].get('locator'))):
+                point = self.step('teach-target', self.watched)
+                point['recognition'] = {'target': 'identified', 'action': 'requires_instruction',
+                                        'result': 'manual', 'reason': 'combo_choice_unproven'}
+                self.model.add(point)
+                self.watched_step = point
+                return point['id']
         return step
 
 
@@ -329,7 +412,7 @@ class CaptureSession:
         self.binding = _BoundWindow(binding, title)
         self.notes = CaptureNotes()
         self.events, self.notices = queue.Queue(maxsize=128), queue.Queue()
-        self.worker = _Worker(self.binding, bridge, self.notes, self.events, self.notices)
+        self.worker = _Worker(self.binding, _CaptureBridge(self.binding), self.notes, self.events, self.notices)
         self.pump = recorder.HookPump(self.binding, bridge, self.events, self.notices)
         self.started = self.ended = False
 
@@ -419,7 +502,7 @@ def capture(binding, *, title):
     edits = StepEdits()
     completed_steps = []
     previous_columns = None
-    message = tk.StringVar(value='시작을 누르고 업무 창에서 작업하세요. 끝나면 이 창으로 돌아오세요.')
+    message = tk.StringVar(value='시작 후 사용할 콤보나 버튼을 눌러 위치를 알려 주세요. 끝나면 실행할 동작과 변수를 입력하세요.')
     frame = ttk.Frame(root, padding=14)
     frame.pack(fill='both', expand=True)
     ttk.Label(frame, text=title, wraplength=460).pack(anchor='w')
@@ -471,7 +554,8 @@ def capture(binding, *, title):
 
     def show_error(exc):
         if isinstance(exc, learned_tasks.TaskError):
-            reason = {'instruction_target_mismatch': '입력한 문장의 대상이 녹화한 요소와 다릅니다.',
+            reason = {'instruction_target_mismatch': '화면 이름이 다르면 ‘문장의 이름을 이 대상에 연결’을 누르세요. 또는 ‘이 항목을 N으로 설정’처럼 입력하세요.',
+                      'instruction_target_unavailable': '이 단계에는 사용할 대상이 없습니다. 이 단계를 삭제하고 해당 콤보나 버튼의 위치를 다시 녹화하세요.',
                       'instruction_requires_structure': '콤보 값 지정에서 고정값이나 필수 변수를 선택하고 값을 입력하세요.',
                       'invalid_step_alias': '다른 별칭을 입력하세요.'}.get(
                           exc.code, '이 단계에서 실행할 수 있는 문장과 값을 입력하세요.')
@@ -503,7 +587,7 @@ def capture(binding, *, title):
         configured = step['action'] in ('row-action', 'result-menu')
         form.children['instruction'].configure(state='readonly' if configured else 'normal')
         mode_box.configure(state='disabled' if configured else 'readonly')
-        alias.set(edits.get(step).get('alias', ''))
+        alias.set(edits.alias(step))
         instruction.set(step['label'] if configured else sentence)
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
@@ -515,14 +599,17 @@ def capture(binding, *, title):
         if not selected or (editing and editing['id'] == selected[0]):
             return
         if not flush():
-            listing.selection_set(editing['id'])
-            return
+            message.set('작성 중인 문장은 초안으로 보존했습니다. 저장 전 실행할 값이나 변수를 지정하세요.')
         editing = next((step for step in steps_now() if step['id'] == selected[0]), None)
         if editing is not None:
             load(editing)
 
     def render(steps):
         nonlocal editing
+        keep = {step['id'] for step in steps}
+        for row_id in listing.get_children():
+            if row_id not in keep:
+                listing.delete(row_id)
         for i, step in enumerate(steps, 1):
             saved = edits.get(step)
             if editing is not None and step['id'] == editing['id'] and editing != step:
@@ -548,11 +635,56 @@ def capture(binding, *, title):
             render(steps_now())
             refresh_preview()
 
+    def apply_next():
+        if not flush():
+            return
+        steps = steps_now()
+        render(steps)
+        index = next((i for i, step in enumerate(steps) if editing and step['id'] == editing['id']), -1)
+        if 0 <= index < len(steps) - 1:
+            listing.selection_set(steps[index + 1]['id'])
+            listing.see(steps[index + 1]['id'])
+        else:
+            message.set('마지막 단계까지 적용했습니다. 마치고 검토한 뒤 저장하세요.' if review is None else '마지막 단계까지 적용했습니다. 저장을 누르면 완료됩니다.')
+
+    def link_subject():
+        if editing is None:
+            return
+        subject = learned_tasks.instruction_subject(instruction.get())
+        if not subject:
+            preview.set('문장의 이름을 찾지 못했습니다. 단계 별칭에 화면 이름을 직접 입력하세요.')
+            return
+        alias.set(subject)
+        apply_text()
+
+    def delete_step():
+        nonlocal editing
+        if editing is None:
+            return
+        if review is None:
+            message.set('마치고 검토를 누른 뒤 불필요한 단계를 삭제하세요.')
+            return
+        removed = editing['id']
+        review['steps'][:] = [step for step in review['steps'] if step['id'] != removed]
+        edits.forget(removed)
+        editing = None
+        alias.set('')
+        instruction.set('')
+        argument.set('')
+        preview.set('')
+        render(review['steps'])
+        message.set('선택한 단계를 삭제했습니다. 남은 단계를 확인하고 저장하세요.')
+
     listing.bind('<<TreeviewSelect>>', select_row)
     for variable in (alias, instruction, mode, argument):
         variable.trace_add('write', refresh_preview)
     refresh_preview()
     ttk.Button(form, text='동작 적용', command=apply_text).grid(row=0, column=2, rowspan=2, padx=6)
+    editing_controls = ttk.Frame(form)
+    editing_controls.grid(row=4, column=0, columnspan=3, sticky='w', pady=(6, 2))
+    for label, callback in [('적용하고 다음 단계', apply_next), ('문장의 이름을 이 대상에 연결', link_subject),
+                            ('선택 단계 삭제', delete_step)]:
+        ttk.Button(editing_controls, text=label, command=callback).pack(side='left', padx=(0, 5))
 
     def start(*_):
         nonlocal result
@@ -633,9 +765,15 @@ def capture(binding, *, title):
         nonlocal result
         if review is None or not flush():
             return
+        if not review['steps']:
+            message.set('저장할 단계가 없습니다. 취소 후 필요한 위치를 다시 녹화하세요.')
+            return
         try:
             final_steps = edits.apply(review['steps'])
         except ValueError as exc:
+            if edits.failed_step and listing.exists(edits.failed_step):
+                listing.selection_set(edits.failed_step)
+                listing.see(edits.failed_step)
             show_error(exc)
             return
         result = dict(review, steps=final_steps)

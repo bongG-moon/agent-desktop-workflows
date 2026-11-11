@@ -5,6 +5,8 @@ import re
 import time
 
 import win_bridge as win
+import provider_values
+import provider_visibility
 
 
 # UIAutomationClient.idl: each of these methods is slot 3 after IUnknown.
@@ -16,6 +18,7 @@ PATTERNS = {
 }
 READBACK_SECONDS = .6
 OPEN_SECONDS = 1.2
+VALUE_SETTLE_SECONDS = .35
 
 
 def _call(element, method, value, authorize, dispatching):
@@ -53,14 +56,16 @@ def _require(ok, reason):
         raise win.BridgeError(reason)
 
 
-def _visible(uia, item):
+def _visible(uia, item, binding=None, root=None):
+    if binding is not None:
+        return provider_visibility.visible(binding, uia, item, root)
     bounds = uia.bounds(item)
     return item.property(30022) is False and bounds['width'] > 0 and bounds['height'] > 0
 
 
 def _combo_visible(binding, uia, combo, root):
-    if combo.property(30022) is False:
-        return _visible(uia, combo)
+    if combo.property(30022) in (False, None):
+        return _visible(uia, combo, binding, root)
     box, window = uia.bounds(combo), uia.bounds(root)
     for axis, size in (('x', 'width'), ('y', 'height')):
         if (box[size] <= 0 or window[size] <= 0 or
@@ -79,7 +84,7 @@ def _combo_visible(binding, uia, combo, root):
         role = child.property(30003)
         if role in (50025, 50026, 50033):
             pending.extend((c, depth + 1) for c in uia.children(child))
-        elif (role in (50004, 50000) and child.property(30010) is True and _visible(uia, child)
+        elif (role in (50004, 50000) and child.property(30010) is True and _visible(uia, child, binding, root)
               and uia.within(child, combo)):
             child_box = uia.bounds(child)
             if all(box[axis] <= child_box[axis] and child_box[axis] + child_box[size] <= box[axis] + box[size]
@@ -111,7 +116,7 @@ def combo_readback(binding, uia, element):
             return uia._selected_option_observation(item)
 
     try:
-        result = win.UIA.value_observation(ScopedReader(), element)
+        result = provider_values.value_observation(ScopedReader(), element)
     except win.BridgeError as error:
         if error.code not in {'accessibility_unavailable', 'element_disappeared'}:
             raise
@@ -175,8 +180,8 @@ def _options(binding, uia, combo, wanted):
     return code, matches
 
 
-def _visible_choice(uia, matches):
-    visible = [item for item in matches if _visible(uia, item)]
+def _visible_choice(uia, matches, binding=None):
+    visible = [item for item in matches if _visible(uia, item, binding)]
     _require(len(visible) < 2, 'combo_option_ambiguous')
     if visible:
         _require(visible[0].property(30010) is True, 'combo_option_disabled')
@@ -237,6 +242,23 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
             _require(role == 'combobox', 'combo_required')
             _require(isinstance(value, str) and value.strip() and '\0' not in value
                      and len(value.encode('utf-8')) <= 10000, 'invalid_combo_value')
+            if 'SetValue' in uia.actions(element):
+                # Writable custom combos need neither visible option peers nor
+                # a truthful ExpandCollapse state. The caller supplies a literal
+                # value; a single write is followed by independent readback.
+                def direct_write_guard():
+                    check_target()
+                    _require('SetValue' in uia.actions(element), 'combo_value_not_writable')
+                send(element, 'SetValue', direct_write_guard, value)
+                verifying = True
+                time.sleep(VALUE_SETTLE_SECONDS)
+                check_target()
+                matched = read_value()
+                if matched is True:
+                    return receipt('verified', 'current_state_matched', 'matched')
+                if matched is False:
+                    return receipt('mismatch', 'current_state_mismatch', 'mismatch')
+                return receipt('delivered_unverified', 'current_state_unavailable')
             try:
                 code, matches = _options(binding, uia, element, value)
             except win.BridgeError as error:
@@ -250,7 +272,7 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
                 check_target()
                 if read_value() is True:
                     return receipt('verified', 'value_already_selected', 'matched')
-            choice = _visible_choice(uia, matches)
+            choice = _visible_choice(uia, matches, binding)
             if choice is None and 'Expand' in uia.actions(element) and element.property(30070) == 0:
                 def expansion_guard():
                     check_target()
@@ -264,7 +286,7 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
                     _require(code is None or known_code in (None, code), 'combo_option_changed')
                     if code is not None:
                         selected_value = known_code = code
-                    choice = _visible_choice(uia, matches)
+                    choice = _visible_choice(uia, matches, binding)
                     if choice is not None or time.monotonic() >= deadline:
                         break
                     time.sleep(.05)
@@ -272,7 +294,7 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
                 def choice_guard():
                     check_target()
                     actual, candidates = _options(binding, uia, element, value)
-                    current = _visible_choice(uia, candidates)
+                    current = _visible_choice(uia, candidates, binding)
                     _require(actual == selected_value and current is not None and uia.same(choice, current),
                              'combo_option_changed')
                 send(choice, 'Select', choice_guard)
@@ -307,7 +329,7 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
                 check_target()
                 _require(capability in uia.actions(element), 'pattern_unavailable')
                 if operation == 'Select' or role != 'combobox':
-                    _require(_visible(uia, element), 'target_offscreen')
+                    _require(_visible(uia, element, binding), 'target_offscreen')
                 if operation == 'Expand':
                     _require(element.property(30070) == 0, 'expansion_state_changed')
             if operation == 'Expand' and element.property(30070) == 1:

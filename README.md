@@ -1,6 +1,10 @@
-# Desktop Select 0.4.0
+# Desktop Select 0.4.2 — 0.4.0 기반 재구성
 
-Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Desktop Select가 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 반복할 작업은 한 번 시연한 다음 각 단계 옆에 실행할 동작을 적어 저장하세요. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Python의 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더를 프로젝트의 `.claude/skills/` 아래에 복사하세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.0/desktop-select-0.4.0-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.0/skills/desktop-select/사용가이드.md)
+0.4.0 태그(`02fa20e`)에서 별도 작업 공간을 만들어 FX 제공자 호환성과 최초 등록 후 Python 실행을 보완했습니다. 0.5/0.6의 intent 녹화, 모델 실행안, 확인된 실행안 캐시 모듈은 이 배포에 포함하지 않습니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 텍스트 파일만 있습니다.
+
+Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 반복 작업은 첫 등록 때 실제 ID를 확인하고, 이후에는 생성된 업무 스킬의 Python 파일을 실행합니다. 녹화로 위치를 알려 주고 단계 옆에 고정값이나 변수 동작을 적는 방식도 유지합니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.2/desktop-select-0.4.2-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.2/skills/desktop-select/사용가이드.md)
+
+핵심 변경은 `IsOffscreen=None` 보정, 동일한 편집 피어 값의 일치 판정, 쓰기 가능한 콤보의 SetValue 1회 후 확인, 조작 전 최소화 창 복원입니다. 먼저 펼침과 항목 선택을 시도하던 경로를 줄였습니다. 등록 실행은 하나의 UIA 연결에서 요소 ID를 직접 조회합니다. 핵심 브리지와 녹화기는 0.4.0 그대로 유지하며 호환 코드는 별도 파일로 분리했습니다. [0.4.0 대비 변경과 검증](docs/desktop-select-040-rebuild.md)을 참고하세요.
 
 예를 들어 첫 단계에 “MES SETUP조건을 N으로 해줘”, 둘째 단계에 “입력받은 변수를 FAMILY조건에 입력해줘”라고 적습니다. 이후 “이 작업을 Family=Hybrid로 실행해 줘”라고 요청하면 첫 단계는 N을, 둘째 단계는 이번에 전달한 Hybrid를 사용합니다. 조회 후 표의 우클릭 메뉴를 이어서 실행하려면 녹화 창에서 **조회 후 우클릭 메뉴 가르치기**를 사용하세요. 조회가 끝났다는 표시를 다시 확인한 후에만 표 내부에서 메뉴를 열며, 지정한 로컬 Excel 파일 생성까지 확인할 수 있습니다. Desktop Select ZIP은 `python tools/build_desktop_select.py`로 빌드할 수 있습니다.
 

@@ -55,7 +55,7 @@ class LiveActionTests(unittest.TestCase):
         self.uia.bounds = lambda e: e.rect
         self.calls = []
         self.after = lambda item, op, arg: None
-        for attr in ('OPEN_SECONDS', 'READBACK_SECONDS'):
+        for attr in ('OPEN_SECONDS', 'READBACK_SECONDS', 'VALUE_SETTLE_SECONDS'):
             p = patch.object(live, attr, 0)
             p.start()
             self.addCleanup(p.stop)
@@ -84,6 +84,7 @@ class LiveActionTests(unittest.TestCase):
                             action, value, still_valid=guard)
 
     def test_hidden_cached_row_and_detached_popup_with_internal_names(self):
+        self.combo.actions = ['Expand']
         stale = self.option(self.combo, 'wanted', visible=False, bounds=False)
         self.combo.props[30022] = True  # Real FX can report the parent offscreen.
         Element(50004, self.combo)  # Its live editor remains visible inside its rectangle.
@@ -112,20 +113,23 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual(self.calls, [(self.combo, 'SetValue', 'wanted')])
 
     def test_repeated_visible_options_do_not_pick_first(self):
+        self.combo.actions = ['Expand']
         for _ in range(2):
             self.option(self.combo, 'wanted')
         result = self.run_action()
         self.assertEqual((result['diagnostic'], result['input_dispatched']), ('combo_option_ambiguous', False))
 
-    def test_nested_or_foreign_combo_option_cannot_authorize_setvalue(self):
+    def test_unrelated_option_does_not_supply_literal_write_value_or_readback(self):
         nested = Element(50003, self.combo, ['SetValue'])
         self.option(nested, 'wanted', owner=nested)
         self.option(self.combo, 'wanted', owner=nested)
         self.combo.actions = ['SetValue']
-        self.assertFalse(self.run_action()['input_dispatched'])
-        self.assertFalse(self.calls)
+        result = self.run_action()
+        self.assertEqual(result['status'], 'mismatch')
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'wanted')])
 
     def test_uncertain_select_does_not_retry_setvalue(self):
+        self.combo.actions = ['Expand']
         self.option(self.combo, 'wanted')
         def fail(*args):
             raise win.BridgeError('hresult_error')
@@ -143,6 +147,7 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
 
     def test_new_popup_unrecognized_reports_prior_expand_and_no_second_input(self):
+        self.combo.actions = ['Expand']
         result = self.run_action()
         self.assertEqual((result['status'], result['input_dispatched'], result['expanded']), ('blocked', True, True))
         self.assertEqual([op for _, op, _ in self.calls], ['Expand'])
@@ -171,7 +176,7 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual(self.run_action('expand', None, item=tree)['status'], 'verified')
         self.assertEqual(self.run_action('choose', None, item=tab)['status'], 'verified')
 
-    def test_exact_display_alias_writes_provider_code_and_checks_provider_code(self):
+    def test_writable_combo_uses_literal_not_option_name_translation(self):
         self.combo.actions = ['SetValue']
         item = self.option(self.combo, 'CODE', visible=False)
         item.props[30005] = 'Readable name'
@@ -179,15 +184,17 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual(inventory, {'options': [{'value': 'CODE', 'name': 'Readable name'}], 'truncated': False})
         self.after = lambda item, op, arg: self.combo.props.update({30045: arg})
         self.assertEqual(self.run_action(value='Readable name')['status'], 'verified')
-        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'CODE')])
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'Readable name')])
 
     def test_code_also_used_as_name_for_another_option_is_ambiguous(self):
+        self.combo.actions = ['Expand']
         self.option(self.combo, 'A').props[30005] = 'B'
         self.option(self.combo, 'B').props[30005] = 'Beta'
         self.assertEqual(self.run_action(value='B')['diagnostic'], 'combo_option_ambiguous')
         self.assertFalse(self.calls)
 
     def test_detached_virtual_selection_is_not_a_precondition_for_expansion(self):
+        self.combo.actions = ['Expand']
         self.combo.props[30037] = True
         stale = Element(50007)
         self.combo.selected_items = lambda: [stale] if self.combo.property(30070) == 0 else []
@@ -240,8 +247,8 @@ class LiveActionTests(unittest.TestCase):
             result = live.combo_readback(self.binding, self.uia, self.combo)
             self.assertEqual((result['value'], result['value_evidence']['status']), (None, 'unavailable'))
             result = self.run_action()
-        self.assertEqual(result['status'], 'blocked')
-        self.assertFalse(self.calls)
+        self.assertEqual(result['status'], 'delivered_unverified')
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'wanted')])
 
     def test_hidden_combo_with_old_overlapping_rectangle_cannot_write(self):
         self.combo.props[30022] = True
@@ -252,14 +259,15 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual(result['diagnostic'], 'target_offscreen')
         self.assertFalse(self.calls)
 
-    def test_hidden_name_only_peer_is_not_a_value_to_write(self):
+    def test_writable_combo_does_not_need_option_provider_value(self):
         self.combo.actions = ['SetValue']
         item = self.option(self.combo, '', visible=False)
         result = self.run_action(value=item.props[30005])
-        self.assertEqual(result['diagnostic'], 'combo_option_provider_value_required')
-        self.assertFalse(self.calls)
+        self.assertEqual(result['status'], 'mismatch')
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', item.props[30005])])
 
     def test_visible_named_option_with_proved_owner_selects_and_reads_back(self):
+        self.combo.actions = ['Expand']
         self.combo.props[30045] = ''
         row = self.option(self.combo, '')
         row.props[30005] = 'Visible option'
@@ -267,6 +275,51 @@ class LiveActionTests(unittest.TestCase):
         result = self.run_action(value='Visible option')
         self.assertEqual(result['status'], 'verified')
         self.assertEqual(self.calls, [(row, 'Select', None)])
+
+    def test_writable_combo_ignores_broken_expand_and_empty_option_inventory(self):
+        self.combo.props[30045] = ''
+        editors = [Element(50004, self.combo, **{'30043': True, '30045': ''}) for _ in range(2)]
+        def apply(item, operation, value):
+            self.assertEqual(operation, 'SetValue')
+            self.combo.props[30045] = value
+            for editor in editors:
+                editor.props[30045] = value
+        self.after = apply
+        with patch.object(live, '_options', side_effect=AssertionError('option scan forbidden')), \
+                patch.object(live, 'combo_readback', wraps=live.combo_readback) as readback:
+            result = self.run_action(value='N')
+        self.assertEqual(result['status'], 'verified')
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N')])
+        readback.assert_called_once()
+        self.assertFalse(result['expanded'])
+
+    def test_os_error_after_literal_write_is_uncertain_and_never_expands(self):
+        def failed(*args):
+            raise OSError('provider failed after method entry')
+        self.after = failed
+        result = self.run_action(value='N')
+        self.assertEqual((result['status'], result['input_dispatched']), ('uncertain', None))
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N')])
+
+    def test_readback_error_after_returned_write_keeps_delivered_without_retry(self):
+        with patch.object(live, 'combo_readback', side_effect=OSError('reader failed')):
+            result = self.run_action(value='N')
+        self.assertEqual((result['status'], result['input_dispatched']), ('delivered_unverified', True))
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N')])
+
+    def test_replaced_target_after_write_is_not_verified_or_retried(self):
+        checks = []
+        def guard():
+            checks.append(True)
+            if len(checks) == 3:
+                raise win.BridgeError('target_changed')
+        self.after = lambda item, op, arg: self.combo.props.update({30045: arg})
+        with patch.object(live, 'combo_readback', wraps=live.combo_readback) as readback:
+            result = self.run_action(value='N', guard=guard)
+        self.assertEqual((result['status'], result['input_dispatched']), ('delivered_unverified', True))
+        self.assertEqual(result['diagnostic'], 'current_state_unavailable')
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N')])
+        readback.assert_not_called()
 
 
 if __name__ == '__main__':

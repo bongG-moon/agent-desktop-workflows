@@ -86,6 +86,23 @@ def _point_target(raw):
                                            'result': 'manual', 'reason': 'combo_choice_unproven'})
 
 
+def instruction_subject(sentence):
+    """Return the field named in a supported sentence for an explicit alias link."""
+    if not isinstance(sentence, str):
+        return None
+    patterns = (r'입력\s*받은\s*(?:\{[^{}]+\}\s*)?변수(?:를|을)\s*(.+?)에\s*',
+                r'\{[^{}]+\}(?:을|를)\s*(.+?)에\s*',
+                r'(.+?)(?:을|를)\s*')
+    for pattern in patterns:
+        match = re.match(pattern, sentence.strip())
+        if match:
+            subject = match[1].strip()
+            if ''.join(subject.split()) in {'이항목', '이필드', '이콤보', '이메뉴', '이버튼'}:
+                return None
+            return re.sub(r'\s*(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴)$', '', subject).strip()
+    return None
+
+
 def _convert(raw, *, allow_point=False):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')

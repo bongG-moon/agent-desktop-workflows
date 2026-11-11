@@ -5,7 +5,6 @@ import argparse
 from collections import deque
 import ctypes as C
 from ctypes import wintypes as W
-from hashlib import sha256
 import importlib.util
 import json
 import os
@@ -13,17 +12,11 @@ from pathlib import Path
 import subprocess
 import sys
 
+from runtime_integrity import checked_path
+
 
 def load_bridge():
-    here = Path(__file__).resolve()
-    path = here.with_name('win_bridge.py')
-    if (not path.exists() and here.parents[2].name == 'skills'
-            and (here.parents[3] / 'engine/bridge-manifest.json').is_file()):
-        path = here.parents[3] / 'scripts' / 'win_bridge.py'  # source checkout
-    # Use only the reviewed bridge, even if the skill was partially copied
-    # into a project containing an unrelated scripts directory.
-    if not path.is_file() or sha256(path.read_bytes()).hexdigest() != 'a1d94dff366248bca7d4d8618c8258b7e10138df528bd34973dcb665501bdc72':
-        raise RuntimeError('skill_incomplete')
+    path = checked_path('win_bridge.py')
     existing = sys.modules.get('win_bridge')
     if existing is not None and Path(existing.__file__).resolve() == path.resolve():
         return existing
@@ -37,6 +30,7 @@ def load_bridge():
 bridge = load_bridge()
 from targeting import SelectionError, field_labels, resolve, scope_map
 from live_action import execute
+import provider_visibility as visibility
 import learned_tasks as tasks
 
 
@@ -109,17 +103,87 @@ def bind_surface(owner, selected):
 
 def add_display_properties(node, element, binding, uia, root):
     bounds = uia.bounds(element)
-    valid = bounds['width'] > 0 and bounds['height'] > 0
+    valid = visibility.valid(bounds)
     node.update(class_name=element.property(30012) or '', bounds=bounds, bounds_valid=valid,
-                offscreen=element.property(30022) is not False or not valid)
+                offscreen=not visibility.visible(binding, uia, element, root))
     if node['role'] in {'combobox', 'textfield', 'checkbox', 'radiobutton', 'spinner'}:
         label = uia.related_element(element, 30018)
         if label is not None:
             if (uia.pid(label) != binding.pid or not uia.within(label, root) or uia.secure(label)
-                    or label.property(30022) is not False):
+                    or not visibility.visible(binding, uia, label, root)):
                 node['label_source'] = 'invalid_labeled_by'
             else:
                 node.update(semantic_label=label.property(30005) or '', label_source='labeled_by')
+
+
+def field_label(binding, uia, element, root):
+    """Read one field's label from its local form, including a single label wrapper.
+
+    This uses the original 0.4.0 label resolver without collecting an entire
+    business window or reading neighboring field values.
+    """
+    binding.check()
+    if (uia.pid(element) != binding.pid or uia.secure(element)
+            or not uia.within(element, root)):
+        return {}
+    node = dict(uia.basic(element), secure=False)
+    if node['role'] not in {'combobox', 'textfield', 'checkbox', 'radiobutton', 'spinner'}:
+        return {}
+    add_display_properties(node, element, binding, uia, root)
+    if node.get('label_source') == 'labeled_by':
+        return {key: node[key] for key in ('semantic_label', 'label_source')}
+    if node.get('label_source') == 'invalid_labeled_by':
+        return {}
+    parent = uia.parent(element)
+    if (parent is None or uia.pid(parent) != binding.pid or uia.secure(parent)
+            or not uia.within(parent, root)):
+        return {}
+    nodes, target = [dict(path='0', parent_path='', secure=False, **uia.basic(parent))], None
+    for index, sibling in enumerate(uia.children(parent)):
+        if index >= 160 or uia.pid(sibling) != binding.pid:
+            return {}
+        path = '0/' + str(index)
+        current = dict(path=path, parent_path='0', secure=uia.secure(sibling))
+        if not current['secure']:
+            current.update(uia.basic(sibling))
+            add_display_properties(current, sibling, binding, uia, root)
+        if uia.same(sibling, element):
+            target = len(nodes)
+        nodes.append(current)
+        if current.get('role') != 'group' or current['secure']:
+            continue
+        children = iter(uia.children(sibling))
+        child = next(children, None)
+        if child is None or next(children, None) is not None:
+            continue
+        if uia.pid(child) != binding.pid:
+            return {}
+        wrapped = dict(path=path+'/0', parent_path=path, secure=uia.secure(child))
+        if not wrapped['secure']:
+            wrapped.update(uia.basic(child))
+            add_display_properties(wrapped, child, binding, uia, root)
+        nodes.append(wrapped)
+    binding.check()
+    return field_labels(nodes).get(target, {})
+
+
+def _stable_selector(nodes, index):
+    """Carry the initially resolved field and its witnessed ancestor scope forward."""
+    node = nodes[index]
+    if not node.get('automation_id') or node.get('role') not in bridge.ROLES.values():
+        return None
+    parents, path, by_path = [], node.get('parent_path'), {n['path']: n for n in nodes}
+    while path:
+        ancestor = by_path[path]
+        if ancestor.get('secure') is not False or ancestor.get('role') not in bridge.ROLES.values():
+            return None
+        identity = {key: ancestor[key] for key in ('automation_id', 'name') if ancestor.get(key)}
+        if identity:
+            parents.append(dict(role=ancestor['role'], **identity))
+        path = ancestor.get('parent_path')
+    if len(parents) > 16:
+        return None
+    return dict(automation_id=node['automation_id'], role=node['role'], ancestors=parents)
 
 
 def observe(binding, uia, *, identities_only=False):
@@ -189,6 +253,8 @@ def near_region(nodes, anchor):
 
 
 def action(args, owner, *, learned=None, anchor=None):
+    if args.command in {'select', 'open'}:
+        visibility.restore_for_action(owner, args.window)
     surface = bind_surface(owner, args.popup)
     mutate = args.command in {'select', 'open'}
     check = lambda: guard(owner, surface, args.window, mutate)
@@ -238,8 +304,30 @@ def action(args, owner, *, learned=None, anchor=None):
                     result.update(options=[], options_status='unavailable')
             return result
 
+        # After the initial 0.4.0 label/region resolution, revalidate a stable
+        # identity with native UIA queries. Learned regions and owned popups
+        # retain their original full-resolution path.
+        stable = (_stable_selector(nodes, i) if learned is None and anchor is None
+                  and args.popup is None else None)
+        initial_label = labels.get(i, {})
+
         def still_valid():
             check()
+            if stable is not None:
+                import control_lookup
+                root = uia.from_handle(surface.hwnd)
+                if not uia.same(elements[0], root):
+                    raise SelectionError('target_changed')
+                current = control_lookup.resolve(surface, uia, stable, root)
+                if not uia.same(element, current):
+                    raise SelectionError('target_changed')
+                if (node['role'] in {'button', 'menuitem', 'splitbutton', 'hyperlink', 'treeitem', 'tab', 'listitem'}
+                        and node.get('name') and current.property(30005) != node['name']):
+                    raise SelectionError('target_name_changed')
+                if initial_label and field_label(surface, uia, current, root) != initial_label:
+                    raise SelectionError('target_label_changed')
+                check()
+                return
             current, live, current_anchor = read_view()
             if anchor is not None:
                 if not uia.same(anchor_element, current_anchor) or not uia.same(elements[0], live[0]):
