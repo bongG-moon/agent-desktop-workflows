@@ -28,7 +28,8 @@ class MenuRecordingTests(unittest.TestCase):
         self.assertEqual(edits.apply([self.step])[0]['alias'], '내보내기')
         changed = deepcopy(self.step)
         changed['context']['menu']['path'] = ['다른 메뉴', '파일']
-        self.assertNotIn('alias', edits.apply([changed])[0])
+        with self.assertRaisesRegex(ValueError, 'recorded_target_changed'):
+            edits.apply([changed])
         view = teach_capture.instruction_view(self.step, None)
         self.assertIn('조회 완료 확인 → 표 우클릭 → 내보내기 → 파일', view)
         self.assertIn('전달까지만 확인', view)

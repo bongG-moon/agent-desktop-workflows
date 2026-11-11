@@ -34,6 +34,7 @@ def previous_trigger(step, context):
 def _pointed_control(binding, point, mode):
     import desktop_select as app
     from result_menu import TEXT_ROLES
+    from provider_visibility import visible
     b = app.bridge
     x, y = point
     hit = b.window_from_point(x, y)
@@ -63,7 +64,7 @@ def _pointed_control(binding, point, mode):
                 matches = [i for i, n in enumerate(nodes) if all(n.get(k) == v for k, v in locator.items())]
                 if len(matches) != 1 or not uia.same(elements[matches[0]], current):
                     raise ValueError('같은 이름의 요소가 여러 개입니다. 고유한 표시나 버튼을 가리키세요.')
-                if current.property(30010) is not True or current.property(30022) is not False:
+                if current.property(30010) is not True or not visible(binding, uia, current, root=root):
                     raise ValueError('표시되고 사용 가능한 요소를 가리키세요.')
                 if mode == 'trigger' and 'Click' not in uia.actions(current):
                     raise ValueError('조회 버튼에서 실행 동작을 확인할 수 없습니다.')

@@ -104,6 +104,7 @@ class MenuTests(unittest.TestCase):
         item.element.property.side_effect = lambda i: {30010:True,30022:False}[i]
         self.uia.pid.return_value = 27
         self.uia.secure.return_value = False
+        self.uia.bounds.return_value = dict(x=50,y=50,width=100,height=25)
         with (patch.object(cm.win,'window_from_point',return_value=30),
               patch.object(cm.win,'foreground',return_value=1),
               patch.object(cm.win,'root_window',return_value=30),

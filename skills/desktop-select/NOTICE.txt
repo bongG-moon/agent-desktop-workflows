@@ -1,4 +1,4 @@
-Desktop Select 0.4.0 (2026)
+Desktop Select 0.4.1 (2026)
 
 Distributed under the Apache License 2.0, see LICENSE in the ZIP.
 The Windows UI Automation bridge and scoped event recorder are reused from Agent Desktop Workflows.

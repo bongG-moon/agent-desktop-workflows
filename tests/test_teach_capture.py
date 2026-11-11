@@ -65,11 +65,43 @@ class CaptureTests(unittest.TestCase):
         edits.store(step, '모드', 'Mode를 {condition}로 선택')
         changed = copy.deepcopy(step)
         changed['target']['locator']['automation_id'] = 'different'
-        self.assertNotIn('instruction', edits.apply([changed])[0])
+        with self.assertRaisesRegex(learned_tasks.TaskError, 'recorded_target_changed'):
+            edits.apply([changed])
         self.assertEqual(edits.apply([step])[0]['instruction']['parameter'], 'condition')
         with self.assertRaises(learned_tasks.TaskError):
             edits.store(step, '', '다른 필드를 N으로 선택')
         self.assertEqual(edits.get(step)['alias'], '모드')
+
+    def test_provider_peer_changes_keep_the_same_control_instructions(self):
+        edits, step = capture.StepEdits(), capture.capture_step(combo())
+        step['target']['locator'].update(name='old provider caption', path='0/5', runtime_id=[10, 2])
+        edits.store(step, '조건', '이 항목을 {조건값}로 설정')
+        updated = copy.deepcopy(step)
+        updated['target']['locator'].update(name='new provider caption', path='0/8', runtime_id=[90, 3])
+        updated['value'] = 'P'
+        self.assertEqual(edits.apply([updated])[0]['instruction']['parameter'], '조건값')
+        updated['target']['locator']['ancestors'] = [{'role': 'group', 'automation_id': 'different-panel'}]
+        with self.assertRaisesRegex(learned_tasks.TaskError, 'recorded_target_changed'):
+            edits.apply([updated])
+
+    def test_value_evidence_upgrade_preserves_the_pointed_combos_binding(self):
+        step = capture.capture_step(combo())
+        step.pop('value')
+        step.update(action='teach-target', recognition={'target': 'identified', 'action': 'requires_instruction',
+                       'result': 'manual', 'reason': 'combo_choice_unproven'})
+        edits = capture.StepEdits()
+        edits.store(step, '상태', '이 항목을 N으로 설정')
+        upgraded = capture.capture_step(combo())
+        self.assertEqual(edits.apply([upgraded])[0]['instruction']['value'], 'N')
+
+    def test_capture_uia_uses_provider_value_helper_for_nodes_and_watched_values(self):
+        uia = capture.CaptureUIA.__new__(capture.CaptureUIA)
+        item = object()
+        observed = {'value': 'Hybrid', 'value_evidence': {'status': 'observed', 'source': 'corroborated'}}
+        with patch('provider_values.value_observation', return_value=observed) as read:
+            self.assertEqual(uia.value_observation(item), observed)
+            self.assertEqual(uia.value(item), 'Hybrid')
+        self.assertEqual(read.call_count, 2)
 
     def test_only_a_witnessed_bound_combo_can_be_promoted_to_point(self):
         binding, uia = Mock(hwnd=5), Mock()

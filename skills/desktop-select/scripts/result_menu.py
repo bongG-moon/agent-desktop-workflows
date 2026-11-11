@@ -7,6 +7,7 @@ import export_evidence
 import context_menu
 import row_vision as pixels
 import win_bridge as bridge
+from provider_visibility import visible
 
 
 def _need(test, reason):
@@ -64,7 +65,7 @@ def _resolve(binding, uia, locator):
         raise tasks.TaskError('result_indicator_cannot_be_resolved_safely')
     _need(len(hits) == 1, 'result_indicator_ambiguous' if hits else 'result_indicator_missing')
     e = elements[hits[0]]
-    _need(e.property(30022) is False and uia.within(e, elements[0]), 'result_indicator_not_visible')
+    _need(visible(binding, uia, e, elements[0]) and uia.within(e, elements[0]), 'result_indicator_not_visible')
     return e, [(n, element) for n,element in zip(nodes,elements) if n['secure']]
 
 

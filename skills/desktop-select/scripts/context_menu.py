@@ -6,6 +6,7 @@ import time
 
 import win_bridge as win
 from row_action import foreground
+from provider_visibility import visible
 
 
 REGIONS = {'table', 'group', 'list', 'tree', 'custom', 'document'}
@@ -57,7 +58,7 @@ def _region(binding, uia, target):
             if all(n.get(k) == v for k, v in target.items())]
     _need(len(hits) == 1, 'context_region_ambiguous' if hits else 'context_region_missing')
     element = hits[0]
-    _need(element.property(30010) is True and element.property(30022) is False, 'context_region_unavailable')
+    _need(element.property(30010) is True and visible(binding, uia, element), 'context_region_unavailable')
     return element
 
 
@@ -179,7 +180,7 @@ def _menus(binding, uia):
                 frame = item
             elif kind == 50010:  # MenuBar routes normal host commands.
                 frame = None
-            if kind == MENUITEM and frame is not None and item.property(30022) is False:
+            if kind == MENUITEM and frame is not None and visible(binding, uia, item):
                 rect = _rect(uia, item)
                 if rect[2] > 1 and rect[3] > 1:
                     name = item.property(30005)
@@ -224,7 +225,7 @@ def _hit_item(binding, uia, item, parent, prior_surfaces, gap):
     hit = win.window_from_point(*center)
     _need(binding.contains_window(hit) and binding.contains_window(win.foreground()),
           'context_menu_occluded')
-    _need(item.element.property(30010) is True and item.element.property(30022) is False
+    _need(item.element.property(30010) is True and visible(binding, uia, item.element)
           and _rect(uia, item.element) == item.box, 'context_menu_item_changed')
     actual = uia.from_point(*center)
     _need(actual is not None and uia.pid(actual) == binding.pid and not uia.secure(actual),

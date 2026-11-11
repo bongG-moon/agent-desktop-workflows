@@ -5,7 +5,6 @@ import argparse
 from collections import deque
 import ctypes as C
 from ctypes import wintypes as W
-from hashlib import sha256
 import importlib.util
 import json
 import os
@@ -15,15 +14,8 @@ import sys
 
 
 def load_bridge():
-    here = Path(__file__).resolve()
-    path = here.with_name('win_bridge.py')
-    if (not path.exists() and here.parents[2].name == 'skills'
-            and (here.parents[3] / 'engine/bridge-manifest.json').is_file()):
-        path = here.parents[3] / 'scripts' / 'win_bridge.py'  # source checkout
-    # Use only the reviewed bridge, even if the skill was partially copied
-    # into a project containing an unrelated scripts directory.
-    if not path.is_file() or sha256(path.read_bytes()).hexdigest() != 'a1d94dff366248bca7d4d8618c8258b7e10138df528bd34973dcb665501bdc72':
-        raise RuntimeError('skill_incomplete')
+    from runtime_integrity import checked_path
+    path = checked_path('win_bridge.py')
     existing = sys.modules.get('win_bridge')
     if existing is not None and Path(existing.__file__).resolve() == path.resolve():
         return existing
@@ -34,10 +26,21 @@ def load_bridge():
     return module
 
 
-bridge = load_bridge()
+try:
+    bridge = load_bridge()
+except RuntimeError as error:
+    if __name__ != '__main__':
+        raise
+    print(json.dumps({'status': 'blocked', 'diagnostic': getattr(error, 'code', 'runtime_load_failed'),
+                      'file': getattr(error, 'filename', 'win_bridge.py'), 'input_dispatched': False,
+                      'help': 'Reinstall the complete Desktop Select ZIP; do not mix versions.'}))
+    raise SystemExit(2)
 from targeting import SelectionError, field_labels, resolve, scope_map
 from live_action import execute
 import learned_tasks as tasks
+from provider_visibility import visible, restore_for_action
+from provider_labels import semantic_label
+from runtime_integrity import RuntimeIntegrityError
 
 
 def windows(exe):
@@ -111,12 +114,13 @@ def add_display_properties(node, element, binding, uia, root):
     bounds = uia.bounds(element)
     valid = bounds['width'] > 0 and bounds['height'] > 0
     node.update(class_name=element.property(30012) or '', bounds=bounds, bounds_valid=valid,
-                offscreen=element.property(30022) is not False or not valid)
+                offscreen=not visible(binding, uia, element, root),
+                visibility_evidence='provider' if element.property(30022) is not None else 'window_geometry')
     if node['role'] in {'combobox', 'textfield', 'checkbox', 'radiobutton', 'spinner'}:
         label = uia.related_element(element, 30018)
         if label is not None:
             if (uia.pid(label) != binding.pid or not uia.within(label, root) or uia.secure(label)
-                    or label.property(30022) is not False):
+                    or not visible(binding, uia, label, root)):
                 node['label_source'] = 'invalid_labeled_by'
             else:
                 node.update(semantic_label=label.property(30005) or '', label_source='labeled_by')
@@ -189,6 +193,7 @@ def near_region(nodes, anchor):
 
 
 def action(args, owner, *, learned=None, anchor=None):
+    restored = restore_for_action(owner, args.window) if args.command in {'select', 'open'} else False
     surface = bind_surface(owner, args.popup)
     mutate = args.command in {'select', 'open'}
     check = lambda: guard(owner, surface, args.window, mutate)
@@ -200,7 +205,7 @@ def action(args, owner, *, learned=None, anchor=None):
                 return nodes, elements, None
             scoped, indexes, a = near_region(nodes, anchor)
             if anchor.get('label'):
-                tasks.check_display(anchor, uia.semantic_label(elements[a], elements[0]))
+                tasks.check_display(anchor, semantic_label(surface, uia, elements[a], elements[0]))
             region = [elements[i] for i in indexes]
             for n, e in zip(scoped, region):
                 if not n['secure']:
@@ -217,7 +222,7 @@ def action(args, owner, *, learned=None, anchor=None):
             if learned is not None:
                 index, evidence = tasks.locate_target(tree, learned)
                 if learned.get('label'):
-                    tasks.check_display(learned, uia.semantic_label(available[index], available[0]))
+                    tasks.check_display(learned, semantic_label(surface, uia, available[index], available[0]))
                 return index, evidence
             return resolve(tree, args.target, role=role, within=args.within)
         i, evidence = locate(nodes, elements)
@@ -252,7 +257,8 @@ def action(args, owner, *, learned=None, anchor=None):
         command = 'select' if args.command == 'select' else ('expand' if args.expand else
                   'choose' if node['role'] in {'treeitem', 'tab', 'listitem'} else 'invoke')
         result = execute(surface, uia, element, node, command, getattr(args, 'value', None), still_valid=still_valid)
-        return dict(result, target=detail, matched_by=evidence, business_commit='not_verified')
+        return dict(result, target=detail, matched_by=evidence, business_commit='not_verified',
+                    window_restored=restored)
 
 
 def run(args):
@@ -282,6 +288,7 @@ def run(args):
     owner = bridge.Binding(binding)
     if args.command == 'record-rows':
         from row_action import teach_rows
+        restore_for_action(owner, args.window)
         guard(owner, owner, args.window)
         return teach_rows(owner, args.window, args, task_directory())
     if args.command == 'row-status':
@@ -305,6 +312,7 @@ def run(args):
     if args.command == 'record':
         from teach_capture import capture
         tasks.check_new_task(args.task, task_directory())
+        restore_for_action(owner, args.window)
         guard(owner, owner, args.window)
         capture_result = capture(owner, title=args.window)
         if capture_result['status'] != 'recorded':
@@ -328,14 +336,16 @@ def replay_step():
     if step['action'] == 'result-menu':
         from result_menu import execute as execute_result
         tasks._validate_context(step)
+        restored = restore_for_action(owner, binding['title'])
         receipt = execute_result(owner, step['context'], lambda: guard(owner, owner, binding['title'], mutate=True),
                                  binding['title'], observe_guard=lambda: guard(owner, owner, binding['title']))
-        return dict(receipt, target=step['label'])
+        return dict(receipt, target=step['label'], window_restored=restored)
     if step['action'] == 'row-action':
         from row_action import execute as execute_row
         tasks._validate_row(step)
+        restored = restore_for_action(owner, binding['title'])
         receipt = execute_row(owner, step['row'], lambda: guard(owner, owner, binding['title'], mutate=True))
-        return dict(receipt, target=step['label'])
+        return dict(receipt, target=step['label'], window_restored=restored)
     args = argparse.Namespace(command=step['action'], role=step['role'], window=binding['title'],
                               target=step['target'], value=step.get('value'), expand=step.get('expand', False),
                               within=step.get('within'), popup=None)
@@ -385,10 +395,12 @@ def parser():
 def worker(args):
     try:
         result = replay_step() if args is None else run(args)
-    except (SelectionError, bridge.BridgeError, tasks.TaskError) as error:
+    except (SelectionError, bridge.BridgeError, tasks.TaskError, RuntimeIntegrityError) as error:
         dispatched = getattr(error, 'input_dispatched', False)
         result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': error.code,
                   'input_dispatched': dispatched}
+        if isinstance(error, RuntimeIntegrityError):
+            result.update(file=error.filename, help='Reinstall the complete Desktop Select ZIP; do not mix versions.')
     print(json.dumps(result, ensure_ascii=False))
     return result_code(result)
 

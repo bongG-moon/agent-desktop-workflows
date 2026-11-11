@@ -151,6 +151,46 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(tasks.TaskError, 'unexpected_task_step_data'):
             self.run_task(p, invoke=lambda _: self.fail())
 
+    def test_unlabeled_combo_can_be_explicitly_linked_without_retargeting_it(self):
+        raw = demo()
+        raw.pop('field_label')
+        raw['target']['locator']['automation_id'] = 'gcboStatus'
+        sentence = 'MES SETUP조건을 N으로 해줘'
+        with self.assertRaisesRegex(tasks.TaskError, 'instruction_target_mismatch'):
+            tasks.compile_instruction(raw, sentence, mode='fixed', argument='N')
+        alias = tasks.bind_instruction_subject(raw, [], sentence, mode='fixed', argument='N')
+        self.assertEqual(alias, 'MES SETUP')
+        linked = dict(raw, alias=alias)
+        plan = task(compiled(linked, sentence, mode='fixed', argument='N'))
+        with tempfile.TemporaryDirectory() as directory:
+            tasks.save_task(plan, directory)
+            saved = tasks.load_task(plan['name'], directory)
+        self.assertEqual(saved['steps'][0]['target'], 'gcboStatus')
+        self.assertEqual(saved['steps'][0]['alias'], 'MES SETUP')
+        self.assertEqual(saved['steps'][0]['instruction']['value'], 'N')
+        self.assertEqual(self.run_task(saved)['status'], 'verified')
+
+    def test_explicit_field_link_does_not_override_another_known_target(self):
+        raw = demo()
+        raw.pop('field_label')
+        raw['target']['locator']['automation_id'] = 'gcboStatus'
+        with self.assertRaisesRegex(tasks.TaskError, 'instruction_target_mismatch'):
+            tasks.bind_instruction_subject(raw, [demo('Family')], 'FAMILY조건을 N으로 해줘')
+        with self.assertRaisesRegex(tasks.TaskError, 'instruction_target_mismatch'):
+            tasks.bind_instruction_subject(demo('MES Setup'), [], 'Family조건을 N으로 해줘')
+        with self.assertRaisesRegex(tasks.TaskError, 'instruction_binding_conflict'):
+            tasks.bind_instruction_subject(raw, [], 'MES SETUP조건을 N으로 해줘', mode='fixed', argument='P')
+
+    def test_label_case_and_spacing_allow_fixed_and_required_sentences(self):
+        raw = demo('MES   Setup')
+        raw['target']['locator']['automation_id'] = 'gcboStatus'
+        self.assertEqual(tasks.compile_instruction(raw, 'mes setup 조건을 N으로 해줘')['value'], 'N')
+        family = demo('FAMILY')
+        family['target']['locator']['automation_id'] = 'gcboFamily'
+        spec = tasks.compile_instruction(family, '입력받은 변수를 family 조건에 입력해줘',
+                                         mode='required', argument='Family')
+        self.assertEqual(spec['parameter'], 'Family')
+
     def test_button_instructions_must_use_recorded_capability(self):
         button = demo('조회', '', 'button', 'click')
         plan = task(compiled(button, '조회 버튼을 눌러줘'))

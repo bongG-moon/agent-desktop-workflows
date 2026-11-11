@@ -7,6 +7,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'skills/desktop-select/scripts'), str(ROOT / 'scripts')]
 import live_action as live
+import provider_visibility
 import win_bridge as win
 
 
@@ -267,6 +268,101 @@ class LiveActionTests(unittest.TestCase):
         result = self.run_action(value='Visible option')
         self.assertEqual(result['status'], 'verified')
         self.assertEqual(self.calls, [(row, 'Select', None)])
+
+    def test_zero_bounds_option_and_noop_expand_write_provider_code_once(self):
+        # A real provider can expose every option in a collapsed combo but
+        # implement Expand as a no-op. Such rows are a value domain, not hits.
+        self.combo.props[30045] = ''
+        row = self.option(self.combo, 'wanted', bounds=False)
+        editors = [Element(50004, self.combo, **{'30043': True, '30045': 'old'}) for _ in range(2)]
+        def apply(item, operation, argument):
+            if operation == 'SetValue':
+                for editor in editors:
+                    editor.props[30045] = argument
+        self.after = apply
+        result = self.run_action()
+        self.assertEqual((result['status'], result['effect_verification']), ('verified', 'matched'))
+        self.assertEqual(self.combo.property(30070), 0)
+        self.assertEqual([op for _, op, _ in self.calls], ['Expand', 'SetValue'])
+        self.assertNotIn(row, [item for item, _, _ in self.calls])
+
+    def test_missing_offscreen_visible_owned_semantic_targets(self):
+        self.combo.props[30022] = None
+        row = self.option(self.combo, 'wanted')
+        row.props[30022] = None
+        self.after = lambda item, op, value: self.combo.props.update({30045: 'wanted'})
+        with patch.object(provider_visibility, '_shown', return_value=True):
+            self.assertEqual(self.run_action()['status'], 'verified')
+        self.assertEqual([op for _, op, _ in self.calls], ['Select'])
+        button = Element(50000, self.root, ['Click'], **{'30022': None})
+        with patch.object(provider_visibility, '_shown', return_value=True):
+            self.assertEqual(self.run_action('click', None, item=button)['status'], 'delivered_unverified')
+        self.assertEqual([op for _, op, _ in self.calls], ['Select', 'Invoke'])
+
+    def test_missing_offscreen_without_current_visible_scope_cannot_select(self):
+        self.combo.props[30022] = None
+        self.option(self.combo, 'wanted')
+        with patch.object(provider_visibility, '_shown', return_value=False):
+            self.assertEqual(self.run_action()['diagnostic'], 'target_offscreen')
+        self.assertFalse(self.calls)
+
+    def test_provider_pattern_conflict_never_authorizes_name_only_write(self):
+        self.combo.actions = ['SetValue']
+        row = self.option(self.combo, 'wanted', bounds=False)
+        row.props.update({30005: 'wanted', 30090: True, 30093: 'other'})
+        result = self.run_action()
+        self.assertEqual(result['status'], 'blocked')
+        self.assertFalse(self.calls)
+
+    def test_uncertain_expand_does_not_fallback_to_provider_value_write(self):
+        self.option(self.combo, 'wanted', bounds=False)
+        def fail(*_):
+            raise win.BridgeError('hresult_error')
+        self.after = fail
+        result = self.run_action()
+        self.assertEqual((result['status'], result['input_dispatched']), ('uncertain', None))
+        self.assertEqual([op for _, op, _ in self.calls], ['Expand'])
+
+    def test_unreadable_or_rejected_provider_write_is_not_success(self):
+        self.combo.props[30045] = ''
+        self.option(self.combo, 'wanted', bounds=False)
+        editors = [Element(50004, self.combo, **{'30043': True}) for _ in range(2)]
+        for current, status in (('', 'delivered_unverified'), ('old', 'mismatch')):
+            with self.subTest(current=current):
+                self.calls.clear()
+                for editor in editors:
+                    editor.props[30045] = current
+                result = self.run_action()
+                self.assertEqual(result['status'], status)
+                self.assertEqual([op for _, op, _ in self.calls], ['Expand', 'SetValue'])
+
+    def test_conflicting_combo_editor_values_block_before_any_mutation(self):
+        self.combo.props[30045] = ''
+        self.option(self.combo, 'wanted', bounds=False)
+        for value in ('N', 'P'):
+            Element(50004, self.combo, **{'30043': True, '30045': value})
+        result = self.run_action()
+        self.assertEqual((result['diagnostic'], result['input_dispatched']), ('combo_value_conflict', False))
+        self.assertFalse(self.calls)
+
+    def test_conflict_appearing_before_write_stops_after_one_expand(self):
+        self.combo.props[30045] = ''
+        self.option(self.combo, 'wanted', bounds=False)
+        def changed(*_):
+            for value in ('N', 'P'):
+                Element(50004, self.combo, **{'30043': True, '30045': value})
+        self.after = changed
+        result = self.run_action()
+        self.assertEqual((result['diagnostic'], result['input_dispatched']), ('combo_value_conflict', True))
+        self.assertEqual([op for _, op, _ in self.calls], ['Expand'])
+
+    def test_hidden_name_only_option_can_expand_but_cannot_write(self):
+        row = self.option(self.combo, '', bounds=False)
+        row.props[30005] = 'wanted'
+        result = self.run_action()
+        self.assertEqual((result['diagnostic'], result['input_dispatched']),
+                         ('combo_option_provider_value_required', True))
+        self.assertEqual([op for _, op, _ in self.calls], ['Expand'])
 
 
 if __name__ == '__main__':

@@ -147,6 +147,10 @@ def _convert(raw, *, allow_point=False):
     return step
 
 
+def _subject_name(subject):
+    return re.sub(r'\s*(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴)$', '', subject.strip()).strip()
+
+
 def _instruction_subject(step, subject):
     candidates = [step.get(k, '') for k in ('label', 'target', 'alias')]
     norm = lambda s: ''.join(s.split()).casefold()
@@ -160,7 +164,7 @@ def _instruction_subject(step, subject):
     raise TaskError('instruction_target_mismatch')
 
 
-def _parse_sentence(step, sentence):
+def _parse_sentence(step, sentence, resolve_subject=_instruction_subject):
     """Only parse one bounded, field-specific instruction. No shell or model evaluation."""
     verb = r'(?:선택|설정|입력|변경|해)(?:해)?\s*(?:줘|주세요)?'
     tail = r'(?:[.!。])?'
@@ -169,10 +173,10 @@ def _parse_sentence(step, sentence):
     into = re.fullmatch(r'\{([^{}]+)\}(?:을|를)\s*(.+?)에\s*' + verb + tail, sentence)
     if required or into:
         match = required or into
-        field = _instruction_subject(step, match[2])
+        field = resolve_subject(step, match[2])
         return 'required', match[1] or field
     if assign:
-        _instruction_subject(step, assign[1])
+        resolve_subject(step, assign[1])
         val = assign[2].strip()
         variable = re.fullmatch(r'\{([^{}]+)\}', val)
         if variable:
@@ -182,11 +186,58 @@ def _parse_sentence(step, sentence):
         return 'fixed', val
     command = re.fullmatch(r'(.+?)(?:을|를)\s*(누르기|눌러|클릭|펼치기|펼쳐|선택|실행)(?:해)?\s*(?:줘|주세요)?' + tail, sentence)
     if command:
-        _instruction_subject(step, command[1])
+        resolve_subject(step, command[1])
         if step.get('action') != 'open' or (command[2] in ('펼치기', '펼쳐') and not step.get('expand')):
             raise TaskError('instruction_action_mismatch')
         return 'recorded', None
     return None
+
+
+def instruction_subject(sentence):
+    """Extract a displayed field name for explicit user binding, never for execution."""
+    found = []
+    def remember(_step, subject):
+        value = _subject_name(subject)
+        found.append(value)
+        return value
+    if not isinstance(sentence, str):
+        return None
+    parsed = _parse_sentence({'action': 'open', 'expand': True}, sentence.strip(), remember)
+    return found[0] if parsed and len(found) == 1 else None
+
+
+def bind_instruction_subject(raw, others, sentence, *, mode=None, argument=None):
+    """Propose a user-confirmed alias only for an otherwise unnamed taught combo.
+
+    Known labels and the identities/names of other controls retain their guard.
+    The caller must show this explicit association before storing the alias.
+    """
+    step = _convert(raw, allow_point=True)
+    if step.get('role') != 'combobox' or step.get('action') != 'select':
+        raise TaskError('instruction_target_unavailable')
+    subject = instruction_subject(sentence)
+    if not subject or subject in {'이 항목', '이 필드', '이 콤보'}:
+        raise TaskError('instruction_requires_structure')
+    normalize = lambda text: ''.join(text.split()).casefold()
+    if step.get('label') and normalize(step['label']) != normalize(step['target']):
+        _instruction_subject(step, subject)  # An actual known label cannot be renamed by this shortcut.
+    for other in others:
+        other_step = _convert(other, allow_point=True)
+        other_step.update(_annotations(other))
+        if (other_step.get('target'), other_step.get('match'), other_step.get('ancestors')) == (
+                step.get('target'), step.get('match'), step.get('ancestors')):
+            continue
+        try:
+            _instruction_subject(other_step, subject)
+        except TaskError:
+            continue
+        raise TaskError('instruction_target_mismatch')
+    linked = dict(raw, alias=subject)
+    _annotations(linked)
+    directive = compile_instruction(linked, sentence, mode=mode, argument=argument)
+    if directive is None or directive.get('mode') not in ('fixed', 'required'):
+        raise TaskError('instruction_requires_structure')
+    return subject
 
 
 def _binding(step, text, mode, argument):

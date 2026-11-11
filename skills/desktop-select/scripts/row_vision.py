@@ -8,6 +8,7 @@ from ctypes import wintypes as W
 import struct
 
 import win_bridge as bridge
+from provider_visibility import visible
 
 
 def _reject(code):
@@ -71,7 +72,7 @@ def _row_layout(binding):
                 scope = [*scope[-3:], aid]
             if control in (50008, 50028, 50036):  # List, DataGrid, Table
                 viewport = _bounds(uia, e)
-            if control in (50007, 50029) and viewport and e.property(30022) is False and e.property(30010) is True:
+            if control in (50007, 50029) and viewport and visible(binding, uia, e, root) and e.property(30010) is True:
                 rect = _bounds(uia, e)
                 if (_inside(rect, viewport) and _inside(rect, window) and
                         rect[2] <= 5000 and rect[3] <= 512):

@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import importlib.util
-from pathlib import Path
 import queue
 import threading
 import time
@@ -14,17 +12,12 @@ import uuid
 import win_bridge as bridge
 from live_action import combo_readback
 import learned_tasks
+from provider_visibility import visible
+from runtime_integrity import checked_path
 
 
 def _load_recorder():
-    here = Path(__file__).resolve()
-    path = here.with_name('recorder.py')
-    if (not path.exists() and here.parents[2].name == 'skills'
-            and (here.parents[3] / 'engine/bridge-manifest.json').is_file()):
-        path = here.parents[3] / 'scripts/recorder.py'
-    expected = 'c26af522a42426988a7fcefdfb4c48366164d7dccca7a5e88796ed6246654086'
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-        raise bridge.BridgeError('recorder_incomplete')
+    path = checked_path('recorder.py')
     spec = importlib.util.spec_from_file_location('_desktop_select_recorder', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -32,6 +25,39 @@ def _load_recorder():
 
 
 recorder = _load_recorder()
+
+
+class CaptureUIA(bridge.UIA):
+    """Use the same provider evidence for initial observations and watch samples."""
+    def __init__(self, binding):
+        super().__init__()
+        self.binding = binding
+
+    def value_observation(self, element):
+        from provider_values import value_observation
+        return value_observation(self, element)
+
+    def semantic_label(self, element, root):
+        from provider_labels import semantic_label
+        return semantic_label(self.binding, self, element, root)
+
+    def node(self, element, root, path='0', parent=''):
+        result = super().node(element, root, path, parent)
+        if element.property(30022) is None and visible(self.binding, self, element, root=root):
+            result['offscreen'] = False
+            result['states'] = [state for state in result['states'] if state != 'offscreen']
+        return result
+
+
+class _CaptureBridge:
+    def __init__(self, binding):
+        self.binding = binding
+
+    def UIA(self):
+        return CaptureUIA(self.binding)
+
+    def __getattr__(self, key):
+        return getattr(bridge, key)
 
 
 def manual(reason, step_id=None):
@@ -151,8 +177,14 @@ class StepEdits:
             return step['action'], step['row'], step['label']
         if step['action'] == 'result-menu':
             return step['action'], step['context'], step['label']
-        return (step['action'], step['target'], step.get('recognition', {}).get('reason') if
-                step['action'] == 'manual' else None)
+        command = learned_tasks._convert(step, allow_point=True)
+        if command['action'] == 'manual':
+            return command, step.get('target')
+        # Use precisely the identity replay will resolve. A provider may change
+        # a peer's caption/path/runtime handle while keeping its control ID.
+        # Teach-target -> set-value is also the same combo, with new evidence.
+        return {key: command[key] for key in ('action', 'role', 'match', 'target', 'ancestors',
+                                              'command_name', 'expand') if key in command}
 
     def compile(self, step, alias, sentence, mode=None, argument=None):
         alias = alias.strip()
@@ -169,7 +201,11 @@ class StepEdits:
 
     def store(self, step, alias, sentence, mode=None, argument=None):
         data = self.compile(step, alias, sentence, mode, argument)
-        self.edits[step['id']] = (self.identity(step), data, (sentence, mode, argument))
+        self.edits[step['id']] = (copy.deepcopy(self.identity(step)), data, (sentence, mode, argument))
+
+    def changed(self, step):
+        saved = self.edits.get(step['id'])
+        return bool(saved and saved[0] != self.identity(step))
 
     def get(self, step):
         saved = self.edits.get(step['id'])
@@ -182,6 +218,8 @@ class StepEdits:
     def apply(self, steps):
         result = []
         for step in steps:
+            if self.changed(step):
+                raise learned_tasks.TaskError('recorded_target_changed')
             saved = self.get(step)
             if saved:
                 sentence, mode, argument = self.form(step)
@@ -285,7 +323,7 @@ class _Worker(recorder.CaptureWorker):
                 break
             role = bridge.ROLES.get(item.property(30003))
             if role in {'button', 'splitbutton', 'menuitem', 'treeitem', 'tab', 'hyperlink'}:
-                if (item.property(30010) is not True or item.property(30022) is not False
+                if (item.property(30010) is not True or not visible(self.binding, self.uia, item, root=root)
                         or not self.uia.within(item, root)
                         or not recorder._inside(self.uia.bounds(item), event.get('x'), event.get('y'))):
                     break
@@ -329,7 +367,7 @@ class CaptureSession:
         self.binding = _BoundWindow(binding, title)
         self.notes = CaptureNotes()
         self.events, self.notices = queue.Queue(maxsize=128), queue.Queue()
-        self.worker = _Worker(self.binding, bridge, self.notes, self.events, self.notices)
+        self.worker = _Worker(self.binding, _CaptureBridge(self.binding), self.notes, self.events, self.notices)
         self.pump = recorder.HookPump(self.binding, bridge, self.events, self.notices)
         self.started = self.ended = False
 
@@ -416,6 +454,7 @@ def capture(binding, *, title):
     result = None
     review = None
     editing = None
+    target_changed = False
     edits = StepEdits()
     completed_steps = []
     previous_columns = None
@@ -472,9 +511,12 @@ def capture(binding, *, title):
     def show_error(exc):
         if isinstance(exc, learned_tasks.TaskError):
             reason = {'instruction_target_mismatch': '입력한 문장의 대상이 녹화한 요소와 다릅니다.',
+                      'recorded_target_changed': '녹화 대상이 바뀌었습니다. 대상과 지시를 다시 확인하고 동작 적용을 누르세요.',
                       'instruction_requires_structure': '콤보 값 지정에서 고정값이나 필수 변수를 선택하고 값을 입력하세요.',
                       'invalid_step_alias': '다른 별칭을 입력하세요.'}.get(
                           exc.code, '이 단계에서 실행할 수 있는 문장과 값을 입력하세요.')
+            if exc.code == 'instruction_target_mismatch':
+                reason += ' 표시 이름이 없으면 아래 이름 연결을 사용하거나 “이 항목을 N으로 설정”처럼 적으세요.'
             preview.set(reason + ' (' + exc.code + ')')
         else:
             preview.set(str(exc))
@@ -483,6 +525,9 @@ def capture(binding, *, title):
         arg_box.configure(state='disabled' if modes[mode.get()] is None else 'normal')
         arg_label.configure(text='변수 이름' if modes[mode.get()] == 'required' else '값')
         if editing is not None:
+            if target_changed:
+                show_error(learned_tasks.TaskError('recorded_target_changed'))
+                return
             try:
                 data = edits.compile(editing, *fields())
                 preview.set('실행 미리보기: ' + instruction_view(editing, data.get('instruction')))
@@ -491,6 +536,9 @@ def capture(binding, *, title):
 
     def flush():
         if editing is not None:
+            if target_changed:
+                show_error(learned_tasks.TaskError('recorded_target_changed'))
+                return False
             try:
                 edits.store(editing, *fields())
             except ValueError as exc:
@@ -499,11 +547,16 @@ def capture(binding, *, title):
         return True
 
     def load(step):
+        nonlocal target_changed
         sentence, chosen, arg = edits.form(step)
+        saved = edits.get(step)
+        target_changed = edits.changed(step)
+        if target_changed:
+            _, saved, (sentence, chosen, arg) = edits.edits[step['id']]
         configured = step['action'] in ('row-action', 'result-menu')
         form.children['instruction'].configure(state='readonly' if configured else 'normal')
         mode_box.configure(state='disabled' if configured else 'readonly')
-        alias.set(edits.get(step).get('alias', ''))
+        alias.set(saved.get('alias', ''))
         instruction.set(step['label'] if configured else sentence)
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
@@ -522,14 +575,17 @@ def capture(binding, *, title):
             load(editing)
 
     def render(steps):
-        nonlocal editing
+        nonlocal editing, target_changed
         for i, step in enumerate(steps, 1):
             saved = edits.get(step)
             if editing is not None and step['id'] == editing['id'] and editing != step:
                 previous = editing
                 editing = step
                 if edits.identity(step) != edits.identity(previous):
-                    load(step)
+                    # Keep the pending text visible. A changed target requires
+                    # an explicit re-apply instead of silently dropping edits.
+                    target_changed = True
+                    show_error(learned_tasks.TaskError('recorded_target_changed'))
                 else:
                     refresh_preview()
             directive = saved.get('instruction')
@@ -544,15 +600,42 @@ def capture(binding, *, title):
             listing.selection_set(steps[0]['id'])
 
     def apply_text():
-        if flush():
+        nonlocal target_changed
+        if editing is None:
+            return
+        try:
+            edits.store(editing, *fields())
+            target_changed = False
             render(steps_now())
             refresh_preview()
+        except ValueError as exc:
+            show_error(exc)
+
+    def link_subject():
+        if editing is None or target_changed:
+            return
+        from tkinter import messagebox
+        try:
+            _, sentence, chosen, arg = fields()
+            others = [dict(step, **edits.get(step)) for step in steps_now() if step['id'] != editing['id']]
+            proposed = learned_tasks.bind_instruction_subject(editing, others, sentence, mode=chosen, argument=arg)
+            command = learned_tasks._convert(editing, allow_point=True)
+            if not messagebox.askyesno('문장의 이름과 녹화 대상 연결',
+                    f'문장의 “{proposed}”가 녹화한 “{command["target"]}” 콤보를 뜻하나요?\n'
+                    '확인하면 이 이름을 단계 별칭으로 저장합니다. 실제 실행 대상은 녹화한 콤보로 유지됩니다.', parent=root):
+                return
+            alias.set(proposed)
+            apply_text()
+        except ValueError as exc:
+            show_error(exc)
 
     listing.bind('<<TreeviewSelect>>', select_row)
     for variable in (alias, instruction, mode, argument):
         variable.trace_add('write', refresh_preview)
     refresh_preview()
     ttk.Button(form, text='동작 적용', command=apply_text).grid(row=0, column=2, rowspan=2, padx=6)
+    ttk.Button(form, text='문장의 이름을 이 대상에 연결', command=link_subject).grid(
+        row=4, column=0, columnspan=3, sticky='w', pady=(4, 0))
 
     def start(*_):
         nonlocal result

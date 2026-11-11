@@ -44,7 +44,8 @@ class RowTeachTests(unittest.TestCase):
         different['row']['key'] = 'different example'
         edits = teach_capture.StepEdits()
         edits.store(step, '첫 장비', '')
-        self.assertNotIn('alias', edits.apply([different])[0])
+        with self.assertRaisesRegex(ValueError, 'recorded_target_changed'):
+            edits.apply([different])
         self.assertEqual(edits.apply([step])[0]['alias'], '첫 장비')
         self.assertEqual(teach_capture.default_text(step), '첫 행 시작 후 준비 표시 확인')
         self.assertIn('같은 행', teach_capture.instruction_view(step, None))
