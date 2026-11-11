@@ -260,6 +260,59 @@ def action(args, owner, *, learned=None, anchor=None):
 
         command = 'select' if args.command == 'select' else ('expand' if args.expand else
                   'choose' if node['role'] in {'treeitem', 'tab', 'listitem'} else 'invoke')
+        # A direct command has already resolved its exact label/ID, scope and
+        # layout once. Pin that choice to native identities for the one action;
+        # neither a saved registration nor repeated full-window reads are needed.
+        direct = (learned is None and anchor is None and args.popup is None
+                  and node.get('automation_id') and len(node['automation_id']) <= 1000)
+        capability = 'SetValue' if command == 'select' else 'Click'
+        if (direct and (command == 'select' or command == 'invoke' and node['role'] in
+                        {'button', 'splitbutton', 'hyperlink', 'menuitem'})
+                and capability in uia.actions(element)):
+            by_path = {n['path']: (n, e) for n, e in zip(nodes, elements)}
+            chain, path = [], node['parent_path']
+            while path:
+                parent, peer = by_path[path]
+                if parent['parent_path']:
+                    chain.append((parent, peer))
+                path = parent['parent_path']
+            ancestors = []
+            for parent, _ in chain:
+                key = 'automation_id' if parent.get('automation_id') else 'name'
+                if parent.get(key):
+                    ancestors.append({'role': parent['role'], key: parent[key]})
+            # Unusually deep/oversized provider identities keep the legacy path.
+            native_shape = (len(ancestors) <= 16 and all(a['role'] in bridge.ROLES.values() for a in ancestors) and all(
+                len(value) <= 1000 and '\0' not in value and value.strip()
+                for item in ancestors for key, value in item.items() if key != 'role'))
+            if native_shape:
+                from registered_runtime import _dispatch
+                import native_targets
+                root = elements[0]
+                selector = {'role': node['role'], 'automation_id': node['automation_id']}
+                if ancestors:
+                    selector['ancestors'] = ancestors
+                def authorize_direct():
+                    check()
+                    current_root = uia.from_handle(surface.hwnd)
+                    if not uia.same(root, current_root):
+                        raise SelectionError('target_changed')
+                    if args.within:
+                        # A region alias can refer to an unnamed/class-only
+                        # container, which an ID selector cannot encode.
+                        current_chain = native_targets.ancestry(uia, element, root, pid=surface.pid)
+                        if any(not any(uia.same(peer, live) for live in current_chain[1:])
+                               for _, peer in chain):
+                            raise SelectionError('target_changed')
+                    if ((command == 'invoke' or evidence == 'name')
+                            and (element.property(30005) or '') != node.get('name', '')):
+                        raise SelectionError('target_caption_changed')
+                step = {'action': 'set-value' if command == 'select' else 'invoke', 'selector': selector}
+                result = _dispatch(surface, uia, root, step, args.window, getattr(args, 'value', None),
+                                   expected_element=element, authorize=authorize_direct)
+                return dict(result, target=detail, matched_by=evidence, business_commit='not_verified',
+                            window_restored=restored, execution_path='direct_native',
+                            metrics={'full_tree_snapshots': 1, 'option_inventories': 0})
         result = execute(surface, uia, element, node, command, getattr(args, 'value', None), still_valid=still_valid)
         return dict(result, target=detail, matched_by=evidence, business_commit='not_verified',
                     window_restored=restored)

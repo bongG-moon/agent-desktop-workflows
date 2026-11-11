@@ -109,6 +109,23 @@ sealed class ProviderCompatibilityFixture : Form {
             Root.Children.Insert(group,peer);
         }
     }
+    void SetWrappedLabels(bool wrapped) {
+        foreach(var pair in Combos) {
+            string key=pair.Key;
+            var combo=Root.Children.Find(delegate(RawPeer peer) { return peer.Key==key; });
+            int index=Root.Children.FindIndex(delegate(RawPeer peer) { return peer.Key==key+"Label" || peer.Key==key+"LabelGroup"; });
+            var previous=Root.Children[index];
+            string caption=key=="conditionState"?"MES Setup":"Family";
+            if(wrapped) {
+                var wrapper=new RawPeer(this,Root,previous.Id,key+"LabelGroup",caption,50026,previous.Relative);
+                wrapper.Children.Add(new RawPeer(this,wrapper,previous.Id+300,key+"Label",caption,50020,previous.Relative));
+                Root.Children[index]=wrapper; combo.Label=null;
+            } else {
+                var label=new RawPeer(this,Root,previous.Id,key+"Label",caption,50020,previous.Relative);
+                Root.Children[index]=label; combo.Label=label;
+            }
+        }
+    }
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e);
         foreach (var peer in Root.Children) {
@@ -142,7 +159,8 @@ sealed class ProviderCompatibilityFixture : Form {
         }
         Console.WriteLine(json.Serialize(new { kind=kind, title=Text, pid=Process.GetCurrentProcess().Id,
             hwnd=Handle.ToInt64(), minimized=Minimized, opens=Opens, exports=Exports, controls=values,
-            result_state=ResultState, result_family=ResultFamily }));
+            result_state=ResultState, result_family=ResultFamily,
+            query_caption=Root.Children.Find(delegate(RawPeer peer) { return peer.Key=="QueryCommand"; }).Name }));
         Console.Out.Flush();
     }
     void Read() {
@@ -160,6 +178,11 @@ sealed class ProviderCompatibilityFixture : Form {
                 else if(command=="minimize")WindowState=FormWindowState.Minimized;
                 else if(command=="restore") { WindowState=FormWindowState.Normal; Activate(); }
                 else if(command.StartsWith("title|"))Text=command.Substring(6);
+                else if(command=="label-wrappers")SetWrappedLabels(true);
+                else if(command=="label-direct")SetWrappedLabels(false);
+                else if(command.StartsWith("query-caption|")) {
+                    Root.Children.Find(delegate(RawPeer peer) { return peer.Key=="QueryCommand"; }).Name=command.Substring(14);
+                }
                 else if(command=="reset-metrics")PropertyReads=Navigations=PatternReads=BoundsReads=0;
                 else if(command=="clear-extra")ClearExtras();
                 else if(command.StartsWith("clutter|"))AddClutter(Int32.Parse(command.Substring(8)));
@@ -179,7 +202,10 @@ sealed class ProviderCompatibilityFixture : Form {
             })); } catch { return; }
         }
     }
-    [STAThread] static void Main() { Application.EnableVisualStyles(); Application.Run(new ProviderCompatibilityFixture()); }
+    [STAThread] static void Main() {
+        Console.InputEncoding=new UTF8Encoding(false); Console.OutputEncoding=new UTF8Encoding(false);
+        Application.EnableVisualStyles(); Application.Run(new ProviderCompatibilityFixture());
+    }
 }
 
 sealed class ComboModel {
@@ -217,7 +243,8 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     internal readonly ProviderCompatibilityFixture Host;
     internal readonly RawPeer Parent;
     internal readonly int Id, Role;
-    internal readonly string Key, Name;
+    internal readonly string Key;
+    internal string Name;
     internal readonly Rectangle Relative;
     internal readonly List<RawPeer> Children=new List<RawPeer>();
     internal ComboModel Combo;

@@ -1,11 +1,13 @@
-# Desktop Select 0.6.0
+# Desktop Select 0.6.1
 
 Windows 업무의 콤보와 버튼을 처음 한 번 확인해 재사용 Python 스킬로 만듭니다. 이후에는 실행 변수만 받아 같은 순서를 바로 실행합니다. 위치 녹화와 자유문장 편집, 표 우클릭 메뉴 재생도 유지합니다.
 
-[Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/tag/desktop-select-v0.6.0) | [사용 가이드](skills/desktop-select/사용가이드.md)
+[Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/tag/desktop-select-v0.6.1) | [사용 가이드](skills/desktop-select/사용가이드.md)
 
 ## 이번 버전에서 달라진 점
 
+- “MES Setup을 N으로 설정” 같은 일반 직접 명령에도 ID 재확인과 SetValue 1회 실행을 연결했습니다. 별도 등록 없이 사용하며, 최초 대상 해석 후 전체 화면을 반복 조사하지 않습니다.
+- 기존 라벨, 범위와 모호한 대상 판정은 유지합니다. 직접 쓰기는 요청 문자열을 그대로 전달하고 실제 값을 확인하며, 옵션 목록 조사를 반복하지 않습니다.
 - 반복 업무는 최초 등록 후 Python 실행 스킬로 저장합니다. 한 프로세스와 UIA 세션에서 필요한 ID만 직접 찾으며 매 단계 전체 화면 조사와 프로세스 시작을 없앴습니다.
 - 처음 등록할 때도 discover로 콤보/버튼/라벨만 읽습니다. 안정 ID가 있는 녹화 위치의 고유성 확인도 전체 트리 순회 대신 native UIA 조회를 사용합니다.
 - 등록된 콤보는 옵션 조사 없이 SetValue 1회와 값 읽기를 사용합니다. 버튼 Invoke와 명시적 대기를 순서대로 처리하고, 조회 실패 시 뒤의 엑셀 버튼을 누르지 않습니다.

@@ -60,7 +60,7 @@ def _check(binding, uia, root, element, selector, title, method):
     _need(shown, 'target_offscreen')
 
 
-def _dispatch(binding, uia, root, step, title, value=None):
+def _dispatch(binding, uia, root, step, title, value=None, *, expected_element=None, authorize=None):
     selector = step['selector']
     method = 'SetValue' if step['action'] == 'set-value' else 'Invoke'
     receipt = dict(status='blocked', input_dispatched=False, method=method, target=selector,
@@ -73,8 +73,19 @@ def _dispatch(binding, uia, root, step, title, value=None):
         receipt['input_dispatched'] = None
 
     try:
+        if method == 'SetValue':
+            # Direct commands also enter here without profile validation.
+            _need(isinstance(value, str) and bool(value.strip()) and '\0' not in value
+                  and len(value.encode('utf8')) <= 10000, 'invalid_combo_value')
+        if authorize is not None:
+            authorize()
         element = native_targets.resolve(binding, uia, selector, root=root)
-        check = lambda: _check(binding, uia, root, element, selector, title, method)
+        if expected_element is not None:
+            _need(uia.same(element, expected_element), 'registered_target_changed')
+        def check():
+            if authorize is not None:
+                authorize()
+            _check(binding, uia, root, element, selector, title, method)
         check()
         if method == 'SetValue':
             before = live.combo_readback(binding, uia, element)
@@ -93,6 +104,8 @@ def _dispatch(binding, uia, root, step, title, value=None):
         _wait(binding, title, READBACK_DELAY)
         current = native_targets.resolve(binding, uia, selector, root=root)
         _need(uia.same(element, current), 'registered_target_changed')
+        if authorize is not None:
+            authorize()
         after = live.combo_readback(binding, uia, current)
         matched = after.get('value_evidence', {}).get('status') == 'observed' and after.get('value') == value
         return dict(receipt, status='verified' if matched else 'delivered_unverified', after=after,
