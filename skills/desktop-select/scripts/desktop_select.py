@@ -276,7 +276,7 @@ def run(args):
         return dict(status='observed', version=version, skill_path=str(here),
                     runtime_integrity='matched', input_dispatched=False,
                     capabilities=['position_recording', 'free_text_instructions', 'edit_delete_steps',
-                                  'model_resolution', 'provider_compatibility'])
+                                  'model_resolution', 'provider_compatibility', 'auto_instruction_drafts'])
     if args.command in ('tasks', 'show'):
         if args.command == 'tasks':
             return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}

@@ -17,9 +17,76 @@ CONTROLS = {'combobox', 'textfield', 'button', 'splitbutton', 'hyperlink', 'chec
             'radiobutton', 'spinner', 'tab', 'treeitem', 'listitem', 'menuitem'}
 
 
-def draft(anchor=None, label='대상 지정 필요', *, step_id=None):
+def suggested_instruction(anchor, label, *, action='point', value=None, role=None):
+    """Suggest prose from a witnessed action, never from an existing field value."""
+    role = role or (anchor or {}).get('role')
+    raw_label = label
+    # UI captions are literal names, not the user's {parameter} syntax.
+    label = label.replace('{', '［').replace('}', '］')
+    parameters = []
+    if action == 'right-click' and role:
+        text = f'{label} 영역을 우클릭해 줘'
+    elif role == 'combobox':
+        if (action == 'select-option' and isinstance(value, str) and value.strip()
+                and len(value) <= 10000 and all(ord(c) >= 32 for c in value)
+                and not any(c in value for c in '{}')):
+            text = f'{label} 조건을 "{value}" 값으로 설정해 줘'
+        else:
+            parameter = raw_label.strip()
+            if (not parameter or len(parameter) > 80 or any(c in parameter for c in '{}=,;')
+                    or any(ord(c) < 32 for c in parameter)):
+                parameter = '입력값'
+            parameters = [parameter]
+            text = f'실행할 때 입력받은 {{{parameter}}} 값을 {label} 조건에 설정해 줘'
+    elif role in {'button', 'splitbutton', 'hyperlink'}:
+        text = f'{label} 버튼을 눌러 줘'
+    elif role == 'menuitem':
+        text = f'{label} 메뉴를 선택해 줘'
+    elif role in {'tab', 'treeitem', 'listitem', 'radiobutton'}:
+        text = f'{label} 항목을 선택해 줘'
+    elif role in {'textfield', 'spinner'}:
+        text = f'{label}에 실행할 때 입력받은 {{입력값}} 값을 입력해 줘'
+        parameters = ['입력값']
+    elif role == 'checkbox':
+        text = f'{label} 체크 상태를 바꿔 줘' if action == 'click' else ''
+    else:
+        # Pointing at a table does not specify whether to click, select or export.
+        text = ''
+    from intent_tasks import collect_parameters
+    return {'mode': 'natural', 'text': text, 'parameters': collect_parameters(text, parameters)}
+
+
+def draft(anchor=None, label='대상 지정 필요', *, step_id=None, action='point', value=None, role=None):
     return {'id': step_id or uuid.uuid4().hex, 'action': 'intent', 'label': label, 'anchor': copy.deepcopy(anchor),
-            'instruction': {'mode': 'natural', 'text': '', 'parameters': []}}
+            'instruction': suggested_instruction(anchor, label, action=action, value=value, role=role)}
+
+
+class DraftEdits:
+    """UI-only ownership of suggestions; saved text never receives an auto-edit flag."""
+    def __init__(self):
+        self.generated = {}
+        self.protected = set()
+
+    def remember(self, item):
+        self.generated[item['id']] = copy.deepcopy(item['instruction'])
+
+    def automatic(self, item):
+        return (item['id'] not in self.protected and item['id'] in self.generated
+                and item.get('instruction') == self.generated[item['id']])
+
+    def note_edit(self, item, text, parameters):
+        original = self.generated.get(item['id'])
+        if original is None or text != original['text'] or parameters != original['parameters']:
+            self.protected.add(item['id'])
+
+    def merge(self, item, candidate):
+        if not self.automatic(item) or item.get('anchor') != candidate.get('anchor'):
+            return False
+        if item['instruction'] == candidate['instruction']:
+            return False
+        item['instruction'] = copy.deepcopy(candidate['instruction'])
+        self.remember(item)
+        return True
 
 
 def editable_step(step):
@@ -75,7 +142,10 @@ def _locator(locator):
 
 class PositionUIA(legacy.CaptureUIA):
     def value_observation(self, element):
-        # A location demonstration cannot supply a desired or default value.
+        # An option's own caption is allowed as click evidence. The combo's
+        # current selection is deliberately not read or used as a default.
+        if element.property(30003) == 50007:
+            return self._selected_option_observation(element)
         return {'value': None, 'value_evidence': {'status': 'unavailable', 'source': 'none'}}
 
 
@@ -135,6 +205,9 @@ def anchor_from_observation(binding, uia, observation, point):
                     raise bridge.BridgeError('target_position_moved')
                 selector['point'] = [(x - box['x']) / box['width'], (y - box['y']) / box['height']]
             label = uia.semantic_label(current, root).get('semantic_label')
+            name = current.property(30005)
+            if not label and isinstance(name, str) and name.strip() and len(name) <= 200:
+                label = name.strip()
             binding.check()
             return {'anchor': selector, 'label': label or selector.get('automation_id') or selector['name']}
         current = uia.parent(current)
@@ -164,18 +237,26 @@ def _read_sample(sender, window, title, op, args):
 
 
 class PositionNotes(legacy.CaptureNotes):
-    def add(self, step):
+    def __init__(self):
+        super().__init__()
+        self.strengths = {}
+
+    def add(self, step, *, strength=0):
         with self.lock:
             if self.closed or self.limit:
                 return
+            if self.steps and step.get('anchor') is not None:
+                last = next(reversed(self.steps.values()))
+                if last.get('anchor') == step['anchor'] and step['anchor'].get('role') == 'combobox':
+                    if strength >= self.strengths.get(last['id'], 0):
+                        last['instruction'] = copy.deepcopy(step['instruction'])
+                        self.strengths[last['id']] = strength
+                    return  # Opening and choosing retain one ID for draft updates.
             if step['id'] not in self.steps and len(self.steps) >= self.max_steps:
                 self.limit = True
                 return
-            if self.steps and step.get('anchor') is not None:
-                last = next(reversed(self.steps.values()))
-                if last.get('anchor') == step['anchor']:
-                    return  # Opening and choosing within one combo teach one location.
             self.steps[step['id']] = copy.deepcopy(step)
+            self.strengths[step['id']] = strength
 
     def manual(self, label, reason):
         self.add(draft(label='대상 지정 필요'))
@@ -185,31 +266,81 @@ class PositionWorker(legacy.recorder.CaptureWorker):
     def finalize_watch(self, *_args, **_kwargs):
         return None
 
+    def selected_option(self, observation, event, anchor):
+        """An actual click and proven combo owner may seed a value suggestion."""
+        if not observation or anchor.get('role') != 'combobox' or event.get('action', 'click') != 'click':
+            return None
+        node = observation.get('node', {})
+        combo = self.uia.combo_observation(observation)
+        if (not combo or combo.get('node', {}).get('secure') is not False
+                or node.get('secure') is not False or node.get('role') != 'listitem'
+                or node.get('enabled') is not True or node.get('offscreen') is not False
+                or node.get('bounds_valid') is not True
+                or not legacy.recorder._inside(node.get('bounds'), event['x'], event['y'])):
+            return None
+        return bridge.option_value(node)
+
     def handle(self, event):
         if not self.check_binding():
             return
         if event['kind'] == 'down':
             observation = self.observe_down(event)
+            strength = 0
             try:
                 picked = anchor_from_observation(self.binding, self.uia, observation, (event['x'], event['y']))
-                item = draft(**picked)
+                selected = self.selected_option(observation, event, picked['anchor'])
+                action = 'select-option' if selected is not None else event.get('action', 'click')
+                item = draft(**picked, action=action, value=selected)
+                strength = 2 if selected is not None else 0
             except bridge.BridgeError:
                 item = draft()
-            self.captures[event['token']] = (event, item)
+                node = observation.get('node', {}) if observation else {}
+                if (node.get('role') == 'menuitem' and node.get('secure') is False
+                        and self.binding.contains_window(observation.get('window', 0))
+                        and isinstance(node.get('name'), str) and node['name'].strip()):
+                    item = draft(label=node['name'][:200], role='menuitem', action=event.get('action', 'click'))
+            # Keep only the currently demonstrated combo's pre-click option
+            # inventory. Never watch its selected value or keyboard contents.
+            self.watched = self.uia.combo_observation(observation) if observation else None
+            self.option_history.clear()
+            self.captures[event['token']] = (event, item, strength)
         elif event['kind'] == 'up':
-            down, item = self.captures.pop(event['token'], (None, None))
+            down, item, strength = self.captures.pop(event['token'], (None, None, None))
             if not down or not event['inside'] or abs(event['x'] - down['x']) > 8 or abs(event['y'] - down['y']) > 8:
                 return
-            self.model.add(item)
+            self.model.add(item, strength=strength)
         elif event['kind'] == 'escape':
+            self.watched = None
+            self.option_history.clear()
             self.enabled.clear()
             self.notices.put(('pause', None))
-        # Typing, chosen options, scrolling and shortcuts are not instructions.
+        elif event['kind'] in {'outside', 'scroll', 'candidate_scroll', 'shortcut', 'pause'}:
+            self.watched = None
+            self.option_history.clear()
+        # Typing/keyboard events alone do not prove a selected or committed value.
 
     def tick(self):
-        if time.monotonic() - self.last_identity > .5:
-            self.last_identity = time.monotonic()
-            self.check_binding()
+        now = time.monotonic()
+        if now - self.last_identity > .5:
+            self.last_identity = now
+            if not self.check_binding():
+                return
+        if now - self.last_hover > .15:
+            self.last_hover = now
+            x, y = self.bridge.cursor()
+            hit = self.bridge.window_from_point(x, y)
+            if self.binding.recording_candidate(hit):
+                try:
+                    observation = self.uia.observe_point(self.binding, x, y, self.bridge.root_window(hit))
+                    self.hovered, self.hover_at = observation, time.monotonic()
+                    self.hover_history.append((self.hover_at, observation))
+                except Exception:
+                    self.hovered = None
+            else:
+                self.hovered = None
+        if self.watched and now - self.last_options > .05:
+            self.last_options = now
+            self.cache_options()
 
 
 class PositionSession(legacy.CaptureSession):
@@ -236,13 +367,15 @@ def capture(binding, *, title, steps=None):
     session.binding.check()
     items = [editable_step(step) for step in (steps or [])]
     seen = set()
+    drafts = DraftEdits()
     result, editing, job, sampling, timer = None, None, None, False, None
+    loading = False
     previous_columns = None
     root = tk.Tk()
     root.title('Desktop Select 위치와 동작')
     frame = ttk.Frame(root, padding=14)
     frame.pack(fill='both', expand=True)
-    message = tk.StringVar(value='위치를 알려주고 각 단계에 실행할 동작을 적으세요. 현재 선택값은 녹화하지 않습니다.')
+    message = tk.StringVar(value='위치와 관찰한 동작으로 설명 초안을 채웁니다. 자유롭게 고치세요. 화면에 보이던 값만으로 고정값을 정하지 않습니다.')
     ttk.Label(frame, text=title, wraplength=740).pack(anchor='w')
     ttk.Label(frame, textvariable=message, wraplength=740, padding=(0, 8)).pack(anchor='w')
     listing = ttk.Treeview(frame, name='steps', columns=('number', 'target', 'text', 'status'), show='headings', height=8)
@@ -271,6 +404,8 @@ def capture(binding, *, title, steps=None):
             return '설정된 동작'
         if item.get('anchor') is None:
             return '대상 지정 필요'
+        if drafts.automatic(item) and item['instruction']['text'].strip():
+            return '자동 초안 · 수정 가능'
         return '실행 시 동작 해석' if item['instruction']['text'].strip() else '동작 설명 필요'
 
     def render():
@@ -293,10 +428,24 @@ def capture(binding, *, title, steps=None):
                      'target_position_unavailable': '대상을 읽지 못했습니다. 동작 설명을 먼저 적고 나중에 대상을 다시 지정할 수 있습니다.'}.get(
                          code, '입력 내용을 확인하세요: ' + code))
 
+    def note_form_edit(*_):
+        if loading or editing is None or editing['action'] != 'intent':
+            return
+        drafts.note_edit(editing, sentence.get('1.0', 'end-1c'),
+                         [value.strip() for value in parameters.get().split(',') if value.strip()])
+
+    def modified(_event):
+        note_form_edit()
+        sentence.edit_modified(False)
+
+    sentence.bind('<<Modified>>', modified)
+    parameters.trace_add('write', note_form_edit)
+
     def flush():
         if editing is None:
             return True
         try:
+            note_form_edit()
             annotation = learned_tasks._annotations({'alias': alias.get()})
             if editing['action'] == 'intent':
                 text = sentence.get('1.0', 'end-1c')
@@ -318,17 +467,23 @@ def capture(binding, *, title, steps=None):
 
     selected_id = [None]
 
-    def load(item):
-        nonlocal editing
-        editing = item
-        selected_id[0] = item['id']
-        configured = item['action'] != 'intent'
-        alias.set(item.get('alias', ''))
-        sentence.configure(state='normal')
-        sentence.delete('1.0', 'end')
-        sentence.insert('1.0', item['label'] if configured else item['instruction']['text'])
-        sentence.configure(state='disabled' if configured else 'normal')
-        parameters.set(', '.join(item.get('instruction', {}).get('parameters', [])))
+    def load(item, *, preserve_alias=False):
+        nonlocal editing, loading
+        display_alias = alias.get() if preserve_alias else item.get('alias', '')
+        loading = True
+        try:
+            editing = item
+            selected_id[0] = item['id']
+            configured = item['action'] != 'intent'
+            alias.set(display_alias)
+            sentence.configure(state='normal')
+            sentence.delete('1.0', 'end')
+            sentence.insert('1.0', item['label'] if configured else item['instruction']['text'])
+            sentence.edit_modified(False)
+            sentence.configure(state='disabled' if configured else 'normal')
+            parameters.set(', '.join(item.get('instruction', {}).get('parameters', [])))
+        finally:
+            loading = False
         preview.set(status(item))
 
     def select(item):
@@ -353,10 +508,20 @@ def capture(binding, *, title, steps=None):
     def sync():
         if session.started and not session.ended:
             session.poll()
+        # The text box may contain an unsaved user edit while a new option
+        # event arrives. Detect it before touching a suggestion or its form.
+        note_form_edit()
         for item in session.notes.snapshot():
             if item['id'] not in seen:
                 seen.add(item['id'])
                 items.append(item)
+                drafts.remember(item)
+            else:
+                current = next((row for row in items if row['id'] == item['id']), None)
+                if current is not None and drafts.merge(current, item) and editing is current:
+                    # A new option can improve the action draft while a user
+                    # is naming this step. Keep that unsaved name verbatim.
+                    load(current, preserve_alias=True)
         render()
         if items and editing is None:
             select(items[0])
@@ -380,7 +545,7 @@ def capture(binding, *, title, steps=None):
             return
         try:
             session.start()
-            message.set('클릭한 위치만 기록 중입니다. 실제로 클릭하면 업무 화면도 반응합니다. 클릭 없이 알려주려면 대상 추가를 사용하세요.')
+            message.set('위치와 동작 초안을 기록 중입니다. 실제로 클릭하면 업무 화면도 반응합니다. 위치만 알려주려면 대상 추가를 사용하세요.')
         except Exception as exc:
             error(exc)
 
@@ -449,10 +614,12 @@ def capture(binding, *, title, steps=None):
             if destination is not None:
                 if picked is not None:
                     destination.update(anchor=picked['anchor'], label=picked['label'])
+                    drafts.protected.add(destination['id'])
                 selected_item = destination
             else:
                 selected_item = draft(**picked) if picked is not None else draft()
                 items.append(selected_item)
+                drafts.remember(selected_item)
             render()
             if not preserve_form:
                 select(selected_item)
