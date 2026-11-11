@@ -311,6 +311,10 @@ def run(args):
                 resolution = json.loads(data, object_pairs_hook=tasks._unique_keys)
             except (ValueError, UnicodeError) as error:
                 raise tasks.TaskError('invalid_resolution_file') from error
+        if any(step['action'] == 'intent' for step in plan['steps']):
+            from confirmed_plan import replay as replay_confirmed
+            return replay_confirmed(plan, args.exe, args.window, overrides, invoke,
+                                    directory=task_directory(), only=args.only, resolution=resolution)
         return tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only, resolution=resolution)
     rows = windows(args.exe)
     if args.command == 'windows':

@@ -119,9 +119,52 @@ def editable_step(step):
     elif not text and result.get('action') == 'open':
         text = label + (' 펼치기' if result.get('expand') else ' 선택')
     converted['instruction'].update(text=text, parameters=parameters)
-    if result.get('alias'):
-        converted['alias'] = result['alias']
+    for key in ('alias', 'description'):
+        if result.get(key):
+            converted[key] = result[key]
     return converted
+
+
+class SavedStepEdits:
+    """Keep executable saved steps when only their editor presentation changes."""
+    def __init__(self, steps):
+        self.items = []
+        self.originals = {}
+        for step in steps:
+            item = editable_step(step)
+            self.items.append(item)
+            if step.get('action') in {'select', 'open', 'manual'}:
+                self.originals[item['id']] = (copy.deepcopy(step), self._meaning(item))
+
+    @staticmethod
+    def _meaning(item):
+        from intent_tasks import collect_parameters
+        meaning = {key: copy.deepcopy(value) for key, value in item.items()
+                   if key not in {'id', 'alias', 'description'}}
+        if meaning.get('action') == 'intent':
+            spec = meaning['instruction']
+            # Saving a form infers explicit variables even when its text did
+            # not change. Compare the same normalization on both sides.
+            spec['parameters'] = collect_parameters(spec['text'], spec['parameters'])
+        return meaning
+
+    def unchanged(self, item):
+        prior = self.originals.get(item.get('id'))
+        return prior is not None and self._meaning(item) == prior[1]
+
+    def saved(self, items):
+        from learned_tasks import _annotations
+        result = []
+        for item in items:
+            if self.unchanged(item):
+                restored = copy.deepcopy(self.originals[item['id']][0])
+                for key in ('id', 'alias', 'description'):
+                    restored.pop(key, None)
+                restored.update(_annotations(item))
+                result.append(restored)
+            else:
+                result.append(copy.deepcopy(item))
+        return result
 
 
 def _locator(locator):
@@ -365,7 +408,8 @@ def capture(binding, *, title, steps=None):
 
     session = PositionSession(binding, title)
     session.binding.check()
-    items = [editable_step(step) for step in (steps or [])]
+    saved_edits = SavedStepEdits(steps or [])
+    items = saved_edits.items
     seen = set()
     drafts = DraftEdits()
     result, editing, job, sampling, timer = None, None, None, False, None
@@ -402,6 +446,8 @@ def capture(binding, *, title, steps=None):
     def status(item):
         if item['action'] != 'intent':
             return '설정된 동작'
+        if saved_edits.unchanged(item):
+            return '기존 동작 유지'
         if item.get('anchor') is None:
             return '대상 지정 필요'
         if drafts.automatic(item) and item['instruction']['text'].strip():
@@ -459,7 +505,9 @@ def capture(binding, *, title, steps=None):
                 editing.pop('alias', None)
                 editing.update(annotation)
             render()
-            preview.set(status(editing) + ' — 설명은 그대로 저장하고 실제 동작은 실행할 때 해석합니다.')
+            detail = ('기존에 설정한 동작을 유지합니다.' if saved_edits.unchanged(editing) else
+                      '설명은 그대로 저장하고 실제 동작은 실행할 때 해석합니다.')
+            preview.set(status(editing) + ' — ' + detail)
             return True
         except ValueError as exc:
             error(exc)
@@ -680,7 +728,7 @@ def capture(binding, *, title, steps=None):
         if not items:
             message.set('저장할 단계가 없습니다. 대상을 추가하세요.')
             return
-        result = {'status': 'recorded', 'steps': copy.deepcopy(items), 'input_dispatched': False}
+        result = {'status': 'recorded', 'steps': saved_edits.saved(items), 'input_dispatched': False}
         root.destroy()
 
     def cancel():

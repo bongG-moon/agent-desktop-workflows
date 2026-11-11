@@ -1,11 +1,14 @@
-# Desktop Select 0.5.1
+# Desktop Select 0.5.2
 
 Windows 화면에서 작업할 위치를 가리키고, 각 단계에 실행할 동작을 자유문장으로 적습니다. Claude Code가 설명과 현재 주변 요소를 해석해 콤보 설정, 버튼 실행, 표 우클릭 메뉴를 진행합니다.
 
-[Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/tag/desktop-select-v0.5.1) | [사용 가이드](skills/desktop-select/사용가이드.md)
+[Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/tag/desktop-select-v0.5.2) | [사용 가이드](skills/desktop-select/사용가이드.md)
 
 ## 이번 버전에서 달라진 점
 
+- 쓰기 가능한 콤보는 SetValue 1회와 실제 값 확인을 우선합니다. 옵션 미노출이나 불안정한 펼침/Select 때문에 이 경로를 막던 문제를 수정했습니다.
+- 자연어 실행안은 첫 전체 실행 성공 후 재사용합니다. 반복 실행마다 모델 해석과 JSON 작성을 요구하지 않으며 실행 변수와 실제 대상은 매번 새로 확인합니다.
+- 작은 라벨 그룹 근처를 가리켜도 상위 업무 영역의 콤보를 찾을 수 있게 했습니다. 기존 작업을 내용 변경 없이 편집·저장해도 원래 실행 방식을 유지합니다.
 - 녹화한 클릭과 옵션 선택으로 수정 가능한 자연어 초안을 채웁니다. 위치만 가리킨 콤보의 현재값은 고정값으로 추정하지 않습니다.
 - 초안은 자유롭게 수정하거나 지울 수 있습니다. 사용자가 고친 문장과 변수는 이후 녹화로 덮어쓰지 않습니다.
 - 실제 표시 이름과 내부 ID가 달라도 문장을 저장합니다. 자유문장은 현재 사용하는 Claude Code 모델이 해석합니다.

@@ -172,6 +172,24 @@ def _options(binding, uia, combo, wanted):
     return code, matches
 
 
+def _requested_value(binding, uia, combo, wanted):
+    """An option inventory can translate a label, but cannot veto an explicit write.
+
+    Many writable custom combos expose no usable option peers. In that case
+    SetValue receives exactly what the caller requested, then live readback
+    determines whether the provider accepted it. Discard incomplete inventories.
+    """
+    try:
+        rows = list(_option_rows(binding, uia, combo))
+    except win.BridgeError:
+        return wanted
+    if any(value == wanted for _, value, _ in rows):
+        return wanted  # An exact provider code takes precedence over another row's label.
+    codes = {value for _, value, name in rows if name == wanted}
+    _require(len(codes) <= 1, 'combo_option_ambiguous')
+    return next(iter(codes), wanted)
+
+
 def _visible_choice(binding, uia, matches):
     choices = [item for item in matches if visible(binding, uia, item)]
     _require(len(choices) < 2, 'combo_option_ambiguous')
@@ -236,39 +254,53 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
             _require(role == 'combobox', 'combo_required')
             _require(isinstance(value, str) and value.strip() and '\0' not in value
                      and len(value.encode('utf-8')) <= 10000, 'invalid_combo_value')
-            try:
-                code, matches = _options(binding, uia, element, value)
-            except win.BridgeError as error:
-                if (error.code not in {'accessibility_unavailable', 'element_disappeared'}
-                        or 'Expand' not in uia.actions(element) or element.property(30070) != 0):
-                    raise
-                code, matches = None, []
-            known_code = code
-            selected_value = code or value
-            if read_value(before_action=True) is True:
-                check_target()
-                if read_value(before_action=True) is True:
-                    return receipt('verified', 'value_already_selected', 'matched')
-            choice = _visible_choice(binding, uia, matches)
-            if choice is None and 'Expand' in uia.actions(element) and element.property(30070) == 0:
-                def expansion_guard():
+            if 'SetValue' in uia.actions(element):
+                selected_value = _requested_value(binding, uia, element, value)
+                if read_value() is True:
                     check_target()
-                    read_value(before_action=True)
-                    _require('Expand' in uia.actions(element) and element.property(30070) == 0,
-                             'expansion_state_changed')
-                send(element, 'Expand', expansion_guard)
-                deadline = time.monotonic() + OPEN_SECONDS
-                while True:
-                    binding.check()
+                    if read_value() is True:
+                        return receipt('verified', 'value_already_selected', 'matched')
+                def write_guard():
+                    check_target()
+                    _require('SetValue' in uia.actions(element), 'combo_value_not_writable')
+                # A requested value and an owned writable combo are sufficient.
+                # Neither an empty old value nor missing/virtual option peers
+                # require expansion. There is no fallback input after this call.
+                send(element, 'SetValue', write_guard, selected_value)
+            else:
+                try:
                     code, matches = _options(binding, uia, element, value)
-                    _require(code is None or known_code in (None, code), 'combo_option_changed')
-                    if code is not None:
-                        selected_value = known_code = code
-                    choice = _visible_choice(binding, uia, matches)
-                    if choice is not None or time.monotonic() >= deadline:
-                        break
-                    time.sleep(.05)
-            if choice is not None:
+                except win.BridgeError as error:
+                    if (error.code not in {'accessibility_unavailable', 'element_disappeared'}
+                            or 'Expand' not in uia.actions(element) or element.property(30070) != 0):
+                        raise
+                    code, matches = None, []
+                known_code = code
+                selected_value = code or value
+                if read_value(before_action=True) is True:
+                    check_target()
+                    if read_value(before_action=True) is True:
+                        return receipt('verified', 'value_already_selected', 'matched')
+                choice = _visible_choice(binding, uia, matches)
+                if choice is None and 'Expand' in uia.actions(element) and element.property(30070) == 0:
+                    def expansion_guard():
+                        check_target()
+                        read_value(before_action=True)
+                        _require('Expand' in uia.actions(element) and element.property(30070) == 0,
+                                 'expansion_state_changed')
+                    send(element, 'Expand', expansion_guard)
+                    deadline = time.monotonic() + OPEN_SECONDS
+                    while True:
+                        binding.check()
+                        code, matches = _options(binding, uia, element, value)
+                        _require(code is None or known_code in (None, code), 'combo_option_changed')
+                        if code is not None:
+                            selected_value = known_code = code
+                        choice = _visible_choice(binding, uia, matches)
+                        if choice is not None or time.monotonic() >= deadline:
+                            break
+                        time.sleep(.05)
+                _require(choice is not None, 'visible_selectable_option_required')
                 def choice_guard():
                     check_target()
                     read_value(before_action=True)
@@ -277,23 +309,6 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
                     _require(actual == selected_value and current is not None and uia.same(choice, current),
                              'combo_option_changed')
                 send(choice, 'Select', choice_guard)
-            else:
-                def write_guard():
-                    check_target()
-                    read_value(before_action=True)
-                    actual, candidates = _options(binding, uia, element, value)
-                    _require(bool(candidates), 'combo_option_not_observed')
-                    _require(actual == selected_value, 'combo_option_changed')
-                    _require(len(candidates) == 1, 'combo_option_ambiguous')
-                    _require(candidates[0].property(30010) is True and 'SetValue' in uia.actions(element),
-                             'combo_value_not_writable')
-                    # Name can identify a visible item for Select, but custom
-                    # editor labels/indices are not a value to write to a combo.
-                    _require(uia._accessible_value(candidates[0]).get('value') == selected_value,
-                             'combo_option_provider_value_required')
-                _require(bool(matches), 'combo_option_not_observed')
-                _require('SetValue' in uia.actions(element), 'visible_selectable_option_required')
-                send(element, 'SetValue', write_guard, selected_value)
             readback = read_value
         else:
             commands = {

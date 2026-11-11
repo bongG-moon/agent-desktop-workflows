@@ -178,12 +178,23 @@ def exercise_intent(case, skill):
     import learned_tasks as tasks
     import context_teach
     import row_teach
+    import intent_tasks
+    import task_edit
     for module in (intent_capture, teach_capture, tasks):
         assert Path(module.__file__).resolve().parent == skill / 'scripts', module.__file__
     first = intent_capture.draft({'role': 'combobox', 'automation_id': 'gcboStatus'}, 'MES Setup')
     second = intent_capture.draft({'role': 'combobox', 'automation_id': 'gcboFamily'}, 'Family')
     missing = intent_capture.draft()
     seed = [first, second, missing] if case == 'intent-edit' else [missing]
+    original_plan = None
+    if case == 'legacy-unchanged':
+        fixed, variable_step = raw(0, 'gcboStatus', 'MES Setup'), raw(1, 'gcboFamily', 'Family')
+        fixed['instruction'] = tasks.compile_instruction(fixed, 'MES Setup을 N으로 설정')
+        variable_step['instruction'] = tasks.compile_instruction(variable_step, '입력받은 변수를 Family에 입력해줘')
+        query = {'action': 'open', 'role': 'button', 'match': 'automation_id', 'target': 'query',
+                 'label': '조회', 'command_name': '조회', 'expand': False}
+        seed = [tasks.recorded_step(fixed), tasks.recorded_step(variable_step), query]
+        original_plan = tasks.from_recording('intent review', 'fixture.exe', 'Synthetic form', seed)
     if case == 'intent-reopen':
         missing['instruction'].update(text='저장해 둔 자유 설명\n이 위치의 값을 확인해줘', parameters=['FAMILY'])
         plan = tasks.from_recording('existing', 'fixture.exe', 'Synthetic form', seed)
@@ -235,6 +246,11 @@ def exercise_intent(case, skill):
             assert field('instruction').get('1.0', 'end-1c') == text
             click('전체 저장')
         def operate():
+            if case == 'legacy-unchanged':
+                for _ in range(2):
+                    click('다음')
+                click('전체 저장')
+                return
             enter('alias', '자유 설명')
             enter('instruction', text)
             if case == 'intent-edit':
@@ -270,8 +286,26 @@ def exercise_intent(case, skill):
     assert seed == original, 'input saved plan mutated'
     plan = tasks.from_recording('intent review', 'fixture.exe', 'Synthetic form', result['steps'])
     with tempfile.TemporaryDirectory(dir=ROOT / '.build') as folder:
-        tasks.save_task(plan, folder)
+        if original_plan is not None:
+            original_path = tasks.save_task(original_plan, folder)
+            before = original_path.read_bytes()
+            replaced = task_edit.replace_task(plan, intent_tasks.plan_digest(original_plan), folder)
+            assert Path(replaced['backup']).read_bytes() == before
+            assert original_path.read_bytes() == before
+        else:
+            tasks.save_task(plan, folder)
         saved = tasks.load_task(plan['name'], folder)
+    if original_plan is not None:
+        assert saved == original_plan
+        assert intent_tasks.plan_digest(saved) == intent_tasks.plan_digest(original_plan)
+        calls = []
+        report = tasks.replay(saved, 'fixture.exe', 'Synthetic form', {'Family': 'Hybrid'},
+                              lambda step: calls.append(step) or {
+                                  'status': 'verified', 'input_dispatched': True, 'effect_verification': 'matched'})
+        assert report['status'] == 'verified' and len(calls) == 3, report
+        assert [step.get('value') for step in calls] == ['N', 'Hybrid', None], calls
+        print(case + ': real Tk unchanged edit, original bytes/digest and no-resolution replay passed', flush=True)
+        return
     actual = saved['steps'][0]
     assert actual['instruction']['text'] == text and actual['alias'] == '자유 설명', actual
     assert actual['anchor'] == (None if case == 'intent-reopen' else first['anchor']), actual
@@ -285,7 +319,7 @@ def exercise_intent(case, skill):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('case', nargs='?', choices=('peer-change', 'unknown-name', 'changed-target',
-                                                   'intent-edit', 'intent-repair', 'intent-reopen'))
+                                                   'intent-edit', 'intent-repair', 'intent-reopen', 'legacy-unchanged'))
     parser.add_argument('--skill-dir', type=Path, default=ROOT / 'skills/desktop-select',
                         help='Source skill or extracted package whose real Tk runtime will be tested')
     args = parser.parse_args()
@@ -295,12 +329,12 @@ if __name__ == '__main__':
     sys.path.insert(0, str(skill / 'scripts'))
     if args.case:
         desktop = isolated_desktop()
-        (exercise_intent if args.case.startswith('intent-') else exercise)(args.case, skill)
+        (exercise_intent if args.case.startswith('intent-') or args.case == 'legacy-unchanged' else exercise)(args.case, skill)
     else:
         # A fresh Tcl interpreter/desktop per case also checks that no global
         # alias state is needed to read the stored result in a later session.
         cases = ['peer-change', 'unknown-name', 'changed-target']
         if (skill / 'scripts/intent_capture.py').is_file():
-            cases += ['intent-edit', 'intent-repair', 'intent-reopen']
+            cases += ['intent-edit', 'intent-repair', 'intent-reopen', 'legacy-unchanged']
         for name in cases:
             subprocess.run([sys.executable, '-X', 'utf8', '-B', __file__, name, '--skill-dir', str(skill)], check=True)

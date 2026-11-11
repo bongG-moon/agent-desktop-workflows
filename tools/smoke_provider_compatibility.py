@@ -35,6 +35,7 @@ def compile_fixture(work):
 def exercise(skill, work, exe):
     sys.path.insert(0, str(skill / "scripts"))
     import desktop_select as app
+    from live_action import combo_readback
     import learned_tasks as tasks
     app.bridge.set_dpi_awareness()
     fixture = Fixture(exe)
@@ -78,6 +79,12 @@ def exercise(skill, work, exe):
                     out.append(dict(node, raw_offscreen=element.property(30022), raw_value=element.property(30045),
                                     raw_legacy_value=element.property(30093), raw_legacy_supported=element.property(30090),
                                     expanded=element.property(30070), actions=uia.actions(element)))
+                    if node.get("role") == "combobox":
+                        out[-1].update(combo_readback(binding, uia, element))
+                        if element.property(30037) is True:
+                            selected = element.selected_items()
+                            out[-1]["selected_values"] = None if selected is None else [
+                                uia._selected_option_observation(item).get("value") for item in selected]
             return out
 
     try:
@@ -100,7 +107,7 @@ def exercise(skill, work, exe):
         actual = control()
         check("direct_selection_uses_setvalue_and_correlated_readback", reply.get("status") == "verified"
               and actual["value"] == actual["parent_value"] == "N" and actual["writes"] == 1
-              and actual["selects"] == 0 and actual["expands"] <= 1, (reply, actual))
+              and actual["selects"] == actual["expands"] == 0, (reply, actual))
         after = state()
         reply = cli("select", "--target", "MES Setup", "--value", "N")
         check("matching_value_is_not_dispatched_again", reply.get("status") == "verified"
@@ -153,25 +160,105 @@ def exercise(skill, work, exe):
               and all(after["controls"][key]["writes"] == 1 and after["controls"][key]["selects"] == 0
                   for key in ("conditionState", "conditionFamily")), (reply, after))
 
-        for mode in ("conflict-editors", "explicit-offscreen"):
-            fixture.command("reset")
-            fixture.command("mode|conditionState|" + mode)
-            before = state()
-            reply = cli("select", "--target", "MES Setup", "--value", "N")
-            check(mode.replace("-", "_") + "_blocks_without_input", reply.get("status") == "blocked"
-                  and reply.get("input_dispatched") is False and state() == before, (reply, state()))
+        # The model's typed plan is supplied only on the first run. Reuse must
+        # retain a variable binding, not the first run's concrete selected value.
+        from intent_tasks import make_step, plan_digest
+        fixture.command("reset")
+        learned = make_step({"anchor": {"role": "combobox", "automation_id": "conditionState"},
+                             "label": "MES Setup"}, "실행할 때 입력받은 {Status} 값을 이 항목에 설정해 줘")
+        intent_plan = tasks.from_recording("Confirmed variable replay", exe.name, fixture.ready["title"], [learned])
+        tasks.save_task(intent_plan, work / "tasks")
+        resolution = {"schema": 1, "plan_digest": plan_digest(intent_plan), "steps": [{"number": 1,
+            "actions": [{"action": "select", "role": "combobox", "match": "automation_id",
+                         "target": "conditionState", "parameter": "Status"}]}]}
+        resolution_path = work / "first-run-resolution.json"
+        resolution_path.write_text(json.dumps(resolution, indent=2), encoding="utf8")
+        first = cli("replay", "--task", intent_plan["name"], "--resolution", str(resolution_path), "--set", "Status=N")
+        first_state = control()
+        second = cli("replay", "--task", intent_plan["name"], "--set", "Status=W")
+        second_state = control()
+        check("confirmed_plan_reuses_structure_with_new_runtime_value", first.get("status") == "verified"
+              and first.get("plan_reuse") == "saved" and first_state["value"] == "N" and first_state["writes"] == 1
+              and second.get("status") == "verified" and second.get("resolution_source") == "confirmed"
+              and second.get("plan_reuse") == "reused" and second_state["value"] == "W" and second_state["writes"] == 2
+              and second_state["expands"] == second_state["selects"] == 0,
+              (first, first_state, second, second_state))
 
         fixture.command("reset")
-        fixture.command("mode|conditionState|unsupported-option")
+        fixture.command("mode|conditionState|explicit-offscreen")
+        before = state()
+        reply = cli("select", "--target", "MES Setup", "--value", "N")
+        check("explicit_offscreen_blocks_without_input", reply.get("status") == "blocked"
+              and reply.get("input_dispatched") is False and state() == before, (reply, state()))
+
+        fixture.command("reset")
+        fixture.command("mode|conditionState|conflict-editors")
         reply = cli("select", "--target", "MES Setup", "--value", "N")
         after = control()
-        check("name_only_virtual_option_never_changes_value", reply.get("status") == "blocked"
-              and after["writes"] == after["selects"] == 0 and after["expands"] <= 1
-              and after["value"] == "W", (reply, after))
+        check("conflicting_readback_never_claims_success_or_repeats_write",
+              reply.get("status") == "delivered_unverified" and reply.get("input_dispatched") is True
+              and after["writes"] == 1 and after["selects"] == after["expands"] == 0,
+              (reply, after))
 
-        for mode, expected_counts in (("uncertain-expand", (0, 1, 0)),
-                                      ("uncertain-write", (1, 1, 0)),
-                                      ("uncertain-select", (0, 0, 1))):
+        # A requested literal value is a valid SetValue input even when the
+        # provider's optional inventory/Expand/Select implementations are bad.
+        # Do not first invoke one of those methods and then retry after failure.
+        for mode in ("unsupported-option", "uncertain-expand", "uncertain-select"):
+            fixture.command("reset")
+            fixture.command("mode|conditionState|" + mode)
+            reply = cli("select", "--target", "MES Setup", "--value", "N")
+            after = control()
+            check(mode.replace("-", "_") + "_uses_one_verified_write_without_expand_or_select",
+                  reply.get("status") == "verified" and reply.get("method") == "SetValue"
+                  and after["writes"] == 1 and after["selects"] == after["expands"] == 0
+                  and after["value"] == "N", (reply, after))
+
+        fixture.command("reset")
+        fixture.command("mode|conditionState|no-options-blank-before")
+        hidden = snapshot()
+        hidden_fields = [n for n in hidden if n.get("automation_id") == "conditionState"
+                         or n.get("automation_id", "").startswith("conditionStateEditor")]
+        check("empty_prewrite_value_and_no_option_inventory_reproduced", len(hidden_fields) == 3
+              and all(n["raw_value"] == "" for n in hidden_fields)
+              and next(n for n in hidden_fields if n.get("automation_id") == "conditionState").get("value_evidence", {}).get("status") == "unavailable"
+              and not any(n.get("automation_id", "").startswith("conditionStateOption") for n in hidden), hidden)
+        reply = cli("select", "--target", "MES Setup", "--value", "N")
+        after = control()
+        check("explicit_value_is_written_once_then_verified_without_inventory", reply.get("status") == "verified"
+              and after["value"] == after["parent_value"] == "N" and after["writes"] == 1
+              and after["expands"] == after["selects"] == 0, (reply, after))
+
+        fixture.command("reset")
+        fixture.command("mode|conditionState|selected-after-write")
+        unselected = snapshot()
+        (work / "selection-transition-before.json").write_text(json.dumps(unselected, indent=2), encoding="utf8")
+        combo, = [n for n in unselected if n.get("automation_id") == "conditionState"]
+        editors = [n for n in unselected if n.get("automation_id", "").startswith("conditionStateEditor")]
+        check("real_selection_pattern_starts_empty_with_blank_parent_and_editors", combo.get("selected_values") == []
+              and combo["raw_value"] == "" and combo.get("value_evidence", {}).get("status") == "unavailable"
+              and len(editors) == 2 and all(n["raw_value"] == "" for n in editors), unselected)
+        reply = cli("select", "--target", "MES Setup", "--value", "N")
+        selected = snapshot()
+        (work / "selection-transition-after.json").write_text(json.dumps(selected, indent=2), encoding="utf8")
+        combo, = [n for n in selected if n.get("automation_id") == "conditionState"]
+        editors = [n for n in selected if n.get("automation_id", "").startswith("conditionStateEditor")]
+        after = control()
+        check("one_write_is_confirmed_by_parent_duplicate_editors_and_real_selection", reply.get("status") == "verified"
+              and after["writes"] == 1 and after["expands"] == after["selects"] == 0
+              and combo["raw_value"] == combo["value"] == "N" and combo.get("selected_values") == ["N"]
+              and combo.get("value_evidence", {}).get("source") == "corroborated"
+              and len(editors) == 2 and all(n["raw_value"] == "N" for n in editors), (reply, selected))
+
+        fixture.command("reset")
+        fixture.command("mode|conditionState|select-only")
+        reply = cli("select", "--target", "MES Setup", "--value", "N")
+        after = control()
+        check("select_only_provider_still_uses_one_select_and_readback", reply.get("status") == "verified"
+              and reply.get("method") == "Select" and after["value"] == "N" and after["selects"] == 1
+              and after["writes"] == after["expands"] == 0, (reply, after))
+
+        for mode, expected_counts in (("uncertain-write", (1, 0, 0)),
+                                      ("uncertain-select-only", (0, 0, 1))):
             fixture.command("reset")
             fixture.command("mode|conditionState|" + mode)
             reply = cli("select", "--target", "MES Setup", "--value", "N")

@@ -82,7 +82,39 @@ def scope(nodes, step):
     _need(len(hits) == 1, 'intent_anchor_ambiguous' if hits else 'intent_anchor_missing')
     idx = hits[0]
     grouping = {'group', 'toolbar', 'tab', 'menu', 'table', 'list', 'tree', 'custom', 'document'}
-    if nodes[idx].get('role') in grouping:
+
+    def label_wrapper(path):
+        """A caption wrapper is a hint beside a field, not the field's search area."""
+        label = by_path[path]
+        if label.get('role') not in {'group', 'statictext'}:
+            return False
+        descendants = [n for n in nodes if n['path'] == path or n['path'].startswith(path + '/')]
+        if any(n.get('secure') is not False or n.get('role') not in {'group', 'statictext'}
+               or n.get('available_actions') for n in descendants):
+            return False
+        captions = {' '.join(n.get('name', '').split()).casefold() for n in descendants
+                    if n.get('role') == 'statictext' and n.get('name', '').strip()}
+        # A group containing one grid cell can also have only static text.
+        # Widen only when the group's own name proves the same label caption;
+        # unnamed/empty surfaces and differently named result groups stay scoped.
+        return bool(len(captions) == 1 and
+                    ' '.join(label.get('name', '').split()).casefold() in captions)
+
+    if label_wrapper(nodes[idx]['path']):
+        base = nodes[idx]['path']
+        path = nodes[idx].get('parent_path')
+        while path:
+            parent = by_path[path]
+            # The root window is not a demonstrated form. If no named local
+            # container exists, keep the label's scope rather than searching all.
+            if not parent.get('parent_path') or parent.get('secure'):
+                break
+            if (parent.get('role') in grouping and not label_wrapper(path)
+                    and (parent.get('automation_id') or parent.get('name'))):
+                base = path
+                break
+            path = parent.get('parent_path')
+    elif nodes[idx].get('role') in grouping:
         base = nodes[idx]['path']
     else:
         base = nodes[idx].get('parent_path') or nodes[0]['path']

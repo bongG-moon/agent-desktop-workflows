@@ -65,7 +65,8 @@ sealed class ProviderCompatibilityFixture : Form {
             if (peer.Role == 50003 || peer.Role == 50000) e.Graphics.DrawRectangle(Pens.Gray, peer.Relative);
             var text = peer.Role == 50003 ? peer.Combo.Current : peer.Name;
             e.Graphics.DrawString(text, Font, Brushes.Black, peer.Relative.X+5, peer.Relative.Y+7);
-            if(peer.Combo!=null && peer.Combo.Mode=="uncertain-select") {
+            if(peer.Combo!=null && (peer.Combo.Mode=="uncertain-select" || peer.Combo.Mode=="select-only" ||
+                    peer.Combo.Mode=="uncertain-select-only")) {
                 int index=0;
                 foreach(var choice in peer.Combo.Choices) {
                     e.Graphics.DrawRectangle(Pens.Gray,470,25+index*32,160,28);
@@ -141,7 +142,7 @@ public interface IFixtureLegacyProvider {
 }
 
 sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandCollapseProvider,
-    ISelectionItemProvider, IInvokeProvider, IFixtureLegacyProvider {
+    ISelectionItemProvider, ISelectionProvider, IInvokeProvider, IFixtureLegacyProvider {
     internal readonly ProviderCompatibilityFixture Host;
     internal readonly RawPeer Parent;
     internal readonly int Id, Role;
@@ -159,13 +160,18 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         get { return Parent==null ? AutomationInteropProvider.HostProviderFromHandle(Host.Handle) : null; }
     }
     public object GetPatternProvider(int id) {
-        if (id==10002 && (Role==50003 || Role==50004 || (Role==50007 && Combo.Mode!="unsupported-option")))return this;
+        if (id==10002 && ValueSupported)return this;
+        if (id==10001 && Role==50003 && SelectionAvailable)return this;
         if (id==10005 && Role==50003)return this;
         if (id==10010 && Role==50007)return this;
         if (id==10000 && Role==50000)return this;
         if (id==10018 && LegacyEnabled)return this;
         return null;
     }
+    bool SelectOnly { get { return Combo!=null && (Combo.Mode=="select-only" || Combo.Mode=="uncertain-select-only"); } }
+    bool SelectionAvailable { get { return Combo!=null && Combo.Mode=="selected-after-write"; } }
+    bool ValueSupported { get { return (Role==50003 && !SelectOnly) || Role==50004 ||
+        (Role==50007 && Combo.Mode!="unsupported-option"); } }
     bool LegacyEnabled { get { return Combo!=null && (Combo.Mode=="legacy-all" ||
         (Role==50007 && Combo.Mode=="legacy-option")); } }
     public object GetPropertyValue(int id) {
@@ -190,12 +196,12 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
             case 30028: return Role==50003;
             case 30031: return Role==50000;
             case 30036: return Role==50007;
-            case 30037: return false;
-            case 30043: return Role==50003 || Role==50004 || (Role==50007 && Combo.Mode!="unsupported-option");
+            case 30037: return Role==50003 && SelectionAvailable;
+            case 30043: return ValueSupported;
             case 30045: return ((IValueProvider)this).Value;
-            case 30046: return Role!=50003;
+            case 30046: return Role!=50003 || SelectOnly;
             case 30070: return 0; // Expand succeeds but this custom provider never updates its state.
-            case 30079: return false;
+            case 30079: return ((ISelectionItemProvider)this).IsSelected;
             case 30080: return Role==50007 ? Parent : null;
             case 30090: return LegacyEnabled;
             case 30093: return LegacyEnabled ? ((IFixtureLegacyProvider)this).Value : null;
@@ -204,11 +210,19 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     }
     public IRawElementProviderFragment Navigate(NavigateDirection dir) {
         if(dir==NavigateDirection.Parent)return Parent;
-        if(dir==NavigateDirection.FirstChild)return Children.Count==0?null:Children[0];
-        if(dir==NavigateDirection.LastChild)return Children.Count==0?null:Children[Children.Count-1];
+        var children=NavigableChildren();
+        if(dir==NavigateDirection.FirstChild)return children.Count==0?null:children[0];
+        if(dir==NavigateDirection.LastChild)return children.Count==0?null:children[children.Count-1];
         if(Parent==null)return null;
-        int index=Parent.Children.IndexOf(this)+(dir==NavigateDirection.NextSibling?1:-1);
-        return index<0 || index>=Parent.Children.Count ? null : Parent.Children[index];
+        var siblings=Parent.NavigableChildren();
+        int index=siblings.IndexOf(this)+(dir==NavigateDirection.NextSibling?1:-1);
+        return index<0 || index>=siblings.Count ? null : siblings[index];
+    }
+    List<RawPeer> NavigableChildren() {
+        var result=new List<RawPeer>();
+        foreach(var child in Children)
+            if(!(Combo!=null && Combo.Mode=="no-options-blank-before" && child.Role==50007))result.Add(child);
+        return result;
     }
     public int[] GetRuntimeId() { return Parent==null ? null : new[] { AutomationInteropProvider.AppendRuntimeId, Id }; }
     public Rect BoundingRectangle {
@@ -216,7 +230,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
             var host=Host.ScreenBounds;
             if(host.Width==0 || host.Height==0)return Rect.Empty;
             if(Parent==null)return new Rect(host.X,host.Y,host.Width,host.Height);
-            if(Role==50007 && Combo.Mode=="uncertain-select")
+            if(Role==50007 && (Combo.Mode=="uncertain-select" || SelectOnly))
                 return new Rect(host.X+470,host.Y+25+Array.IndexOf(Combo.Choices,Choice)*32,160,28);
             if(Relative.Width==0 || Relative.Height==0)return Rect.Empty;
             return new Rect(host.X+Relative.X,host.Y+Relative.Y,Relative.Width,Relative.Height);
@@ -234,13 +248,15 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         get {
             if(Combo==null)return "";
             if(Combo.Mode=="legacy-all")return "";
+            if(Combo.Mode=="no-options-blank-before" && Combo.Writes==0)return "";
+            if(SelectionAvailable && Combo.Writes==0 && (Role==50003 || Role==50004))return "";
             if(Role==50003)return Combo.Writes==0 ? "" : Combo.Current;
             if(Role==50007)return Combo.Mode=="legacy-option" ? "" : Choice;
             if(Role==50004 && Combo.Mode=="conflict-editors" && EditorIndex==1)return "CONFLICT";
             return Combo.Current;
         }
     }
-    bool IValueProvider.IsReadOnly { get { return Role!=50003; } }
+    bool IValueProvider.IsReadOnly { get { return Role!=50003 || SelectOnly; } }
     void IValueProvider.SetValue(string value) {
         if(Role!=50003)throw new InvalidOperationException("fixture_readonly");
         Combo.Writes++;
@@ -254,9 +270,23 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         if(Combo.Mode=="uncertain-expand")throw new COMException("fixture_expand_failed",unchecked((int)0x80131515));
     }
     void IExpandCollapseProvider.Collapse() {}
-    bool ISelectionItemProvider.IsSelected { get { return false; } }
+    bool ISelectionItemProvider.IsSelected { get { return Role==50007 && SelectionAvailable &&
+        Combo.Writes>0 && Combo.Current==Choice; } }
     IRawElementProviderSimple ISelectionItemProvider.SelectionContainer { get { return Parent; } }
-    void ISelectionItemProvider.Select() { Combo.Selects++; throw new COMException("virtual_option_select_failed",unchecked((int)0x80131515)); }
+    bool ISelectionProvider.CanSelectMultiple { get { return false; } }
+    bool ISelectionProvider.IsSelectionRequired { get { return false; } }
+    IRawElementProviderSimple[] ISelectionProvider.GetSelection() {
+        var selected=new List<IRawElementProviderSimple>();
+        if(Role==50003 && SelectionAvailable && Combo.Writes>0)
+            foreach(var child in Children)
+                if(child.Role==50007 && child.Choice==Combo.Current)selected.Add(child);
+        return selected.ToArray();
+    }
+    void ISelectionItemProvider.Select() {
+        Combo.Selects++;
+        if(Combo.Mode=="select-only") { Combo.Current=Choice; Host.RefreshDisplay(); return; }
+        throw new COMException("virtual_option_select_failed",unchecked((int)0x80131515));
+    }
     void ISelectionItemProvider.AddToSelection() { ((ISelectionItemProvider)this).Select(); }
     void ISelectionItemProvider.RemoveFromSelection() { throw new InvalidOperationException(); }
     void IInvokeProvider.Invoke() { Host.Opens++; }

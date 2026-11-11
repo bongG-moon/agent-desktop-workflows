@@ -295,6 +295,14 @@ def _check_instruction(step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    if ((raw.get('action') in {'select', 'open'} and isinstance(raw.get('target'), str))
+            or (raw.get('action') == 'manual' and 'reason' in raw)):
+        # The editor can return an unchanged executable saved step. Validate
+        # its complete schema instead of converting it as a fresh capture.
+        step = {key: value for key, value in raw.items() if key != 'id'}
+        _validate({'schema': 1, 'name': 'Saved step', 'exe': 'Example.exe',
+                   'window': 'Example', 'steps': [step]})
+        return step
     if raw.get('action') == 'intent':
         from intent_tasks import validate_step
         step = {k: value for k, value in raw.items() if k != 'id'}

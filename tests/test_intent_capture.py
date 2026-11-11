@@ -10,9 +10,113 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/desktop-sel
 import desktop_select
 import intent_capture as capture
 import intent_tasks
+import learned_tasks as tasks
 
 
 class IntentCaptureTests(unittest.TestCase):
+    def executable_steps(self):
+        return [
+            {'action': 'select', 'role': 'combobox', 'match': 'automation_id', 'target': 'state',
+             'label': 'MES Setup', 'recorded_effect': 'unobserved',
+             'instruction': {'mode': 'fixed', 'text': 'MES Setup을 N으로 설정', 'value': 'N'}},
+            {'action': 'select', 'role': 'combobox', 'match': 'automation_id', 'target': 'family',
+             'label': 'Family', 'recorded_effect': 'unobserved',
+             'instruction': {'mode': 'required', 'text': '', 'parameter': 'FAMILY'}},
+            {'action': 'open', 'role': 'button', 'match': 'automation_id', 'target': 'query',
+             'label': '조회', 'command_name': '조회', 'expand': False},
+        ]
+
+    @staticmethod
+    def flushed(item):
+        if item['action'] != 'intent':
+            return copy.deepcopy(item)
+        return dict(intent_tasks.make_step(item, item['instruction']['text'],
+                                          parameters=item['instruction']['parameters']), id=item['id'])
+
+    def test_unchanged_editor_save_preserves_executable_plan_digest_and_replay(self):
+        steps = self.executable_steps()
+        original = tasks.from_recording('Saved conditions', 'Example.exe', 'Business', steps)
+        edits = capture.SavedStepEdits(original['steps'])
+        # The selected form is normalized on save; untouched forms are not.
+        edits.items[1] = self.flushed(edits.items[1])
+        reopened = tasks.from_recording('Saved conditions', 'Example.exe', 'Business', edits.saved(edits.items))
+        self.assertEqual(reopened, original)
+        self.assertEqual(intent_tasks.plan_digest(reopened), intent_tasks.plan_digest(original))
+        calls = []
+        report = tasks.replay(reopened, 'Example.exe', 'Business', {'FAMILY': 'Hybrid'},
+                              lambda step: calls.append(step) or {
+                                  'status': 'verified', 'effect_verification': 'matched', 'input_dispatched': True})
+        self.assertEqual(report['status'], 'verified')
+        self.assertEqual([step.get('value') for step in calls], ['N', 'Hybrid', None])
+        self.assertEqual(steps, self.executable_steps())
+
+    def test_annotation_changes_preserve_compiled_actions_and_do_not_leak_edit_metadata(self):
+        original = dict(self.executable_steps()[0], alias='상태', description='기존 설명')
+        edits = capture.SavedStepEdits([original])
+        self.assertEqual(edits.items[0]['description'], original['description'])
+        edits.items[0].update(alias='새 상태', description='변경한 설명')
+        saved, = edits.saved([self.flushed(edits.items[0])])
+        self.assertEqual(saved, dict(original, alias='새 상태', description='변경한 설명'))
+        self.assertEqual(tasks.recorded_step(saved), saved)
+        edits.items[0].pop('alias')
+        edits.items[0].pop('description')
+        cleared, = edits.saved(edits.items)
+        self.assertEqual(cleared, self.executable_steps()[0])
+
+    def test_changed_sentence_variables_target_or_label_remain_natural_instructions(self):
+        for change in ('text', 'parameters', 'anchor', 'label'):
+            with self.subTest(change=change):
+                edits = capture.SavedStepEdits(self.executable_steps()[:1])
+                item = edits.items[0]
+                if change == 'text':
+                    item['instruction']['text'] = '이 조건을 P로 설정해 줘'
+                elif change == 'parameters':
+                    item['instruction']['parameters'] = ['STATE']
+                elif change == 'anchor':
+                    item['anchor']['automation_id'] = 'another'
+                else:
+                    item['label'] = '다른 조건'
+                changed, = edits.saved([self.flushed(item)])
+                self.assertEqual(changed['action'], 'intent')
+                self.assertFalse(edits.unchanged(item))
+                tasks.recorded_step(changed)
+
+    def test_unchanged_manual_and_old_default_parameter_steps_keep_original_behavior(self):
+        original = {'action': 'select', 'role': 'combobox', 'match': 'automation_id', 'target': 'family',
+                    'value': 'Hybrid', 'parameter': 'Family', 'recorded_effect': 'matched'}
+        manual = {'action': 'manual', 'reason': 'capture_target_unavailable'}
+        edits = capture.SavedStepEdits([original, manual])
+        saved = edits.saved([self.flushed(item) for item in edits.items])
+        self.assertEqual(saved, [original, manual])
+        plan = tasks.from_recording('Prior defaults', 'Example.exe', 'Business', saved)
+        calls = []
+        report = tasks.replay(plan, 'Example.exe', 'Business', {'Family': 'DRAM'},
+                              lambda step: calls.append(step) or {
+                                  'status': 'verified', 'effect_verification': 'matched', 'input_dispatched': True}, only='1')
+        self.assertEqual(report['status'], 'verified')
+        self.assertEqual(calls[0]['value'], 'DRAM')
+
+    def test_delete_reorder_and_new_steps_do_not_restore_by_list_position(self):
+        old = self.executable_steps()
+        edits = capture.SavedStepEdits(old)
+        fresh = capture.draft({'role': 'button', 'automation_id': 'another'}, '다른 버튼')
+        specialized = dict(action='row-action', label='행 실행', row={'unchanged': True}, id='row')
+        reordered = [edits.items[2], fresh, specialized, edits.items[0]]
+        saved = edits.saved(reordered)
+        self.assertEqual(saved, [old[2], fresh, specialized, old[0]])
+        saved[0]['target'] = 'does-not-mutate-original'
+        self.assertEqual(old, self.executable_steps())
+
+    def test_compiled_step_input_still_uses_strict_saved_schema(self):
+        step = self.executable_steps()[0]
+        self.assertEqual(tasks.recorded_step(dict(step, id='ui-only')), step)
+        bad_steps = [dict(step, extra='not accepted'), dict(step, target=''),
+                     dict(step, within='wrong'), dict(step, recorded_effect='unknown'),
+                     dict(action='manual', reason='capture_target_unavailable', extra='not accepted')]
+        for bad in bad_steps:
+            with self.subTest(bad=bad), self.assertRaises(tasks.TaskError):
+                tasks.recorded_step(bad)
+
     def test_location_reader_does_not_request_value_or_option_state(self):
         uia = capture.PositionUIA.__new__(capture.PositionUIA)
         uia._pattern_value = Mock(side_effect=AssertionError('value was read'))
