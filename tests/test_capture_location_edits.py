@@ -43,15 +43,15 @@ class LocationEditsTests(unittest.TestCase):
         self.assertNotIn('value', final)
         self.assertEqual(edits.form(changed)[0], '이 항목을 {Family}로 설정')
 
-    def test_invalid_draft_survives_switch_and_can_be_completed_structurally(self):
+    def test_freeform_draft_survives_save_and_can_be_completed_structurally(self):
         step = capture.capture_step(combo())
         edits = capture.StepEdits()
-        with self.assertRaisesRegex(tasks.TaskError, 'instruction_requires_structure'):
-            edits.store(step, '제품군', '실행할 때 요청한 제품군으로')
+        edits.store(step, '제품군', '실행할 때 요청한 제품군으로')
         self.assertEqual(edits.form(step)[0], '실행할 때 요청한 제품군으로')
         self.assertEqual(edits.alias(step), '제품군')
-        with self.assertRaises(tasks.TaskError):
-            edits.apply([step])
+        saved = tasks.recorded_step(edits.apply([step])[0])
+        self.assertEqual(saved['instruction_draft'], '실행할 때 요청한 제품군으로')
+        self.assertEqual(saved['target'], 'comboMode')
         edits.store(step, '제품군', '실행할 때 요청한 제품군으로', 'required', 'Family')
         self.assertEqual(edits.apply([step])[0]['instruction']['parameter'], 'Family')
         edits.forget(step['id'])
@@ -80,7 +80,9 @@ class LocationEditsTests(unittest.TestCase):
         step.pop('value')
         step.update(action='teach-target', recognition={'target': 'identified', 'action': 'requires_instruction',
                     'result': 'manual', 'reason': 'combo_choice_unproven'})
-        self.assertEqual(capture.default_text(capture.capture_step(step)), '')
+        draft = capture.default_text(capture.capture_step(step))
+        self.assertEqual(draft, '입력받은 변수를 Mode 조건에 입력해줘')
+        self.assertEqual(tasks.compile_instruction(capture.capture_step(step), draft)['mode'], 'required')
 
     def test_clicked_combo_is_immediately_recorded_before_value_readback(self):
         binding, uia = Mock(hwnd=5), Mock()
@@ -112,7 +114,8 @@ class LocationEditsTests(unittest.TestCase):
         changed = copy.deepcopy(step)
         changed['target']['locator']['ancestors'] = [{'role': 'group', 'automation_id': 'different'}]
         self.assertEqual(edits.alias(changed), '')
-        self.assertNotIn('instruction', edits.apply([changed])[0])
+        self.assertEqual(edits.apply([changed])[0]['instruction']['mode'], 'fixed')
+        self.assertNotIn('parameter', edits.apply([changed])[0]['instruction'])
 
     def test_recorder_adapter_uses_shared_local_label_resolution(self):
         uia = capture._CaptureUIA.__new__(capture._CaptureUIA)

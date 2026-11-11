@@ -372,12 +372,12 @@ def save_instruction(args):
     step = plan['steps'][number - 1]
     if args.alias is not None:
         step['alias'] = args.alias
-    spec = tasks.compile_instruction(step, args.text, mode=args.mode, argument=args.argument)
+    spec = tasks.compile_instruction(step, args.text, mode=args.mode, argument=args.argument,
+                                     target=args.target, role=args.role, within=args.within)
     if spec is None:
         raise tasks.TaskError('instruction_required')
-    step['instruction'] = spec
-    step.pop('value', None)
-    step.pop('parameter', None)
+    step = tasks.instructed_step(step, spec)
+    plan['steps'][number - 1] = step
     if args.wait_after is not None:
         step['wait_after'] = args.wait_after
     plan['name'] = args.save_as
@@ -514,7 +514,7 @@ def replay_step():
                               within=step.get('within'), popup=None)
     if args.command not in ('select', 'open'):
         raise SelectionError('step_requires_review')
-    return action(args, owner, learned=step)
+    return action(args, owner, learned=None if step.get('match') == 'query' else step)
 
 
 def parser():
@@ -530,6 +530,9 @@ def parser():
     edit.add_argument('--mode', choices=('fixed', 'required', 'recorded'))
     edit.add_argument('--argument', help='literal value or required parameter name')
     edit.add_argument('--alias', help='explicitly associate this name with the recorded target')
+    edit.add_argument('--target', help='interpreted current-screen field or command name when recording missed it')
+    edit.add_argument('--role', help='interpreted target role, such as combobox or button')
+    edit.add_argument('--within', help='observed region to distinguish identical names')
     edit.add_argument('--wait-after', type=float, help='explicit seconds to wait after this button call')
     edit.add_argument('--save-as', required=True, help='new task name; never overwrite the original')
     for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay', 'record-rows', 'row-status'):

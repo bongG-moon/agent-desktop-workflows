@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 1
+COMPILER = 2
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -47,9 +47,11 @@ def compile_plan(task):
     # Establish whole-task compatibility before deriving any executable steps.
     for number, step in enumerate(task['steps'], 1):
         reason = None
-        if step.get('action') not in ('select', 'open'):
+        if step.get('instruction_draft'):
+            reason = 'instruction_requires_structure'
+        elif step.get('action') not in ('select', 'open'):
             reason = 'execution_plan_special_step'
-        elif step.get('match') != 'automation_id':
+        elif step.get('match') not in ('automation_id', 'query'):
             reason = 'execution_plan_stable_id_required'
         elif step['action'] == 'open' and (step.get('expand') or step['role'] not in tasks.INVOKE):
             reason = 'execution_plan_invoke_required'
@@ -61,14 +63,20 @@ def compile_plan(task):
         # was unverified. Do not silently turn that into immediate continuation.
         if step['action'] == 'open' and number < len(task['steps']) and not step.get('wait_after'):
             return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
-        selector = dict(automation_id=step['target'], role=step['role'])
-        if step.get('ancestors'):
+        selector = dict(role=step['role'])
+        if step['match'] == 'query':
+            selector['query'] = step['target']
+            if step.get('within'):
+                selector['within'] = step['within']
+        else:
+            selector['automation_id'] = step['target']
+        if step.get('ancestors') and step['match'] != 'query':
             selector['ancestors'] = deepcopy(step['ancestors'])
         current = dict(action='set-value' if step['action'] == 'select' else 'invoke', selector=selector)
-        label = step.get('alias') or step.get('label')
+        label = step.get('alias') or step.get('label') or step['target']
         if label:
             current['label'] = label
-        if step['action'] == 'select' and step.get('label'):
+        if step['action'] == 'select' and step.get('label') and step['match'] != 'query':
             current['field_label'] = step['label']
         if step.get('command_name'):
             current['command_name'] = step['command_name']

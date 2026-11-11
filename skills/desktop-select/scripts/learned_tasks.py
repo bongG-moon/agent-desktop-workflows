@@ -18,6 +18,12 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 INVOKE = {'button', 'hyperlink', 'menuitem', 'splitbutton'}
 CHOOSE = {'listitem', 'tab', 'treeitem'}
 EXPAND = {'menuitem', 'combobox', 'treeitem', 'splitbutton'}
+RECOVERABLE_CAPTURE_REASONS = {
+    'capture_target_unavailable', 'stable_locator_unavailable', 'unsupported_recorded_action',
+    'unsupported_demonstration', 'combo_value_unobserved', 'combo_choice_unproven',
+    'combo_option_click_required', 'value_readback_unavailable', 'value_before_transition_unproven',
+    'combo_option_owner_required',
+}
 
 
 class TaskError(ValueError):
@@ -84,6 +90,36 @@ def _point_target(raw):
     return (raw.get('action') == 'teach-target' and 'value' not in raw
             and raw.get('recognition') == {'target': 'identified', 'action': 'requires_instruction',
                                            'result': 'manual', 'reason': 'combo_choice_unproven'})
+
+
+def is_recoverable(step):
+    """An absent capture identity may be replaced by a fresh, named lookup.
+
+    This does not authorize recovery from a protected control, uncertain input,
+    a popup binding, or a physical context-menu gesture.
+    """
+    if not isinstance(step, dict) or step.get('action') in ('right-click', 'result-menu', 'row-action'):
+        return False
+    if (step.get('role') == 'password' or any(step.get(key) is True for key in
+            ('secure', 'protected', 'is_protected', 'is_password', 'password'))):
+        return False
+    source = step.get('target')
+    if isinstance(source, dict):
+        if 'window' in source or (step.get('action') == 'teach-target' and not _point_target(step)):
+            return False
+        locator = source.get('locator') or {}
+        candidates = [step, source, locator]
+        if isinstance(locator, dict) and isinstance(locator.get('ancestors'), list):
+            candidates.extend(locator['ancestors'])
+        for candidate in candidates:
+            if isinstance(candidate, dict) and (candidate.get('role') == 'password' or any(
+                    candidate.get(key) is True for key in ('secure', 'protected', 'is_protected', 'is_password', 'password'))):
+                return False
+        converted = _convert(step, allow_point=True)
+    else:
+        converted = step
+    return (converted.get('action') == 'manual'
+            and converted.get('reason') in RECOVERABLE_CAPTURE_REASONS)
 
 
 def instruction_subject(sentence):
@@ -165,7 +201,7 @@ def _convert(raw, *, allow_point=False):
 
 
 def _instruction_subject(step, subject):
-    candidates = [step.get(k, '') for k in ('label', 'target', 'alias')]
+    candidates = [step.get(k, '') for k in ('label', 'target', 'alias', 'command_name')]
     norm = lambda s: ''.join(s.split()).casefold()
     text = norm(subject)
     without_kind = re.sub(r'(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴)$', '', text)
@@ -196,6 +232,10 @@ def _parse_sentence(step, sentence):
             return 'required', variable[1]
         if not re.fullmatch(r'[\w +./()-]+', val):
             return None
+        # Descriptions such as "이번 시험에 맞는 상태" are not literal option
+        # values. Keep the user's prose for the host to interpret once.
+        if re.search(r'(?:쓰던|사용한|선택한|맞는|같은|원하는|필요한|적절한|알맞은)\s*(?:값|상태|조건)', val):
+            return None
         return 'fixed', val
     command = re.fullmatch(r'(.+?)(?:을|를)\s*(누르기|눌러|클릭|펼치기|펼쳐|선택|실행)(?:해)?\s*(?:줘|주세요)?' + tail, sentence)
     if command:
@@ -220,13 +260,77 @@ def _binding(step, text, mode, argument):
     return {'mode': mode, 'text': text, 'parameter' if mode == 'required' else 'value': argument}
 
 
-def compile_instruction(raw_step, sentence, *, mode=None, argument=None):
+def _semantic_instruction(raw_step, sentence, mode, argument, target, role, within):
+    """Bind a new instruction to a live query, never to the missed click's coordinates."""
+    if not is_recoverable(raw_step):
+        raise TaskError('instruction_target_unavailable')
+    explicit = any(value is not None for value in (mode, argument, target, role, within))
+    subject = instruction_subject(sentence)
+    query = target if target is not None else subject
+    if query is None and _text(raw_step.get('alias')):
+        query = raw_step['alias']
+    if query is None:
+        if explicit:
+            raise TaskError('instruction_target_unavailable')
+        return {'mode': 'draft', 'text': sentence}
+    if not _text(query) or query != query.strip():
+        raise TaskError('invalid_task_target')
+    if within is not None and (not _text(within) or within != within.strip()):
+        raise TaskError('invalid_task_scope')
+    # Classification only identifies the small action grammar; the existing
+    # parser below still checks the subject, operation, and bound argument.
+    command = re.fullmatch(r'(.+?)(?:을|를)\s*(누르기|눌러|클릭|펼치기|펼쳐|선택|실행)'
+                           r'(?:해)?\s*(?:줘|주세요)?(?:[.!。])?', sentence)
+    action = 'open' if mode == 'recorded' or (mode is None and command) else 'select'
+    inferred_role = ('menuitem' if command and re.search(r'메뉴\s*$', command[1]) else 'button')
+    role = role if role is not None else ('combobox' if action == 'select' else inferred_role)
+    if not isinstance(role, str) or role not in ({'combobox'} if action == 'select' else INVOKE):
+        raise TaskError('instruction_action_mismatch')
+    step = {'action': action, 'target': query, 'match': 'query', 'role': role}
+    query_label = subject if target is not None and subject and ''.join(subject.split()).casefold() != ''.join(query.split()).casefold() else None
+    if query_label is not None:
+        if not _text(query_label, 200):
+            raise TaskError('invalid_task_target')
+        step['label'] = query_label
+    if within is not None:
+        step['within'] = within
+    if action == 'open':
+        # Semantic recovery invokes a newly found command. Expanding a menu
+        # still needs its recorded capability and is not inferred here.
+        step['expand'] = False
+    try:
+        parsed = _parse_sentence(step, sentence)
+    except TaskError as error:
+        if not explicit and error.code in ('instruction_target_mismatch', 'instruction_action_mismatch'):
+            return {'mode': 'draft', 'text': sentence}
+        raise
+    if mode is None:
+        if not parsed or argument is not None:
+            if explicit:
+                raise TaskError('instruction_requires_structure')
+            return {'mode': 'draft', 'text': sentence}
+        mode, argument = parsed
+    elif parsed:
+        actual_mode, actual_arg = parsed
+        if mode != actual_mode or (argument != actual_arg and not (
+                mode == 'required' and isinstance(argument, str) and argument.casefold() == actual_arg.casefold())):
+            raise TaskError('instruction_binding_conflict')
+    spec = _binding(step, sentence, mode, argument)
+    spec.update(query=query, role=role)
+    if query_label is not None:
+        spec['query_label'] = query_label
+    if within is not None:
+        spec['within'] = within
+    return spec
+
+
+def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=None, role=None, within=None):
     if not isinstance(raw_step, dict) or not isinstance(sentence, str):
         raise TaskError('invalid_step_instruction')
     sentence = sentence.strip()
     if sentence and (not _text(sentence, 1000) or len(sentence.encode('utf-8')) > 1000):
         raise TaskError('invalid_step_instruction')
-    if not sentence and mode is None and argument is None:
+    if not sentence and all(value is None for value in (mode, argument, target, role, within)):
         return None
     if isinstance(raw_step.get('target'), dict):
         step = _convert(raw_step, allow_point=True)
@@ -234,11 +338,18 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None):
     else:
         step = raw_step
     if step.get('action') not in ('select', 'open'):
-        raise TaskError('instruction_target_unavailable')
+        return _semantic_instruction(raw_step, sentence, mode, argument, target, role, within)
+    if any(value is not None for value in (target, role, within)):
+        if ((target is not None and target != step.get('target'))
+                or (role is not None and role != step.get('role'))
+                or (within is not None and within != step.get('within'))):
+            raise TaskError('instruction_target_mismatch')
     parsed = _parse_sentence(step, sentence)
     if mode is None:
         if not parsed or argument is not None:
-            raise TaskError('instruction_requires_structure')
+            if argument is not None:
+                raise TaskError('instruction_requires_structure')
+            return {'mode': 'draft', 'text': sentence}
         mode, argument = parsed
     elif parsed:
         actual_mode, actual_arg = parsed
@@ -258,6 +369,56 @@ def _check_instruction(step, spec):
     return compiled
 
 
+def instructed_step(raw_step, spec):
+    """Turn a provisional instruction into the same source step used by replay.
+
+    Query metadata exists only while editing. The saved source step carries the
+    query identity and its instruction contains only fixed/required/recorded.
+    A free-form draft is retained as text on a manual step for host interpretation.
+    """
+    if not isinstance(raw_step, dict) or not isinstance(spec, dict):
+        raise TaskError('invalid_step_instruction')
+    step = (_convert(raw_step, allow_point=True) if isinstance(raw_step.get('target'), dict)
+            else dict(raw_step))
+    step.update(_annotations(raw_step))
+    if spec.get('mode') == 'draft':
+        if ((not is_recoverable(raw_step) and step.get('action') not in ('select', 'open'))
+                or set(spec) != {'mode', 'text'}
+                or not _text(spec.get('text'), 1000) or len(spec['text'].encode('utf-8')) > 1000
+                or spec['text'] != spec['text'].strip()):
+            raise TaskError('invalid_step_instruction')
+        if step.get('action') == 'manual':
+            return {**_manual(step['reason']), **_annotations(raw_step), 'instruction_draft': spec['text']}
+        step.pop('instruction', None)
+        step['instruction_draft'] = spec['text']
+        if 'wait_after' in raw_step:
+            step['wait_after'] = raw_step['wait_after']
+        return step
+    if 'query' in spec:
+        compiled = compile_instruction(raw_step, spec.get('text'), mode=spec.get('mode'),
+                                       argument=spec.get('parameter', spec.get('value')),
+                                       target=spec.get('query'), role=spec.get('role'), within=spec.get('within'))
+        if compiled != spec:
+            raise TaskError('invalid_step_instruction')
+        step = {'action': 'open' if spec['mode'] == 'recorded' else 'select',
+                'target': spec['query'], 'match': 'query', 'role': spec['role'], **_annotations(raw_step)}
+        if 'within' in spec:
+            step['within'] = spec['within']
+        if 'query_label' in spec:
+            step['label'] = spec['query_label']
+        if step['action'] == 'select':
+            step['recorded_effect'] = 'unobserved'
+        else:
+            step['expand'] = False
+        spec = {key: value for key, value in spec.items() if key not in ('query', 'role', 'within', 'query_label')}
+    step['instruction'] = _check_instruction(step, spec)
+    for key in ('value', 'parameter', 'instruction_draft'):
+        step.pop(key, None)
+    if 'wait_after' in raw_step:
+        step['wait_after'] = raw_step['wait_after']
+    return step
+
+
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
@@ -270,12 +431,12 @@ def recorded_step(raw):
         _validate_row(step)
         return step
     spec = raw.get('instruction')
+    if spec is not None:
+        return instructed_step(raw, spec)
     step = _convert(raw, allow_point=spec is not None)
     step.update(_annotations(raw))
-    if spec is not None:
-        step['instruction'] = _check_instruction(step, spec)
-        step.pop('parameter', None)
-        step.pop('value', None)
+    if 'instruction_draft' in raw:
+        step = instructed_step(raw, {'mode': 'draft', 'text': raw['instruction_draft']})
     if 'wait_after' in raw:
         step['wait_after'] = raw['wait_after']
     return step
@@ -348,7 +509,14 @@ def _validate(plan):
             _validate_context(s)
             continue
         if s.get('action') == 'manual':
-            if set(s) - set(annotation) != {'action', 'reason'} or s['reason'] != _reason(s['reason']):
+            expected = {'action', 'reason'}
+            if 'instruction_draft' in s:
+                expected.add('instruction_draft')
+                draft = s['instruction_draft']
+                if (not is_recoverable(s) or not _text(draft, 1000)
+                        or len(draft.encode('utf-8')) > 1000 or draft != draft.strip()):
+                    raise TaskError('invalid_step_instruction')
+            if set(s) - set(annotation) != expected or s['reason'] != _reason(s['reason']):
                 raise TaskError('invalid_task_step')
             continue
         allowed = {'action', 'role', 'target', 'match', 'ancestors', 'within', 'label', 'command_name', *annotation}
@@ -362,19 +530,33 @@ def _validate(plan):
         if 'command_name' in s and (s.get('role') not in INVOKE or s.get('match') != 'automation_id'
                                     or not _text(s['command_name'])):
             raise TaskError('invalid_task_target')
-        if s.get('match') not in ('name', 'automation_id') or not _text(s.get('target')):
+        if s.get('match') not in ('name', 'automation_id', 'query') or not _text(s.get('target')):
             raise TaskError('invalid_task_target')
         ancestors = s.get('ancestors', [])
         if (not isinstance(ancestors, list) or len(ancestors) > 4
                 or any(not isinstance(a, dict) or a != _selector(a) for a in ancestors)):
             raise TaskError('invalid_task_scope')
         scope = (ancestors[0].get('automation_id') or ancestors[0].get('name')) if ancestors else None
-        if s.get('within') != scope:
+        if s['match'] == 'query':
+            if ('ancestors' in s or s['target'] != s['target'].strip() or ('within' in s
+                    and (not _text(s['within']) or s['within'] != s['within'].strip()))):
+                raise TaskError('invalid_task_scope')
+        elif s.get('within') != scope:
             raise TaskError('invalid_task_scope')
         instruction = None
+        draft = s.get('instruction_draft')
+        if 'instruction_draft' in s:
+            allowed.add('instruction_draft')
+            if ('instruction' in s or not _text(draft, 1000)
+                    or len(draft.encode('utf-8')) > 1000 or draft != draft.strip()):
+                raise TaskError('invalid_step_instruction')
         if 'instruction' in s:
             allowed.add('instruction')
             instruction = _check_instruction(s, s['instruction'])
+        if s['match'] == 'query' and ((instruction is None and draft is None) or not isinstance(s.get('role'), str) or (s.get('action') == 'open'
+                and (s.get('role') not in INVOKE or s.get('expand'))) or (s.get('action') == 'select'
+                and s.get('recorded_effect') != 'unobserved')):
+            raise TaskError('invalid_task_instruction_query')
         if s.get('action') == 'select':
             allowed.add('recorded_effect')
             if s.get('role') != 'combobox' or s.get('recorded_effect') not in ('matched', 'unverified', 'unobserved'):
@@ -382,10 +564,15 @@ def _validate(plan):
             if instruction is None:
                 allowed.update(('value', 'parameter'))
                 key = s.get('parameter')
-                if (not _text(s.get('value'), 10000) or not _text(key, 1000) or '=' in key
-                        or key.casefold() in parameters or s.get('recorded_effect') == 'unobserved'):
+                if draft is not None:
+                    if (('value' in s and not _text(s['value'], 10000)) or ('parameter' in s
+                            and (not _text(key, 1000) or '=' in key))):
+                        raise TaskError('invalid_task_selection')
+                elif (not _text(s.get('value'), 10000) or not _text(key, 1000) or '=' in key
+                      or key.casefold() in parameters or s.get('recorded_effect') == 'unobserved'):
                     raise TaskError('invalid_task_selection')
-                parameters.add(key.casefold())
+                if draft is None:
+                    parameters.add(key.casefold())
         elif s.get('action') == 'open':
             allowed.add('expand')
             if (type(s.get('expand')) is not bool or not isinstance(s.get('role'), str)
@@ -619,6 +806,8 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
     for number, s in sequence:
         if s['action'] == 'manual':
             return dict(report, status='needs_review', stopped_at=number, diagnostic=s['reason'])
+        if 'instruction_draft' in s:
+            return dict(report, status='needs_review', stopped_at=number, diagnostic='instruction_requires_structure')
     missing = [s['instruction']['parameter'] for number, s in sequence if number not in values
                and s.get('instruction', {}).get('mode') == 'required']
     if missing:

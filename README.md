@@ -1,8 +1,8 @@
-# Desktop Select 0.4.3 — 자연어 녹화와 빠른 실행
+# Desktop Select 0.4.4 — 녹화 설명 초안과 현재 화면 재탐색
 
-0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 녹화한 위치와 문장 원문을 보존하고 고정값, 필수 변수, 버튼 및 명시적 대기를 저장합니다. 다음 실행에는 현재 ID를 확인하고 저장된 동작을 한 UIA 연결에서 실행합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 텍스트 파일만 있습니다.
+0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 녹화한 위치를 바탕으로 설명 초안을 만들고 문장 원문, 고정값, 필수 변수, 버튼 및 명시적 대기를 저장합니다. 녹화 때 요소를 못 찾았어도 설명의 이름으로 실행 시 현재 화면에서 다시 찾습니다. 식별된 대상은 현재 ID를 확인하고 저장된 동작을 한 UIA 연결에서 실행합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 텍스트 파일만 있습니다.
 
-Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 반복 작업은 녹화 단계 옆에 지시를 적고 저장한 뒤 그대로 재생하거나 Python 업무 스킬로 등록해 실행합니다. 자유로운 문장도 현재 호스트 모델이 처음 한 번 해석한 내용과 원문을 함께 저장할 수 있습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.3/desktop-select-0.4.3-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.3/skills/desktop-select/사용가이드.md)
+Claude Code에 업무 창, 필드, 원하는 값을 알려 주면 Windows 접근성 기능으로 해당 컨트롤을 찾아 선택합니다. 반복 작업은 녹화 단계 옆에 지시를 적고 저장한 뒤 그대로 재생하거나 Python 업무 스킬로 등록해 실행합니다. 자유로운 문장도 초안으로 보관하고 현재 호스트 모델이 처음 한 번 해석해 실행 지시로 저장할 수 있습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.4/desktop-select-0.4.4-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.4/skills/desktop-select/사용가이드.md)
 
 `record` 저장 시 호환되는 작업의 실행안도 저장합니다. `plan --task`로 기존 작업에서 만들 수 있고 `instruct --save-as`는 지시를 수정한 새 작업을 만듭니다. 원본이 바뀌면 이전 실행안은 사용하지 않습니다. 조회 뒤에는 사용자가 지정한 대기를 넣으며, 행/우클릭 등 전용 단계가 섞이면 전체 작업에 기존 재생을 사용합니다. 입력 실패 후에는 자동으로 다른 방식으로 재시도하지 않습니다.
 

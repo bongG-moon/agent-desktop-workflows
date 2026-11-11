@@ -35,6 +35,57 @@ def text(value, limit=1000):
             and not any(ord(c) < 32 for c in value))
 
 
+def validate_selector(selector):
+    if isinstance(selector, dict) and 'query' in selector:
+        need(not set(selector) - {'query', 'role', 'within'} and text(selector['query'])
+             and selector.get('role') in app.bridge.ROLES.values()
+             and ('within' not in selector or text(selector['within'])), 'invalid_semantic_selector')
+    else:
+        lookup._selector(selector)
+
+
+def semantic_match(binding, uia, root, selector):
+    """Use the same current-window label/name resolver as a direct command."""
+    nodes, elements = app.observe(binding, uia)
+    need(bool(elements) and uia.same(root, elements[0]), 'target_window_changed')
+    index, basis = app.resolve(nodes, selector['query'], role=selector['role'], within=selector.get('within'))
+    element, node = elements[index], nodes[index]
+    lookup.ancestry(uia, element, root, pid=binding.pid)
+    # Promote only an identity witnessed in this live read, never old coordinates.
+    stable = app._stable_selector(nodes, index)
+    if stable is not None:
+        current = lookup.resolve(binding, uia, stable, root=root)
+        need(uia.same(element, current), 'target_changed')
+    observed_label = app.field_labels(nodes).get(index, {})
+    proof = dict(matched_by=basis, query=selector['query'], role=node['role'])
+    if node.get('automation_id'):
+        proof['automation_id'] = node['automation_id']
+    if node.get('name'):
+        proof['name'] = node['name']
+    proof.update(observed_label)
+    return element, stable, proof
+
+
+def resolve_step(binding, uia, root, selector):
+    if 'query' in selector:
+        return semantic_match(binding, uia, root, selector)
+    return lookup.resolve(binding, uia, selector, root=root), selector, None
+
+
+def revalidate_step(binding, uia, root, selector, stable, proof, element):
+    if stable is not None:
+        current = lookup.resolve(binding, uia, stable, root=root)
+    else:
+        current, _, _ = semantic_match(binding, uia, root, selector)
+    need(uia.same(element, current), 'target_changed')
+    if proof:
+        if selector['role'] != 'combobox' and proof.get('name'):
+            need(current.property(30005) == proof['name'], 'command_name_changed')
+        if proof.get('semantic_label'):
+            app.tasks.check_display({'label': proof['semantic_label']}, app.field_label(binding, uia, current, root))
+    return current
+
+
 def validate(recipe):
     need(isinstance(recipe, dict) and recipe.get('schema') == 1, 'invalid_workflow')
     need(not set(recipe) - {'schema', 'name', 'exe', 'window', 'steps'}, 'unknown_workflow_field')
@@ -51,7 +102,7 @@ def validate(recipe):
         need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label'}, 'unknown_step_field')
         need(step.get('action') in ('set-value', 'invoke'), 'unsupported_workflow_action')
         selector = step.get('selector')
-        lookup._selector(selector)
+        validate_selector(selector)
         need(text(step.get('label', 'step'), 200), 'invalid_step_label')
         need('command_name' not in step or (step['action'] == 'invoke' and text(step['command_name'])),
              'invalid_command_name')
@@ -131,7 +182,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                    business_result='not_verified')
                 else:
                     selector = step['selector']
-                    element = lookup.resolve(binding, uia, selector, root=root)
+                    element, stable, resolution = resolve_step(binding, uia, root, selector)
                     need('command_name' not in step or element.property(30005) == step['command_name'],
                          'command_name_changed')
                     if step.get('field_label'):
@@ -139,6 +190,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                 app.field_label(binding, uia, element, root))
                     if read_only:
                         receipt = dict(status='observed', input_dispatched=False, actions=uia.actions(element))
+                        if resolution is not None:
+                            receipt['target_resolution'] = resolution
+                            if stable is not None:
+                                receipt['resolved_selector'] = stable
                         if step['action'] == 'set-value':
                             receipt.update(live.combo_readback(binding, uia, element))
                         else:
@@ -146,8 +201,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     else:
                         def check():
                             app.guard(binding, binding, recipe['window'], mutate=True)
-                            current = lookup.resolve(binding, uia, selector, root=root)
-                            need(uia.same(element, current), 'target_changed')
+                            current = revalidate_step(binding, uia, root, selector, stable, resolution, element)
                             need('command_name' not in step or current.property(30005) == step['command_name'],
                                  'command_name_changed')
                             if step.get('field_label'):
@@ -162,6 +216,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                'select' if step['action'] == 'set-value' else 'invoke',
                                                value, still_valid=check)
                         dispatching = False
+                        if resolution is not None:
+                            receipt['target_resolution'] = resolution
                 report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt))
                 report['input_dispatched'] = combine(report['input_dispatched'], receipt['input_dispatched'])
                 if read_only or receipt['status'] in ('verified', 'waited'):
@@ -213,7 +269,7 @@ import sys
 HERE = Path(__file__).resolve()
 RUNTIME = HERE.parents[2] / "desktop-select" / "scripts"
 if not (RUNTIME / "python_workflow.py").is_file():
-    raise SystemExit("Install Desktop Select 0.4.3 or later beside this skill.")
+    raise SystemExit("Install Desktop Select 0.4.4 or later beside this skill.")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))
@@ -235,6 +291,11 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     for step, row in zip(active, observed['steps']):
         need(('SetValue' if step['action'] == 'set-value' else 'Click') in row['receipt']['actions'],
              'workflow_pattern_unavailable')
+        if row['receipt'].get('resolved_selector'):
+            step['selector'] = row['receipt']['resolved_selector']
+        resolution = row['receipt'].get('target_resolution', {})
+        if step['action'] == 'set-value' and resolution.get('semantic_label'):
+            step['field_label'] = resolution['semantic_label']
         if step['action'] == 'invoke' and text(row['receipt'].get('command_name')):
             step['command_name'] = row['receipt']['command_name']
     required = list(dict.fromkeys(s['parameter'] for s in active if 'parameter' in s))

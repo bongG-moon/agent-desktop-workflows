@@ -117,8 +117,8 @@ class PlanTests(unittest.TestCase):
         p = task(compiled(a, '이 항목을 N으로 설정'))
         with self.assertRaisesRegex(tasks.TaskError, 'fixed_value_override'):
             self.run_task(p, {'MES': 'Y'}, lambda _: self.fail())
-        with self.assertRaisesRegex(tasks.TaskError, 'instruction_requires_structure'):
-            tasks.compile_instruction(a, '전에 쓰던 값으로 알아서')
+        self.assertEqual(tasks.compile_instruction(a, '전에 쓰던 값으로 알아서'),
+                         {'mode': 'draft', 'text': '전에 쓰던 값으로 알아서'})
         self.assertEqual(tasks.compile_instruction(a, '전에 쓰던 값으로 알아서', mode='fixed', argument='N')['value'], 'N')
         with self.assertRaisesRegex(tasks.TaskError, 'instruction_target_mismatch'):
             tasks.compile_instruction(a, 'Family를 N으로 설정', mode='fixed', argument='N')

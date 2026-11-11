@@ -28,9 +28,12 @@ recorder = _load_recorder()
 
 def manual(reason, step_id=None):
     label = '일반 녹화에서 감지한 우클릭' if reason == 'right_click_requires_menu_teaching' else '직접 확인할 단계'
-    return {'id': step_id or uuid.uuid4().hex, 'label': label,
+    step = {'id': step_id or uuid.uuid4().hex, 'label': label,
             'action': 'manual', 'target': {'kind': 'manual', 'locator': {}},
             'recognition': {'action': 'manual', 'result': 'manual', 'reason': reason}}
+    if learned_tasks.is_recoverable(step):
+        step['label'] = '설명으로 다시 찾을 단계'
+    return step
 
 
 def capture_step(step):
@@ -114,13 +117,19 @@ def default_text(step):
     if step['action'] in ('row-action', 'result-menu'):
         return step['label']
     command = learned_tasks.recorded_step(step)
-    field = command.get('label') or command.get('target') or step['label']
+    field = (step.get('alias') or command.get('label') or command.get('command_name')
+             or command.get('target') or step['label'])
     if step['action'] == 'teach-target':
-        return ''
+        field = step.get('alias') or step.get('field_label') or step['label']
+        return f'입력받은 변수를 {field} 조건에 입력해줘'
     if command['action'] == 'select':
-        return f"이 항목을 {command['value']}로 설정"
+        return f"{field} 조건을 {command['value']}로 설정해줘"
     if command['action'] == 'open':
-        return '이 항목을 ' + ('펼쳐줘' if command.get('expand') else '선택해줘')
+        kind = '버튼' if command.get('role') in {'button', 'splitbutton'} else '항목'
+        verb = '펼쳐줘' if command.get('expand') else '눌러줘'
+        return f'{field} {kind}을 {verb}'
+    if learned_tasks.is_recoverable(step):
+        return '화면의 대상 이름과 실행할 동작을 입력하세요.'
     return ''
 
 
@@ -134,13 +143,20 @@ def instruction_view(step, instruction):
         return ' → '.join(route)
     if step['action'] == 'row-action':
         return step['label'] + ' (버튼 선택 후 같은 행의 완료 표시 확인)'
+    if instruction and instruction['mode'] == 'draft':
+        return '설명은 저장됩니다. 실행 전 Claude가 문장을 해석하고 현재 화면에서 대상을 다시 찾습니다.'
+    retry = '실행할 때 현재 화면에서 대상을 다시 찾습니다. ' if instruction and instruction.get('query') else ''
     if instruction and instruction['mode'] == 'fixed':
-        return '지정한 값으로 선택: ' + instruction['value']
+        return retry + '지정한 값으로 선택: ' + instruction['value']
     if instruction and instruction['mode'] == 'required':
-        return '실행 시 입력할 변수: ' + instruction['parameter']
+        return retry + '실행 시 입력할 변수: ' + instruction['parameter']
+    if retry:
+        return retry + instruction['text']
     if step['action'] == 'teach-target':
         return '콤보 대상 확인됨. 고정값이나 입력 변수를 지정하세요.'
-    return default_text(step) or '직접 수행하거나 다시 녹화할 단계'
+    if learned_tasks.is_recoverable(step):
+        return '대상을 못 읽어도 설명을 저장할 수 있습니다. 대상 이름과 동작을 적으면 실행 시 다시 찾습니다.'
+    return default_text(step) or '직접 확인할 단계'
 
 
 class StepEdits:
@@ -159,6 +175,11 @@ class StepEdits:
         locator = target.get('locator', {})
         identity = learned_tasks._selector(locator)
         if identity is None:
+            if learned_tasks.is_recoverable(step):
+                # The same recorded event can acquire a different recognition
+                # diagnostic while its provider settles. The prose is its
+                # identity until execution resolves a live target.
+                return 'description_target',
             return step['action'], target, step.get('recognition', {}).get('reason')
         # Runtime handles, screen coordinates and duplicated peer names vary
         # while one clicked field settles. They are not the recorded identity.
@@ -168,11 +189,18 @@ class StepEdits:
 
     def compile(self, step, alias, sentence, mode=None, argument=None):
         alias = alias.strip()
+        if mode is None and argument == '':
+            argument = None
         if (len(alias.encode('utf-8')) > 120 or any(unicodedata.category(c) == 'Cc' for c in alias)):
             raise ValueError('별칭은 120바이트 이내의 한 줄로 입력하세요.')
         if '=' in alias or alias.isdecimal():
             raise ValueError('별칭에는 등호 또는 숫자만으로 된 이름을 사용할 수 없습니다.')
         data = {'alias': alias} if alias else {}
+        # A recorded literal can contain punctuation outside the sentence
+        # parser. Persist our own generated draft as literal data, never code.
+        if (mode is None and argument is None and step['action'] == 'set-value'
+                and sentence.strip() == default_text(step)):
+            mode, argument = 'fixed', step['value']
         directive = learned_tasks.compile_instruction(dict(step, **data), sentence.strip(),
                                                        mode=mode, argument=argument)
         if directive is not None:
@@ -209,7 +237,10 @@ class StepEdits:
         for step in steps:
             saved = self.get(step)
             draft = self.drafts.get(step['id'])
-            if saved or (draft and draft[0] == self.identity(step)):
+            # Persist the visible generated instructions too. Otherwise an
+            # untouched row can silently keep old recording-only semantics.
+            if (step['action'] not in ('row-action', 'result-menu')
+                    and (saved or (draft and draft[0] == self.identity(step)) or default_text(step))):
                 sentence, mode, argument = self.form(step)
                 try:
                     saved = self.compile(step, self.alias(step), sentence, mode, argument)
@@ -502,7 +533,7 @@ def capture(binding, *, title):
     edits = StepEdits()
     completed_steps = []
     previous_columns = None
-    message = tk.StringVar(value='시작 후 사용할 콤보나 버튼을 눌러 위치를 알려 주세요. 끝나면 실행할 동작과 변수를 입력하세요.')
+    message = tk.StringVar(value='위치를 누르면 설명 초안이 생깁니다. 원하는 동작과 변수로 고친 뒤 ‘적용하고 다음 단계’를 누르세요. 대상을 못 읽은 단계도 설명을 저장할 수 있습니다.')
     frame = ttk.Frame(root, padding=14)
     frame.pack(fill='both', expand=True)
     ttk.Label(frame, text=title, wraplength=460).pack(anchor='w')
@@ -555,7 +586,7 @@ def capture(binding, *, title):
     def show_error(exc):
         if isinstance(exc, learned_tasks.TaskError):
             reason = {'instruction_target_mismatch': '화면 이름이 다르면 ‘문장의 이름을 이 대상에 연결’을 누르세요. 또는 ‘이 항목을 N으로 설정’처럼 입력하세요.',
-                      'instruction_target_unavailable': '이 단계에는 사용할 대상이 없습니다. 이 단계를 삭제하고 해당 콤보나 버튼의 위치를 다시 녹화하세요.',
+                      'instruction_target_unavailable': '이 단계는 보호된 입력이나 별도 절차가 필요한 동작입니다. 일반 대상 인식 실패는 설명을 저장한 뒤 실행할 때 다시 찾을 수 있습니다.',
                       'instruction_requires_structure': '콤보 값 지정에서 고정값이나 필수 변수를 선택하고 값을 입력하세요.',
                       'invalid_step_alias': '다른 별칭을 입력하세요.'}.get(
                           exc.code, '이 단계에서 실행할 수 있는 문장과 값을 입력하세요.')

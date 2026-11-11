@@ -65,7 +65,8 @@ class CaptureTests(unittest.TestCase):
         edits.store(step, '모드', 'Mode를 {condition}로 선택')
         changed = copy.deepcopy(step)
         changed['target']['locator']['automation_id'] = 'different'
-        self.assertNotIn('instruction', edits.apply([changed])[0])
+        self.assertEqual(edits.apply([changed])[0]['instruction']['mode'], 'fixed')
+        self.assertNotIn('parameter', edits.apply([changed])[0]['instruction'])
         self.assertEqual(edits.apply([step])[0]['instruction']['parameter'], 'condition')
         with self.assertRaises(learned_tasks.TaskError):
             edits.store(step, '', '다른 필드를 N으로 선택')

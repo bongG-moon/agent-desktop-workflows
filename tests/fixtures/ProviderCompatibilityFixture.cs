@@ -183,6 +183,10 @@ sealed class ProviderCompatibilityFixture : Form {
                 else if(command.StartsWith("query-caption|")) {
                     Root.Children.Find(delegate(RawPeer peer) { return peer.Key=="QueryCommand"; }).Name=command.Substring(14);
                 }
+                else if(command.StartsWith("automation-id|")) {
+                    var parts=command.Split('|');
+                    Root.Children.Find(delegate(RawPeer peer) { return peer.Key==parts[1]; }).AutomationKey=parts[2];
+                }
                 else if(command=="reset-metrics")PropertyReads=Navigations=PatternReads=BoundsReads=0;
                 else if(command=="clear-extra")ClearExtras();
                 else if(command.StartsWith("clutter|"))AddClutter(Int32.Parse(command.Substring(8)));
@@ -244,6 +248,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     internal readonly RawPeer Parent;
     internal readonly int Id, Role;
     internal readonly string Key;
+    internal string AutomationKey;
     internal string Name;
     internal readonly Rectangle Relative;
     internal readonly List<RawPeer> Children=new List<RawPeer>();
@@ -284,7 +289,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
             case 30008: return false;
             case 30009: return Role==50003 || Role==50004 || Role==50000;
             case 30010: return true;
-            case 30011: return Key;
+            case 30011: return AutomationKey ?? Key;
             case 30012: return "RawCompatibilityProvider";
             case 30013: return "";
             case 30016: case 30017: return true;
