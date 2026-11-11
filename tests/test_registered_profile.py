@@ -213,6 +213,8 @@ class RegisteredProfileTests(unittest.TestCase):
                                  encoding='utf8', timeout=10)
             self.assertEqual(run.returncode, 0, run.stderr)
             observed = json.loads(run.stdout)
-            self.assertEqual(Path(observed['path']), out / 'workflow.json')
+            # Hosted Windows TEMP can use an 8.3 user name while the runner's
+            # __file__.resolve() returns the same file through its long path.
+            self.assertEqual(Path(observed['path']).resolve(), (out / 'workflow.json').resolve())
             self.assertEqual(observed['args'], ['--set', 'Family=Hybrid', '--read-only'])
             self.assertEqual(original, profile())
