@@ -443,7 +443,13 @@ class CaptureSession:
         return {'status': 'cancelled', 'steps': [], 'input_dispatched': False}
 
 
-def capture(binding, *, title):
+def capture(binding, *, title, steps=None):
+    """Record locations and keep the user's instruction verbatim by default."""
+    from intent_capture import capture as capture_intents
+    return capture_intents(binding, title=title, steps=steps)
+
+
+def capture_legacy(binding, *, title):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
     from tkinter import ttk

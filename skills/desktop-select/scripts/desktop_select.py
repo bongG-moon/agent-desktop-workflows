@@ -41,6 +41,7 @@ import learned_tasks as tasks
 from provider_visibility import visible, restore_for_action
 from provider_labels import semantic_label
 from runtime_integrity import RuntimeIntegrityError
+from intent_tasks import IntentError
 
 
 def windows(exe):
@@ -171,6 +172,9 @@ def task_directory():
 
 def near_region(nodes, anchor):
     """Return the nearest grouping of a freshly resolved demonstrated control."""
+    if anchor.get('action') == 'intent':
+        from intent_replay import scope
+        return scope(nodes, anchor)
     if anchor.get('action') in ('manual', 'row-action', 'result-menu'):
         raise SelectionError('anchor_requires_review')
     anchor_idx, _ = tasks.locate_target(nodes, anchor)
@@ -204,7 +208,7 @@ def action(args, owner, *, learned=None, anchor=None):
             if anchor is None:
                 return nodes, elements, None
             scoped, indexes, a = near_region(nodes, anchor)
-            if anchor.get('label'):
+            if anchor.get('label') and anchor.get('action') != 'intent':
                 tasks.check_display(anchor, semantic_label(surface, uia, elements[a], elements[0]))
             region = [elements[i] for i in indexes]
             for n, e in zip(scoped, region):
@@ -263,11 +267,21 @@ def action(args, owner, *, learned=None, anchor=None):
 
 def run(args):
     bridge.set_dpi_awareness()
+    if args.command == 'doctor':
+        from runtime_integrity import checked_path
+        checked_path('win_bridge.py')
+        checked_path('recorder.py')
+        here = Path(__file__).resolve().parent.parent
+        version = json.loads((here / 'runtime-manifest.json').read_text(encoding='utf8')).get('version', 'unknown')
+        return dict(status='observed', version=version, skill_path=str(here),
+                    runtime_integrity='matched', input_dispatched=False,
+                    capabilities=['position_recording', 'free_text_instructions', 'edit_delete_steps',
+                                  'model_resolution', 'provider_compatibility'])
     if args.command in ('tasks', 'show'):
         if args.command == 'tasks':
             return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
-        return {'status': 'observed', 'task': tasks.summary(tasks.load_task(args.task, task_directory())),
-                'input_dispatched': False}
+        from intent_replay import describe_plan
+        return dict(describe_plan(tasks.load_task(args.task, task_directory())), status='observed')
     if args.command == 'replay':
         plan = tasks.load_task(args.task, task_directory())
         overrides = tasks.parse_overrides(args.set)
@@ -280,7 +294,24 @@ def run(args):
                 except (SelectionError, bridge.BridgeError) as error:
                     return {'status': 'blocked', 'diagnostic': error.code, 'input_dispatched': False}
             return worker_receipt(['_step'], mutating=True, payload={'binding': binding, 'step': step})
-        return tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only)
+        resolution = None
+        if getattr(args, 'resolution', None):
+            try:
+                path = Path(args.resolution).absolute()
+                if str(path).startswith(('\\\\', '//')):
+                    raise tasks.TaskError('local_resolution_required')
+                tasks._deny_redirect(path)
+                with path.open('rb') as f:
+                    data = f.read(tasks.MAX_FILE_BYTES + 1)
+            except OSError as error:
+                raise tasks.TaskError('resolution_file_unavailable') from error
+            if len(data) > tasks.MAX_FILE_BYTES:
+                raise tasks.TaskError('resolution_too_large')
+            try:
+                resolution = json.loads(data, object_pairs_hook=tasks._unique_keys)
+            except (ValueError, UnicodeError) as error:
+                raise tasks.TaskError('invalid_resolution_file') from error
+        return tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only, resolution=resolution)
     rows = windows(args.exe)
     if args.command == 'windows':
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
@@ -309,17 +340,28 @@ def run(args):
             guard(owner, owner, args.window)
             result.append({'number': number, 'label': step['label'], 'observed_state': state})
         return {'status': 'observed', 'steps': result, 'input_dispatched': False}
-    if args.command == 'record':
+    if args.command in ('record', 'edit'):
         from teach_capture import capture
-        tasks.check_new_task(args.task, task_directory())
+        old = None
+        if args.command == 'edit':
+            old = tasks.load_task(args.task, task_directory())
+            tasks.check_binding(old, args.exe, args.window)
+        else:
+            tasks.check_new_task(args.task, task_directory())
         restore_for_action(owner, args.window)
         guard(owner, owner, args.window)
-        capture_result = capture(owner, title=args.window)
+        capture_result = capture(owner, title=args.window, steps=old['steps'] if old else None)
         if capture_result['status'] != 'recorded':
             return capture_result
         plan = tasks.from_recording(args.task, args.exe, args.window, capture_result['steps'])
-        tasks.save_task(plan, task_directory())
-        return {'status': 'recorded', 'task': tasks.summary(plan), 'input_dispatched': False}
+        saved = {}
+        if old:
+            from intent_tasks import plan_digest
+            from task_edit import replace_task
+            saved = replace_task(plan, plan_digest(old), task_directory())
+        else:
+            tasks.save_task(plan, task_directory())
+        return {'status': 'recorded', 'task': tasks.summary(plan), 'input_dispatched': False, **saved}
     anchor = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
@@ -333,6 +375,35 @@ def replay_step():
     binding, step = request['binding'], request['step']
     bridge.set_dpi_awareness()
     owner = bridge.Binding(binding)
+    if step['action'] == 'intent-execute':
+        from intent_tasks import validate_step
+        from intent_replay import validate_action, scope
+        intent = step['intent']
+        validate_step(intent)
+        operation = validate_action(step['operation'])
+        if 'parameter' in operation:
+            raise tasks.TaskError('required_parameter_missing')
+        if operation['action'] == 'result-menu':
+            from result_menu import execute as execute_result
+            restored = restore_for_action(owner, binding['title'])
+            def check_context():
+                guard(owner, owner, binding['title'], mutate=True)
+                with bridge.UIA() as uia:
+                    nodes, _ = observe(owner, uia, identities_only=True)
+                    region, _, _ = scope(nodes, intent)
+                    target = operation['context']['menu']['target']
+                    matches = [n for n in region if not n.get('secure') and
+                               all(n.get(k) == v for k, v in target.items())]
+                    if len(matches) != 1:
+                        raise tasks.TaskError('resolved_target_outside_taught_area')
+            check_context()
+            receipt = execute_result(owner, operation['context'], check_context, binding['title'],
+                                     observe_guard=lambda: guard(owner, owner, binding['title']))
+            return dict(receipt, target=intent['label'], window_restored=restored)
+        args = argparse.Namespace(command=operation['action'], role=operation['role'], window=binding['title'],
+                                  target=operation['target'], value=operation.get('value'),
+                                  expand=operation.get('expand', False), within=None, popup=None)
+        return action(args, owner, learned=operation, anchor=intent)
     if step['action'] == 'result-menu':
         from result_menu import execute as execute_result
         tasks._validate_context(step)
@@ -358,14 +429,15 @@ def parser():
     p = argparse.ArgumentParser(description='Select an exact field or command in one Windows business window.')
     commands = p.add_subparsers(dest='command', required=True)
     commands.add_parser('tasks', help='list local named demonstrations')
+    commands.add_parser('doctor', help='show installed version, path and compatibility capabilities')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
-    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay', 'record-rows', 'row-status'):
+    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'edit', 'replay', 'record-rows', 'row-status'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
         if verb != 'windows':
             s.add_argument('--window', required=True, help='exact business window title from windows')
             s.add_argument('--hwnd', type=int, help='disambiguate windows with identical titles')
-        if verb in ('record', 'replay', 'record-rows', 'row-status'):
+        if verb in ('record', 'edit', 'replay', 'record-rows', 'row-status'):
             s.add_argument('--task', required=True, help='local task name')
         if verb == 'record-rows':
             s.add_argument('--row', nargs=3, action='append', required=True, metavar=('LABEL', 'X', 'Y'),
@@ -375,6 +447,7 @@ def parser():
                                help='physical pixel rectangle relative to the row')
         if verb == 'replay':
             s.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
+            s.add_argument('--resolution', help='local JSON actions interpreted from this exact saved task')
         if verb in ('replay', 'row-status'):
             s.add_argument('--only', help='run just one named step or step number')
         if verb in ('inspect', 'open', 'select'):
@@ -395,7 +468,7 @@ def parser():
 def worker(args):
     try:
         result = replay_step() if args is None else run(args)
-    except (SelectionError, bridge.BridgeError, tasks.TaskError, RuntimeIntegrityError) as error:
+    except (SelectionError, bridge.BridgeError, tasks.TaskError, RuntimeIntegrityError, IntentError) as error:
         dispatched = getattr(error, 'input_dispatched', False)
         result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': error.code,
                   'input_dispatched': dispatched}
@@ -406,9 +479,10 @@ def worker(args):
 
 
 def result_code(result):
-    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed'):
+    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed', 'completed_unverified'):
         return 0
-    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review') else 3
+    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review', 'needs_target', 'needs_instruction',
+                                   'needs_interpretation') else 3
 
 
 def worker_receipt(argv, mutating, payload=None):
@@ -416,7 +490,7 @@ def worker_receipt(argv, mutating, payload=None):
     # our helper only; never assume a timed-out mutation failed or repeat it.
     try:
         kind = (payload or {}).get('step', {}).get('action')
-        timeout = {'row-action': 120, 'result-menu': 160}.get(kind, 90)
+        timeout = {'row-action': 120, 'result-menu': 160, 'intent-execute': 160}.get(kind, 90)
         child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
                                input=json.dumps(payload) if payload is not None else None,
                                capture_output=True, encoding='utf-8', timeout=timeout)
@@ -456,7 +530,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('record', 'edit', 'record-rows', 'replay', 'tasks', 'show') else supervise(args, argv)
 
 
 if __name__ == '__main__':

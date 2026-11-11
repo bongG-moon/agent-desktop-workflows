@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "version": "0.5.0",
   "files": {
     "win_bridge.py": "a1d94dff366248bca7d4d8618c8258b7e10138df528bd34973dcb665501bdc72",
     "recorder.py": "c26af522a42426988a7fcefdfb4c48366164d7dccca7a5e88796ed6246654086"

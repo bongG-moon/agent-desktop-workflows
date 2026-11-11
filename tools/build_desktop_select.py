@@ -8,7 +8,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'skills' / 'desktop-select'
-VERSION = '0.4.1'
+VERSION = '0.5.0'
 FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'scripts/desktop_select.py',
                                          'scripts/live_action.py', 'scripts/targeting.py',
                                          'scripts/teach_capture.py', 'scripts/learned_tasks.py',
@@ -17,7 +17,9 @@ FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'scri
                                          'scripts/result_menu.py', 'scripts/export_evidence.py',
                                          'scripts/provider_visibility.py', 'scripts/provider_values.py',
                                          'scripts/provider_labels.py', 'scripts/runtime_integrity.py',
-                                         'runtime-manifest.json')}
+                                         'scripts/intent_tasks.py', 'scripts/intent_capture.py',
+                                         'scripts/intent_replay.py', 'scripts/task_edit.py',
+                                         'references/natural-replay.md', 'runtime-manifest.json')}
 FILES.update({'scripts/win_bridge.py': ROOT / 'scripts/win_bridge.py', 'scripts/recorder.py': ROOT / 'scripts/recorder.py',
               'LICENSE': ROOT / 'LICENSE',
               'NOTICE.txt': SKILL / 'NOTICE.txt'})
@@ -30,7 +32,8 @@ def build(destination):
     # Windows checkouts with autocrlf and on checkouts that preserve LF.
     contents = {name: path.read_bytes().replace(b'\r\n', b'\n') for name, path in FILES.items()}
     manifest = json.loads(contents['runtime-manifest.json'])
-    if manifest.get('schema') != 1 or set(manifest.get('files', {})) != {'win_bridge.py', 'recorder.py'}:
+    if (manifest.get('schema') != 1 or manifest.get('version') != VERSION or
+            set(manifest.get('files', {})) != {'win_bridge.py', 'recorder.py'}):
         raise ValueError('runtime_manifest_invalid')
     for name, expected in manifest['files'].items():
         if sha256(contents['scripts/' + name]).hexdigest() != expected:

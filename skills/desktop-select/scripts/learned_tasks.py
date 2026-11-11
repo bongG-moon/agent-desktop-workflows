@@ -295,6 +295,11 @@ def _check_instruction(step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    if raw.get('action') == 'intent':
+        from intent_tasks import validate_step
+        step = {k: value for k, value in raw.items() if k != 'id'}
+        validate_step(step)
+        return step
     if raw.get('action') == 'result-menu':
         step = {'action': 'result-menu', 'label': raw.get('label'), 'context': raw.get('context'), **_annotations(raw)}
         _validate_context(step)
@@ -373,6 +378,10 @@ def _validate(plan):
         annotation = _annotations(s)
         if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
             raise TaskError('invalid_step_annotation')
+        if s.get('action') == 'intent':
+            from intent_tasks import validate_step
+            validate_step(s)
+            continue
         if s.get('action') == 'row-action':
             _validate_row(s)
             continue
@@ -616,9 +625,12 @@ def _parameter(step):
     return instruction.get('parameter') if instruction else step.get('parameter')
 
 
-def replay(plan, exe, window, overrides, invoke, *, only=None):
+def replay(plan, exe, window, overrides, invoke, *, only=None, resolution=None):
     """Invoke each requested step at most once. Unverified delivery stops the sequence."""
     check_binding(plan, exe, window)
+    if any(s['action'] == 'intent' for s in plan['steps']):
+        from intent_replay import replay_intents
+        return replay_intents(plan, exe, window, overrides, invoke, only=only, resolution=resolution)
     if only is not None:
         only = _step_number(plan, only)
     sequence = [(i, s) for i, s in enumerate(plan['steps'], 1) if only is None or only == i]
