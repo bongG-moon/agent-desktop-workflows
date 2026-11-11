@@ -25,9 +25,9 @@ class IntegrityTests(unittest.TestCase):
                     integrity.checked_path('win_bridge.py')
                 core=scripts/'win_bridge.py'
                 core.write_bytes(source.replace(b'\n',b'\r\n'))
-                self.assertEqual(core, integrity.checked_path('win_bridge.py'))
+                self.assertEqual(core.resolve(), integrity.checked_path('win_bridge.py'))
                 (scripts/'provider_values.py').write_text('customized compatibility',encoding='utf8')
-                self.assertEqual(core, integrity.checked_path('win_bridge.py'))
+                self.assertEqual(core.resolve(), integrity.checked_path('win_bridge.py'))
                 core.write_bytes(source+b'wrong version')
                 with self.assertRaisesRegex(integrity.RuntimeIntegrityError,'runtime_file_mismatch: win_bridge.py'):
                     integrity.checked_path('win_bridge.py')
