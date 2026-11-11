@@ -276,6 +276,8 @@ def recorded_step(raw):
         step['instruction'] = _check_instruction(step, spec)
         step.pop('parameter', None)
         step.pop('value', None)
+    if 'wait_after' in raw:
+        step['wait_after'] = raw['wait_after']
     return step
 
 
@@ -350,6 +352,11 @@ def _validate(plan):
                 raise TaskError('invalid_task_step')
             continue
         allowed = {'action', 'role', 'target', 'match', 'ancestors', 'within', 'label', 'command_name', *annotation}
+        if 'wait_after' in s:
+            allowed.add('wait_after')
+            if (s.get('action') != 'open' or s.get('expand') or s.get('role') not in INVOKE
+                    or type(s['wait_after']) not in (int, float) or not 0 < s['wait_after'] <= 120):
+                raise TaskError('invalid_step_wait')
         if 'label' in s and not _text(s['label'], 200):
             raise TaskError('invalid_task_target')
         if 'command_name' in s and (s.get('role') not in INVOKE or s.get('match') != 'automation_id'

@@ -48,13 +48,15 @@ def validate(recipe):
             need(set(step) == {'action', 'seconds'} and type(step.get('seconds')) in (int, float)
                  and 0 <= step['seconds'] <= 120, 'invalid_wait')
             continue
-        need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name'}, 'unknown_step_field')
+        need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label'}, 'unknown_step_field')
         need(step.get('action') in ('set-value', 'invoke'), 'unsupported_workflow_action')
         selector = step.get('selector')
         lookup._selector(selector)
         need(text(step.get('label', 'step'), 200), 'invalid_step_label')
         need('command_name' not in step or (step['action'] == 'invoke' and text(step['command_name'])),
              'invalid_command_name')
+        need('field_label' not in step or (step['action'] == 'set-value' and text(step['field_label'], 200)),
+             'invalid_field_label')
         if step['action'] == 'set-value':
             need(selector['role'] == 'combobox', 'combo_required')
             need(('value' in step) != ('parameter' in step), 'fixed_value_or_parameter_required')
@@ -105,7 +107,7 @@ def combine(previous, current):
     return None if previous is None or current is None else bool(previous or current)
 
 
-def run(recipe, overrides=None, *, read_only=False, hwnd=None):
+def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False):
     recipe = validate(recipe)
     values, missing = values_for(recipe, overrides or {})
     if missing and not read_only:
@@ -132,6 +134,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None):
                     element = lookup.resolve(binding, uia, selector, root=root)
                     need('command_name' not in step or element.property(30005) == step['command_name'],
                          'command_name_changed')
+                    if step.get('field_label'):
+                        app.tasks.check_display({'label': step['field_label']},
+                                                app.field_label(binding, uia, element, root))
                     if read_only:
                         receipt = dict(status='observed', input_dispatched=False, actions=uia.actions(element))
                         if step['action'] == 'set-value':
@@ -145,8 +150,12 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None):
                             need(uia.same(element, current), 'target_changed')
                             need('command_name' not in step or current.property(30005) == step['command_name'],
                                  'command_name_changed')
-                            need(('SetValue' if step['action'] == 'set-value' else 'Click') in uia.actions(current),
-                                 'workflow_pattern_unavailable')
+                            if step.get('field_label'):
+                                app.tasks.check_display({'label': step['field_label']},
+                                                        app.field_label(binding, uia, current, root))
+                            if step['action'] != 'set-value' or not allow_recorded_selection:
+                                need(('SetValue' if step['action'] == 'set-value' else 'Click') in uia.actions(current),
+                                     'workflow_pattern_unavailable')
                         value = values[step['parameter'].casefold()] if 'parameter' in step else step.get('value')
                         dispatching = True
                         receipt = live.execute(binding, uia, element, {'role': selector['role']},
@@ -204,16 +213,18 @@ import sys
 HERE = Path(__file__).resolve()
 RUNTIME = HERE.parents[2] / "desktop-select" / "scripts"
 if not (RUNTIME / "python_workflow.py").is_file():
-    raise SystemExit("Install Desktop Select 0.4.2 beside this skill.")
+    raise SystemExit("Install Desktop Select 0.4.3 or later beside this skill.")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))
 '''
 
 
-def register(recipe, destination, hwnd=None):
+def register(recipe, destination, hwnd=None, *, source_task=None):
     """Validate current targets read-only, then create three local text files."""
     recipe = deepcopy(validate(recipe))
+    if source_task is not None:
+        app.tasks._validate(source_task)
     destination = Path(destination).resolve()
     need(not destination.exists(), 'workflow_destination_exists')
     need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', destination.name), 'workflow_folder_name_required')
@@ -231,6 +242,9 @@ def register(recipe, destination, hwnd=None):
     (destination / 'scripts').mkdir()
     (destination / 'workflow.json').write_text(json.dumps(recipe, ensure_ascii=False, indent=2) + '\n', encoding='utf8')
     (destination / 'scripts/run.py').write_text(RUNNER, encoding='utf8')
+    if source_task is not None:
+        (destination / 'source-task.json').write_text(json.dumps(source_task, ensure_ascii=False, indent=2) + '\n',
+                                                     encoding='utf8')
     guide = ('---\nname: ' + destination.name + '\ndescription: 로컬에 등록한 Windows 업무 순서를 실행한다.\n---\n\n'
              '# 등록된 업무 실행\n\n'
              '업무명, 대상 창과 순서는 `workflow.json`에 있다. 사용자의 실행 요청 범위와 대조한다. '
@@ -240,6 +254,8 @@ def register(recipe, destination, hwnd=None):
              '콤보 확인 실패 또는 불확실한 전달이면 다음 단계로 진행하지 않는다. '
              '조회/내보내기 버튼 전달과 대기는 업무 완료나 파일 생성의 증거가 아니다. 재클릭하지 않는다. '
              '동일 폴더 아래 `desktop-select`가 필요하며 외부 통신과 CUA 드라이버는 사용하지 않는다.\n')
+    if source_task is not None:
+        guide += '\n녹화한 위치와 자연어 지시 원문은 `source-task.json`에 보관되어 있다. 실행에는 `workflow.json`을 사용한다.\n'
     (destination / 'SKILL.md').write_text(guide, encoding='utf8')
     return dict(status='registered', path=str(destination), required_parameters=required, input_dispatched=False)
 
@@ -253,7 +269,12 @@ def main(argv=None):
     discovery.add_argument('--hwnd', type=int)
     for command in ('register', 'run'):
         p = sub.add_parser(command)
-        p.add_argument('--recipe', type=Path, required=True)
+        if command == 'register':
+            source = p.add_mutually_exclusive_group(required=True)
+            source.add_argument('--recipe', type=Path)
+            source.add_argument('--task', help='saved natural-language recording to register')
+        else:
+            p.add_argument('--recipe', type=Path, required=True)
         p.add_argument('--hwnd', type=int)
         if command == 'register':
             p.add_argument('--out', type=Path, required=True)
@@ -266,16 +287,26 @@ def main(argv=None):
     mutating = args.command == 'run' and not args.read_only
     launched = False
     try:
+        source_task = None
+        recipe = None
+        if args.command != 'discover':
+            if getattr(args, 'task', None):
+                import recorded_plan
+                source_task = app.tasks.load_task(args.task, app.task_directory())
+                planned = recorded_plan.get_plan(source_task, app.task_directory())
+                need(bool(planned.get('envelope')), 'recorded_task_not_compatible')
+                recipe = planned['envelope']['recipe']
+            else:
+                recipe = load(args.recipe)
         if args._worker:
             if args.command == 'discover':
                 result = discover(args.exe, args.window, args.hwnd)
             elif args.command == 'register':
-                result = register(load(args.recipe), args.out, args.hwnd)
+                result = register(recipe, args.out, args.hwnd, source_task=source_task)
             else:
-                result = run(load(args.recipe), app.tasks.parse_overrides(args.set),
+                result = run(recipe, app.tasks.parse_overrides(args.set),
                              read_only=args.read_only, hwnd=args.hwnd)
         else:
-            recipe = load(args.recipe) if args.command != 'discover' else None
             timeout = 90 + sum(s.get('seconds', 0) for s in recipe['steps']) if recipe else 90
             launched = True
             child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),

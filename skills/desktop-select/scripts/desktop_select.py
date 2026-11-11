@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from copy import deepcopy
 import ctypes as C
 from ctypes import wintypes as W
 import importlib.util
@@ -343,8 +344,88 @@ def action(args, owner, *, learned=None, anchor=None):
         return dict(result, target=detail, matched_by=evidence, business_commit='not_verified')
 
 
+def saved_execution_plan(plan):
+    """Derived plans are optional; failure cannot undo an already saved recording."""
+    import recorded_plan
+    try:
+        return recorded_plan.get_plan(plan, task_directory())
+    except (ValueError, OSError) as error:
+        return {'status': 'unavailable', 'diagnostic': getattr(error, 'code', 'execution_plan_unavailable')}
+
+
+def execution_plan_info(result):
+    info = {key: result[key] for key in ('status', 'path', 'diagnostic', 'step') if key in result}
+    envelope = result.get('envelope', {})
+    recipe = envelope.get('recipe')
+    if recipe:
+        info.update(source_fingerprint=envelope['source_fingerprint'], steps=len(recipe['steps']),
+                    required_parameters=list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s)))
+    return info
+
+
+def save_instruction(args):
+    """Keep freeform source prose and its once-interpreted action in a new task."""
+    source = tasks.load_task(args.task, task_directory())
+    plan = deepcopy(source)
+    tasks.check_new_task(args.save_as, task_directory())
+    number = tasks._step_number(plan, args.only)
+    step = plan['steps'][number - 1]
+    if args.alias is not None:
+        step['alias'] = args.alias
+    spec = tasks.compile_instruction(step, args.text, mode=args.mode, argument=args.argument)
+    if spec is None:
+        raise tasks.TaskError('instruction_required')
+    step['instruction'] = spec
+    step.pop('value', None)
+    step.pop('parameter', None)
+    if args.wait_after is not None:
+        step['wait_after'] = args.wait_after
+    plan['name'] = args.save_as
+    tasks.save_task(plan, task_directory())
+    return dict(status='recorded', task=tasks.summary(plan), source_task=source['name'],
+                execution_plan=execution_plan_info(saved_execution_plan(plan)), input_dispatched=False)
+
+
+def fast_replay(plan, args, overrides):
+    """Use a saved literal plan only when the entire original task is compatible."""
+    if args.only is not None or any(s['action'] == 'select' and 'instruction' not in s for s in plan['steps']):
+        return None
+    tasks.check_binding(plan, args.exe, args.window)
+    saved = saved_execution_plan(plan)
+    recipe = saved.get('envelope', {}).get('recipe')
+    if recipe is None:
+        return None
+    parameters = {s['parameter'].casefold() for s in recipe['steps'] if 'parameter' in s}
+    if any(key.casefold() not in parameters for key in overrides):
+        return None  # Keep the original alias and fixed-value-override rules.
+    import python_workflow
+    _, missing = python_workflow.values_for(recipe, overrides)
+    if missing:
+        return dict(status='needs_input', diagnostic='required_parameter_missing', missing_parameters=missing,
+                    steps=[], input_dispatched=False, execution_plan=execution_plan_info(saved))
+    result = worker_receipt(['_plan'], mutating=True,
+                            payload={'recipe': recipe, 'overrides': overrides, 'hwnd': args.hwnd})
+    source_steps = saved['envelope']['source_steps']
+    for row in result.get('steps', []):
+        number = row.get('number')
+        if type(number) is int and 1 <= number <= len(source_steps):
+            row['source_step'] = source_steps[number - 1]
+            row['phase'] = 'wait' if recipe['steps'][number - 1]['action'] == 'wait' else 'action'
+    stopped = result.get('stopped_at')
+    if type(stopped) is int and 1 <= stopped <= len(source_steps):
+        result['source_stopped_at'] = source_steps[stopped - 1]
+    return dict(result, execution_engine='saved_python_plan', execution_plan=execution_plan_info(saved))
+
+
 def run(args):
     bridge.set_dpi_awareness()
+    if args.command == 'instruct':
+        return save_instruction(args)
+    if args.command == 'plan':
+        plan = tasks.load_task(args.task, task_directory())
+        result = saved_execution_plan(plan)
+        return dict(status='planned' if result.get('envelope') else 'needs_review',
+                    task=tasks.summary(plan), execution_plan=execution_plan_info(result), input_dispatched=False)
     if args.command in ('tasks', 'show'):
         if args.command == 'tasks':
             return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
@@ -353,6 +434,9 @@ def run(args):
     if args.command == 'replay':
         plan = tasks.load_task(args.task, task_directory())
         overrides = tasks.parse_overrides(args.set)
+        quick = fast_replay(plan, args, overrides)
+        if quick is not None:
+            return quick
         binding = None
         def invoke(step):
             nonlocal binding
@@ -399,7 +483,8 @@ def run(args):
             return capture_result
         plan = tasks.from_recording(args.task, args.exe, args.window, capture_result['steps'])
         tasks.save_task(plan, task_directory())
-        return {'status': 'recorded', 'task': tasks.summary(plan), 'input_dispatched': False}
+        return {'status': 'recorded', 'task': tasks.summary(plan), 'input_dispatched': False,
+                'execution_plan': execution_plan_info(saved_execution_plan(plan))}
     anchor = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
@@ -437,6 +522,16 @@ def parser():
     commands = p.add_subparsers(dest='command', required=True)
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
+    commands.add_parser('plan', help='save a literal execution plan from recorded instructions').add_argument('--task', required=True)
+    edit = commands.add_parser('instruct', help='save an interpreted instruction as a new task, preserving its source')
+    edit.add_argument('--task', required=True)
+    edit.add_argument('--only', required=True, help='recorded step number or alias')
+    edit.add_argument('--text', required=True, help='original natural-language instruction')
+    edit.add_argument('--mode', choices=('fixed', 'required', 'recorded'))
+    edit.add_argument('--argument', help='literal value or required parameter name')
+    edit.add_argument('--alias', help='explicitly associate this name with the recorded target')
+    edit.add_argument('--wait-after', type=float, help='explicit seconds to wait after this button call')
+    edit.add_argument('--save-as', required=True, help='new task name; never overwrite the original')
     for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay', 'record-rows', 'row-status'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
@@ -473,16 +568,16 @@ def parser():
 def worker(args):
     try:
         result = replay_step() if args is None else run(args)
-    except (SelectionError, bridge.BridgeError, tasks.TaskError) as error:
+    except (SelectionError, bridge.BridgeError, tasks.TaskError, ValueError) as error:
         dispatched = getattr(error, 'input_dispatched', False)
-        result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': error.code,
+        result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': getattr(error, 'code', 'invalid_request'),
                   'input_dispatched': dispatched}
     print(json.dumps(result, ensure_ascii=False))
     return result_code(result)
 
 
 def result_code(result):
-    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed'):
+    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed', 'planned'):
         return 0
     return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review') else 3
 
@@ -493,6 +588,8 @@ def worker_receipt(argv, mutating, payload=None):
     try:
         kind = (payload or {}).get('step', {}).get('action')
         timeout = {'row-action': 120, 'result-menu': 160}.get(kind, 90)
+        if argv == ['_plan']:
+            timeout += sum(s.get('seconds', 0) for s in payload['recipe']['steps'])
         child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
                                input=json.dumps(payload) if payload is not None else None,
                                capture_output=True, encoding='utf-8', timeout=timeout)
@@ -517,6 +614,17 @@ def supervise(args, argv):
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
     argv = sys.argv[1:]
+    if argv == ['_plan']:
+        import python_workflow
+        try:
+            payload = json.load(sys.stdin)
+            result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
+                                         allow_recorded_selection=True)
+        except Exception as error:
+            result = dict(status='uncertain', diagnostic=getattr(error, 'code', 'execution_plan_unavailable'),
+                          input_dispatched=None)
+        print(json.dumps(result, ensure_ascii=False))
+        return result_code(result)
     if argv == ['_step']:
         return worker(None)
     is_worker = argv[:1] == ['_worker']
@@ -532,7 +640,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct') else supervise(args, argv)
 
 
 if __name__ == '__main__':
