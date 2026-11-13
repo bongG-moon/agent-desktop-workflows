@@ -13,18 +13,19 @@ import subprocess
 import sys
 
 from runtime_integrity import checked_path
+from provider_security import install as install_security_compatibility
 
 
 def load_bridge():
     path = checked_path('win_bridge.py')
     existing = sys.modules.get('win_bridge')
     if existing is not None and Path(existing.__file__).resolve() == path.resolve():
-        return existing
+        return install_security_compatibility(existing)
     spec = importlib.util.spec_from_file_location('win_bridge', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     sys.modules['win_bridge'] = module
-    return module
+    return install_security_compatibility(module)
 
 
 bridge = load_bridge()

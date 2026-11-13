@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 3
+COMPILER = 4
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -51,7 +51,7 @@ def compile_plan(task):
             reason = 'instruction_requires_structure'
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
-        elif step.get('match') not in ('automation_id', 'query'):
+        elif step.get('match') not in ('automation_id', 'name', 'query'):
             reason = 'execution_plan_stable_id_required'
         elif step['action'] == 'open' and (step.get('expand') or step['role'] not in tasks.INVOKE):
             reason = 'execution_plan_invoke_required'
@@ -69,7 +69,7 @@ def compile_plan(task):
             if step.get('within'):
                 selector['within'] = step['within']
         else:
-            selector['automation_id'] = step['target']
+            selector[step['match']] = step['target']
         if step.get('ancestors') and step['match'] != 'query':
             selector['ancestors'] = deepcopy(step['ancestors'])
         current = dict(action='set-value' if step['action'] in tasks.VALUE_ACTIONS else 'invoke', selector=selector)

@@ -89,9 +89,7 @@ class CompilationTests(unittest.TestCase):
         manual = dict(action='manual', reason='target_missing')
         expanded = dict(action='open', role='menuitem', target='export', match='automation_id', expand=True)
         choice = dict(action='open', role='listitem', target='selection', match='automation_id', expand=False)
-        named = deepcopy(recording()['steps'][0])
-        named['match'] = 'name'
-        for unsupported in (manual, expanded, choice, named):
+        for unsupported in (manual, expanded, choice):
             with self.subTest(unsupported=unsupported):
                 task = recording()
                 task['steps'].append(unsupported)

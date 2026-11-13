@@ -99,7 +99,7 @@ def ancestry(uia, element, root, *, pid=None):
     raise win.BridgeError('target_ancestry_incomplete')
 
 
-def find_all(uia, root, *, automation_id=None, roles=(), limit=128):
+def find_all(uia, root, *, automation_id=None, name=None, roles=(), limit=128):
     """Native descendant search, retaining all usable matches to detect duplicates.
 
     The provider still searches its subtree internally. This removes Python's
@@ -109,8 +109,10 @@ def find_all(uia, root, *, automation_id=None, roles=(), limit=128):
     _need(root is not None, 'root_unavailable')
     _need(type(limit) is int and 1 <= limit <= _MAX_CANDIDATES, 'invalid_target_limit')
     _need(automation_id is None or _text(automation_id), 'invalid_target_identifier')
+    _need(name is None or _text(name), 'invalid_target_name')
+    _need(automation_id is None or name is None, 'invalid_target_selector')
     role_numbers = _roles(roles)
-    _need(automation_id is not None or bool(role_numbers), 'target_query_required')
+    _need(automation_id is not None or name is not None or bool(role_numbers), 'target_query_required')
     pid = uia.pid(root)
     _need(type(pid) is int and pid > 0, 'target_owner_mismatch')
     _need(not uia.secure(root), 'target_protected')
@@ -124,8 +126,9 @@ def find_all(uia, root, *, automation_id=None, roles=(), limit=128):
                 part = _join(uia, condition, part, either=True)
                 resources.append(part)
             condition = part
-        if automation_id is not None:
-            part = _property_condition(uia, 30011, automation_id)
+        if automation_id is not None or name is not None:
+            part = _property_condition(uia, 30011 if automation_id is not None else 30005,
+                                       automation_id if automation_id is not None else name)
             resources.append(part)
             if condition is not None:
                 part = _join(uia, condition, part)
@@ -173,8 +176,10 @@ def _matches(element, identity):
 
 
 def _selector(selector):
-    _need(isinstance(selector, dict) and not set(selector) - {'automation_id', 'role', 'ancestors'}
-          and _text(selector.get('automation_id')) and selector.get('role') in win.ROLES.values(),
+    _need(isinstance(selector, dict) and not set(selector) - {'automation_id', 'name', 'role', 'ancestors'}
+          and (('automation_id' in selector) != ('name' in selector))
+          and _text(selector.get('automation_id') if 'automation_id' in selector else selector.get('name'))
+          and selector.get('role') in win.ROLES.values(),
           'invalid_target_selector')
     parents = selector.get('ancestors', [])
     _need(isinstance(parents, list) and len(parents) <= 16, 'invalid_target_ancestors')
@@ -188,18 +193,19 @@ def _selector(selector):
 
 
 def resolve(binding, uia, selector, root=None):
-    """Resolve an ID+role and optional nearest-first ancestor identities uniquely."""
+    """Resolve an exact ID/name+role and nearest-first ancestor identities uniquely."""
     parents = _selector(selector)
     binding.check()
     window = uia.from_handle(binding.hwnd)
     _need(window is not None and uia.pid(window) == binding.pid, 'root_unavailable')
     root = window if root is None else root
     ancestry(uia, root, window, pid=binding.pid)
-    candidates = find_all(uia, root, automation_id=selector['automation_id'], roles=(selector['role'],))
+    key = 'automation_id' if 'automation_id' in selector else 'name'
+    candidates = find_all(uia, root, **{key: selector[key]}, roles=(selector['role'],))
     chosen, returned = [], None
     try:
         # FindAll excludes its starting element; a demonstrated group may be it.
-        identity = {key: selector[key] for key in ('automation_id', 'role')}
+        identity = {key: selector[key], 'role': selector['role']}
         if _matches(root, identity):
             candidates.insert(0, root)
         for element in candidates:

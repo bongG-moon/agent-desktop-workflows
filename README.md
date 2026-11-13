@@ -1,14 +1,16 @@
-# Desktop Select 0.4.6 — 한 번 등록하고 선택값과 입력값만 바꿔 실행
+# Desktop Select 0.4.7 — 한 번 등록하고 선택값과 입력값만 바꿔 실행
 
-0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 처음에는 위치를 녹화하고 설명 초안을 수정한 뒤 Python 업무 스킬로 등록합니다. 이후에는 Family 같은 콤보 선택값과 SearchText 같은 일반 입력란의 값을 매번 받아 같은 순서로 실행합니다. 0.4.6은 기존 콤보 변수에 일반 입력란의 고정값과 변수 지원을 추가했습니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 텍스트 파일만 있습니다.
+0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 처음에는 위치를 녹화하고 설명 초안을 수정한 뒤 Python 업무 스킬로 등록합니다. 이후에는 Family 같은 콤보 선택값과 SearchText 같은 일반 입력란의 값을 매번 받아 같은 순서로 실행합니다. 0.4.7은 실제 Notepad++에서 발견한 대화상자 탐색 누락과 이름으로 녹화한 대상의 Python 등록 거부를 보완합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 Python 소스를 포함한 텍스트 파일만 있습니다.
 
-Claude Code에 “이 녹화를 업무 스킬로 만들어 줘. MES Setup은 N으로 고정하고 Family와 검색어는 매번 입력받게 해 줘”라고 요청하세요. 현재 호스트 모델이 문장을 한 번 해석하고 등록 시 실제 대상 ID를 확인합니다. 생성되는 Python 실행 파일은 JSON에 저장된 동작을 한 UIA 연결에서 실행하며 외부 모델을 호출하지 않습니다. 반복 해석과 탐색을 줄이는 방식이며 업무 앱의 서버 처리 시간을 줄이지는 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.6/desktop-select-0.4.6-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.6/skills/desktop-select/사용가이드.md)
+Claude Code에 “이 녹화를 업무 스킬로 만들어 줘. MES Setup은 N으로 고정하고 Family와 검색어는 매번 입력받게 해 줘”라고 요청하세요. 현재 호스트 모델이 문장을 한 번 해석하고 등록 시 실제 대상의 ID 또는 정확한 이름과 역할, 상위 영역을 확인합니다. 생성되는 Python 실행 파일은 JSON에 저장된 동작을 한 UIA 연결에서 실행하며 외부 모델을 호출하지 않습니다. 반복 해석과 탐색을 줄이는 방식이며 업무 앱의 서버 처리 시간을 줄이지는 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.7/desktop-select-0.4.7-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.7/skills/desktop-select/사용가이드.md)
+
+표준 Windows 대화상자가 보호 여부 속성을 생략해도 실제 창의 소속과 클래스, 편집 기능이 없는 창 외곽임을 확인한 경우 내부 탐색을 허용합니다. 입력란의 보호 여부가 불명확하거나 명시적으로 보호된 경우는 그대로 차단합니다. 안정적인 ID가 없어 이름으로 녹화된 대상도 같은 창의 정확한 이름, 역할, 상위 영역으로 등록하고 다시 찾습니다. 후보가 여럿이면 입력하지 않으며 숫자 ID나 옛 좌표를 추측하지 않습니다.
 
 **0.4.5의 프로젝트별 저장은 그대로 유지합니다.** 프로젝트의 `.desktop-select/tasks`와 그 아래 `execution-plans`를 사용하므로 실행 명령을 어느 폴더에서 시작해도 설치한 프로젝트의 작업을 찾습니다. `storage` 명령으로 실제 저장 위치를 확인할 수 있습니다. 별도 설치 질문 없이 프로젝트 저장이 기본이며, 공용 저장을 원하는 경우에만 `DESKTOP_SELECT_TASK_DIR`을 명시합니다. 기존 사용자 공용 녹화를 자동으로 가져오거나 삭제하지 않습니다.
 
 `record` 저장 시 호환되는 작업의 실행안도 저장합니다. `plan --task`로 기존 작업에서 만들 수 있고 `instruct --save-as`는 지시를 수정한 새 작업을 만듭니다. 원본이 바뀌면 이전 실행안은 사용하지 않습니다. Python 등록은 콤보, 보호되지 않은 일반 입력란, 버튼, 명시적 대기로 구성된 전체 작업을 지원합니다. 행/우클릭 등 전용 단계가 섞이면 전체 작업에 기존 재생을 사용합니다. 입력 실패 후에는 자동으로 다른 방식으로 재시도하지 않습니다.
 
-핵심 변경은 `IsOffscreen=None` 보정, 동일한 편집 피어 값의 일치 판정, 쓰기 가능한 콤보의 SetValue 1회 후 확인, 조작 전 최소화 창 복원입니다. 먼저 펼침과 항목 선택을 시도하던 경로를 줄였습니다. 등록 실행은 하나의 UIA 연결에서 요소 ID를 직접 조회합니다. 핵심 브리지와 녹화기는 0.4.0 그대로 유지하며 호환 코드는 별도 파일로 분리했습니다. [0.4.0 대비 변경과 검증](docs/desktop-select-040-rebuild.md)을 참고하세요.
+핵심 변경은 `IsOffscreen=None` 보정, 동일한 편집 피어 값의 일치 판정, 쓰기 가능한 콤보의 SetValue 1회 후 확인, 조작 전 최소화 창 복원입니다. 먼저 펼침과 항목 선택을 시도하던 경로를 줄였습니다. 등록 실행은 하나의 UIA 연결에서 저장한 ID 또는 정확한 이름과 역할로 조회하고 현재 상위 영역을 확인합니다. 핵심 브리지와 녹화기는 0.4.0 그대로 유지하며 호환 코드는 별도 파일로 분리했습니다. [0.4.0 대비 변경과 검증](docs/desktop-select-040-rebuild.md)을 참고하세요.
 
 고정값으로 등록한 MES Setup=N은 매번 유지되고, 필수 변수로 등록한 Family와 SearchText만 실행 때 바뀝니다. 예: `scripts/run.py --set "Family=Hybrid" --set "SearchText=00123"`. 필요한 값이 빠지면 실행 전에 함께 묻습니다. 일반 입력란은 `--set "SearchText="`로 비울 수 있지만 콤보의 빈 값은 허용하지 않습니다. 고정값도 바꾸어 받고 싶다면 등록 지시부터 필수 변수로 바꾸세요. 조회 후 표의 우클릭 메뉴를 이어서 실행하려면 녹화 창의 **조회 후 우클릭 메뉴 가르치기**를 사용하세요. Desktop Select ZIP은 `python tools/build_desktop_select.py`로 빌드할 수 있습니다.
 

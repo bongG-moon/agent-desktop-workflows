@@ -283,7 +283,7 @@ import sys
 HERE = Path(__file__).resolve()
 RUNTIME = HERE.parents[2] / "desktop-select" / "scripts"
 if not (RUNTIME / "python_workflow.py").is_file():
-    raise SystemExit("Install Desktop Select 0.4.6 or later beside this skill.")
+    raise SystemExit("Install Desktop Select 0.4.7 or later beside this skill.")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))

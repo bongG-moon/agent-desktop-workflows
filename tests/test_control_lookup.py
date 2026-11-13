@@ -263,7 +263,7 @@ class NativeTargetsTests(unittest.TestCase):
         self.assertEqual(group.closed, 0)
 
     def test_invalid_selectors_do_not_search(self):
-        for selector in ({'name': 'Field', 'role': 'combobox'},
+        for selector in ({'name': 'Field', 'automation_id': 'Field', 'role': 'combobox'},
                          {'automation_id': 'Field', 'role': 'unknown'},
                          {'automation_id': 'Field', 'role': 'combobox', 'ancestors': [{'name': 'Row'}]},
                          {'automation_id': 'Field', 'role': 'combobox', 'ancestors': [{'role': 'group'}]}):
