@@ -79,7 +79,7 @@ def revalidate_step(binding, uia, root, selector, stable, proof, element):
         current, _, _ = semantic_match(binding, uia, root, selector)
     need(uia.same(element, current), 'target_changed')
     if proof:
-        if selector['role'] != 'combobox' and proof.get('name'):
+        if selector['role'] not in ('combobox', 'textfield') and proof.get('name'):
             need(current.property(30005) == proof['name'], 'command_name_changed')
         if proof.get('semantic_label'):
             app.tasks.check_display({'label': proof['semantic_label']}, app.field_label(binding, uia, current, root))
@@ -109,10 +109,11 @@ def validate(recipe):
         need('field_label' not in step or (step['action'] == 'set-value' and text(step['field_label'], 200)),
              'invalid_field_label')
         if step['action'] == 'set-value':
-            need(selector['role'] == 'combobox', 'combo_required')
+            need(selector['role'] in ('combobox', 'textfield'), 'value_field_required')
             need(('value' in step) != ('parameter' in step), 'fixed_value_or_parameter_required')
             if 'value' in step:
-                need(text(step['value'], 10000), 'invalid_combo_value')
+                need(app.tasks.valid_value(step['value'], selector['role']),
+                     'invalid_text_value' if selector['role'] == 'textfield' else 'invalid_combo_value')
             else:
                 need(text(step['parameter'], 100) and step['parameter'] == step['parameter'].strip()
                      and '=' not in step['parameter'], 'invalid_parameter')
@@ -131,8 +132,13 @@ def load(path):
 def values_for(recipe, overrides):
     parameters = {s['parameter'].casefold(): s['parameter'] for s in recipe['steps'] if 'parameter' in s}
     values = {k.casefold(): v for k, v in overrides.items()}
-    need(len(values) == len(overrides) and all(text(v, 10000) for v in values.values()), 'invalid_override')
+    need(len(values) == len(overrides) and all(app.tasks.valid_value(v, 'textfield') for v in values.values()),
+         'invalid_override')
     need(not set(values) - parameters.keys(), 'unknown_parameter')
+    for step in recipe['steps']:
+        key = step.get('parameter', '').casefold()
+        if key in values:
+            need(app.tasks.valid_value(values[key], step['selector']['role']), 'invalid_override')
     return values, [name for key, name in parameters.items() if key not in values]
 
 
@@ -195,7 +201,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             if stable is not None:
                                 receipt['resolved_selector'] = stable
                         if step['action'] == 'set-value':
-                            receipt.update(live.combo_readback(binding, uia, element))
+                            reader = live.text_readback if selector['role'] == 'textfield' else live.combo_readback
+                            receipt.update(reader(binding, uia, element))
                         else:
                             receipt['command_name'] = element.property(30005) or ''
                     else:
@@ -207,13 +214,13 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             if step.get('field_label'):
                                 app.tasks.check_display({'label': step['field_label']},
                                                         app.field_label(binding, uia, current, root))
-                            if step['action'] != 'set-value' or not allow_recorded_selection:
+                            if step['action'] != 'set-value' or selector['role'] == 'textfield' or not allow_recorded_selection:
                                 need(('SetValue' if step['action'] == 'set-value' else 'Click') in uia.actions(current),
                                      'workflow_pattern_unavailable')
                         value = values[step['parameter'].casefold()] if 'parameter' in step else step.get('value')
                         dispatching = True
-                        receipt = live.execute(binding, uia, element, {'role': selector['role']},
-                                               'select' if step['action'] == 'set-value' else 'invoke',
+                        operation = ('fill' if selector['role'] == 'textfield' else 'select') if step['action'] == 'set-value' else 'invoke'
+                        receipt = live.execute(binding, uia, element, {'role': selector['role']}, operation,
                                                value, still_valid=check)
                         dispatching = False
                         if resolution is not None:
@@ -250,7 +257,14 @@ def discover(exe, title, hwnd=None):
     found = []
     with app.bridge.UIA() as uia:
         root = uia.from_handle(binding.hwnd)
-        for element in lookup.find_all(uia, root, roles=('combobox', 'button'), limit=256):
+        for element in lookup.find_all(uia, root, roles=('combobox', 'textfield', 'button'), limit=256):
+            if element.property(30003) == 50004:
+                try:
+                    live.textfield_scope(binding, uia, element)
+                except app.bridge.BridgeError as error:
+                    if error.code == 'textfield_requires_combo':
+                        continue
+                    raise
             identifier = element.property(30011)
             if not text(identifier):
                 continue
@@ -269,7 +283,7 @@ import sys
 HERE = Path(__file__).resolve()
 RUNTIME = HERE.parents[2] / "desktop-select" / "scripts"
 if not (RUNTIME / "python_workflow.py").is_file():
-    raise SystemExit("Install Desktop Select 0.4.4 or later beside this skill.")
+    raise SystemExit("Install Desktop Select 0.4.6 or later beside this skill.")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))
@@ -312,7 +326,10 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
              '필수 입력은 ' + json.dumps(required, ensure_ascii=False) + '이다. 값을 받지 않으면 실행하지 않는다.\n\n'
              '`python -X utf8 -B scripts/run.py --set "변수명=값"`으로 실행한다. '
              '현재 상태만 확인할 때는 `--read-only`를 붙인다. 이 명령은 대상 창을 복원하지 않는다.\n\n'
-             '콤보 확인 실패 또는 불확실한 전달이면 다음 단계로 진행하지 않는다. '
+             '콤보 선택값과 입력란 문자열을 필수 변수로 받을 수 있다. '
+             '예를 들어 `--set "Family=Hybrid" --set "검색어=00123"`처럼 이번 값을 전달한다. '
+             '입력란을 비우라는 요청은 해당 변수에 `--set "검색어="`를 준다. 콤보에는 빈 값을 쓰지 않는다. '
+             '값 확인 실패 또는 불확실한 전달이면 다음 단계로 진행하지 않는다. '
              '조회/내보내기 버튼 전달과 대기는 업무 완료나 파일 생성의 증거가 아니다. 재클릭하지 않는다. '
              '동일 폴더 아래 `desktop-select`가 필요하며 외부 통신과 CUA 드라이버는 사용하지 않는다.\n')
     if source_task is not None:
@@ -346,7 +363,7 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     mutating = args.command == 'run' and not args.read_only
-    launched = False
+    launched, executing = False, False
     try:
         source_task = None
         recipe = None
@@ -359,14 +376,22 @@ def main(argv=None):
                 recipe = planned['envelope']['recipe']
             else:
                 recipe = load(args.recipe)
+        overrides = {}
+        if args.command == 'run':
+            overrides = app.tasks.parse_overrides(args.set)
+            _, missing = values_for(recipe, overrides)
+            if missing and not args.read_only:
+                print(json.dumps(dict(status='needs_input', missing_parameters=missing,
+                                      steps=[], input_dispatched=False), ensure_ascii=False))
+                return 2
         if args._worker:
             if args.command == 'discover':
                 result = discover(args.exe, args.window, args.hwnd)
             elif args.command == 'register':
                 result = register(recipe, args.out, args.hwnd, source_task=source_task)
             else:
-                result = run(recipe, app.tasks.parse_overrides(args.set),
-                             read_only=args.read_only, hwnd=args.hwnd)
+                executing = mutating
+                result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd)
         else:
             timeout = 90 + sum(s.get('seconds', 0) for s in recipe['steps']) if recipe else 90
             launched = True
@@ -376,7 +401,7 @@ def main(argv=None):
             need(child.returncode in (0, 2, 3) and isinstance(result, dict) and 'status' in result,
                  'invalid_worker_receipt')
     except (Exception, KeyboardInterrupt) as error:
-        uncertain = (launched or args._worker) and mutating
+        uncertain = (launched or executing) and mutating
         result = dict(status='uncertain' if uncertain else 'blocked', input_dispatched=None if uncertain else False,
                       diagnostic=getattr(error, 'code', 'workflow_unavailable'))
     print(json.dumps(result, ensure_ascii=False))

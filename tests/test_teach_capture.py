@@ -22,12 +22,14 @@ def combo(name='Mode', value='N'):
 
 
 class CaptureTests(unittest.TestCase):
-    def test_unrelated_inputs_and_coordinates_do_not_survive_review(self):
+    def test_protected_inputs_and_unscoped_coordinates_do_not_survive_review(self):
         notes = capture.CaptureNotes()
         for i, (role, action) in enumerate((('textfield', 'set-value'), ('table', 'right-click'))):
             step = combo()
             step.update(id=str(i), action=action, value='PRIVATE', field_label='PRIVATE')
             step['target']['locator'].update(role=role, name='PRIVATE')
+            if role == 'textfield':
+                step['target']['locator']['password'] = True
             step['target']['point'] = {'x_ratio': .12345}
             notes.add(step)
         self.assertEqual([s['action'] for s in notes.snapshot()], ['manual', 'manual'])

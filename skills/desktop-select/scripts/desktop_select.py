@@ -261,10 +261,10 @@ def near_region(nodes, anchor):
 
 
 def action(args, owner, *, learned=None, anchor=None):
-    if args.command in {'select', 'open'}:
+    if args.command in {'select', 'fill', 'open'}:
         visibility.restore_for_action(owner, args.window)
     surface = bind_surface(owner, args.popup)
-    mutate = args.command in {'select', 'open'}
+    mutate = args.command in {'select', 'fill', 'open'}
     check = lambda: guard(owner, surface, args.window, mutate)
     check()
     with bridge.UIA() as uia:
@@ -286,7 +286,7 @@ def action(args, owner, *, learned=None, anchor=None):
             items = [describe(n, grouped[i], labels.get(i, {})) for i, n in enumerate(nodes) if not n['secure']
                      and n.get('role') in LIST_ROLES and (n.get('automation_id') or n.get('name') or i in labels)]
             return {'status': 'observed', 'targets': items, 'owned_popups': owned_popups(owner), 'input_dispatched': False}
-        role = 'combobox' if args.command == 'select' else args.role
+        role = {'select': 'combobox', 'fill': 'textfield'}.get(args.command, getattr(args, 'role', None))
         def locate(tree, available):
             if learned is not None:
                 index, evidence = tasks.locate_target(tree, learned)
@@ -310,6 +310,9 @@ def action(args, owner, *, learned=None, anchor=None):
                     result.update(option_inventory(surface, uia, element))
                 except bridge.BridgeError:
                     result.update(options=[], options_status='unavailable')
+            elif node['role'] == 'textfield':
+                from live_action import text_readback
+                result.update(text_readback(surface, uia, element))
             return result
 
         # After the initial 0.4.0 label/region resolution, revalidate a stable
@@ -345,7 +348,7 @@ def action(args, owner, *, learned=None, anchor=None):
                 raise SelectionError('target_changed')
             check()
 
-        command = 'select' if args.command == 'select' else ('expand' if args.expand else
+        command = args.command if args.command in ('select', 'fill') else ('expand' if args.expand else
                   'choose' if node['role'] in {'treeitem', 'tab', 'listitem'} else 'invoke')
         result = execute(surface, uia, element, node, command, getattr(args, 'value', None), still_valid=still_valid)
         return dict(result, target=detail, matched_by=evidence, business_commit='not_verified')
@@ -395,7 +398,7 @@ def save_instruction(args):
 
 def fast_replay(plan, args, overrides):
     """Use a saved literal plan only when the entire original task is compatible."""
-    if args.only is not None or any(s['action'] == 'select' and 'instruction' not in s for s in plan['steps']):
+    if args.only is not None or any(s['action'] in ('select', 'fill') and 'instruction' not in s for s in plan['steps']):
         return None
     tasks.check_binding(plan, args.exe, args.window)
     saved = saved_execution_plan(plan)
@@ -521,7 +524,7 @@ def replay_step():
     args = argparse.Namespace(command=step['action'], role=step['role'], window=binding['title'],
                               target=step['target'], value=step.get('value'), expand=step.get('expand', False),
                               within=step.get('within'), popup=None)
-    if args.command not in ('select', 'open'):
+    if args.command not in ('select', 'fill', 'open'):
         raise SelectionError('step_requires_review')
     return action(args, owner, learned=None if step.get('match') == 'query' else step)
 
@@ -545,7 +548,7 @@ def parser():
     edit.add_argument('--within', help='observed region to distinguish identical names')
     edit.add_argument('--wait-after', type=float, help='explicit seconds to wait after this button call')
     edit.add_argument('--save-as', required=True, help='new task name; never overwrite the original')
-    for verb in ('windows', 'inspect', 'select', 'open', 'record', 'replay', 'record-rows', 'row-status'):
+    for verb in ('windows', 'inspect', 'select', 'fill', 'open', 'record', 'replay', 'record-rows', 'row-status'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
         if verb != 'windows':
@@ -563,7 +566,7 @@ def parser():
             s.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
         if verb in ('replay', 'row-status'):
             s.add_argument('--only', help='run just one named step or step number')
-        if verb in ('inspect', 'open', 'select'):
+        if verb in ('inspect', 'open', 'select', 'fill'):
             s.add_argument('--popup', type=int, help='owned popup from current inspect output')
             s.add_argument('--target', required=verb != 'inspect', help='field label, name or automation ID')
             s.add_argument('--within', help='observed region, ancestor ID or name')
@@ -571,8 +574,8 @@ def parser():
             s.add_argument('--near', help='limit search to this demonstrated step’s current container')
         if verb in ('inspect', 'open'):
             s.add_argument('--role', help='e.g. combobox, button, menuitem, treeitem')
-        if verb == 'select':
-            s.add_argument('--value', required=True, help='exact option text/code')
+        if verb in ('select', 'fill'):
+            s.add_argument('--value', required=True, help='literal text to enter' if verb == 'fill' else 'exact option text/code')
         if verb == 'open':
             s.add_argument('--expand', action='store_true', help='expand a submenu/tree item instead of invoking it')
     return p
@@ -619,7 +622,7 @@ def worker_receipt(argv, mutating, payload=None):
 
 
 def supervise(args, argv):
-    receipt = worker_receipt(['_worker', *argv], mutating=args.command in ('open', 'select'))
+    receipt = worker_receipt(['_worker', *argv], mutating=args.command in ('open', 'select', 'fill'))
     print(json.dumps(receipt, ensure_ascii=False))
     return result_code(receipt)
 
@@ -644,7 +647,7 @@ def main():
     if is_worker:
         argv = argv[1:]
     args = parser().parse_args(argv)
-    if args.command in ('inspect', 'select', 'open') and (
+    if args.command in ('inspect', 'select', 'fill', 'open') and (
             bool(args.task) != bool(args.near) or (args.popup is not None and args.near)):
         print(json.dumps({'status': 'blocked', 'diagnostic': 'near_requires_task_and_main_window', 'input_dispatched': False}))
         return 2

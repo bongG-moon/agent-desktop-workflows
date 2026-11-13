@@ -5,6 +5,7 @@ import re
 import time
 
 import win_bridge as win
+import control_lookup
 import provider_values
 import provider_visibility
 
@@ -125,6 +126,34 @@ def combo_readback(binding, uia, element):
     return result
 
 
+def textfield_scope(binding, uia, element):
+    """Prove an ordinary input belongs to this window before reading its text.
+
+    A combo's editor must still be handled through its owning combo. Raw-tree
+    ancestry includes wrappers that the accessibility control view may omit.
+    """
+    binding.check()
+    root = uia.from_handle(binding.hwnd)
+    chain = control_lookup.ancestry(uia, element, root, pid=binding.pid)
+    _require(element.property(30003) == 50004, 'textfield_required')
+    _require(not any(parent.property(30003) == 50003 for parent in chain[1:]),
+             'textfield_requires_combo')
+    return root
+
+
+def text_readback(binding, uia, element):
+    """An available ValuePattern can prove an intentional empty value as well."""
+    unknown = {'value': None, 'value_evidence': {'status': 'unavailable', 'source': 'none'}}
+    textfield_scope(binding, uia, element)
+    if element.property(30043) is not True:
+        return unknown
+    value = element.property(30045)
+    binding.check()
+    if not isinstance(value, str):
+        return unknown
+    return {'value': value, 'value_evidence': {'status': 'observed', 'source': 'value_pattern'}}
+
+
 def _option_rows(binding, uia, combo):
     """Rows can be in the combo's tree or in a proven SelectionContainer popup."""
     root = uia.from_handle(binding.hwnd)
@@ -238,7 +267,28 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
         role = win.ROLES.get(element.property(30003))
         _require(role and role == node.get('role'), 'target_role_changed')
 
-        if action in ('select', 'set-value'):
+        if action == 'fill':
+            _require(role == 'textfield', 'textfield_required')
+            _require(isinstance(value, str) and (value == '' or value.strip())
+                     and not any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF for c in value)
+                     and len(value.encode('utf-8')) <= 10000, 'invalid_text_value')
+            def text_write_guard():
+                check_target()
+                root = textfield_scope(binding, uia, element)
+                _require(_visible(uia, element, binding, root), 'target_offscreen')
+                _require(element.property(30043) is True and element.property(30046) is False
+                         and 'SetValue' in uia.actions(element), 'text_value_not_writable')
+            send(element, 'SetValue', text_write_guard, value)
+            verifying = True
+            time.sleep(VALUE_SETTLE_SECONDS)
+            check_target()
+            result = text_readback(binding, uia, element)
+            if result.get('value_evidence', {}).get('status') != 'observed':
+                return receipt('delivered_unverified', 'current_state_unavailable')
+            if result['value'] != value:
+                return receipt('mismatch', 'current_state_mismatch', 'mismatch')
+            return receipt('verified', 'current_state_matched', 'matched')
+        elif action in ('select', 'set-value'):
             _require(role == 'combobox', 'combo_required')
             _require(isinstance(value, str) and value.strip() and '\0' not in value
                      and len(value.encode('utf-8')) <= 10000, 'invalid_combo_value')

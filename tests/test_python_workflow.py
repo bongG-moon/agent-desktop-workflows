@@ -146,7 +146,7 @@ class BoundaryTests(unittest.TestCase):
             with (self.subTest(read_only=read_only), patch.object(flow, 'load', return_value=recipe()), patch.object(
                 flow.subprocess, 'run', side_effect=subprocess.TimeoutExpired('workflow', 90)) as launched,
                 redirect_stdout(StringIO()) as output):
-                flow.main(['run', '--recipe', 'example.json', *(['--read-only'] if read_only else [])])
+                flow.main(['run', '--recipe', 'example.json', '--set', 'Family=Hybrid', *(['--read-only'] if read_only else [])])
                 result = json.loads(output.getvalue())
             launched.assert_called_once()
             self.assertEqual(result['status'], 'blocked' if read_only else 'uncertain')

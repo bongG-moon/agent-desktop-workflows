@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 2
+COMPILER = 3
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -49,7 +49,7 @@ def compile_plan(task):
         reason = None
         if step.get('instruction_draft'):
             reason = 'instruction_requires_structure'
-        elif step.get('action') not in ('select', 'open'):
+        elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
         elif step.get('match') not in ('automation_id', 'query'):
             reason = 'execution_plan_stable_id_required'
@@ -72,15 +72,15 @@ def compile_plan(task):
             selector['automation_id'] = step['target']
         if step.get('ancestors') and step['match'] != 'query':
             selector['ancestors'] = deepcopy(step['ancestors'])
-        current = dict(action='set-value' if step['action'] == 'select' else 'invoke', selector=selector)
+        current = dict(action='set-value' if step['action'] in tasks.VALUE_ACTIONS else 'invoke', selector=selector)
         label = step.get('alias') or step.get('label') or step['target']
         if label:
             current['label'] = label
-        if step['action'] == 'select' and step.get('label') and step['match'] != 'query':
+        if step['action'] in tasks.VALUE_ACTIONS and step.get('label') and step['match'] != 'query':
             current['field_label'] = step['label']
         if step.get('command_name'):
             current['command_name'] = step['command_name']
-        if step['action'] == 'select':
+        if step['action'] in tasks.VALUE_ACTIONS:
             instruction = step.get('instruction', {})
             if instruction.get('mode') == 'fixed':
                 current['value'] = instruction['value']

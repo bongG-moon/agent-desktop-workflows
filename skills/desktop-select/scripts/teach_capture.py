@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import queue
 import threading
 import time
@@ -11,6 +12,7 @@ import uuid
 
 import win_bridge as bridge
 from live_action import combo_readback
+import live_action
 import learned_tasks
 from runtime_integrity import checked_path
 
@@ -41,21 +43,30 @@ def capture_step(step):
     target = step['target']
     locator = target.get('locator', {})
     action, role = step['action'], locator.get('role')
-    # A known combo with an unreadable value still teaches its location. Its
+    if role == 'textfield':
+        chain = [step, target, locator, *locator.get('ancestors', [])]
+        if any(isinstance(item, dict) and (item.get('role') == 'password' or any(item.get(key) is True
+               for key in ('secure', 'protected', 'is_password', 'password'))) for item in chain):
+            return manual('protected_input_not_recorded', step['id'])
+        if any(isinstance(item, dict) and item.get('role') == 'combobox' for item in locator.get('ancestors', [])):
+            return manual('textfield_requires_combo', step['id'])
+    # A known field with an unreadable value still teaches its location. Its
     # intended value is supplied later by the user's instruction, not guessed.
-    if (action == 'manual' and role == 'combobox' and target.get('kind') == 'element'
+    if (action == 'manual' and role in {'combobox', 'textfield'} and target.get('kind') == 'element'
             and 'window' not in target and recorder._locator_valid(locator)
             and step.get('recognition', {}).get('target') == 'identified'
             and step.get('recognition', {}).get('reason') in {
                 'combo_value_unobserved', 'combo_choice_unproven', 'combo_option_click_required',
-                'value_readback_unavailable', 'value_before_transition_unproven'}):
+                'value_readback_unavailable', 'value_before_transition_unproven', 'text_value_unobserved'}):
         step = dict(step, action='teach-target', recognition={'target': 'identified',
-                    'action': 'requires_instruction', 'result': 'manual', 'reason': 'combo_choice_unproven'})
+                    'action': 'requires_instruction', 'result': 'manual',
+                    'reason': 'combo_choice_unproven' if role == 'combobox' else 'text_value_unobserved'})
         action = 'teach-target'
-    pointed = (action == 'teach-target' and role == 'combobox' and 'window' not in target
+    pointed = (action == 'teach-target' and role in {'combobox', 'textfield'} and 'window' not in target
                and step.get('recognition') == {'target': 'identified', 'action': 'requires_instruction',
-                                               'result': 'manual', 'reason': 'combo_choice_unproven'})
+                    'result': 'manual', 'reason': 'combo_choice_unproven' if role == 'combobox' else 'text_value_unobserved'})
     supported = (pointed or (action == 'set-value' and role == 'combobox' and bool(step.get('value')))
+                 or (action == 'set-value' and role == 'textfield' and isinstance(step.get('value'), str))
                  or (action == 'click' and role in {'menuitem', 'button', 'splitbutton', 'hyperlink'})
                  or (action == 'select' and role in {'tab', 'treeitem', 'listitem'})
                  or (action == 'expand' and role in {'treeitem', 'menuitem', 'splitbutton'}))
@@ -121,9 +132,12 @@ def default_text(step):
              or command.get('target') or step['label'])
     if step['action'] == 'teach-target':
         field = step.get('alias') or step.get('field_label') or step['label']
-        return f'입력받은 변수를 {field} 조건에 입력해줘'
+        kind = '입력란' if step['target'].get('locator', {}).get('role') == 'textfield' else '조건'
+        return f'입력받은 변수를 {field} {kind}에 입력해줘'
     if command['action'] == 'select':
         return f"{field} 조건을 {command['value']}로 설정해줘"
+    if command['action'] == 'fill':
+        return f"{field} 입력란을 {json.dumps(command['value'], ensure_ascii=False)}로 설정해줘"
     if command['action'] == 'open':
         kind = '버튼' if command.get('role') in {'button', 'splitbutton'} else '항목'
         verb = '펼쳐줘' if command.get('expand') else '눌러줘'
@@ -147,13 +161,17 @@ def instruction_view(step, instruction):
         return '설명은 저장됩니다. 실행 전 Claude가 문장을 해석하고 현재 화면에서 대상을 다시 찾습니다.'
     retry = '실행할 때 현재 화면에서 대상을 다시 찾습니다. ' if instruction and instruction.get('query') else ''
     if instruction and instruction['mode'] == 'fixed':
+        role = instruction.get('role') or step.get('target', {}).get('locator', {}).get('role')
+        if role == 'textfield':
+            return retry + ('입력란 비우기' if instruction['value'] == '' else '지정한 값 입력: ' + instruction['value'])
         return retry + '지정한 값으로 선택: ' + instruction['value']
     if instruction and instruction['mode'] == 'required':
         return retry + '실행 시 입력할 변수: ' + instruction['parameter']
     if retry:
         return retry + instruction['text']
     if step['action'] == 'teach-target':
-        return '콤보 대상 확인됨. 고정값이나 입력 변수를 지정하세요.'
+        kind = '입력란' if step['target'].get('locator', {}).get('role') == 'textfield' else '콤보'
+        return kind + ' 대상 확인됨. 고정값이나 입력 변수를 지정하세요.'
     if learned_tasks.is_recoverable(step):
         return '대상을 못 읽어도 설명을 저장할 수 있습니다. 대상 이름과 동작을 적으면 실행 시 다시 찾습니다.'
     return default_text(step) or '직접 확인할 단계'
@@ -183,7 +201,7 @@ class StepEdits:
             return step['action'], target, step.get('recognition', {}).get('reason')
         # Runtime handles, screen coordinates and duplicated peer names vary
         # while one clicked field settles. They are not the recorded identity.
-        action = 'combo' if identity['role'] == 'combobox' else step['action']
+        action = identity['role'] if identity['role'] in {'combobox', 'textfield'} else step['action']
         return (action, identity, [learned_tasks._selector(p) for p in locator.get('ancestors', [])],
                 target.get('window'))
 
@@ -271,6 +289,13 @@ class _CaptureUIA(bridge.UIA):
         self.binding = binding
 
     def value_observation(self, element):
+        if element.property(30003) == 50004:
+            try:
+                return live_action.text_readback(self.binding, self, element)
+            except bridge.BridgeError:
+                # A combo's inner editor still needs its node/owner mapping,
+                # but must never become an independently captured input value.
+                return {'value': None, 'value_evidence': {'status': 'unavailable', 'source': 'none'}}
         from provider_values import value_observation
         return value_observation(self, element)
 
@@ -310,14 +335,22 @@ class _Worker(recorder.CaptureWorker):
         obs = self.watched
         if (not self.pointed or obs is not self.pointed
                 or (self.watched_step and self.watched_step['action'] != 'teach-target') or self.watched_selection
-                or obs['window'] != self.binding.hwnd or obs['node'].get('role') != 'combobox'
+                or obs['window'] != self.binding.hwnd or obs['node'].get('role') not in {'combobox', 'textfield'}
                 or obs['node'].get('secure') is not False or obs['node'].get('enabled') is not True):
             return False
         self.binding.check()
         locator = obs['node'].get('locator')
         if self.uia.secure(obs['element']) or not recorder._locator_valid(locator):
             return False
-        if not self.watched_step:
+        role = obs['node']['role']
+        if role == 'textfield':
+            try:
+                root = live_action.textfield_scope(self.binding, self.uia, obs['element'])
+                if learned_tasks._selector(self.uia.locator(obs['element'], root)) != learned_tasks._selector(locator):
+                    return False
+            except bridge.BridgeError:
+                return False
+        elif not self.watched_step:
             try:
                 current = bridge._current_combo(self.binding, self.uia, locator)
             except bridge.BridgeError:
@@ -328,7 +361,8 @@ class _Worker(recorder.CaptureWorker):
         if self.watched_step:
             step['id'] = self.watched_step['id']
         step['recognition'] = {'target': 'identified', 'action': 'requires_instruction',
-                               'result': 'manual', 'reason': 'combo_choice_unproven'}
+                               'result': 'manual',
+                               'reason': 'combo_choice_unproven' if role == 'combobox' else 'text_value_unobserved'}
         self.model.add(step)
         self._drop_watch()
         return True
@@ -351,6 +385,29 @@ class _Worker(recorder.CaptureWorker):
         return result
 
     def watch(self, observation):
+        if observation['node'].get('role') == 'textfield':
+            try:
+                live_action.textfield_scope(self.binding, self.uia, observation['element'])
+            except bridge.BridgeError as error:
+                self.freeze_watch()
+                self.model.manual('', 'protected_input_not_recorded' if error.code == 'target_protected' else error.code)
+                return
+            node = observation['node']
+            if node.get('secure') is not False or node.get('enabled') is not True or 'SetValue' not in node.get('available_actions', []):
+                self.freeze_watch()
+                self.model.manual('', 'text_field_not_writable')
+                return
+            if self.watched and self.uia.same(self.watched['element'], observation['element']):
+                return
+            self.freeze_watch()
+            observed = live_action.text_readback(self.binding, self.uia, observation['element'])
+            value = observed.get('value') if observed.get('value_evidence', {}).get('status') == 'observed' else None
+            self.watched, self.watched_value, self.watched_step = observation, value, None
+            self.watched_selection = None
+            self.selection_deadline = 0
+            self.watched_samples.clear()
+            self.watched_samples.append((time.monotonic(), value))
+            return
         if observation['node'].get('role') != 'combobox':
             self.freeze_watch()
             now = time.monotonic()
@@ -361,6 +418,20 @@ class _Worker(recorder.CaptureWorker):
         return super().watch(observation)
 
     def _commit_value(self, current):
+        if self.watched and self.watched['node'].get('role') == 'textfield':
+            try:
+                live_action.textfield_scope(self.binding, self.uia, self.watched['element'])
+            except bridge.BridgeError as error:
+                self._manual_watch('protected_input_not_recorded' if error.code == 'target_protected' else error.code)
+                return
+            if not isinstance(current, str):
+                self._manual_watch('value_readback_unavailable')
+                return
+            # A location-only click does not demonstrate assigning the existing
+            # text. Preserve its variable draft until a changed value is read.
+            if self.watched_step and self.watched_step['action'] == 'teach-target' and current == self.watched_value:
+                return
+            return super()._commit_value(current)
         # An unchanged or unreadable collapsed value after a mere field click
         # cannot teach a selection. A witnessed option click retains its intent.
         if self.watched_selection is None and (not self.watched_step or self.watched_step['action'] == 'teach-target'):
@@ -370,6 +441,15 @@ class _Worker(recorder.CaptureWorker):
             if observed.get('value') != current or observed.get('value_evidence', {}).get('status') != 'observed':
                 return self._unobserved_combo('combo_choice_unproven')
         return super()._commit_value(current)
+
+    def finalize_watch(self, force, sample_only=False):
+        if self.watched and self.watched['node'].get('role') == 'textfield':
+            try:
+                live_action.textfield_scope(self.binding, self.uia, self.watched['element'])
+            except bridge.BridgeError as error:
+                self._manual_watch('protected_input_not_recorded' if error.code == 'target_protected' else error.code)
+                return
+        return super().finalize_watch(force, sample_only)
 
     def _command_owner(self, event, observation):
         # Providers may return a passive caption or icon inside the actual
@@ -419,6 +499,8 @@ class _Worker(recorder.CaptureWorker):
                 return
             if event['action'] == 'click' and node.get('role') != 'listitem':
                 pointed = self.combo_for(observation)
+                if pointed is None and node.get('role') == 'textfield':
+                    pointed = observation
         step = super().capture_action(event, observation)
         if pointed and self.watched and self.uia.same(pointed['element'], self.watched['element']):
             self.pointed = self.watched
@@ -431,7 +513,8 @@ class _Worker(recorder.CaptureWorker):
                     and recorder._locator_valid(self.watched['node'].get('locator'))):
                 point = self.step('teach-target', self.watched)
                 point['recognition'] = {'target': 'identified', 'action': 'requires_instruction',
-                                        'result': 'manual', 'reason': 'combo_choice_unproven'}
+                    'result': 'manual', 'reason': 'combo_choice_unproven'
+                    if self.watched['node']['role'] == 'combobox' else 'text_value_unobserved'}
                 self.model.add(point)
                 self.watched_step = point
                 return point['id']
@@ -559,7 +642,7 @@ def capture(binding, *, title):
     for row, (key, label, var) in enumerate((('alias', '단계 별칭', alias), ('instruction', '실행할 동작', instruction))):
         ttk.Label(form, text=label).grid(row=row, column=0, padx=(0, 6), sticky='w')
         ttk.Entry(form, name=key, textvariable=var, width=42).grid(row=row, column=1, sticky='ew')
-    ttk.Label(form, text='콤보 값 지정').grid(row=2, column=0, padx=(0, 6), sticky='w')
+    ttk.Label(form, text='값 지정').grid(row=2, column=0, padx=(0, 6), sticky='w')
     choices = ttk.Frame(form)
     choices.grid(row=2, column=1, sticky='w')
     mode_box = ttk.Combobox(choices, name='mode', values=list(modes), state='readonly', textvariable=mode, width=11)
@@ -587,7 +670,7 @@ def capture(binding, *, title):
         if isinstance(exc, learned_tasks.TaskError):
             reason = {'instruction_target_mismatch': '화면 이름이 다르면 ‘문장의 이름을 이 대상에 연결’을 누르세요. 또는 ‘이 항목을 N으로 설정’처럼 입력하세요.',
                       'instruction_target_unavailable': '이 단계는 보호된 입력이나 별도 절차가 필요한 동작입니다. 일반 대상 인식 실패는 설명을 저장한 뒤 실행할 때 다시 찾을 수 있습니다.',
-                      'instruction_requires_structure': '콤보 값 지정에서 고정값이나 필수 변수를 선택하고 값을 입력하세요.',
+                      'instruction_requires_structure': '값 지정에서 고정값이나 필수 변수를 선택하고 값을 입력하세요.',
                       'invalid_step_alias': '다른 별칭을 입력하세요.'}.get(
                           exc.code, '이 단계에서 실행할 수 있는 문장과 값을 입력하세요.')
             preview.set(reason + ' (' + exc.code + ')')

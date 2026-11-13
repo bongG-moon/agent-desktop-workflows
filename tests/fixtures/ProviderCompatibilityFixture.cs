@@ -25,6 +25,8 @@ sealed class ProviderCompatibilityFixture : Form {
     internal int Opens;
     internal int Exports, PropertyReads, Navigations, PatternReads, BoundsReads;
     internal string HiddenKey, WorkbookPath, ResultState, ResultFamily;
+    internal string EntryValue="", EntryMode="normal", ResultEntry="";
+    internal int EntryWrites;
     internal ProviderCompatibilityFixture() {
         Text = "Synthetic provider compatibility"; ClientSize = new System.Drawing.Size(660, 250);
         StartPosition = FormStartPosition.Manual; Location = new System.Drawing.Point(45, 45);
@@ -72,6 +74,7 @@ sealed class ProviderCompatibilityFixture : Form {
     internal void Query() {
         Interlocked.Increment(ref Opens);
         ResultState=Combos["conditionState"].Current; ResultFamily=Combos["conditionFamily"].Current;
+        ResultEntry=EntryValue;
     }
     internal void Export() {
         Interlocked.Increment(ref Exports);
@@ -87,8 +90,8 @@ sealed class ProviderCompatibilityFixture : Form {
             var sheet=package.CreatePart(new Uri("/xl/worksheets/sheet1.xml",UriKind.Relative),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml");
             WritePart(sheet,"<worksheet xmlns='"+ss+"'><sheetData><row r='1'>"+Cell("A1","MES Setup")+
-                Cell("B1","Family")+Cell("C1","Generation")+"</row><row r='2'>"+Cell("A2",ResultState)+
-                Cell("B2",ResultFamily)+Cell("C2",Opens.ToString())+"</row></sheetData></worksheet>");
+                Cell("B1","Family")+Cell("C1","Generation")+Cell("D1","Search text")+"</row><row r='2'>"+Cell("A2",ResultState)+
+                Cell("B2",ResultFamily)+Cell("C2",Opens.ToString())+Cell("D2",ResultEntry)+"</row></sheetData></worksheet>");
         }
     }
     static void WritePart(PackagePart part,string text) {
@@ -129,8 +132,8 @@ sealed class ProviderCompatibilityFixture : Form {
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e);
         foreach (var peer in Root.Children) {
-            if (peer.Role == 50003 || peer.Role == 50000) e.Graphics.DrawRectangle(Pens.Gray, peer.Relative);
-            var text = peer.Role == 50003 ? peer.Combo.Current : peer.Name;
+            if (peer.Role == 50003 || peer.Role == 50000 || peer.Key=="searchText") e.Graphics.DrawRectangle(Pens.Gray, peer.Relative);
+            var text = peer.Role == 50003 ? peer.Combo.Current : peer.Key=="searchText" ? EntryValue : peer.Name;
             e.Graphics.DrawString(text, Font, Brushes.Black, peer.Relative.X+5, peer.Relative.Y+7);
             if(peer.Combo!=null && (peer.Combo.Mode=="uncertain-select" || peer.Combo.Mode=="select-only" ||
                     peer.Combo.Mode=="uncertain-select-only")) {
@@ -142,7 +145,7 @@ sealed class ProviderCompatibilityFixture : Form {
             }
         }
         e.Graphics.DrawString("Raw UIA provider: missing visibility property; duplicate editors; virtual options", Font,
-            Brushes.DarkSlateGray, 20, 220);
+            Brushes.DarkSlateGray, 20, ClientSize.Height-30);
     }
     protected override void WndProc(ref Message m) {
         if (m.Msg == 0x003D && m.LParam.ToInt64() == AutomationInteropProvider.RootObjectId && Root != null) {
@@ -159,7 +162,8 @@ sealed class ProviderCompatibilityFixture : Form {
         }
         Console.WriteLine(json.Serialize(new { kind=kind, title=Text, pid=Process.GetCurrentProcess().Id,
             hwnd=Handle.ToInt64(), minimized=Minimized, opens=Opens, exports=Exports, controls=values,
-            result_state=ResultState, result_family=ResultFamily,
+            result_state=ResultState, result_family=ResultFamily, result_entry=ResultEntry,
+            text_value=EntryValue, text_writes=EntryWrites, text_mode=EntryMode,
             query_caption=Root.Children.Find(delegate(RawPeer peer) { return peer.Key=="QueryCommand"; }).Name }));
         Console.Out.Flush();
     }
@@ -177,12 +181,24 @@ sealed class ProviderCompatibilityFixture : Form {
                 if(command=="reset") { foreach(var model in Combos.Values)model.Reset(); Opens=Exports=0; ResultState=ResultFamily=""; HiddenKey=null; }
                 else if(command=="minimize")WindowState=FormWindowState.Minimized;
                 else if(command=="restore") { WindowState=FormWindowState.Normal; Activate(); }
+                else if(command=="point-front") { TopMost=true; BringToFront(); Activate(); }
+                else if(command=="point-done")TopMost=false;
                 else if(command.StartsWith("title|"))Text=command.Substring(6);
                 else if(command=="label-wrappers")SetWrappedLabels(true);
                 else if(command=="label-direct")SetWrappedLabels(false);
                 else if(command.StartsWith("query-caption|")) {
                     Root.Children.Find(delegate(RawPeer peer) { return peer.Key=="QueryCommand"; }).Name=command.Substring(14);
                 }
+                else if(command=="text-add") {
+                    ClientSize=new System.Drawing.Size(660,310);
+                    if(!Root.Children.Exists(delegate(RawPeer p) { return p.Key=="searchText"; })) {
+                        var label=new RawPeer(this,Root,70,"searchTextLabel","Search text",50020,new Rectangle(20,211,145,30));
+                        var field=new RawPeer(this,Root,71,"searchText","",50004,new Rectangle(180,211,260,30));
+                        field.Label=label; Root.Children.Add(label); Root.Children.Add(field);
+                    }
+                }
+                else if(command.StartsWith("text-mode|"))EntryMode=command.Substring(10);
+                else if(command=="text-reset") { EntryValue=ResultEntry=""; EntryWrites=0; EntryMode="normal"; }
                 else if(command.StartsWith("automation-id|")) {
                     var parts=command.Split('|');
                     Root.Children.Find(delegate(RawPeer peer) { return peer.Key==parts[1]; }).AutomationKey=parts[2];
@@ -273,6 +289,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         return null;
     }
     bool SelectOnly { get { return Combo!=null && (Combo.Mode=="select-only" || Combo.Mode=="uncertain-select-only"); } }
+    bool TextEntry { get { return Key=="searchText" && Role==50004; } }
     bool SelectionAvailable { get { return Combo!=null && Combo.Mode=="selected-after-write"; } }
     bool ValueSupported { get { return (Role==50003 && !SelectOnly) || Role==50004 ||
         (Role==50007 && Combo.Mode!="unsupported-option"); } }
@@ -288,13 +305,13 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
                 return Role==50007 && Combo.Mode=="unsupported-option" ? Choice : Name;
             case 30008: return false;
             case 30009: return Role==50003 || Role==50004 || Role==50000;
-            case 30010: return true;
+            case 30010: return !(TextEntry && Host.EntryMode=="disabled");
             case 30011: return AutomationKey ?? Key;
             case 30012: return "RawCompatibilityProvider";
             case 30013: return "";
             case 30016: case 30017: return true;
             case 30018: return Label;
-            case 30019: return false;
+            case 30019: return TextEntry && Host.EntryMode=="password";
             case 30020: return Parent==null ? Host.Handle.ToInt32() : 0;
             // null is UIA NotSupported, not false. GetCurrentPropertyValueEx(true)
             // must preserve this distinction; WPF bool-only peers cannot model it.
@@ -305,8 +322,8 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
             case 30036: return Role==50007;
             case 30037: return Role==50003 && SelectionAvailable;
             case 30043: return ValueSupported;
-            case 30045: return ((IValueProvider)this).Value;
-            case 30046: return Role!=50003 || SelectOnly;
+            case 30045: return TextEntry && Host.EntryMode=="unreadable" ? null : ((IValueProvider)this).Value;
+            case 30046: return ((IValueProvider)this).IsReadOnly;
             case 30070: return 0; // Expand succeeds but this custom provider never updates its state.
             case 30079: return ((ISelectionItemProvider)this).IsSelected;
             case 30080: return Role==50007 ? Parent : null;
@@ -355,6 +372,9 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     public IRawElementProviderFragment GetFocus() { return Host.Root; }
     string IValueProvider.Value {
         get {
+            if(TextEntry && Host.EntryMode=="unreadable")
+                throw new COMException("fixture_value_unavailable",unchecked((int)0x80004005));
+            if(TextEntry)return Host.EntryValue;
             if(Combo==null)return "";
             if(Combo.Mode=="legacy-all")return "";
             if(Combo.Mode=="no-options-blank-before" && Combo.Writes==0)return "";
@@ -365,8 +385,17 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
             return Combo.Current;
         }
     }
-    bool IValueProvider.IsReadOnly { get { return Role!=50003 || SelectOnly; } }
+    bool IValueProvider.IsReadOnly { get { return TextEntry ? Host.EntryMode=="readonly" : Role!=50003 || SelectOnly; } }
     void IValueProvider.SetValue(string value) {
+        if(TextEntry) {
+            if(((IValueProvider)this).IsReadOnly || Host.EntryMode=="password" || Host.EntryMode=="disabled")
+                throw new InvalidOperationException("fixture_text_not_writable");
+            Host.EntryWrites++;
+            if(Host.EntryMode!="mismatch")Host.EntryValue=value;
+            Host.RefreshDisplay();
+            if(Host.EntryMode=="uncertain-write")throw new COMException("fixture_text_mutated_then_failed",unchecked((int)0x80131515));
+            return;
+        }
         if(Role!=50003)throw new InvalidOperationException("fixture_readonly");
         Combo.Writes++;
         if(Array.IndexOf(Combo.Choices,value)<0)throw new ArgumentException("fixture_unknown_choice");

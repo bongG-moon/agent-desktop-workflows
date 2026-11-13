@@ -19,11 +19,12 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 INVOKE = {'button', 'hyperlink', 'menuitem', 'splitbutton'}
 CHOOSE = {'listitem', 'tab', 'treeitem'}
 EXPAND = {'menuitem', 'combobox', 'treeitem', 'splitbutton'}
+VALUE_ACTIONS = {'select': 'combobox', 'fill': 'textfield'}
 RECOVERABLE_CAPTURE_REASONS = {
     'capture_target_unavailable', 'stable_locator_unavailable', 'unsupported_recorded_action',
     'unsupported_demonstration', 'combo_value_unobserved', 'combo_choice_unproven',
     'combo_option_click_required', 'value_readback_unavailable', 'value_before_transition_unproven',
-    'combo_option_owner_required',
+    'combo_option_owner_required', 'text_value_unobserved',
 }
 
 
@@ -36,6 +37,12 @@ class TaskError(ValueError):
 def _text(value, limit=1024):
     return (isinstance(value, str) and bool(value.strip()) and len(value) <= limit
             and not any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF for c in value))
+
+
+def valid_value(value, role):
+    """Keep entered strings literal, allowing an explicit clear only for text fields."""
+    return (role in VALUE_ACTIONS.values() and (value == '' and role == 'textfield' or _text(value, 10000))
+            and len(value.encode('utf-8')) <= 10000)
 
 
 def _name(name):
@@ -88,9 +95,12 @@ def _selector(raw):
 
 
 def _point_target(raw):
-    return (raw.get('action') == 'teach-target' and 'value' not in raw
+    locator = raw.get('target', {}).get('locator') if isinstance(raw.get('target'), dict) else None
+    role = locator.get('role') if isinstance(locator, dict) else None
+    reason = {'combobox': 'combo_choice_unproven', 'textfield': 'text_value_unobserved'}.get(role) if isinstance(role, str) else None
+    return (reason is not None and raw.get('action') == 'teach-target' and 'value' not in raw
             and raw.get('recognition') == {'target': 'identified', 'action': 'requires_instruction',
-                                           'result': 'manual', 'reason': 'combo_choice_unproven'})
+                                           'result': 'manual', 'reason': reason})
 
 
 def is_recoverable(step):
@@ -134,9 +144,9 @@ def instruction_subject(sentence):
         match = re.match(pattern, sentence.strip())
         if match:
             subject = match[1].strip()
-            if ''.join(subject.split()) in {'이항목', '이필드', '이콤보', '이메뉴', '이버튼'}:
+            if ''.join(subject.split()) in {'이항목', '이필드', '이콤보', '이메뉴', '이버튼', '이입력란'}:
                 return None
-            return re.sub(r'\s*(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴)$', '', subject).strip()
+            return re.sub(r'\s*(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴|입력란)$', '', subject).strip()
     return None
 
 
@@ -153,6 +163,11 @@ def _convert(raw, *, allow_point=False):
     if 'window' in source:
         return _manual('popup_needs_live_binding')
     locator = source.get('locator')
+    if any(isinstance(candidate, dict) and (candidate.get('role') == 'password' or any(
+            candidate.get(key) is True for key in ('secure', 'protected', 'is_protected', 'is_password', 'password')))
+            for candidate in [raw, source, locator, *((locator or {}).get('ancestors', []) if isinstance(locator, dict)
+                               and isinstance(locator.get('ancestors', []), list) else [])]):
+        return _manual('target_protected')
     selector = _selector(locator)
     if not selector:
         return _manual('stable_locator_unavailable')
@@ -175,8 +190,11 @@ def _convert(raw, *, allow_point=False):
     action = raw.get('action')
     if role == 'listitem' and any(a['role'] == 'combobox' for a in ancestors):
         return _manual('combo_option_owner_required')
-    if point and role == 'combobox':
-        step.update(action='select', parameter=step.get('label') or step['target'], recorded_effect='unobserved')
+    if role == 'textfield' and any(a['role'] == 'combobox' for a in ancestors):
+        return _manual('text_input_owned_by_combo')
+    if point and role in VALUE_ACTIONS.values():
+        step.update(action='select' if role == 'combobox' else 'fill',
+                    parameter=step.get('label') or step['target'], recorded_effect='unobserved')
     elif action == 'set-value' and role == 'combobox':
         value = raw.get('value')
         selection = raw.get('selection') or {}
@@ -193,6 +211,15 @@ def _convert(raw, *, allow_point=False):
             label = step['target']
         parameter = label if _text(label, 200) and '=' not in label else 'value'
         step.update(action='select', value=value, parameter=parameter, recorded_effect='matched' if observed else 'unverified')
+    elif action == 'set-value' and role == 'textfield':
+        if recognition.get('result') == 'mismatch':
+            return _manual('text_value_mismatch')
+        value = raw.get('value')
+        if not valid_value(value, role) or recognition.get('result') != 'checkable':
+            return _manual('text_value_unobserved')
+        label = step.get('label') or step['target']
+        parameter = label if _text(label, 200) and '=' not in label else 'value'
+        step.update(action='fill', value=value, parameter=parameter, recorded_effect='matched')
     elif ((action == 'click' and role in INVOKE) or (action == 'select' and role in CHOOSE)
           or (action == 'expand' and role in EXPAND)):
         step.update(action='open', expand=action == 'expand')
@@ -205,8 +232,8 @@ def _instruction_subject(step, subject):
     candidates = [step.get(k, '') for k in ('label', 'target', 'alias', 'command_name')]
     norm = lambda s: ''.join(s.split()).casefold()
     text = norm(subject)
-    without_kind = re.sub(r'(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴)$', '', text)
-    if text in {'이항목', '이필드', '이콤보', '이메뉴', '이버튼'}:
+    without_kind = re.sub(r'(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴|입력란)$', '', text)
+    if text in {'이항목', '이필드', '이콤보', '이메뉴', '이버튼', '이입력란'}:
         return next(c for c in candidates if c)
     for c in candidates:
         if c and norm(c) in (text, without_kind):
@@ -221,6 +248,10 @@ def _parse_sentence(step, sentence):
     required = re.fullmatch(r'입력\s*받은\s*(?:\{([^{}]+)\}\s*)?변수(?:를|을)\s*(.+?)에\s*' + verb + tail, sentence)
     assign = re.fullmatch(r'(.+?)(?:을|를)\s*(.+?)(?:으로|로)\s*' + verb + tail, sentence)
     into = re.fullmatch(r'\{([^{}]+)\}(?:을|를)\s*(.+?)에\s*' + verb + tail, sentence)
+    clear = re.fullmatch(r'(.+?)(?:을|를)\s*비워\s*(?:줘|주세요)?' + tail, sentence)
+    if clear and step.get('action') == 'fill':
+        _instruction_subject(step, clear[1])
+        return 'fixed', ''
     if required or into:
         match = required or into
         field = _instruction_subject(step, match[2])
@@ -231,6 +262,12 @@ def _parse_sentence(step, sentence):
         variable = re.fullmatch(r'\{([^{}]+)\}', val)
         if variable:
             return 'required', variable[1]
+        if step.get('action') == 'fill' and val.startswith('"'):
+            try:
+                literal = json.loads(val)
+            except (ValueError, RecursionError):
+                return None
+            return ('fixed', literal) if valid_value(literal, 'textfield') else None
         if not re.fullmatch(r'[\w +./()-]+', val):
             return None
         # Descriptions such as "이번 시험에 맞는 상태" are not literal option
@@ -252,13 +289,29 @@ def _binding(step, text, mode, argument):
         if step.get('action') != 'open' or argument not in (None, ''):
             raise TaskError('instruction_action_mismatch')
         return {'mode': mode, 'text': text}
-    if mode not in ('required', 'fixed') or step.get('action') != 'select' or step.get('role') != 'combobox':
+    if (mode not in ('required', 'fixed') or step.get('action') not in VALUE_ACTIONS
+            or step.get('role') != VALUE_ACTIONS[step['action']]):
         raise TaskError('instruction_action_mismatch')
-    if not _text(argument, 200 if mode == 'required' else 10000):
+    if not (_text(argument, 200) if mode == 'required' else valid_value(argument, step['role'])):
         raise TaskError('invalid_instruction_argument')
     if mode == 'required' and ('=' in argument or argument != argument.strip()):
         raise TaskError('invalid_instruction_argument')
     return {'mode': mode, 'text': text, 'parameter' if mode == 'required' else 'value': argument}
+
+
+def _instruction_agrees(parsed, sentence, mode, argument):
+    actual_mode, actual_arg = parsed
+    if mode != actual_mode:
+        return False
+    if argument == actual_arg:
+        return True
+    if mode != 'required' or not isinstance(argument, str):
+        return False
+    # A plain "input variable" sentence names only the field. Its field label
+    # supplies an initial parameter name, which the explicit editor can rename.
+    # Braced names are explicit instructions and must still match.
+    return (argument.casefold() == actual_arg.casefold()
+            or bool(re.match(r'^입력\s*받은\s*변수(?:를|을)\s*', sentence)))
 
 
 def _semantic_instruction(raw_step, sentence, mode, argument, target, role, within):
@@ -284,8 +337,11 @@ def _semantic_instruction(raw_step, sentence, mode, argument, target, role, with
                            r'(?:해)?\s*(?:줘|주세요)?(?:[.!。])?', sentence)
     action = 'open' if mode == 'recorded' or (mode is None and command) else 'select'
     inferred_role = ('menuitem' if command and re.search(r'메뉴\s*$', command[1]) else 'button')
-    role = role if role is not None else ('combobox' if action == 'select' else inferred_role)
-    if not isinstance(role, str) or role not in ({'combobox'} if action == 'select' else INVOKE):
+    inferred_input = 'textfield' if re.search(r'입력란\s*(?:에|을|를)', sentence) else 'combobox'
+    role = role if role is not None else (inferred_input if action == 'select' else inferred_role)
+    if action == 'select' and role == 'textfield':
+        action = 'fill'
+    if not isinstance(role, str) or role not in ({VALUE_ACTIONS[action]} if action in VALUE_ACTIONS else INVOKE):
         raise TaskError('instruction_action_mismatch')
     step = {'action': action, 'target': query, 'match': 'query', 'role': role}
     query_label = subject if target is not None and subject and ''.join(subject.split()).casefold() != ''.join(query.split()).casefold() else None
@@ -311,11 +367,8 @@ def _semantic_instruction(raw_step, sentence, mode, argument, target, role, with
                 raise TaskError('instruction_requires_structure')
             return {'mode': 'draft', 'text': sentence}
         mode, argument = parsed
-    elif parsed:
-        actual_mode, actual_arg = parsed
-        if mode != actual_mode or (argument != actual_arg and not (
-                mode == 'required' and isinstance(argument, str) and argument.casefold() == actual_arg.casefold())):
-            raise TaskError('instruction_binding_conflict')
+    elif parsed and not _instruction_agrees(parsed, sentence, mode, argument):
+        raise TaskError('instruction_binding_conflict')
     spec = _binding(step, sentence, mode, argument)
     spec.update(query=query, role=role)
     if query_label is not None:
@@ -338,7 +391,7 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         step.update(_annotations(raw_step))
     else:
         step = raw_step
-    if step.get('action') not in ('select', 'open'):
+    if step.get('action') not in (*VALUE_ACTIONS, 'open'):
         return _semantic_instruction(raw_step, sentence, mode, argument, target, role, within)
     if any(value is not None for value in (target, role, within)):
         if ((target is not None and target != step.get('target'))
@@ -352,11 +405,8 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
                 raise TaskError('instruction_requires_structure')
             return {'mode': 'draft', 'text': sentence}
         mode, argument = parsed
-    elif parsed:
-        actual_mode, actual_arg = parsed
-        if mode != actual_mode or (argument != actual_arg
-                and not (mode == 'required' and isinstance(argument, str) and argument.casefold() == actual_arg.casefold())):
-            raise TaskError('instruction_binding_conflict')
+    elif parsed and not _instruction_agrees(parsed, sentence, mode, argument):
+        raise TaskError('instruction_binding_conflict')
     return _binding(step, sentence, mode, argument)
 
 
@@ -383,7 +433,7 @@ def instructed_step(raw_step, spec):
             else dict(raw_step))
     step.update(_annotations(raw_step))
     if spec.get('mode') == 'draft':
-        if ((not is_recoverable(raw_step) and step.get('action') not in ('select', 'open'))
+        if ((not is_recoverable(raw_step) and step.get('action') not in (*VALUE_ACTIONS, 'open'))
                 or set(spec) != {'mode', 'text'}
                 or not _text(spec.get('text'), 1000) or len(spec['text'].encode('utf-8')) > 1000
                 or spec['text'] != spec['text'].strip()):
@@ -401,13 +451,13 @@ def instructed_step(raw_step, spec):
                                        target=spec.get('query'), role=spec.get('role'), within=spec.get('within'))
         if compiled != spec:
             raise TaskError('invalid_step_instruction')
-        step = {'action': 'open' if spec['mode'] == 'recorded' else 'select',
+        step = {'action': 'open' if spec['mode'] == 'recorded' else ('fill' if spec['role'] == 'textfield' else 'select'),
                 'target': spec['query'], 'match': 'query', 'role': spec['role'], **_annotations(raw_step)}
         if 'within' in spec:
             step['within'] = spec['within']
         if 'query_label' in spec:
             step['label'] = spec['query_label']
-        if step['action'] == 'select':
+        if step['action'] in VALUE_ACTIONS:
             step['recorded_effect'] = 'unobserved'
         else:
             step['expand'] = False
@@ -498,7 +548,7 @@ def _validate(plan):
         raise TaskError('invalid_task_steps')
     parameters = set()
     for s in plan['steps']:
-        if not isinstance(s, dict):
+        if not isinstance(s, dict) or not isinstance(s.get('action'), str):
             raise TaskError('invalid_task_step')
         annotation = _annotations(s)
         if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
@@ -555,21 +605,23 @@ def _validate(plan):
             allowed.add('instruction')
             instruction = _check_instruction(s, s['instruction'])
         if s['match'] == 'query' and ((instruction is None and draft is None) or not isinstance(s.get('role'), str) or (s.get('action') == 'open'
-                and (s.get('role') not in INVOKE or s.get('expand'))) or (s.get('action') == 'select'
+                and (s.get('role') not in INVOKE or s.get('expand'))) or (s.get('action') in VALUE_ACTIONS
                 and s.get('recorded_effect') != 'unobserved')):
             raise TaskError('invalid_task_instruction_query')
-        if s.get('action') == 'select':
+        if s.get('action') in VALUE_ACTIONS:
             allowed.add('recorded_effect')
-            if s.get('role') != 'combobox' or s.get('recorded_effect') not in ('matched', 'unverified', 'unobserved'):
+            if s.get('role') != VALUE_ACTIONS[s['action']] or s.get('recorded_effect') not in ('matched', 'unverified', 'unobserved'):
                 raise TaskError('invalid_task_selection')
+            if s['action'] == 'fill' and any(a['role'] == 'combobox' for a in ancestors):
+                raise TaskError('text_input_owned_by_combo')
             if instruction is None:
                 allowed.update(('value', 'parameter'))
                 key = s.get('parameter')
                 if draft is not None:
-                    if (('value' in s and not _text(s['value'], 10000)) or ('parameter' in s
+                    if (('value' in s and not valid_value(s['value'], s['role'])) or ('parameter' in s
                             and (not _text(key, 1000) or '=' in key))):
                         raise TaskError('invalid_task_selection')
-                elif (not _text(s.get('value'), 10000) or not _text(key, 1000) or '=' in key
+                elif (not valid_value(s.get('value'), s['role']) or not _text(key, 1000) or '=' in key
                       or key.casefold() in parameters or s.get('recorded_effect') == 'unobserved'):
                     raise TaskError('invalid_task_selection')
                 if draft is None:
@@ -736,7 +788,7 @@ def parse_overrides(items):
     seen = set()
     for item in items or []:
         key, separator, val = item.partition('=')
-        if not separator or not _text(key, 1000) or not _text(val, 10000):
+        if not separator or not _text(key, 1000) or not valid_value(val, 'textfield'):
             raise TaskError('invalid_override')
         if key.casefold() in seen:
             raise TaskError('duplicate_override')
@@ -797,9 +849,9 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
         for number, s in targets:
             if s.get('instruction', {}).get('mode') == 'fixed':
                 raise TaskError('fixed_value_override')
-            if s['action'] != 'select':
+            if s['action'] not in VALUE_ACTIONS:
                 raise TaskError('unknown_parameter')
-            if number in values or not _text(value, 10000):
+            if number in values or not valid_value(value, s['role']):
                 raise TaskError('invalid_override')
             values[number] = value
     results = []
@@ -816,7 +868,7 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
                     missing_parameters=list(dict.fromkeys(missing)))
     for number, s in sequence:
         step = s.copy()
-        if step['action'] == 'select':
+        if step['action'] in VALUE_ACTIONS:
             if number in values:
                 step['value'] = values[number]
             elif 'instruction' in step:
