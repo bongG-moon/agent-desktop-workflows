@@ -33,6 +33,7 @@ from targeting import SelectionError, field_labels, resolve, scope_map
 from live_action import execute
 import provider_visibility as visibility
 import learned_tasks as tasks
+import input_policy
 
 
 def windows(exe):
@@ -280,13 +281,22 @@ def near_region(nodes, anchor):
 
 
 def action(args, owner, *, learned=None, anchor=None):
+    background = getattr(args, 'background_only', False)
     if args.command in {'select', 'fill', 'open'}:
-        visibility.restore_for_action(owner, args.window)
+        if background:
+            input_policy.window_ready(owner)
+        else:
+            visibility.restore_for_action(owner, args.window)
     surface = bind_surface(owner, args.popup)
     mutate = args.command in {'select', 'fill', 'open'}
-    check = lambda: guard(owner, surface, args.window, mutate)
+    def check():
+        guard(owner, surface, args.window, mutate)
+        if background and mutate:
+            input_policy.window_ready(surface)
     check()
     with bridge.UIA() as uia:
+        if background and mutate:
+            input_policy.configure_uia(uia)
         def read_view():
             nodes, elements = observe(surface, uia, identities_only=learned is not None or anchor is not None)
             if anchor is None:
@@ -370,7 +380,8 @@ def action(args, owner, *, learned=None, anchor=None):
         command = args.command if args.command in ('select', 'fill') else ('expand' if args.expand else
                   'choose' if node['role'] in {'treeitem', 'tab', 'listitem'} else 'invoke')
         result = execute(surface, uia, element, node, command, getattr(args, 'value', None), still_valid=still_valid)
-        return dict(result, target=detail, matched_by=evidence, business_commit='not_verified')
+        return dict(result, target=detail, matched_by=evidence, business_commit='not_verified',
+                    input_policy='background_only' if background else 'auto')
 
 
 def saved_execution_plan(plan):
@@ -433,7 +444,8 @@ def fast_replay(plan, args, overrides):
         return dict(status='needs_input', diagnostic='required_parameter_missing', missing_parameters=missing,
                     steps=[], input_dispatched=False, execution_plan=execution_plan_info(saved))
     result = worker_receipt(['_plan'], mutating=True,
-                            payload={'recipe': recipe, 'overrides': overrides, 'hwnd': args.hwnd})
+                            payload={'recipe': recipe, 'overrides': overrides, 'hwnd': args.hwnd,
+                                     'background_only': getattr(args, 'background_only', False)})
     source_steps = saved['envelope']['source_steps']
     for row in result.get('steps', []):
         number = row.get('number')
@@ -444,6 +456,19 @@ def fast_replay(plan, args, overrides):
     if type(stopped) is int and 1 <= stopped <= len(source_steps):
         result['source_stopped_at'] = source_steps[stopped - 1]
     return dict(result, execution_engine='saved_python_plan', execution_plan=execution_plan_info(saved))
+
+
+def replay_input_requirements(plan, only=None):
+    """Use the same literal compiler as replay without saving or observing anything."""
+    if only is not None:
+        number = tasks._step_number(plan, only)
+        return input_policy.profile([plan['steps'][number - 1]], [number])
+    import recorded_plan
+    compiled = recorded_plan.compile_plan(plan)
+    recipe = compiled.get('envelope', {}).get('recipe')
+    if recipe:
+        return input_policy.profile(recipe['steps'], compiled['envelope']['source_steps'])
+    return input_policy.profile(plan['steps'])
 
 
 def run(args):
@@ -464,6 +489,14 @@ def run(args):
                 'input_dispatched': False}
     if args.command == 'replay':
         plan = tasks.load_task(args.task, task_directory())
+        requirements = replay_input_requirements(plan, args.only)
+        if getattr(args, 'input_plan', False):
+            return dict(status='observed', input_dispatched=False, input_requirements=requirements)
+        background = getattr(args, 'background_only', False)
+        if background:
+            refusal = input_policy.blocked(requirements)
+            if refusal:
+                return refusal
         overrides = tasks.parse_overrides(args.set)
         quick = fast_replay(plan, args, overrides)
         if quick is not None:
@@ -476,8 +509,10 @@ def run(args):
                     binding = pick_window(windows(args.exe), args.window, args.hwnd)
                 except (SelectionError, bridge.BridgeError) as error:
                     return {'status': 'blocked', 'diagnostic': error.code, 'input_dispatched': False}
-            return worker_receipt(['_step'], mutating=True, payload={'binding': binding, 'step': step})
-        return tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only)
+            return worker_receipt(['_step'], mutating=True,
+                                  payload={'binding': binding, 'step': step, 'background_only': background})
+        return dict(tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only),
+                    input_policy='background_only' if background else 'auto', input_requirements=requirements)
     rows = windows(args.exe)
     if args.command == 'windows':
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
@@ -527,6 +562,11 @@ def run(args):
 def replay_step():
     request = json.load(sys.stdin)
     binding, step = request['binding'], request['step']
+    background = request.get('background_only', False)
+    if background:
+        refusal = input_policy.blocked(input_policy.profile([step]))
+        if refusal:
+            return refusal
     bridge.set_dpi_awareness()
     owner = bridge.Binding(binding)
     if step['action'] == 'result-menu':
@@ -542,7 +582,7 @@ def replay_step():
         return dict(receipt, target=step['label'])
     args = argparse.Namespace(command=step['action'], role=step['role'], window=binding['title'],
                               target=step['target'], value=step.get('value'), expand=step.get('expand', False),
-                              within=step.get('within'), popup=None)
+                              within=step.get('within'), popup=None, background_only=background)
     if args.command not in ('select', 'fill', 'open'):
         raise SelectionError('step_requires_review')
     return action(args, owner, learned=None if step.get('match') == 'query' else step)
@@ -583,6 +623,9 @@ def parser():
                                help='physical pixel rectangle relative to the row')
         if verb == 'replay':
             s.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
+            s.add_argument('--input-plan', action='store_true', help='preview input modes without inspecting an app')
+        if verb in ('replay', 'select', 'fill', 'open'):
+            s.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and restoration')
         if verb in ('replay', 'row-status'):
             s.add_argument('--only', help='run just one named step or step number')
         if verb in ('inspect', 'open', 'select', 'fill'):
@@ -654,7 +697,8 @@ def main():
         try:
             payload = json.load(sys.stdin)
             result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
-                                         allow_recorded_selection=True)
+                                         allow_recorded_selection=True,
+                                         background_only=payload.get('background_only', False))
         except Exception as error:
             result = dict(status='uncertain', diagnostic=getattr(error, 'code', 'execution_plan_unavailable'),
                           input_dispatched=None)

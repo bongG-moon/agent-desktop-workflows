@@ -11,7 +11,8 @@ import win_bridge as bridge
 def _result(status, sent, state, *, diagnostic=None, before=None):
     result = {'status': status, 'input_dispatched': sent, 'observed_state': state,
               'effect_verification': 'matched' if status == 'verified' else 'unverified',
-              'verification_scope': 'recorded_row_state'}
+              'verification_scope': 'recorded_row_state',
+              'input_mode': 'physical_pointer', 'physical_input': True}
     if before:
         result['initial_state'] = before
     if diagnostic:

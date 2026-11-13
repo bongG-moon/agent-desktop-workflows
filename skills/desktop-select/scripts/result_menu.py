@@ -197,6 +197,7 @@ def execute(binding, spec, guard, title, *, observe_guard=None):
             info.update(input_dispatched=None, query_dispatched=None)
             q = _query(binding, trigger, title)
             info.update(input_dispatched=q['input_dispatched'], query_dispatched=q['input_dispatched'])
+            info.update({key: q[key] for key in ('input_mode', 'physical_input') if key in q})
             if q['input_dispatched'] is not True or q['status'] not in ('verified', 'delivered_unverified'):
                 return dict(info, status=q['status'] if q['status'] != 'verified' else 'blocked',
                             diagnostic=q['diagnostic'])

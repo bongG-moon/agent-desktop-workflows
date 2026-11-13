@@ -221,7 +221,8 @@ def _visible_choice(uia, matches, binding=None):
 
 def _receipt(status, effect, diagnostic, method, dispatched, expanded):
     return {'status': status, 'effect_verification': effect, 'diagnostic': diagnostic,
-            'method': method, 'input_dispatched': dispatched, 'expanded': expanded}
+            'method': method, 'input_dispatched': dispatched, 'expanded': expanded,
+            'input_mode': 'accessibility', 'physical_input': False}
 
 
 def submit_ready(binding, uia, element, node):

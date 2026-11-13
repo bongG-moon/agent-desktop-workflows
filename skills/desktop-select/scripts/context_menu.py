@@ -453,8 +453,10 @@ def execute(binding, spec, guard, *, before_leaf=None):
                 parent, anchor, before = fresh, fresh.box, snapshot
         return dict(status='delivered_unverified', diagnostic='menu_leaf_sent',
                     input_dispatched=True, leaf_dispatched=True, menu_path_completed=True,
-                    menu_items=completed, effect_verification='unverified')
+                    menu_items=completed, effect_verification='unverified',
+                    input_mode='physical_pointer', physical_input=True)
     except Exception as error:
         return dict(status='uncertain' if pending else 'blocked', diagnostic=getattr(error,'code','context_provider_error'),
                     input_dispatched=None if pending and not sent else sent, leaf_dispatched=leaf_sent,
-                    menu_path_completed=False, menu_items=completed, effect_verification='unverified')
+                    menu_path_completed=False, menu_items=completed, effect_verification='unverified',
+                    input_mode='physical_pointer', physical_input=True)

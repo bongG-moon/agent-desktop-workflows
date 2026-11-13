@@ -1,8 +1,8 @@
-# Desktop Select 0.4.8 — 등록한 조회와 Excel 내보내기를 이어서 실행
+# Desktop Select 0.4.9 — 입력 방식 확인과 백그라운드 전용 실행
 
-0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 처음에는 위치를 녹화하고 설명 초안을 수정한 뒤 Python 업무 스킬로 등록합니다. 이후에는 Family 같은 선택값과 SearchText 같은 입력값을 받아 같은 순서로 실행합니다. 0.4.8은 별도 Python 실행안에 표 우클릭 메뉴, 내보내기 대화상자, Enter로 조건 적용, Excel 파일 확인을 이어 붙일 수 있도록 보완합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 Python 소스를 포함한 텍스트 파일만 있습니다.
+0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 처음에는 위치를 녹화하고 설명 초안을 수정한 뒤 Python 업무 스킬로 등록합니다. 이후에는 Family 같은 선택값과 SearchText 같은 입력값을 받아 같은 순서로 실행합니다. 0.4.9는 실행 전에 입력 방식을 확인하고, 필요할 때 도구의 물리 입력과 전면화를 금지할 수 있도록 보완합니다. 기본 조회와 Excel 내보내기 흐름은 유지합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 Python 소스를 포함한 텍스트 파일만 있습니다.
 
-Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받아 줘. 조회 뒤 결과 표를 우클릭해서 Excel로 내보내고, 저장 창과 파일 확인까지 Python 업무 스킬로 연결해 줘”라고 요청하세요. 호스트 모델이 현재 화면을 확인해 실행안을 한 번 정리하고, 반복 실행은 저장한 동작을 Python으로 수행합니다. 외부 모델 호출은 없으며 업무 앱의 서버 처리 시간은 줄이지 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.8/desktop-select-0.4.8-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.8/skills/desktop-select/사용가이드.md)
+Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받아 줘. 조회 뒤 결과 표를 우클릭해서 Excel로 내보내고, 저장 창과 파일 확인까지 Python 업무 스킬로 연결해 줘”라고 요청하세요. 호스트 모델이 현재 화면을 확인해 실행안을 한 번 정리하고, 반복 실행은 저장한 동작을 Python으로 수행합니다. 외부 모델 호출은 없으며 업무 앱의 서버 처리 시간은 줄이지 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.9/desktop-select-0.4.9-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.9/skills/desktop-select/사용가이드.md)
 
 정확한 ID나 이름이 없는 입력란은 확인된 상위 영역과 그 안의 상대 위치를 기록할 수 있습니다. 실행 때 영역과 실제 UIA 대상의 역할, 클래스, 소속을 다시 확인합니다. 임시 HWND를 저장하거나 옛 절대좌표를 누르지 않습니다. 표준 Win32 우클릭 메뉴는 대상 창의 실제 메뉴 소유자를 확인한 뒤 읽습니다. 이름 있는 표 영역과 완료 표식, 메뉴 항목은 필요한 후보만 조회해 전체 화면 반복 탐색을 줄입니다.
 
@@ -12,11 +12,13 @@ Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받�
 
 등록은 읽기 전용입니다. 아직 열리지 않은 저장 창의 단계는 `pending_scopes`로 남으며 실제 실행 때 소속과 대상이 확인되어야 진행합니다. 표 우클릭은 실제 마우스를 사용하고 `submit`은 지정 입력란에 Enter를 보냅니다. 이름 없는 입력란을 상대 위치로 찾을 때도 창을 앞으로 가져옵니다. 이 단계 중에는 마우스와 키보드를 사용하지 마세요. 일반 값 설정과 버튼 호출은 접근성 API를 사용합니다. 파일 확인은 새로 생성되거나 변경된 통합 문서 구조를 확인하며 조회 내용의 정확성과는 구분합니다.
 
+`scripts/run.py --input-plan`으로 앱을 실행하지 않고 입력 방식을 확인할 수 있습니다. `--background-only`는 우클릭, Enter 또는 위치 기반 대상이 포함된 전체 요청을 첫 입력 전에 거절하며 최소화된 창도 복원하지 않습니다. 허용된 UIA 실행에서는 자동 포커스를 끕니다. 옵션을 생략하면 기존 방식으로 실행합니다. 앱이 스스로 창을 열거나 포커스를 바꾸는 동작까지 격리하는 기능은 아닙니다. [원본 스킬과 CUA 입력 방식 비교](docs/desktop-select-input-modes.md)를 참고하세요.
+
 핵심 변경은 `IsOffscreen=None` 보정, 동일한 편집 피어 값의 일치 판정, 쓰기 가능한 콤보의 SetValue 1회 후 확인, 조작 전 최소화 창 복원입니다. 먼저 펼침과 항목 선택을 시도하던 경로를 줄였습니다. 일반 값/버튼 단계는 UIA 연결을 재사용하고 저장한 ID 또는 정확한 이름과 역할로 조회한 뒤 현재 상위 영역을 확인합니다. 핵심 브리지와 녹화기는 0.4.0 그대로 유지하며 호환 코드는 별도 파일로 분리했습니다. [0.4.0 대비 변경과 검증](docs/desktop-select-040-rebuild.md)을 참고하세요.
 
 고정값으로 등록한 MES Setup=N은 매번 유지되고, 필수 변수로 등록한 Family와 SearchText만 실행 때 바뀝니다. 예: `scripts/run.py --set "Family=Hybrid" --set "SearchText=00123"`. 필요한 값이 빠지면 실행 전에 함께 묻습니다. 일반 입력란은 `--set "SearchText="`로 비울 수 있지만 콤보의 빈 값은 허용하지 않습니다. 고정값도 바꾸어 받고 싶다면 등록 지시부터 필수 변수로 바꾸세요. 기존 방식의 조회 완료 표시와 우클릭은 녹화 창의 **조회 후 우클릭 메뉴 가르치기**를 사용합니다. Desktop Select ZIP은 `python tools/build_desktop_select.py`로 빌드할 수 있습니다.
 
-실제 앱 시험 범위와 속도 측정은 [0.4.8 검증 기록](docs/desktop-select-048-validation.md)에 구분해 기록합니다. 이 PC의 시험은 회사 FX와 FarPoint 제공자의 실검증을 대신하지 않습니다.
+새 입력 정책과 커서/포커스 보존 시험은 [0.4.9 검증 기록](docs/desktop-select-049-validation.md)에 기록합니다. 기존 실제 DBeaver 시험과 속도 측정은 [0.4.8 검증 기록](docs/desktop-select-048-validation.md)에 보존합니다. 이 PC의 시험은 회사 FX와 FarPoint 제공자의 실검증을 대신하지 않습니다.
 
 목록 안의 버튼은 행 번호나 이름, 버튼 모양, 실행 전후 상태를 한 번 가르치면 재생할 수 있습니다. 실행 중에는 실제 마우스를 사용하고 같은 행에서 완료 표시를 다시 읽습니다.
 

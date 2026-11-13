@@ -885,6 +885,8 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
                                                             or type(receipt['input_dispatched']) is not bool))):
             receipt = {'status': 'uncertain', 'input_dispatched': None, 'diagnostic': 'invalid_action_receipt'}
         results.append({'number': number, 'receipt': receipt})
+        if receipt.get('physical_input'):
+            report['physical_input'] = True
         sent = receipt['input_dispatched']
         if sent is None or report['input_dispatched'] is None:
             report['input_dispatched'] = None

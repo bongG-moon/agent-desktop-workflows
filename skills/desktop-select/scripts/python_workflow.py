@@ -18,6 +18,7 @@ import desktop_select as app
 import control_lookup as lookup
 import context_menu
 import export_evidence
+import input_policy
 import live_action as live
 
 
@@ -218,25 +219,36 @@ def check_surface(owner, surface, title, popup=None, *, mutate=False):
         need(len(matches) == 1 and matches[0]['hwnd'] == surface.hwnd, 'popup_scope_changed')
 
 
-def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False):
+def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
+        background_only=False):
     recipe = validate(recipe)
+    requirements = input_policy.profile(recipe['steps'])
+    if background_only and not read_only:
+        refusal = input_policy.blocked(requirements)
+        if refusal:
+            return refusal
     values, missing = values_for(recipe, overrides or {})
     if missing and not read_only:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     report = dict(status='observed' if read_only else 'verified', steps=[], input_dispatched=False,
-                  business_commit='not_verified')
+                  business_commit='not_verified', input_requirements=requirements,
+                  input_policy='background_only' if background_only else 'auto')
     started = time.monotonic()
     number, dispatching = 0, False
     anchor_proof = None
     stage_started = started
     try:
         binding = bind(recipe['exe'], recipe['window'], hwnd)
+        if background_only and not read_only:
+            input_policy.window_ready(binding)
         # Capture every requested output before window restoration or any input.
         baselines = {i: export_evidence.baseline(step['output']) for i, step in enumerate(recipe['steps'], 1)
                      if step['action'] == 'verify-file'} if not read_only else {}
         report['window_restored'] = False
         owner_prepared = False
         with app.bridge.UIA() as uia:
+            if background_only and not read_only:
+                input_policy.configure_uia(uia)
             for number, step in enumerate(recipe['steps'], 1):
                 stage_started = time.monotonic()
                 app.guard(binding, binding, recipe['window'])
@@ -244,7 +256,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 # require it to be enabled/restored; missing popups never do.
                 if (not read_only and not owner_prepared and 'popup' not in step
                         and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu')):
-                    report['window_restored'] = app.visibility.restore_for_action(binding, recipe['window'])
+                    if background_only:
+                        input_policy.window_ready(binding)
+                    else:
+                        report['window_restored'] = app.visibility.restore_for_action(binding, recipe['window'])
                     owner_prepared = True
                 if step['action'] == 'wait':
                     if read_only:
@@ -289,6 +304,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                     elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                         continue
                     check_surface(binding, surface, recipe['window'], popup, mutate=not read_only)
+                    if background_only and not read_only:
+                        input_policy.window_ready(surface)
                     root = uia.from_handle(surface.hwnd)
                     selector = step['selector']
                     anchor_proof = None
@@ -297,6 +314,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         # exposed. Ordinary UIA actions remain background-capable.
                         from row_action import foreground
                         foreground(surface)
+                        report['foreground_requested'] = True
                         check_surface(binding, surface, recipe['window'], popup, mutate=True)
                         anchor_proof = lookup.bind_anchored(surface, uia, selector, root=root)
                         element, stable, resolution = anchor_proof.element, None, None
@@ -325,6 +343,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     else:
                         def check():
                             check_surface(binding, surface, recipe['window'], popup, mutate=True)
+                            if background_only:
+                                input_policy.window_ready(surface)
                             current = (anchor_proof.revalidate() if anchor_proof is not None else
                                        revalidate_step(surface, uia, root, selector, stable, resolution, element))
                             need('command_name' not in step or current.property(30005) == step['command_name'],
@@ -482,6 +502,11 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
              '필수 입력은 ' + json.dumps(required, ensure_ascii=False) + '이다. 값을 받지 않으면 실행하지 않는다.\n\n'
              '`python -X utf8 -B scripts/run.py --set "변수명=값"`으로 실행한다. '
              '현재 상태만 확인할 때는 `--read-only`를 붙인다. 이 명령은 대상 창을 복원하지 않는다.\n\n'
+             '`--input-plan`은 앱을 조회하지 않고 전체 단계의 입력 방식을 표시한다. '
+             '`--background-only`는 도구의 실제 마우스/키보드 입력과 전면화 요청을 금지한다. '
+             '그런 단계가 있으면 첫 입력 전에 전체 실행을 거절한다. 최소화된 창도 복원하지 않는다. '
+             '허용된 UIA 실행에서는 자동 포커스를 끄고 설정값을 확인한다. '
+             '앱 자체가 대화상자를 열거나 포커스를 바꾸는 동작은 별개이며 독립 데스크톱은 아니다.\n\n'
              '콤보 선택값과 입력란 문자열을 필수 변수로 받을 수 있다. '
              '예를 들어 `--set "Family=Hybrid" --set "검색어=00123"`처럼 이번 값을 전달한다. '
              '입력란을 비우라는 요청은 해당 변수에 `--set "검색어="`를 준다. 콤보에는 빈 값을 쓰지 않는다. '
@@ -510,7 +535,8 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
                   '같은 종류 입력란의 배치가 바뀌면 역할과 클래스 검사만으로 구별할 수 없으므로 지정 위치를 다시 확인한다. '
                   '등록과 --read-only는 창을 앞으로 가져오지 않으므로 사용자가 해당 영역을 보이게 해 두어야 한다.\n')
     (destination / 'SKILL.md').write_text(guide, encoding='utf8')
-    result = dict(status='registered', path=str(destination), required_parameters=required, input_dispatched=False)
+    result = dict(status='registered', path=str(destination), required_parameters=required, input_dispatched=False,
+                  input_requirements=input_policy.profile(active))
     if observed.get('pending_scopes'):
         result.update(target_validation='pending_scopes', pending_scopes=observed['pending_scopes'])
     return result
@@ -537,10 +563,12 @@ def main(argv=None):
         else:
             p.add_argument('--set', action='append', default=[])
             p.add_argument('--read-only', action='store_true')
+            p.add_argument('--input-plan', action='store_true', help='preview input modes without opening or inspecting an app')
+            p.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and window restoration')
     parser.add_argument('--_worker', action='store_true', help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
-    mutating = args.command == 'run' and not args.read_only
+    mutating = args.command == 'run' and not args.read_only and not args.input_plan
     launched, executing = False, False
     try:
         source_task = None
@@ -556,6 +584,15 @@ def main(argv=None):
                 recipe = load(args.recipe)
         overrides = {}
         if args.command == 'run':
+            if args.input_plan:
+                print(json.dumps(dict(status='observed', input_dispatched=False,
+                                      input_requirements=input_policy.profile(recipe['steps'])), ensure_ascii=False))
+                return 0
+            if args.background_only and not args.read_only:
+                refusal = input_policy.blocked(input_policy.profile(recipe['steps']))
+                if refusal:
+                    print(json.dumps(refusal, ensure_ascii=False))
+                    return 2
             overrides = app.tasks.parse_overrides(args.set)
             _, missing = values_for(recipe, overrides)
             if missing and not args.read_only:
@@ -569,7 +606,8 @@ def main(argv=None):
                 result = register(recipe, args.out, args.hwnd, source_task=source_task)
             else:
                 executing = mutating
-                result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd)
+                result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd,
+                             background_only=args.background_only)
         else:
             timeout = 90 + sum(s.get('seconds', 0) + s.get('popup', {}).get('timeout', 3 if 'popup' in s else 0)
                                + (s.get('timeout', 26) if s['action'] == 'verify-file' else 0)
