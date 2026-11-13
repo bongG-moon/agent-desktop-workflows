@@ -87,7 +87,7 @@ class ResolutionTests(unittest.TestCase):
     def test_registration_promotes_live_id_and_keeps_original_description(self):
         source = task()
         recipe = recorded_plan.compile_plan(source)['envelope']['recipe']
-        observed = dict(status='observed', input_dispatched=False, steps=[dict(receipt=dict(
+        observed = dict(status='observed', input_dispatched=False, steps=[dict(number=1, receipt=dict(status='observed',
             actions=['SetValue'], resolved_selector=self.stable,
             target_resolution=dict(semantic_label='MES Setup')))])
         with tempfile.TemporaryDirectory() as folder, patch.object(flow, 'run', return_value=observed):

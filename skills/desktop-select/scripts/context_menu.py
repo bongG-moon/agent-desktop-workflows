@@ -1,16 +1,84 @@
 """Teach an interior point of a named surface and follow its newly opened menu."""
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
+import ctypes as C
+from ctypes import wintypes as W
 import math
 import time
 
 import win_bridge as win
+import control_lookup as lookup
+import provider_visibility as visibility
 from row_action import foreground
 
 
 REGIONS = {'table', 'group', 'list', 'tree', 'custom', 'document'}
 MENU = 50009
 MENUITEM = 50011
+
+
+class _GUI_THREAD_INFO(C.Structure):
+    _fields_ = [('cbSize', W.DWORD), ('flags', W.DWORD),
+                ('hwndActive', W.HWND), ('hwndFocus', W.HWND), ('hwndCapture', W.HWND),
+                ('hwndMenuOwner', W.HWND), ('hwndMoveSize', W.HWND), ('hwndCaret', W.HWND),
+                ('rcCaret', win.RECT)]
+
+
+def _thread_identity(hwnd):
+    pid = W.DWORD()
+    thread = win._sig(win.user32, 'GetWindowThreadProcessId', W.DWORD, W.HWND, C.POINTER(W.DWORD))(
+        hwnd, C.byref(pid))
+    return int(thread or 0), pid.value
+
+
+def _native_menu_owner(binding):
+    """Prove a native menu loop belongs to this exact bound business window."""
+    binding.check()
+    if type(binding.hwnd) is not int or type(binding.pid) is not int:
+        return None
+    thread, pid = _thread_identity(binding.hwnd)
+    if not thread or pid != binding.pid:
+        return None
+    state = _GUI_THREAD_INFO()
+    state.cbSize = C.sizeof(state)
+    read = win._sig(win.user32, 'GetGUIThreadInfo', W.BOOL, W.DWORD, C.POINTER(_GUI_THREAD_INFO))
+    if not read(thread, C.byref(state)):
+        return None
+    owner = int(state.hwndMenuOwner or 0)
+    # GUI_INMENUMODE / GUI_POPUPMENUMODE. A stale nonzero HWND is insufficient.
+    if (not state.flags & (0x4 | 0x10) or not owner or not binding.contains_window(owner)
+            or _thread_identity(owner) != (thread, binding.pid)):
+        return None
+    return thread, owner
+
+
+def _scoped_windows(binding):
+    """Include ownerless #32768 only during the proven target thread's menu loop."""
+    windows = list(binding.scoped_windows())
+    state = _native_menu_owner(binding)
+    if state is None:
+        return windows
+    found = []
+    callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+    def visit(hwnd, _):
+        hwnd = int(hwnd)
+        if (win.user32.IsWindowVisible(hwnd) and win.window_class(hwnd) == '#32768'
+                and win.root_window(hwnd) == hwnd
+                and _thread_identity(hwnd) == (state[0], binding.pid)):
+            found.append(hwnd)
+        return len(found) < 64
+    complete = win._sig(win.user32, 'EnumThreadWindows', W.BOOL, W.DWORD, callback_type, W.LPARAM)(
+        state[0], callback_type(visit), 0)
+    _need(complete and len(found) < 64, 'context_menu_scope_incomplete')
+    _need(_native_menu_owner(binding) == state, 'context_menu_owner_changed')
+    return list(dict.fromkeys([*windows, *found]))
+
+
+def _contains_window(binding, hwnd):
+    if binding.contains_window(hwnd):
+        return True
+    return bool(hwnd and win.root_window(hwnd) in _scoped_windows(binding))
 
 
 def _need(condition, code):
@@ -50,15 +118,40 @@ def _inside(point, rect):
 
 
 def _region(binding, uia, target):
-    # The standard observer skips protected descendants and validates the PID.
-    from desktop_select import observe
-    nodes, elements = observe(binding, uia, identities_only=True)
-    hits = [e for n, e in zip(nodes[1:], elements[1:])
-            if all(n.get(k) == v for k, v in target.items())]
-    _need(len(hits) == 1, 'context_region_ambiguous' if hits else 'context_region_missing')
-    element = hits[0]
-    _need(element.property(30010) is True and element.property(30022) is False, 'context_region_unavailable')
+    # Resolve only the demonstrated identity. The native lookup retains all
+    # matches and proves the entire owned, unprotected ancestor chain.
+    try:
+        element = lookup.resolve(binding, uia, target)
+    except win.BridgeError as error:
+        code = {'target_missing': 'context_region_missing',
+                'target_ambiguous': 'context_region_ambiguous'}.get(error.code, error.code)
+        raise win.BridgeError(code) from error
+    root = uia.from_handle(binding.hwnd)
+    _need(not uia.same(element, root), 'context_region_missing')
+    _need(element.property(30010) is True and visibility.visible(binding, uia, element, root),
+          'context_region_unavailable')
     return element
+
+
+def _menu_visible(binding, uia, item):
+    # Keep the normal provider path unchanged. Unknown visibility additionally
+    # requires current geometry and containment in a visible owned surface.
+    state = item.property(30022)
+    if state is not None:
+        return state is False
+    if visibility.visible(binding, uia, item):
+        return True
+    # Native #32768 popups do not necessarily have a Win32 owner chain, so
+    # the bridge's normal visibility helper cannot find their surface. Use a
+    # temporary read-only surface after the active menu-owner proof above.
+    for hwnd in _scoped_windows(binding):
+        if binding.contains_window(hwnd):
+            continue
+        root = uia.from_handle(hwnd)
+        surface = SimpleNamespace(hwnd=hwnd, pid=binding.pid, check=binding.check)
+        if visibility.visible(surface, uia, item, root) and hwnd in _scoped_windows(binding):
+            return True
+    return False
 
 
 def _check_region_children(binding, uia, region, point):
@@ -160,11 +253,49 @@ def _menus(binding, uia):
     """Only visible menu items in the selected window or its owned popups."""
     items = []
     count = 0
+    def append(hwnd, item, frame):
+        if frame is None or not _menu_visible(binding, uia, item):
+            return
+        rect = _rect(uia, item)
+        if rect[2] > 1 and rect[3] > 1:
+            name = item.property(30005)
+            if _text(name) and not any(uia.same(item, prior.element) for prior in items):
+                items.append(_Item(hwnd, item, frame, _rect(uia, frame), rect, name))
     # Some trees expose a popup both on its own HWND and below the host.
     # Prefer the popup root so the final hit test has its actual window.
-    for hwnd in sorted(binding.scoped_windows(), key=lambda h: h == binding.hwnd):
+    for hwnd in sorted(_scoped_windows(binding), key=lambda h: h == binding.hwnd):
         root = uia.from_handle(hwnd)
         _need(root is not None and uia.pid(root) == binding.pid, 'context_menu_scope_unavailable')
+        if hwnd == binding.hwnd:
+            if uia.secure(root):
+                continue
+            # The main window may contain thousands of unrelated grid cells.
+            # Ask its provider only for menu items, retaining all candidates
+            # for ambiguity checks. find_all proves raw owned/unprotected
+            # ancestry before any candidate name is read.
+            candidates = lookup.find_all(uia, root, roles=('menuitem',), limit=4096)
+            count += len(candidates)
+            _need(count <= 4200, 'context_menu_tree_incomplete')
+            for item in candidates:
+                current, frame, classified, complete = item, None, False, False
+                # Recover the original ControlView MENU / MENUBAR frame.
+                # Continue to the host after finding it so a disappearing or
+                # reparented peer cannot silently broaden the menu scope.
+                for depth in range(29):
+                    _need(current is not None and uia.pid(current) == binding.pid
+                          and not uia.secure(current), 'context_menu_scope_unavailable')
+                    kind = current.property(30003)
+                    if depth == 0:
+                        _need(kind == MENUITEM, 'context_menu_item_changed')
+                    elif not classified and kind in (MENU, 50010):
+                        frame, classified = (current if kind == MENU else None), True
+                    if uia.same(current, root):
+                        complete = True
+                        break
+                    current = uia.parent(current)
+                _need(complete, 'context_menu_tree_incomplete')
+                append(hwnd, item, frame)
+            continue
         # Some providers expose visible items directly below an owned popup.
         default_frame = root if hwnd != binding.hwnd else None
         pending = deque([(root, default_frame, 0)])
@@ -179,12 +310,8 @@ def _menus(binding, uia):
                 frame = item
             elif kind == 50010:  # MenuBar routes normal host commands.
                 frame = None
-            if kind == MENUITEM and frame is not None and item.property(30022) is False:
-                rect = _rect(uia, item)
-                if rect[2] > 1 and rect[3] > 1:
-                    name = item.property(30005)
-                    if _text(name) and not any(uia.same(item, prior.element) for prior in items):
-                        items.append(_Item(hwnd, item, frame, _rect(uia, frame), rect, name))
+            if kind == MENUITEM:
+                append(hwnd, item, frame)
             pending.extend((c, frame, depth+1) for c in uia.children(item))
     return items
 
@@ -222,9 +349,9 @@ def _choose(uia, items, old, name, anchor, parent, gap):
 def _hit_item(binding, uia, item, parent, prior_surfaces, gap):
     center = item.center
     hit = win.window_from_point(*center)
-    _need(binding.contains_window(hit) and binding.contains_window(win.foreground()),
+    _need(_contains_window(binding, hit) and _contains_window(binding, win.foreground()),
           'context_menu_occluded')
-    _need(item.element.property(30010) is True and item.element.property(30022) is False
+    _need(item.element.property(30010) is True and _menu_visible(binding, uia, item.element)
           and _rect(uia, item.element) == item.box, 'context_menu_item_changed')
     actual = uia.from_point(*center)
     _need(actual is not None and uia.pid(actual) == binding.pid and not uia.secure(actual),
@@ -258,7 +385,7 @@ def _hit_item(binding, uia, item, parent, prior_surfaces, gap):
             observed = uia.menu_observation(binding, *center, hit)
             _need(observed is not None and uia.same(observed['element'], item.element)
                   and win.root_window(hit) != binding.hwnd, 'context_menu_hit_unproven')
-    _need(win.window_from_point(*center) == hit, 'context_menu_occluded')
+    _need(win.window_from_point(*center) == hit and _contains_window(binding, hit), 'context_menu_occluded')
     return surface
 
 
@@ -276,7 +403,7 @@ def execute(binding, spec, guard, *, before_leaf=None):
             px, py = x+round(w*spec['point'][0]), y+round(h*spec['point'][1])
             _hit_region(binding, uia, region, (px, py))
             before = _menus(binding, uia)
-            prior_surfaces = set(binding.scoped_windows())
+            prior_surfaces = set(_scoped_windows(binding))
             guard()
             current = _region(binding, uia, spec['target'])
             _need(uia.same(current, region) and _rect(uia, current) == rect, 'context_region_changed')
@@ -311,7 +438,7 @@ def execute(binding, spec, guard, *, before_leaf=None):
                     guard()
                 exposed = _hit_item(binding, uia, fresh, parent, prior_surfaces, gap)
                 win._combo_surface(binding)
-                prior_surfaces = set(binding.scoped_windows())
+                prior_surfaces = set(_scoped_windows(binding))
                 _need(exposed in prior_surfaces and win.root_window(win.window_from_point(*fresh.center)) == exposed,
                       'context_menu_occluded')
                 pending = True

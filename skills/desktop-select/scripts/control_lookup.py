@@ -5,6 +5,9 @@ entire ancestor chain is proven to belong to the selected, unprotected window.
 The Windows bridge stays pinned; these adapters use its COM lifetime handling.
 """
 import ctypes as C
+from copy import deepcopy
+import math
+import threading
 
 import win_bridge as win
 
@@ -176,6 +179,17 @@ def _matches(element, identity):
 
 
 def _selector(selector):
+    if isinstance(selector, dict) and 'anchor' in selector:
+        _need(set(selector) == {'anchor', 'point', 'role', 'class_name'}
+              and isinstance(selector['anchor'], dict) and 'anchor' not in selector['anchor']
+              and selector.get('role') in win.ROLES.values() and _text(selector.get('class_name')),
+              'invalid_anchored_selector')
+        _selector(selector['anchor'])
+        point = selector['point']
+        _need(isinstance(point, list) and len(point) == 2 and all(
+            type(v) in (int, float) and math.isfinite(v) and .02 <= v <= .98 for v in point),
+            'invalid_anchored_point')
+        return []
     _need(isinstance(selector, dict) and not set(selector) - {'automation_id', 'name', 'role', 'ancestors'}
           and (('automation_id' in selector) != ('name' in selector))
           and _text(selector.get('automation_id') if 'automation_id' in selector else selector.get('name'))
@@ -195,6 +209,8 @@ def _selector(selector):
 def resolve(binding, uia, selector, root=None):
     """Resolve an exact ID/name+role and nearest-first ancestor identities uniquely."""
     parents = _selector(selector)
+    if 'anchor' in selector:
+        return _anchored(binding, uia, selector, root)
     binding.check()
     window = uia.from_handle(binding.hwnd)
     _need(window is not None and uia.pid(window) == binding.pid, 'root_unavailable')
@@ -223,3 +239,133 @@ def resolve(binding, uia, selector, root=None):
         for element in candidates:
             if element is not root and element is not returned:
                 element.close()
+
+
+def _anchored(binding, uia, selector, root, *, _return_proof=False):
+    """Locate an unnamed field near a demonstrated, currently unique anchor.
+
+    The point is used for UIA hit-testing only. No mouse event is sent and no
+    transient HWND or accessibility ref is stored in the recipe.
+    """
+    import provider_visibility as visibility
+    binding.check()
+    window = uia.from_handle(binding.hwnd)
+    _need(window is not None and uia.pid(window) == binding.pid, 'root_unavailable')
+    root = window if root is None else root
+    ancestry(uia, root, window, pid=binding.pid)
+    anchor = resolve(binding, uia, selector['anchor'], root=root)
+    _need(visibility.visible(binding, uia, anchor, window), 'anchor_not_visible')
+    box = dict(uia.bounds(anchor))
+    _need(visibility.valid(box), 'anchor_not_visible')
+    x = round(box['x'] + box['width'] * selector['point'][0])
+    y = round(box['y'] + box['height'] * selector['point'][1])
+
+    def owned_hit():
+        handle = win.window_from_point(x, y)
+        _need(handle and win.root_window(handle) == binding.hwnd and win.hwnd_pid(handle) == binding.pid,
+              'anchored_target_occluded')
+        return handle
+
+    native_hit = owned_hit()
+    element = uia.from_point(x, y)
+    ancestry(uia, element, window, pid=binding.pid)
+    _need(uia.within(element, anchor), 'anchored_target_outside_anchor')
+    if win.ROLES.get(element.property(30003)) != selector['role']:
+        # A provider may hit the containing group instead of its actual field.
+        # Never walk through an unrelated peer or descend into an input field.
+        _need(element.property(30003) in (50008, 50009, 50010, 50026, 50032),
+              'anchored_target_type_changed')
+        element = uia.point_descendant(element, x, y, binding.pid)
+        ancestry(uia, element, window, pid=binding.pid)
+        _need(uia.within(element, anchor), 'anchored_target_outside_anchor')
+    _need(win.ROLES.get(element.property(30003)) == selector['role']
+          and element.property(30012) == selector['class_name'], 'anchored_target_type_changed')
+    target_box = dict(uia.bounds(element))
+    _need(visibility.visible(binding, uia, element, window)
+          and visibility.inside(target_box, box)
+          and target_box['x'] <= x < target_box['x'] + target_box['width']
+          and target_box['y'] <= y < target_box['y'] + target_box['height'],
+          'anchored_target_not_visible')
+    current = resolve(binding, uia, selector['anchor'], root=root)
+    _need(uia.same(current, anchor) and uia.bounds(current) == box
+          and uia.bounds(element) == target_box and owned_hit() == native_hit,
+          'anchored_target_changed')
+    binding.check()
+    if _return_proof:
+        return _AnchoredBinding(binding, uia, selector, root, window, anchor, element,
+                                box, target_box, (x, y), native_hit)
+    return element
+
+
+def bind_anchored(binding, uia, selector, root=None):
+    """Bind one primitive action to its initially unique live UIA target.
+
+    The caller must close the proof when that step ends. It must never retain
+    this object for the next step, popup, UIA session or workflow run. Read-only
+    discovery continues to use resolve(), including both uniqueness searches.
+    """
+    _selector(selector)
+    _need('anchor' in selector, 'anchored_selector_required')
+    return _anchored(binding, uia, selector, root, _return_proof=True)
+
+
+class _AnchoredBinding:
+    """Ephemeral evidence; revalidation reads the same target, never searches another."""
+    def __init__(self, binding, uia, selector, root, window, anchor, element, box, target_box, point, native_hit):
+        self._binding, self._uia = binding, uia
+        self._selector = deepcopy(selector)
+        self._root, self._window, self._anchor, self._element = root, window, anchor, element
+        self._box, self._target_box = dict(box), dict(target_box)
+        self._point, self._native_hit = point, native_hit
+        self._thread, self._active = threading.get_ident(), True
+
+    @property
+    def element(self):
+        return self._element
+
+    def close(self):
+        self._active = False
+
+    def revalidate(self):
+        import provider_visibility as visibility
+        _need(self._active and not getattr(self._uia, 'closed', False), 'anchored_binding_expired')
+        _need(threading.get_ident() == self._thread, 'accessibility_wrong_thread')
+        binding, uia, selector = self._binding, self._uia, self._selector
+        binding.check()
+        window = uia.from_handle(binding.hwnd)
+        _need(window is not None and uia.same(window, self._window) and uia.pid(window) == binding.pid,
+              'root_changed')
+        # One current raw chain proves the input, its anchor and selected root
+        # remain owned and unprotected. No cross-step tree or value cache exists.
+        chain = ancestry(uia, self._element, window, pid=binding.pid)
+        anchor_index = next((i for i, node in enumerate(chain) if uia.same(node, self._anchor)), None)
+        _need(anchor_index is not None and any(uia.same(node, self._root) for node in chain)
+              and uia.within(self._element, self._anchor), 'anchored_target_outside_anchor')
+        identity = selector['anchor']
+        key = 'automation_id' if 'automation_id' in identity else 'name'
+        _need(_matches(self._anchor, {key: identity[key], 'role': identity['role']}), 'anchored_target_changed')
+        remaining = iter(chain[anchor_index + 1:])
+        _need(all(any(_matches(node, expected) for node in remaining)
+                  for expected in identity.get('ancestors', [])), 'anchored_target_changed')
+        _need(win.ROLES.get(self._element.property(30003)) == selector['role']
+              and self._element.property(30012) == selector['class_name'], 'anchored_target_type_changed')
+        _need(visibility.visible(binding, uia, self._anchor, window)
+              and visibility.visible(binding, uia, self._element, window), 'anchored_target_not_visible')
+        _need(uia.bounds(self._anchor) == self._box and uia.bounds(self._element) == self._target_box,
+              'anchored_target_changed')
+        x, y = self._point
+        hit = win.window_from_point(x, y)
+        _need(hit == self._native_hit and win.root_window(hit) == binding.hwnd
+              and win.hwnd_pid(hit) == binding.pid, 'anchored_target_occluded')
+        current = uia.from_point(x, y)
+        if not uia.same(current, self._element):
+            ancestry(uia, current, window, pid=binding.pid)
+            _need(uia.within(current, self._anchor)
+                  and current.property(30003) in (50008, 50009, 50010, 50026, 50032),
+                  'anchored_target_changed')
+            current = uia.point_descendant(current, x, y, binding.pid)
+            _need(uia.same(current, self._element), 'anchored_target_changed')
+        _need(uia.bounds(self._anchor) == self._box and uia.bounds(self._element) == self._target_box
+              and win.window_from_point(x, y) == hit, 'anchored_target_changed')
+        binding.check()
+        return self._element

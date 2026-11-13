@@ -1,5 +1,4 @@
 """One taught query, one fresh completion signal, and one scoped context-menu route."""
-from types import SimpleNamespace
 import time
 
 import learned_tasks as tasks
@@ -7,6 +6,8 @@ import export_evidence
 import context_menu
 import row_vision as pixels
 import win_bridge as bridge
+import control_lookup as lookup
+import provider_visibility as visibility
 
 
 def _need(test, reason):
@@ -56,7 +57,22 @@ def validate_spec(spec):
         raise tasks.TaskError(e.code) from e
 
 
-def _resolve(binding, uia, locator):
+def _resolve(binding, uia, locator, *, include_protected=False):
+    if not include_protected:
+        try:
+            e = lookup.resolve(binding, uia, locator)
+        except bridge.BridgeError as error:
+            if error.code != 'target_missing':
+                code = {'target_ambiguous': 'result_indicator_ambiguous'}.get(error.code, error.code)
+                raise tasks.TaskError(code) from error
+            # A missing native result can also be a protected subtree. Retain
+            # the original fail-closed distinction on this exceptional path.
+        else:
+            _need(visibility.visible(binding, uia, e, uia.from_handle(binding.hwnd)),
+                  'result_indicator_not_visible')
+            return e, []
+    # Visual sampling still needs every protected region, including overlays
+    # outside the target's subtree. Never replace this with a target-only walk.
     from desktop_select import observe
     nodes, elements = observe(binding, uia, identities_only=True)
     hits = [i for i,n in enumerate(nodes) if not n['secure'] and all(n.get(k)==v for k,v in locator.items())]
@@ -64,7 +80,8 @@ def _resolve(binding, uia, locator):
         raise tasks.TaskError('result_indicator_cannot_be_resolved_safely')
     _need(len(hits) == 1, 'result_indicator_ambiguous' if hits else 'result_indicator_missing')
     e = elements[hits[0]]
-    _need(e.property(30022) is False and uia.within(e, elements[0]), 'result_indicator_not_visible')
+    _need(visibility.visible(binding, uia, e, elements[0]) and uia.within(e, elements[0]),
+          'result_indicator_not_visible')
     return e, [(n, element) for n,element in zip(nodes,elements) if n['secure']]
 
 
@@ -72,7 +89,7 @@ def _visual(binding, locator, box=None):
     _locator(locator, context_menu.REGIONS)
     window = pixels._window_rect(binding)
     with bridge.UIA() as uia:
-        e, protected = _resolve(binding, uia, locator)
+        e, protected = _resolve(binding, uia, locator, include_protected=True)
         rect = pixels._bounds(uia, e)
         _need(pixels._inside(rect, window) and rect[2]*rect[3] <= 4_194_304, 'result_region_clipped')
         if box is not None:
@@ -138,12 +155,17 @@ def _wait_for_ready(read, *, needs_transition, timeout=24, pause=.18):
 
 
 def _query(binding, locator, title):
-    from desktop_select import action
-    key = 'automation_id' if 'automation_id' in locator else 'name'
-    step = dict(action='open', target=locator[key], match=key, role='button')
-    args = SimpleNamespace(command='open', role='button', window=title, target=locator[key],
-                           expand=False, within=None, popup=None)
-    return action(args, binding, learned=step)
+    from desktop_select import guard
+    from live_action import execute
+    visibility.restore_for_action(binding, title)
+    with bridge.UIA() as uia:
+        guard(binding, binding, title, True)
+        element = lookup.resolve(binding, uia, locator)
+        def still_valid():
+            guard(binding, binding, title, True)
+            current = lookup.resolve(binding, uia, locator)
+            _need(uia.same(current, element), 'query_target_changed')
+        return execute(binding, uia, element, {'role': 'button'}, 'invoke', still_valid=still_valid)
 
 
 def execute(binding, spec, guard, title, *, observe_guard=None):

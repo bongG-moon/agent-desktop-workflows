@@ -171,20 +171,35 @@ def field_label(binding, uia, element, root):
 def _stable_selector(nodes, index):
     """Carry the initially resolved field and its witnessed ancestor scope forward."""
     node = nodes[index]
-    if not node.get('automation_id') or node.get('role') not in bridge.ROLES.values():
+    if node.get('role') not in bridge.ROLES.values():
         return None
+    # SWT/native providers can expose decimal HWNDs as AutomationId. Those
+    # identify this instance only, and must not become a registered selector.
+    identifier = node.get('automation_id')
+    if isinstance(identifier, str) and identifier and not identifier.isdecimal():
+        target = dict(automation_id=identifier)
+    else:
+        name = node.get('name')
+        if not isinstance(name, str) or not name.strip() or sum(
+                n.get('secure') is False and n.get('role') == node['role'] and n.get('name') == name
+                for n in nodes) != 1:
+            return None
+        # The caller also resolves this selector against the live tree and
+        # compares element identity before storing or using it.
+        target = dict(name=name)
     parents, path, by_path = [], node.get('parent_path'), {n['path']: n for n in nodes}
     while path:
         ancestor = by_path[path]
         if ancestor.get('secure') is not False or ancestor.get('role') not in bridge.ROLES.values():
             return None
-        identity = {key: ancestor[key] for key in ('automation_id', 'name') if ancestor.get(key)}
+        identity = {key: ancestor[key] for key in ('automation_id', 'name') if ancestor.get(key)
+                    and (key != 'automation_id' or not str(ancestor[key]).isdecimal())}
         if identity:
             parents.append(dict(role=ancestor['role'], **identity))
         path = ancestor.get('parent_path')
     if len(parents) > 16:
         return None
-    return dict(automation_id=node['automation_id'], role=node['role'], ancestors=parents)
+    return dict(**target, role=node['role'], ancestors=parents)
 
 
 def observe(binding, uia, *, identities_only=False):
@@ -197,10 +212,13 @@ def observe(binding, uia, *, identities_only=False):
     queue = deque([(root, '0', '', 0)])
     while queue:
         element, path, parent, depth = queue.popleft()
-        if len(nodes) >= 2500 or depth > 18 or uia.pid(element) != binding.pid:
+        if len(nodes) >= 2500 or depth > 32:
             raise SelectionError('incomplete_tree')
-        # A protected subtree has no usable targets and leaks no labels.
-        secure = uia.secure(element)
+        # An embedded browser can have a different process from its native
+        # host. Keep an opaque boundary instead of aborting every unrelated
+        # host control; never read its identity, value or descendants.
+        foreign = uia.pid(element) != binding.pid
+        secure = foreign or uia.secure(element)
         node = {'path': path, 'parent_path': parent, 'secure': secure}
         if not secure:
             basic = uia.basic(element)

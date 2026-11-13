@@ -224,8 +224,103 @@ def _receipt(status, effect, diagnostic, method, dispatched, expanded):
             'method': method, 'input_dispatched': dispatched, 'expanded': expanded}
 
 
+def submit_ready(binding, uia, element, node):
+    """Read-only capability check for submitting one ordinary editable field."""
+    binding.check()
+    root = uia.from_handle(binding.hwnd)
+    control_lookup.ancestry(uia, element, root, pid=binding.pid)
+    role = win.ROLES.get(element.property(30003))
+    _require(role in ('textfield', 'combobox') and role == node.get('role'), 'submit_field_required')
+    if role == 'textfield':
+        textfield_scope(binding, uia, element)
+    _require(not uia.secure(element) and element.property(30010) is True, 'target_not_actionable')
+    _require(element.property(30009) is True, 'submit_target_not_focusable')
+    _require(element.property(30043) is True and element.property(30046) is False,
+             'submit_writable_value_required')
+    visible = _combo_visible(binding, uia, element, root) if role == 'combobox' else _visible(uia, element, binding, root)
+    _require(visible, 'target_offscreen')
+    return root
+
+
+def submit(binding, uia, element, node, *, still_valid):
+    """Focus the revalidated field and send exactly one Enter pair, without retries."""
+    from row_action import foreground, _input_tick
+    pending, focused, focus_pending = False, False, False
+    sent_count = None
+
+    def result(status, diagnostic, dispatched):
+        return dict(status=status, diagnostic=diagnostic, input_dispatched=dispatched,
+                    input_mode='physical_keyboard', physical_input=True, method='SendInput.Enter',
+                    keyboard_events_sent=sent_count, focus_changed=None if focus_pending else focused,
+                    effect_verification='unverified', business_commit='not_verified', retry='unsafe')
+
+    def current():
+        still_valid()
+        return submit_ready(binding, uia, element, node)
+
+    def idle():
+        win._combo_surface(binding)
+        _require(win.root_window(win.foreground()) == binding.hwnd, 'target_not_foreground')
+        _require(not any(win.user32.GetAsyncKeyState(key) & 0x8000 for key in range(1, 255)),
+                 'physical_input_busy')
+
+    try:
+        current()
+        foreground(binding)
+        current()
+        idle()
+        tick = _input_tick()
+        focus_pending = True
+        element.call(3, ())  # IUIAutomationElement::SetFocus.
+        focus_pending, focused = False, True
+        root = current()
+        idle()
+        _require(_input_tick() == tick, 'physical_input_changed')
+        focus = uia.focused()
+        _require(focus is not None, 'submit_focus_unavailable')
+        chain = control_lookup.ancestry(uia, focus, root, pid=binding.pid)
+        _require(not uia.secure(focus) and focus.property(30010) is True, 'submit_focus_protected')
+        if not uia.same(focus, element):
+            _require(node['role'] == 'combobox' and focus.property(30003) == 50004,
+                     'submit_focus_mismatch')
+            owner = next((ancestor for ancestor in chain[1:] if ancestor.property(30003) == 50003), None)
+            _require(owner is not None and uia.same(owner, element) and uia.within(focus, element),
+                     'submit_focus_mismatch')
+            _require(focus.property(30043) is True and focus.property(30046) is False
+                     and _visible(uia, focus, binding, root), 'submit_focus_not_editable')
+        # Recheck the selector, foreground and OS focus immediately before input.
+        current()
+        idle()
+        _require(_input_tick() == tick, 'physical_input_changed')
+        latest = uia.focused()
+        _require(latest is not None and uia.same(focus, latest), 'submit_focus_changed')
+        control_lookup.ancestry(uia, latest, root, pid=binding.pid)
+        _require(not uia.secure(latest) and latest.property(30010) is True
+                 and latest.property(30043) is True and latest.property(30046) is False,
+                 'submit_focus_not_editable')
+        idle()
+        _require(_input_tick() == tick, 'physical_input_changed')
+        events = (win.INPUT * 2)()
+        events[0].type, events[0].ki = 1, win.KEYBDINPUT(0x0D, 0, 0, 0, 0)
+        events[1].type, events[1].ki = 1, win.KEYBDINPUT(0x0D, 0, 0x0002, 0, 0)
+        pending = True
+        sent_count = win.user32.SendInput(2, events, C.sizeof(win.INPUT))
+        if sent_count != 2:
+            return result('uncertain', 'submit_partial_input', None)
+        pending = False
+        return result('delivered_unverified', 'submit_enter_sent', True)
+    except (Exception, KeyboardInterrupt) as error:
+        return result('uncertain' if pending else 'blocked',
+                      'submit_delivery_unknown' if pending else getattr(error, 'code', 'submit_unavailable'),
+                      None if pending else False)
+
+
 def execute(binding, uia, element, node, action, value=None, *, still_valid):
     """The caller re-resolves this exact business field/window in still_valid()."""
+    if action == 'submit':
+        if value is not None:
+            return _receipt('blocked', 'unavailable', 'submit_value_not_allowed', None, False, False)
+        return submit(binding, uia, element, node, still_valid=still_valid)
     method, pending, sent, expanded = None, False, False, False
     selected_value = value
     verifying = False
