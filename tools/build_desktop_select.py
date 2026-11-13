@@ -7,7 +7,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'skills' / 'desktop-select'
-VERSION = '0.4.4'
+VERSION = '0.4.5'
 FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'scripts/desktop_select.py',
                                          'scripts/live_action.py', 'scripts/targeting.py',
                                          'scripts/teach_capture.py', 'scripts/learned_tasks.py',
@@ -17,7 +17,7 @@ FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'scri
                                          'scripts/provider_visibility.py', 'scripts/provider_values.py',
                                          'scripts/runtime_integrity.py', 'runtime-manifest.json',
                                          'scripts/control_lookup.py', 'scripts/python_workflow.py',
-                                         'scripts/recorded_plan.py')}
+                                         'scripts/recorded_plan.py', 'scripts/storage_paths.py')}
 FILES.update({'scripts/win_bridge.py': ROOT / 'scripts/win_bridge.py', 'scripts/recorder.py': ROOT / 'scripts/recorder.py',
               'LICENSE': ROOT / 'LICENSE',
               'NOTICE.txt': SKILL / 'NOTICE.txt'})

@@ -11,6 +11,7 @@ import stat
 import tempfile
 
 from targeting import _protected, _tree, SelectionError
+import storage_paths
 
 
 MAX_STEPS = 300
@@ -622,10 +623,10 @@ def locate_target(nodes, step):
 
 def _directory(directory):
     if directory is None:
-        base = os.environ.get('LOCALAPPDATA')
-        if not base:
-            raise TaskError('task_store_unavailable')
-        directory = Path(base) / 'DesktopSelect' / 'tasks'
+        try:
+            directory = storage_paths.default_store()
+        except storage_paths.StorageError as error:
+            raise TaskError(error.code) from error
     path = Path(directory).absolute()
     if str(path).startswith(('\\\\', '//')):
         raise TaskError('local_task_directory_required')

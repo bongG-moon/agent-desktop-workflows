@@ -8,7 +8,6 @@ import ctypes as C
 from ctypes import wintypes as W
 import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -227,7 +226,15 @@ def describe(node, regions, label):
 
 
 def task_directory():
-    return os.environ.get('DESKTOP_SELECT_TASK_DIR')
+    return tasks._directory(None)
+
+
+def storage_info():
+    """Describe the chosen local store without creating it or observing a window."""
+    directory = task_directory()
+    info = tasks.storage_paths.storage_info()
+    return dict(status='observed', **info, execution_plan_directory=str(directory / 'execution-plans'),
+                input_dispatched=False)
 
 
 def near_region(nodes, anchor):
@@ -418,6 +425,8 @@ def fast_replay(plan, args, overrides):
 
 
 def run(args):
+    if args.command == 'storage':
+        return storage_info()
     bridge.set_dpi_awareness()
     if args.command == 'instruct':
         return save_instruction(args)
@@ -520,6 +529,7 @@ def replay_step():
 def parser():
     p = argparse.ArgumentParser(description='Select an exact field or command in one Windows business window.')
     commands = p.add_subparsers(dest='command', required=True)
+    commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
     commands.add_parser('plan', help='save a literal execution plan from recorded instructions').add_argument('--task', required=True)
@@ -643,7 +653,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
 
 
 if __name__ == '__main__':
