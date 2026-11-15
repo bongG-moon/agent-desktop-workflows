@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 7
+COMPILER = 8
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -32,7 +32,7 @@ def _result(status, **fields):
     return dict(status=status, input_dispatched=False, **fields)
 
 
-def compile_plan(task):
+def compile_plan(task, *, replacements=None):
     """Return a complete compatible recipe or no recipe at all.
 
     Explicit fixed/required instructions retain their meaning. Legacy recordings
@@ -44,6 +44,13 @@ def compile_plan(task):
     # Keep the original instruction and fingerprint in the envelope, including
     # legacy drafts whose supported action can now be resolved locally.
     steps = tasks.resolve_saved_intents(task)['steps']
+    if replacements:
+        for number, replacement in replacements.items():
+            original = steps[number - 1]
+            step = deepcopy(replacement)
+            if 'window_context' in original:
+                step['window_context'] = deepcopy(original['window_context'])
+            steps[number - 1] = step
     if len(steps) > 100:
         return _result('not_compatible', diagnostic='execution_plan_step_limit')
     # Establish whole-task compatibility before deriving any executable steps.
@@ -53,7 +60,7 @@ def compile_plan(task):
             return _result('not_compatible', diagnostic='instruction_requires_structure', step=number,
                            grounding_steps=[tasks.grounding_request(i, s) for i, s in enumerate(steps, 1)
                                             if s.get('instruction_draft')])
-        elif step['action'] in ('row-action', 'row-launch', 'visual-click'):
+        elif step['action'] in ('row-action', 'row-launch', 'visual-click', 'conditional-open'):
             continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
@@ -72,6 +79,13 @@ def compile_plan(task):
         context = deepcopy(step.get('window_context'))
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
+        if step['action'] == 'conditional-open':
+            current = deepcopy(step)
+            if context is not None:
+                current['window_context'] = context
+            converted.append(current)
+            source_steps.append(number)
+            continue
         if step['action'] in ('row-action', 'row-launch', 'visual-click'):
             # Preserve demonstrated identity versus a live ordinal request.
             # A relative row instruction must still select the current Nth row.
@@ -88,7 +102,7 @@ def compile_plan(task):
             # make the next device depend on the first one's business outcome.
             next_step = steps[number]
             current_scope, next_scope = step.get('window_context'), next_step.get('window_context')
-            independent = (current_scope and next_scope and next_step['action'] in ('visual-click', 'open')
+            independent = (current_scope and next_scope and next_step['action'] in ('visual-click', 'open', 'conditional-open')
                            and (current_scope['exe'].casefold(), current_scope['title']) !=
                                (next_scope['exe'].casefold(), next_scope['title']))
             if not independent:
@@ -160,13 +174,24 @@ def plan_path(task, directory=None):
     return path
 
 
+def compile_saved(task, directory=None):
+    """Compile using this original's locally registered interpretation, if any."""
+    if any(step.get('instruction_draft') for step in task.get('steps', ())):
+        import compound_plan
+        try:
+            return compile_plan(task, replacements=compound_plan.load(task, directory))
+        except (ValueError, OSError) as error:
+            return _result('plan_unavailable', diagnostic=getattr(error, 'code', 'invalid_interpretation'))
+    return compile_plan(task)
+
+
 def save_plan(task, directory=None):
     """Atomically replace only this derived plan; never modify the recording.
 
     Store failure is a separate status so saving the original recording can
     still succeed. Invalid source tasks raise their original validation error.
     """
-    result = compile_plan(task)
+    result = compile_saved(task, directory)
     if result['status'] != 'compiled':
         return result
     data = (json.dumps(result['envelope'], ensure_ascii=False, indent=2) + '\n').encode('utf8')
@@ -198,7 +223,7 @@ def save_plan(task, directory=None):
 
 def load_plan(task, directory=None):
     """Never expose a stale or altered recipe, even if its fingerprint was kept."""
-    expected = compile_plan(task)
+    expected = compile_saved(task, directory)
     if expected['status'] != 'compiled':
         return expected
     try:

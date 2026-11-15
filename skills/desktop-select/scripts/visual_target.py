@@ -268,7 +268,7 @@ def teach(binding, screen_point):
     return spec
 
 
-def execute(binding, spec, guard, *, read_only=False, background_only=False, first_match_timeout=0):
+def execute(binding, spec, guard, *, read_only=False, background_only=False, first_match_timeout=0, before_input=None):
     """Deliver at most one click after independently matching the current window."""
     def blocked(reason):
         return dict(status='blocked', input_dispatched=False, diagnostic=reason)
@@ -299,6 +299,8 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
                  'visual_target_changed_before_input')
         with bridge.UIA() as uia:
             shown = _safe_patch(binding, uia, box, point, exposed=True)
+        if before_input is not None:
+            before_input(point)
         guard()
         bridge._combo_surface(binding)
         raw = vision._frame(binding, current['window'], crop=box)

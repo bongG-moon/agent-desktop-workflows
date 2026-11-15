@@ -126,10 +126,12 @@ def run(app, args):
     plan = tasks.load_task(args.task,store)
     number = tasks._step_number(plan,args.only)
     step = plan['steps'][number-1]
-    if not _usable(step):
+    children = [s['window_context'] for s in plan['steps']
+                if step['action'] == 'row-launch' and s.get('window_context', {}).get('after_step') == number]
+    if not _usable(step) and not children:
         raise tasks.TaskError('grounding_requires_recoverable_target')
     sentence = (step.get('instruction_draft') or step.get('description') or step.get('instruction',{}).get('text')
-                or (step.get('label') if step.get('action')=='visual-click' else None) or step.get('alias'))
+                or (step.get('label') if step.get('action')=='visual-click' or children else None) or step.get('alias'))
     if not sentence or sentence==tasks.LEGACY_INSTRUCTION_HINT:
         raise tasks.TaskError('grounding_instruction_required')
     owner = app.bridge.Binding(app.pick_window(app.windows(plan['exe']),plan['window'],None))
@@ -161,7 +163,8 @@ def run(app, args):
                 raise tasks.TaskError('grounding_frame_changed')
             path.touch()
         return dict(status='observed',frame=token,image=str(path),width=window[2],height=window[3],
-                    step=number,instruction=sentence,expires_seconds=TTL,input_dispatched=False)
+                    step=number,instruction=sentence,expires_seconds=TTL,input_dispatched=False,
+                    **({'expected_windows': children} if children else {}))
     tasks.check_new_task(args.save_as,store)
     if not re.fullmatch('[a-f0-9]{64}',args.frame):
         raise tasks.TaskError('grounding_frame_invalid')

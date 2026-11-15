@@ -400,6 +400,13 @@ def execution_plan_info(result):
     if recipe:
         info.update(source_fingerprint=envelope['source_fingerprint'], steps=len(recipe['steps']),
                     required_parameters=list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s)))
+        conditional = [dict(number=n, seconds=s['seconds'], when_present=s['when_present']['name'],
+                            dismiss=s['dismiss']['name'], always=s['always']['name'])
+                       for n, s in zip(envelope['source_steps'], recipe['steps']) if s['action'] == 'conditional-open']
+        if conditional:
+            info['interpreted_steps'] = conditional
+    elif result.get('diagnostic') == 'instruction_requires_structure':
+        info['host_action'] = 'interpret_recorded_instructions'
     return info
 
 
@@ -445,25 +452,60 @@ def save_instruction(args):
 
 def fast_replay(plan, args, overrides):
     """Use a saved literal plan only when the entire original task is compatible."""
-    if args.only is not None or any(s['action'] in ('select', 'fill') and 'instruction' not in s for s in plan['steps']):
+    has_draft = any(s.get('instruction_draft') for s in plan['steps'])
+    legacy_values = any(s['action'] in ('select', 'fill') and 'instruction' not in s and 'instruction_draft' not in s
+                        for s in plan['steps'])
+    if not has_draft and (args.only is not None or legacy_values):
         return None
     tasks.check_binding(plan, args.exe, args.window)
     saved = saved_execution_plan(plan)
     recipe = saved.get('envelope', {}).get('recipe')
     if recipe is None:
         return None
-    parameters = {s['parameter'].casefold() for s in recipe['steps'] if 'parameter' in s}
+    source_steps = saved['envelope']['source_steps']
+    conditional = any(step['action'] == 'conditional-open' for step in recipe['steps'])
+    if legacy_values and not conditional:
+        return None
+    if conditional:
+        # A host interpretation can coexist with 0.4 recorded defaults. A raw
+        # field whose prose now describes a conditional is no longer an input.
+        recipe = deepcopy(recipe)
+        selected = tasks._step_number(plan, args.only) if args.only is not None else None
+        source_numbers = {n for n, step in zip(source_steps, recipe['steps'])
+                          if step['action'] != 'conditional-open' and (selected is None or n == selected)}
+        sequence = [(n, plan['steps'][n - 1]) for n in sorted(source_numbers)]
+        supplied = tasks.recorded_overrides(sequence, overrides)
+        for n, step in zip(source_steps, recipe['steps']):
+            raw = plan['steps'][n - 1]
+            if n in source_numbers and 'parameter' in step:
+                if n in supplied:
+                    step['value'] = supplied[n]
+                elif 'instruction' not in raw and 'value' in raw:
+                    step['value'] = raw['value']
+                if 'value' in step:
+                    del step['parameter']
+        overrides = {}
+    active = recipe
+    only = None
+    if args.only is not None:
+        number = tasks._step_number(plan, args.only)
+        matches = [i for i, n in enumerate(source_steps) if n == number]
+        if len(matches) != 1 or recipe['steps'][matches[0]]['action'] != 'conditional-open':
+            return None
+        only = str(matches[0] + 1)
+        active = dict(recipe, steps=[recipe['steps'][matches[0]]])
+    parameters = {s['parameter'].casefold() for s in active['steps'] if 'parameter' in s}
     if any(key.casefold() not in parameters for key in overrides):
         return None  # Keep the original alias and fixed-value-override rules.
     import python_workflow
-    _, missing = python_workflow.values_for(recipe, overrides)
+    _, missing = python_workflow.values_for(active, overrides)
     if missing:
         return dict(status='needs_input', diagnostic='required_parameter_missing', missing_parameters=missing,
                     steps=[], input_dispatched=False, execution_plan=execution_plan_info(saved))
     result = worker_receipt(['_plan'], mutating=True,
                             payload={'recipe': recipe, 'overrides': overrides, 'hwnd': args.hwnd,
-                                     'background_only': getattr(args, 'background_only', False)})
-    source_steps = saved['envelope']['source_steps']
+                                     'background_only': getattr(args, 'background_only', False),
+                                     **({'only': only} if only is not None else {})})
     for row in result.get('steps', []):
         number = row.get('number')
         if type(number) is int and 1 <= number <= len(source_steps):
@@ -477,12 +519,15 @@ def fast_replay(plan, args, overrides):
 
 def replay_input_requirements(plan, only=None):
     """Use the same literal compiler as replay without saving or observing anything."""
+    import recorded_plan
+    compiled = recorded_plan.compile_saved(plan, task_directory())
+    recipe = compiled.get('envelope', {}).get('recipe')
     if only is not None:
         number = tasks._step_number(plan, only)
+        if recipe:
+            linked = [step for step, n in zip(recipe['steps'], compiled['envelope']['source_steps']) if n == number]
+            return input_policy.profile(linked, [number] * len(linked))
         return input_policy.profile([plan['steps'][number - 1]], [number])
-    import recorded_plan
-    compiled = recorded_plan.compile_plan(plan)
-    recipe = compiled.get('envelope', {}).get('recipe')
     if recipe:
         return input_policy.profile(recipe['steps'], compiled['envelope']['source_steps'])
     return input_policy.profile(plan['steps'])
@@ -588,6 +633,13 @@ def run(args):
         return grounding.run(sys.modules[__name__],args)
     if args.command == 'instruct':
         return save_instruction(args)
+    if args.command == 'interpret':
+        import compound_plan
+        task = tasks.load_task(args.task, task_directory())
+        instructions = compound_plan.read_json(args.plan_file)
+        result = compound_plan.save(task, instructions, task_directory())
+        return dict(status='planned' if result.get('envelope') else 'needs_review', task=task['name'],
+                    execution_plan=execution_plan_info(result), input_dispatched=False)
     if args.command == 'plan':
         plan = tasks.load_task(args.task, task_directory())
         result = saved_execution_plan(plan)
@@ -601,7 +653,7 @@ def run(args):
     if args.command == 'replay':
         original = tasks.load_task(args.task, task_directory())
         plan = tasks.resolve_saved_intents(original)
-        requirements = replay_input_requirements(plan, args.only)
+        requirements = replay_input_requirements(original, args.only)
         if getattr(args, 'input_plan', False):
             return dict(status='observed', input_dispatched=False, input_requirements=requirements)
         background = getattr(args, 'background_only', False)
@@ -613,8 +665,10 @@ def run(args):
         quick = fast_replay(original, args, overrides)
         if quick is not None:
             return quick
-        return dict(_replay_recorded(plan, args, overrides, background),
-                    input_policy='background_only' if background else 'auto', input_requirements=requirements)
+        report = _replay_recorded(plan, args, overrides, background)
+        if report.get('diagnostic') == 'instruction_requires_structure':
+            report['host_action'] = 'interpret_recorded_instructions'
+        return dict(report, input_policy='background_only' if background else 'auto', input_requirements=requirements)
     rows = windows(args.exe)
     if args.command == 'windows':
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
@@ -743,6 +797,9 @@ def parser():
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
     commands.add_parser('plan', help='save a literal execution plan from recorded instructions').add_argument('--task', required=True)
+    interpret = commands.add_parser('interpret', help='compile host-interpreted conditional steps for an existing recording')
+    interpret.add_argument('--task', required=True)
+    interpret.add_argument('--plan-file', type=Path, required=True, help='local declarative instruction JSON')
     for name in ('ground','bind-visual'):
         tool = commands.add_parser(name, help='inspect or bind a visible target for one recorded instruction, without input')
         tool.add_argument('--task', required=True)
@@ -817,7 +874,8 @@ def worker(args):
 def result_code(result):
     if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed', 'planned'):
         return 0
-    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review','needs_grounding') else 3
+    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review',
+                                     'needs_grounding', 'needs_scene') else 3
 
 
 def worker_receipt(argv, mutating, payload=None):
@@ -860,7 +918,7 @@ def main():
             payload = json.load(sys.stdin)
             result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
                                          allow_recorded_selection=True,
-                                         background_only=payload.get('background_only', False))
+                                         background_only=payload.get('background_only', False), only=payload.get('only'))
         except Exception as error:
             result = dict(status='uncertain', diagnostic=getattr(error, 'code', 'execution_plan_unavailable'),
                           input_dispatched=None)

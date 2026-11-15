@@ -140,9 +140,16 @@ def is_recoverable(step):
             and converted.get('reason') in RECOVERABLE_CAPTURE_REASONS)
 
 
+def _conditional_sentence(sentence):
+    """Leave a branched request intact for the host instead of extracting its last verb."""
+    return re.search(r'(?:있으|없으|열리|보이|나오|나타나|뜨|표시되|발견되)면(?:\s|[,，])'
+                     r'|(?:있든|없든|유무와\s*(?:관계|상관)없이)|\b(?:if|unless|otherwise|whether)\b',
+                     sentence, re.I) is not None
+
+
 def click_request(sentence):
     """Extract the visible name from one affirmative click or launch instruction."""
-    if not isinstance(sentence, str):
+    if not isinstance(sentence, str) or _conditional_sentence(sentence):
         return None
     text = sentence.strip().rstrip('.!。').rstrip()
     # A parenthesized label may follow either the target or the whole sentence.
@@ -440,6 +447,8 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         raise TaskError('invalid_step_instruction')
     if not sentence and all(value is None for value in (mode, argument, target, role, within)):
         return None
+    if _conditional_sentence(sentence) and all(value is None for value in (mode, argument, target, role, within)):
+        return {'mode': 'draft', 'text': sentence}
     if ('visual_hint' in raw_step and is_recoverable(raw_step) and click_request(sentence)
             and all(value is None for value in (mode, argument, target, role, within))):
         return {'mode': 'visual-click', 'text': sentence}
@@ -1012,12 +1021,8 @@ def _parameter(step):
     return instruction.get('parameter') if instruction else step.get('parameter')
 
 
-def replay(plan, exe, window, overrides, invoke, *, only=None):
-    """Invoke each requested step at most once. Unverified delivery stops the sequence."""
-    check_binding(plan, exe, window)
-    if only is not None:
-        only = _step_number(plan, only)
-    sequence = [(i, s) for i, s in enumerate(plan['steps'], 1) if only is None or only == i]
+def recorded_overrides(sequence, overrides):
+    """Bind supplied names and aliases using their recorded parameter contracts."""
     values = {}
     for key, value in overrides.items():
         if not _text(key, 1000):
@@ -1037,6 +1042,16 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
             if number in values or not valid_value(value, s['role']):
                 raise TaskError('invalid_override')
             values[number] = value
+    return values
+
+
+def replay(plan, exe, window, overrides, invoke, *, only=None):
+    """Invoke each requested step at most once. Unverified delivery stops the sequence."""
+    check_binding(plan, exe, window)
+    if only is not None:
+        only = _step_number(plan, only)
+    sequence = [(i, s) for i, s in enumerate(plan['steps'], 1) if only is None or only == i]
+    values = recorded_overrides(sequence, overrides)
     results = []
     report = {'status': 'verified', 'steps': results, 'input_dispatched': False}
     for number, s in sequence:

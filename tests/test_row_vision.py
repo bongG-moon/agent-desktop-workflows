@@ -16,12 +16,13 @@ STATE = [24, 1, 20, 12]
 W, H = 68, 15
 
 
-def frame(rows, pos=(100, 200), background=24):
+def frame(rows, pos=(100, 200), background=24, offsets=()):
     # Horizontal/vertical glyphs make three identities, even on a changed hover background.
     raw = bytearray([background, background, background, 255] * W * H * len(rows))
     layout = []
     def dot(x, y):
-        start = (W*y+x)*4
+        dx, dy = offsets[y//H] if offsets else (0, 0)
+        start = (W*(y+dy)+x+dx)*4
         raw[start:start+3] = bytes([220])*3
     for i, (key, status, button) in enumerate(rows):
         y = i*H
@@ -98,6 +99,45 @@ class RowRecognitionTests(unittest.TestCase):
                 patch.object(vision, '_frame', return_value=changed[2]):
             with self.assertRaisesRegex(vision.bridge.BridgeError, 'row_pixels_changed'):
                 vision.confirm_pixels(None, task, observed)
+
+    def test_one_pixel_paint_shift_keeps_identity_point_and_state_together(self):
+        task = self.demonstrated()
+        # A scroll put the former first row second. The UIA bounds are stable
+        # but all three render patches are now a pixel left and down.
+        rows = list(reversed(self.stopped))
+        shifted = frame(rows, offsets=[(0,0), (-1,1)])
+        observed = vision.observe_row(None, task, snapshot=shifted)
+        self.assertEqual(observed, dict(kind='before', row_bounds=shifted[1][1][0],
+                                        point=[157,223], paint_offset=[-1,1]))
+        binding = MagicMock(hwnd=8,pid=25)
+        with (patch.object(vision, '_window_rect', return_value=shifted[0]),
+              patch.object(vision, '_frame', return_value=shifted[2]),
+              patch.object(vision.bridge,'window_from_point',return_value=8),
+              patch.object(vision.bridge,'foreground',return_value=8),
+              patch.object(vision.bridge,'root_window',return_value=8),
+              patch.object(vision.bridge,'hwnd_pid',return_value=25)):
+            vision.confirm_pixels(binding, task, observed)
+            # The exact last input check cannot switch alignments a second time.
+            with (patch.object(vision,'_frame',return_value=frame(rows)[2]),
+                  self.assertRaisesRegex(vision.bridge.BridgeError, 'row_pixels_changed')):
+                vision.confirm_pixels(binding, task, observed)
+        after = frame([rows[0], ('a','running','stop')], offsets=[(0,0), (-1,1)])
+        self.assertEqual(vision.observe_row(None, task, snapshot=after)['kind'],'after')
+        duplicate = frame([self.stopped[0]]*2, offsets=[(0,0), (-1,1)])
+        self.assertEqual(vision.observe_row(None,task,snapshot=duplicate)['kind'],'ambiguous')
+
+    def test_shifted_identity_cannot_borrow_unshifted_button_or_state(self):
+        task = self.demonstrated()
+        window, rows, shifted = frame(self.stopped, offsets=[(-1,1), (0,0)])
+        mixed = bytearray(self.image[2])
+        unchanged = frame(self.stopped)[2]
+        for y in range(H):
+            line = y*W*4
+            mixed[line:line+20*4] = shifted[line:line+20*4]
+            mixed[line+20*4:line+W*4] = unchanged[line+20*4:line+W*4]
+        observed = vision.observe_row(None,task,snapshot=(window,rows,bytes(mixed)))
+        self.assertEqual(observed['kind'],'unknown')
+        self.assertIsNone(observed['point'])
 
     def test_untrusted_geometry_masks_or_scope_cannot_be_reused(self):
         task = self.demonstrated()

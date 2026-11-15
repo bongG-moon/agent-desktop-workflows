@@ -1120,14 +1120,18 @@ def capture(binding, *, title):
     primary = ttk.Frame(header)
     primary.pack(side='right')
     active_title = tk.StringVar(value=title)
-    ttk.Label(frame, textvariable=active_title, wraplength=540, style='Muted.TLabel').pack(anchor='w', pady=(0, 6))
+    active_window = ttk.Frame(frame)
+    active_window.pack(fill='x', pady=(0, 6))
+    ttk.Label(active_window, text='녹화 대상 창', style='Muted.TLabel').pack(side='left', padx=(0, 8))
+    ttk.Label(active_window, textvariable=active_title, wraplength=540, style='Muted.TLabel').pack(side='left')
     status_line = ttk.Label(frame, textvariable=message, wraplength=540, style='Muted.TLabel')
     status_line.pack(anchor='w', pady=(0, 10))
     table = ttk.Frame(frame)
     table.pack(fill='both', expand=True)
-    listing = ttk.Treeview(table, name='steps', columns=('number', 'instruction', 'status'),
+    listing = ttk.Treeview(table, name='steps', columns=('number', 'window', 'instruction', 'status'),
                            show='headings', selectmode='browse', height=5, style='Steps.Treeview')
-    for key, heading, chars in [('number', '단계', 4), ('instruction', '실행할 동작', 29), ('status', '상태', 8)]:
+    for key, heading, chars in [('number', '단계', 4), ('window', '작업 창', 14),
+                                ('instruction', '실행할 동작', 26), ('status', '상태', 9)]:
         width = font.measure('가') * chars + 12
         listing.heading(key, text=heading, anchor='w')
         listing.column(key, width=width, minwidth=min(width, 60), stretch=key == 'instruction', anchor='w')
@@ -1136,6 +1140,7 @@ def capture(binding, *, title):
     listing.configure(yscrollcommand=scroll.set)
     scroll.pack(side='right', fill='y')
     listing.pack(side='left', fill='both', expand=True)
+    window_detail = ttk.Label(frame, name='step_window', wraplength=540, style='Muted.TLabel')
     form = ttk.Frame(frame, padding=12, style='Card.TFrame')
     form.columnconfigure(1, weight=1)
     alias, instruction, argument = tk.StringVar(), tk.StringVar(), tk.StringVar()
@@ -1167,6 +1172,28 @@ def capture(binding, *, title):
 
     def steps_now():
         return review['steps'] if review is not None else completed_steps + session.notes.snapshot()
+
+    def show_step_window(step, steps):
+        if step is None:
+            window_detail.pack_forget()
+            return
+        scope = step.get('_capture_window', {})
+        window_title = scope.get('title', title)
+        exe = scope.get('exe') or getattr(binding, 'exe', '')
+        if isinstance(exe, str) and exe:
+            window_title = f'{window_title} ({exe})'
+        if '_openers' in scope:
+            origin = '창을 연 단계 지정 필요'
+        elif 'after_id' in scope:
+            opener = next((i for i, item in enumerate(steps, 1) if item['id'] == scope['after_id']), None)
+            origin = f'{opener}단계에서 열린 창' if opener is not None else '창을 연 단계 확인 필요'
+        else:
+            origin = '기존 창' if scope else '기본 창'
+        detail = f'{origin}   {window_title}'
+        if window_detail.cget('text') != detail:
+            window_detail.configure(text=detail)
+        if not window_detail.winfo_manager():
+            window_detail.pack(after=table, fill='x', pady=(4, 0))
 
     def row_repairable(step):
         return (step['action'] == 'row-action' or learned_tasks.is_recoverable(step)
@@ -1243,8 +1270,8 @@ def capture(binding, *, title):
             opener_btn.pack(side='left', padx=(0, 5), before=details_btn)
         else:
             opener_btn.pack_forget()
-        caption = f'   ·   {scope["title"]}' if scope else ''
-        edit_title.set(f'{selected_number}단계   {step["label"]}{caption}')
+        edit_title.set(f'{selected_number}단계   {step["label"]}')
+        show_step_window(step, steps_now())
         if row_repairable(step):
             repair_btn.configure(text='행 버튼 다시 지정' if step['action'] == 'row-action' else '행 버튼으로 지정')
             repair_btn.pack(side='left', padx=(0, 5), before=details_btn)
@@ -1305,10 +1332,8 @@ def capture(binding, *, title):
             text = directive.get('text') if directive else default_text(step)
             if not text:
                 text = step['label'] if step['label'] != '설명으로 다시 찾을 단계' else '대상 이름을 읽지 못한 클릭'
-            if step.get('_capture_window'):
-                text = f'[{step["_capture_window"]["title"]}] {text}'
             state = step_status(step, directive)
-            row = (i, text, state)
+            row = (i, step.get('_capture_window', {}).get('title', title), text, state)
             if shown_rows.get(step['id']) != row:
                 tags = () if state == '준비됨' else ('unresolved',)
                 if listing.exists(step['id']):
@@ -1318,6 +1343,7 @@ def capture(binding, *, title):
                 shown_rows[step['id']] = row
         if steps and not listing.selection():
             listing.selection_set(steps[0]['id'])
+        show_step_window(editing, steps)
         if review is not None:
             update_review_status(steps)
 
@@ -1685,6 +1711,7 @@ def capture(binding, *, title):
     def resize(event):
         if event.widget is root:
             status_line.configure(wraplength=max(210, event.width - 40))
+            window_detail.configure(wraplength=max(210, event.width - 40))
             preview_label.configure(wraplength=max(190, event.width - 72))
     root.bind('<Configure>', resize)
     root.bind('<Alt-s>', start)

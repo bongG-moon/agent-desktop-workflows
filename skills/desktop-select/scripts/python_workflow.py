@@ -24,6 +24,7 @@ import row_action
 import row_intent
 import row_vision
 import window_context
+import conditional_action
 
 
 CHILD_VISUAL_TIMEOUT = 30
@@ -109,6 +110,9 @@ def validate(recipe):
         if isinstance(raw, dict) and 'window_context' in raw:
             step = {key: value for key, value in raw.items() if key != 'window_context'}
         need(isinstance(step, dict), 'invalid_workflow_step')
+        if step.get('action') == 'conditional-open':
+            conditional_action.validate_conditional(step)
+            continue
         if step.get('action') == 'visual-click':
             from visual_target import validate_spec
             need(set(step) - {'alias'} == {'action', 'label', 'visual'}
@@ -342,7 +346,7 @@ def _missing_groundings(recipe, entries, owner, uia):
 
 
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
-        background_only=False, only=None):
+        background_only=False, only=None, scene_session=None):
     recipe = validate(recipe)
     entries = selected_steps(recipe, only)
     active = [step for _, step in entries]
@@ -354,6 +358,28 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     values, missing = values_for(dict(recipe, steps=active), overrides or {})
     if missing and not read_only:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
+    # A relative row by itself means "start the current Nth row". When a
+    # conditional instruction explicitly targets the window it opened, starting
+    # the new occupant at that ordinal could dispatch into a different device.
+    if not read_only:
+        requested = dict(entries)
+        unresolved = []
+        for number, step in entries:
+            scope = step.get('window_context', {})
+            opener = scope.get('after_step')
+            if (step['action'] == 'conditional-open'
+                    and requested.get(opener, {}).get('action') == 'row-launch'):
+                unresolved.append(dict(number=opener, child_step=number, expected_window=scope['title'],
+                                       expected_exe=scope['exe'], instruction=requested[opener]['label']))
+        if unresolved:
+            return dict(status='needs_grounding', diagnostic='named_window_row_identity_required',
+                        grounding_steps=unresolved, stopped_at=unresolved[0]['number'], steps=[],
+                        input_dispatched=False)
+    if not read_only and scene_session is None and any(s['action']=='conditional-open' for s in active):
+        from scene_session import start
+        return start(__file__, recipe, dict(overrides=overrides, hwnd=hwnd, only=only,
+                                            allow_recorded_selection=allow_recorded_selection),
+                     worker_timeout(recipe))
     report = dict(status='observed' if read_only else 'verified', steps=[], input_dispatched=False,
                   business_commit='not_verified', input_requirements=requirements,
                   input_policy='background_only' if background_only else 'auto')
@@ -419,7 +445,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 # require it to be enabled/restored; missing popups never do.
                 if (not read_only and binding.hwnd not in prepared and 'popup' not in step
                         and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action',
-                                               'row-launch', 'visual-click')):
+                                               'row-launch', 'visual-click', 'conditional-open')):
                     if background_only:
                         input_policy.window_ready(binding)
                     else:
@@ -444,6 +470,12 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         receipt = dict(status='verified' if ok else 'blocked', input_dispatched=False,
                                        diagnostic=diagnostic, file_verified=ok,
                                        baseline_scope='before_workflow', business_commit='not_verified')
+                elif step['action'] == 'conditional-open':
+                    if read_only:
+                        receipt = dict(status='observed',input_dispatched=False,condition='pending_execution')
+                    else:
+                        receipt = conditional_action.execute(binding,step,lambda:check_target(binding,mutate=True),
+                                                             scene_session,report,number,title)
                 elif step['action'] == 'visual-click':
                     import visual_target
                     def click_guard():
@@ -592,7 +624,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 delivered_visual = (step['action'] == 'visual-click' and receipt['status'] == 'delivered_unverified'
                                     and receipt['input_dispatched'] is True
                                     and receipt.get('diagnostic') == 'visual_click_dispatched')
-                if delivered or delivered_menu or delivered_submit or delivered_visual:
+                delivered_conditional = (step['action'] == 'conditional-open' and receipt['status'] == 'delivered_unverified'
+                                         and receipt.get('diagnostic') == 'conditional_open_dispatched'
+                                         and receipt['input_dispatched'] is True)
+                if delivered or delivered_menu or delivered_submit or delivered_visual or delivered_conditional:
                     report['status'] = 'completed_unverified'
                     if delivered and routes.origins.get(number):
                         pending_opener = number
@@ -662,6 +697,8 @@ if not (RUNTIME / "python_workflow.py").is_file():
     raise SystemExit(f"Desktop Select runtime missing: {RUNTIME}")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
+if sys.argv[1:2] == ["scene"]:
+    raise SystemExit(python_workflow.main(sys.argv[1:]))
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))
 '''
 
@@ -680,13 +717,15 @@ def _registered_runner(destination):
 
 
 def _recorded_targets(recipe, source_task):
+    has_conditional = any(s['action']=='conditional-open' for s in recipe['steps'])
     if source_task is None or not all(
-            step['action'] in ('visual-click', 'row-action')
-            or (step['action'] == 'row-launch' and 'row_hint' in step)
+            step['action'] in ('visual-click', 'row-action', 'conditional-open')
+            or (step['action'] == 'row-launch' and ('row_hint' in step or has_conditional))
             for step in recipe['steps']):
         return False
     import recorded_plan
-    compiled = recorded_plan.compile_plan(source_task)
+    compiled = (recorded_plan.compile_saved(source_task, app.task_directory())
+                if has_conditional else recorded_plan.compile_plan(source_task))
     need(compiled.get('envelope', {}).get('recipe') == recipe, 'recorded_workflow_mismatch')
     return True
 
@@ -706,7 +745,7 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     rows = {row['number']: row for row in observed['steps']}
     for number, step in enumerate(recipe['steps'], 1):
-        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch', 'visual-click'):
+        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch', 'visual-click','conditional-open'):
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
@@ -754,9 +793,15 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     if source_task is not None:
         guide += '\n녹화한 위치와 자연어 지시 원문은 `source-task.json`에 보관되어 있다. 실행에는 `workflow.json`을 사용한다.\n'
         guide += '\n## 녹화한 순서\n\n'
+        interpreted = {i: step for i,step in enumerate(recipe['steps'],1) if step['action']=='conditional-open'}
         for index, step in enumerate(source_task['steps'], 1):
             caption = (step.get('description') or step.get('instruction', {}).get('text') or step.get('instruction_draft')
                        or step.get('alias') or step.get('label') or step.get('target') or step['action'])
+            if index in interpreted and len(recipe['steps'])==len(source_task['steps']):
+                conditional = interpreted[index]
+                caption = (f"{conditional['seconds']}초 기다린 뒤 {conditional['when_present']['name']}이 보이면 "
+                           f"{conditional['dismiss']['name']}을 눌러 닫고, 표시 여부와 관계없이 "
+                           f"{conditional['always']['name']}을 연다.")
             guide += f'{index}. {caption}\n'
     if any(step['action'] in ('row-action', 'row-launch') for step in active):
         guide += ('\n녹화한 행 버튼은 저장된 행 표시와 버튼을 다시 찾아 실행한다. '
@@ -769,6 +814,13 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
                   '앞 단계가 실행된 뒤 해당 창이 열리면 이어서 처리한다. 녹화한 행이 이미 실행 중이면 '
                   '시작 버튼을 생략하고 같은 행에 연결된 기존 창을 확인한다. 같은 제목의 창이 둘이면 '
                   '단계 번호와 이유를 확인한다. --read-only에서 아직 열리지 않은 창은 deferred로 표시된다.\n')
+    if any(step['action'] == 'conditional-open' for step in active):
+        guide += ('\n조건 단계가 `needs_scene`이면 Claude Code가 영수증의 `image`에서 지정된 창을 읽는다. '
+                  '광고처럼 조건의 대상이 보이면 그 안의 닫기 버튼을, 없고 최종 아이콘이 보이면 그 아이콘을 찾는다. '
+                  f'같은 실행을 `{command} scene --ticket <ticket> --decision present|absent --point X Y`로 이어간다. '
+                  '원본 PNG 기준 좌표를 사용한다. 판단할 수 없으면 `--decision unknown`만 보낸다. '
+                  '창 제목 표시줄의 X를 누르지 않는다. 닫기 뒤의 새 화면에서 최종 아이콘을 확인한다. '
+                  '새 영수증이 나오면 같은 절차를 계속하며, 실행 명령을 처음부터 다시 시작하지 않는다.\n')
     if any(step['action'] == 'visual-click' for step in active):
         guide += ('\n화면으로 녹화한 클릭은 지정한 창에서 녹화된 모양을 다시 찾고 실제 마우스로 한 번 누른다. '
                   'delivered_unverified는 클릭 전달을 뜻한다. 앱 실행 등 결과는 해당 창에서 별도로 확인한다.\n')
@@ -808,8 +860,17 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == '_scene_worker':
+        from scene_session import worker
+        worker(sys.modules[__name__],argv[1])
+        return 0
     parser = argparse.ArgumentParser(description='Discover once, register literal actions, run with Python.')
     sub = parser.add_subparsers(dest='command', required=True)
+    scene = sub.add_parser('scene',help='continue the exact live run after inspecting the returned window image')
+    scene.add_argument('--ticket',required=True)
+    scene.add_argument('--decision',choices=['present','absent','unknown'],required=True)
+    scene.add_argument('--point',type=int,nargs=2)
     discovery = sub.add_parser('discover')
     discovery.add_argument('--exe', required=True)
     discovery.add_argument('--window', required=True)
@@ -832,8 +893,15 @@ def main(argv=None):
             p.add_argument('--input-plan', action='store_true', help='preview input modes without opening or inspecting an app')
             p.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and window restoration')
     parser.add_argument('--_worker', action='store_true', help=argparse.SUPPRESS)
-    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
+    if args.command == 'scene':
+        from scene_session import answer
+        try:
+            result = answer(args.ticket,args.decision,args.point)
+        except (ValueError,OSError) as error:
+            result = dict(status='blocked',diagnostic=getattr(error,'code','scene_answer_unavailable'),input_dispatched=False)
+        print(json.dumps(result,ensure_ascii=False))
+        return 0 if result['status']=='verified' else (3 if result['status'] in ('completed_unverified','uncertain') else 2)
     mutating = args.command == 'run' and not args.read_only and not args.input_plan
     launched, executing = False, False
     try:

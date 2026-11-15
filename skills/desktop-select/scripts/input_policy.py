@@ -5,7 +5,7 @@ import ctypes as C
 from ctypes import wintypes as W
 
 
-_POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'visual-click'})
+_POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'visual-click', 'conditional-open'})
 _ACCESSIBILITY_ACTIONS = frozenset({'set-value', 'invoke', 'select', 'fill', 'open'})
 _OBSERVATION_ACTIONS = frozenset({'wait', 'verify-file'})
 

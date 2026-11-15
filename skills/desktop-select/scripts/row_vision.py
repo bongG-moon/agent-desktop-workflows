@@ -185,8 +185,8 @@ def _ppm_header(size):
     return ('P6\n%d %d\n255\n' % tuple(size)).encode('ascii')
 
 
-def _patch(rect, box):
-    return [rect[0]+box[0], rect[1]+box[1], box[2], box[3]]
+def _patch(rect, box, offset=(0, 0)):
+    return [rect[0]+box[0]+offset[0], rect[1]+box[1]+offset[1], box[2], box[3]]
 
 
 def _glyph(rgb):
@@ -311,23 +311,36 @@ def _match(snapshot, spec):
     key = spec['boxes']['key']
     reference = _unpack(spec['key'],key[2]*key[3])
     scores = []
+    # A provider's row rectangle can be rounded one physical pixel differently
+    # from its painted contents. One common translation must fit all three boxes.
+    offsets = [(dx, dy) for dx in (0, -1, 1) for dy in (0, -1, 1)
+               if all(_inside(_patch([0, 0], box, (dx, dy)), [0, 0, *spec['size']])
+                      for box in spec['boxes'].values())]
     for rect,meta in snapshot[1]:
         if (rect[2:] == spec['size'] and all(meta[k]==spec[k] for k in ('role','scope'))
                 and meta.get('row_id') == spec.get('row_id')):
-            current = _glyph(_rgb(snapshot,_patch(rect,key)))
-            scores.append((_match_distance(reference, current, key[2]), rect))
-    scores.sort()
+            best, offset, tied = 1., None, False
+            for delta in offsets:
+                current = _glyph(_rgb(snapshot, _patch(rect, key, delta)))
+                distance = _match_distance(reference, current, key[2])
+                if distance < best:
+                    best, offset, tied = distance, delta, False
+                elif distance == best:
+                    tied = True
+            scores.append((best, rect, offset, tied))
+    scores.sort(key=lambda candidate: candidate[0])
     if not scores or scores[0][0] > .14:
-        return 'missing', None
-    if len(scores)>1 and scores[1][0] <= max(.20,scores[0][0]+.10):
-        return 'ambiguous', None
-    return 'found', scores[0][1]
+        return 'missing', None, None
+    best, rect, offset, tied = scores[0]
+    if tied or (len(scores)>1 and scores[1][0] <= max(.20,best+.10)):
+        return 'ambiguous', None, None
+    return 'found', rect, offset
 
 
-def _evidence(snapshot, rect, spec, field):
+def _evidence(snapshot, rect, spec, field, offset=(0, 0)):
     box = spec['boxes']['state' if field in ('before','after') else field]
     reference = _unpack(spec[field], box[2] * box[3])
-    current = _glyph(_rgb(snapshot, _patch(rect, box)))
+    current = _glyph(_rgb(snapshot, _patch(rect, box, offset)))
     return _match_distance(reference, current, box[2])
 
 
@@ -353,7 +366,7 @@ def teach_before(binding,row_point,key_box,button_box,state_box,*,preview=None):
             if _match_distance(_glyph(shown), _glyph(current), w) > .14:
                 _reject('row_preview_changed')
         spec['before' if area=='state' else area] = _pattern(current)
-    kind, found = _match(snapshot,spec)
+    kind, found, _ = _match(snapshot,spec)
     if kind!='found' or found!=rect:
         _reject('row_key_not_unique')
     validate_spec(spec,draft=True)
@@ -363,10 +376,10 @@ def teach_before(binding,row_point,key_box,button_box,state_box,*,preview=None):
 def teach_after(binding,draft):
     validate_spec(draft,draft=True)
     snapshot = _snapshot(binding)
-    kind,rect = _match(snapshot,draft)
+    kind,rect,offset = _match(snapshot,draft)
     if kind!='found':
         _reject('row_key_'+kind)
-    spec = dict(draft,after=_pattern(_rgb(snapshot,_patch(rect,draft['boxes']['state']))))
+    spec = dict(draft,after=_pattern(_rgb(snapshot,_patch(rect,draft['boxes']['state'],offset))))
     validate_spec(spec)
     return spec
 
@@ -389,18 +402,21 @@ def observe_row(binding,spec, *, snapshot=None):
     validate_spec(spec)
     if snapshot is None:
         snapshot = _snapshot(binding)
-    kind,rect = _match(snapshot,spec)
+    kind,rect,offset = _match(snapshot,spec)
     point = None
     if kind=='found':
-        if _evidence(snapshot,rect,spec,'after') <= .14:
+        if _evidence(snapshot,rect,spec,'after',offset) <= .14:
             kind = 'after'
-        elif _evidence(snapshot,rect,spec,'before') <= .14 and _evidence(snapshot,rect,spec,'button') <= .14:
+        elif _evidence(snapshot,rect,spec,'before',offset) <= .14 and _evidence(snapshot,rect,spec,'button',offset) <= .14:
             kind = 'before'
-            x,y,w,h = _patch(rect,spec['boxes']['button'])
+            x,y,w,h = _patch(rect,spec['boxes']['button'],offset)
             point = [x+w//2,y+h//2]
         else:
             kind = 'unknown'
-    return {'kind':kind,'point':point,'row_bounds':rect}
+    observation = {'kind':kind,'point':point,'row_bounds':rect}
+    if offset and offset != (0, 0):
+        observation['paint_offset'] = list(offset)
+    return observation
 
 
 def _list_hit_row(uia, element, pid, point, rect):
@@ -486,9 +502,14 @@ def confirm_pixels(binding, spec, obs):
     if not _inside(rect, window):
         _reject('row_window_moved')
     snapshot = window, (), _frame(binding, window)
-    if any(_evidence(snapshot, rect, spec, field) > .14 for field in ('key', 'button', 'before')):
+    offset = obs.get('paint_offset', (0, 0))
+    if (not isinstance(offset, (list, tuple)) or len(offset) != 2
+            or any(type(v) is not int or abs(v)>1 for v in offset)
+            or any(not _inside(_patch(rect,b,offset), rect) for b in spec['boxes'].values())):
         _reject('row_pixels_changed')
-    x, y, w, h = _patch(rect, spec['boxes']['button'])
+    if any(_evidence(snapshot, rect, spec, field, offset) > .14 for field in ('key', 'button', 'before')):
+        _reject('row_pixels_changed')
+    x, y, w, h = _patch(rect, spec['boxes']['button'], offset)
     point = [x + w//2, y + h//2]
     hit = bridge.window_from_point(*point)
     if (obs.get('point') != point or bridge.root_window(bridge.foreground()) != binding.hwnd
