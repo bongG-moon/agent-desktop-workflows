@@ -160,12 +160,37 @@ class CaptureTrail:
                              if key not in self.baseline}
         self.last_inventory = now
 
-    def connect(self, key, *, automatic=False):
+    def choice_scope(self):
+        """Take a stable recorder scope on the GUI thread for listing in a worker."""
+        return tuple(part.binding for part in self.connected.values()), self.binding
+
+    def connect_choice(self, choice):
+        """Confirm the displayed window again; selecting it sends no desktop input."""
+        self.active_hint = ''
+        try:
+            self.primary.binding.check()
+            confirmed = windows.confirm_choice(choice)
+            if self.connect((confirmed[0].hwnd, confirmed[0].pid), confirmed=confirmed):
+                return True
+        except (bridge.BridgeError, OSError, ValueError) as exc:
+            if getattr(exc, 'code', None) == 'recorded_window_ambiguous':
+                self.active_hint = '프로그램과 창 제목이 같은 창이 여러 개입니다. 제목을 구분한 후 새로 고치세요.'
+            elif getattr(exc, 'code', None) in ('recorded_window_lifetime_changed','target_lifetime_changed',
+                                                'target_window_mismatch','target_executable_mismatch',
+                                                'target_unavailable','business_window_changed'):
+                self.active_hint = '선택한 창이 닫혔거나 변경됐습니다. 목록을 새로 고치고 다시 선택하세요.'
+        if not self.active_hint:
+            self.active_hint = '창을 연결할 수 없습니다. 목록을 새로 고치고 다시 선택하세요.'
+        return False
+
+    def connect(self, key, *, automatic=False, confirmed=None):
         if not key or not self.started or self.ended or self.limit:
             return False
         existing = self.connected.get(key)
         if existing is not None:
             existing.binding.check()
+            if confirmed and (existing.binding.created != confirmed[0].created or existing.binding.title != confirmed[1]):
+                return False
             self.active = existing
             return True
         if len(self.connected) >= 16:
@@ -196,6 +221,20 @@ class CaptureTrail:
                         matches[parent] = None
             options = [item for item in options if matches[item[1]]]
             found = matches[options[-1][1]] if options else None
+        elif confirmed is not None:
+            found = confirmed
+            # Independent applications opened by other means are prerequisites.
+            # Record a causal link only if a demonstrated opener belongs to
+            # the same process, an owning window or an ancestor process.
+            if options:
+                related = set()
+                for part in {part for _, part, _ in options if not part.ended}:
+                    try:
+                        if windows.related(found[0], part.binding):
+                            related.add(part)
+                    except (bridge.BridgeError, OSError):
+                        pass
+                options = [row for row in options if row[1] in related]
         else:
             parent = self.active
             found = windows.candidate(key, parent.binding, parent.binding.title, automatic=False,
@@ -204,7 +243,7 @@ class CaptureTrail:
             return False
         binding, title = found
         scope = dict(exe=binding.exe, title=title)
-        if key in (self.baseline or ()):
+        if key in (self.baseline or ()) or (confirmed and not options):
             scope['mode'] = 'existing'
         elif options:
             # Earlier launches can complete after a later launch. Timing and
@@ -213,7 +252,7 @@ class CaptureTrail:
                 scope['after_id'] = options[0][2]
             else:
                 scope['_openers'] = tuple(record[2] for record in options)
-            if automatic:
+            if automatic or confirmed:
                 scope['related'] = True
         else:
             self.active_hint = '이 창을 연 녹화 단계가 없습니다. 창을 열기 전부터 다시 녹화하세요.'

@@ -788,6 +788,171 @@ class CaptureSession:
         return {'status': 'cancelled', 'steps': [], 'input_dispatched': False}
 
 
+def pick_recording_window(root, session):
+    """Let the user choose a live window by title during recording."""
+    import tkinter as tk
+    from tkinter import ttk
+    from capture_windows import window_choices
+
+    dialog = tk.Toplevel(root, name='window_picker')
+    dialog.title('열린 창 선택')
+    dialog.transient(root)
+    panel = ttk.Frame(dialog, padding=14)
+    panel.pack(fill='both', expand=True)
+    tools = ttk.Frame(panel)
+    tools.pack(fill='x')
+    status = tk.StringVar(dialog, value='')
+    all_windows = tk.BooleanVar(dialog, value=False)
+    scope_title = tk.StringVar(dialog, value='관련 창')
+    ttk.Label(tools, textvariable=scope_title, style='Title.TLabel').pack(side='left')
+    include = ttk.Checkbutton(tools, name='all_windows', text='다른 프로그램의 창도 보기', variable=all_windows)
+    include.pack(side='right')
+    table = ttk.Frame(panel)
+    table.pack(fill='both', expand=True, pady=(8, 4))
+    tree = ttk.Treeview(table, name='windows', show='headings', columns=('title', 'exe', 'status'),
+                        selectmode='browse', height=7, style='Steps.Treeview')
+    for key, label, width in (('title','창 제목',290), ('exe','프로그램',170), ('status','상태',140)):
+        tree.heading(key, text=label, anchor='w')
+        tree.column(key, width=width, minwidth=70, anchor='w', stretch=key=='title')
+    scroll = ttk.Scrollbar(table, command=tree.yview)
+    tree.configure(yscrollcommand=scroll.set)
+    scroll.pack(side='right', fill='y')
+    tree.pack(side='left', fill='both', expand=True)
+    ttk.Label(panel, textvariable=status, style='Muted.TLabel', wraplength=560).pack(anchor='w')
+    footer = ttk.Frame(panel)
+    footer.pack(fill='x', pady=(8, 0))
+    rows, result = {}, None
+    loading, scheduled = False, None
+
+    def close(value=None):
+        nonlocal result, scheduled
+        result = value
+        if scheduled is not None:
+            root.after_cancel(scheduled)
+            scheduled = None
+        dialog.destroy()
+
+    def chosen():
+        selected = tree.selection()
+        return rows.get(selected[0]) if selected else None
+
+    def selection_changed(*_):
+        item = chosen()
+        usable = item and not item['ambiguous'] and not loading
+        use.state(['!disabled'] if usable else ['disabled'])
+        if item and item['ambiguous']:
+            status.set('같은 프로그램에 같은 제목의 창이 있습니다. 제목을 구분한 뒤 새로 고침하세요.')
+        elif item:
+            status.set(item['title'])
+
+    def select(*_):
+        item = chosen()
+        if session.ended:
+            close()
+        elif item and not loading and not item['ambiguous']:
+            try:
+                session.active_hint = ''
+                if session.connect_choice(item):
+                    close('selected')
+                else:
+                    tree.selection_remove(*tree.selection())
+                    use.state(['disabled'])
+                    status.set(session.active_hint or '창이 바뀌었습니다. 새로 고침한 뒤 다시 선택하세요.')
+            except (bridge.BridgeError, OSError, ValueError):
+                tree.selection_remove(*tree.selection())
+                use.state(['disabled'])
+                status.set('창을 연결하지 못했습니다. 새로 고침한 뒤 다시 선택하세요.')
+        return 'break'
+
+    def refresh(*_):
+        nonlocal loading, scheduled
+        if loading:
+            return
+        if session.ended:
+            close()
+            return
+        loading = True
+        tree.delete(*tree.get_children())
+        rows.clear()
+        use.state(['disabled'])
+        reload_button.state(['disabled'])
+        include.state(['disabled'])
+        show_all = all_windows.get()
+        scope_title.set('모든 창' if show_all else '관련 창')
+        status.set('열린 창을 찾고 있습니다…')
+        connected, active = session.choice_scope()
+        scanned = queue.SimpleQueue()
+
+        def scan():
+            try:
+                scanned.put(window_choices(connected, active, all_windows=show_all))
+            except Exception:
+                scanned.put(None)
+
+        def collect():
+            nonlocal loading, scheduled
+            scheduled = None
+            if not dialog.winfo_exists():
+                return
+            if session.ended:
+                close()
+                return
+            try:
+                choices = scanned.get_nowait()
+            except queue.Empty:
+                scheduled = root.after(40, collect)
+                return
+            loading, scheduled = False, None
+            reload_button.state(['!disabled'])
+            include.state(['!disabled'])
+            if choices is None:
+                status.set('창 목록을 읽지 못했습니다. 새로 고침하세요.')
+                return
+            for item in choices:
+                tags = []
+                if item['current']:
+                    tags.append('현재 녹화 창')
+                elif item['connected']:
+                    tags.append('연결됨')
+                if item['minimized']:
+                    tags.append('최소화')
+                if item['ambiguous']:
+                    tags.append('동일 제목')
+                key = tree.insert('', 'end', values=(item['title'], item['exe'], ', '.join(tags)))
+                rows[key] = item
+            status.set('이어서 녹화할 창을 선택하세요.' if choices else '현재 선택할 창이 없습니다.')
+
+        threading.Thread(target=scan, name='desktop-select-window-list', daemon=True).start()
+        scheduled = root.after(0, collect)
+
+    reload_button = ttk.Button(footer, name='refresh', text='새로 고침', command=refresh)
+    reload_button.pack(side='left')
+    ttk.Button(footer, name='point', text='화면에서 가리키기', command=lambda:close('point')).pack(side='left', padx=4)
+    use = ttk.Button(footer, name='use', text='이 창 선택', command=select, style='Primary.TButton')
+    use.pack(side='right')
+    ttk.Button(footer, name='cancel', text='취소', command=close).pack(side='right', padx=4)
+    include.configure(command=refresh)
+    tree.bind('<<TreeviewSelect>>', selection_changed)
+    tree.bind('<Return>', select)
+    # A double click in empty space must not act on a previously selected row.
+    tree.bind('<Double-1>', lambda e:select() if tree.identify_row(e.y) in tree.selection() else None)
+    dialog.bind('<Escape>', lambda _:close())
+    dialog.bind('<F5>', refresh)
+    dialog.protocol('WM_DELETE_WINDOW', close)
+    dialog.grab_set()
+    tree.focus_set()
+    refresh()
+    try:
+        root.wait_window(dialog)
+    finally:
+        if scheduled is not None:
+            try:
+                root.after_cancel(scheduled)
+            except tk.TclError:
+                pass  # The recorder itself may have closed.
+    return result
+
+
 def capture(binding, *, title):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
@@ -1185,15 +1350,30 @@ def capture(binding, *, title):
 
     def choose_window():
         nonlocal picking_window
-        if not isinstance(session, CaptureTrail) or review is not None or picking_window:
+        if not isinstance(session, CaptureTrail) or not session.started or session.ended or review is not None or picking_window:
             return
         from capture_windows import pointed_key
+        original = session
+        picking_window = True
+        try:
+            choice = pick_recording_window(root, session)
+        finally:
+            picking_window = False
+        if review is not None or session is not original or session.ended:
+            return
+        if choice == 'selected':
+            active_title.set(session.binding.title)
+            session.active_hint = session.active_hint or f'{session.binding.title} 창에서 이어서 녹화합니다.'
+            message.set(session.active_hint)
+            return
+        if choice != 'point':
+            return
         picking_window = True
         message.set('3초 동안 이어서 녹화할 창 위에 마우스를 두세요. 클릭할 필요가 없습니다.')
         def connect_pointed():
             nonlocal picking_window
             picking_window = False
-            if review is not None or session.ended:
+            if review is not None or session is not original or session.ended:
                 return
             try:
                 session.active_hint = ''
@@ -1349,7 +1529,7 @@ def capture(binding, *, title):
 
     tick.last_id = None
     begin = ttk.Button(primary, text='시작', command=start, style='Primary.TButton')
-    link_window = ttk.Button(primary, text='이어갈 창 선택', command=choose_window)
+    link_window = ttk.Button(primary, text='열린 창 선택', command=choose_window)
     end = ttk.Button(primary, text='마치고 검토', command=finish, style='Primary.TButton')
     save = ttk.Button(primary, text='저장', command=save_review, style='Primary.TButton')
     add_button = ttk.Menubutton(controls, text='단계 추가 ▾')
