@@ -23,7 +23,9 @@ sealed class PaintedRowsFixture : Form {
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     readonly string[] names = { "Atlas", "Birch", "Cobalt" };
 
-    PaintedRowsFixture() {
+    readonly Dictionary<string,int> childCalls = new Dictionary<string,int>();
+
+    PaintedRowsFixture(bool linked) {
         Text = "Desktop Select painted launchers";
         ClientSize = new Size(640, 240);
         StartPosition = FormStartPosition.Manual;
@@ -40,7 +42,17 @@ sealed class PaintedRowsFixture : Form {
         list.MouseUp += delegate(object sender, MouseEventArgs e) {
             int i = list.IndexFromPoint(e.Location);
             if (i >= 0 && e.Button == MouseButtons.Left && ButtonBox(list.GetItemRectangle(i)).Contains(e.Location)) {
-                calls[((Device)list.Items[i]).Name]++;
+                string name = ((Device)list.Items[i]).Name;
+                calls[name]++;
+                if (linked && calls[name] == 1) {
+                    var child = new Form { Text = "Details " + name, StartPosition = FormStartPosition.Manual,
+                        Location = new Point(800, 100), Size = new Size(200, 140), ShowInTaskbar = false };
+                    childCalls[name] = 0;
+                    var confirm = new Button { Text = "Confirm", Name = "Confirm", Dock = DockStyle.Fill };
+                    confirm.Click += delegate { childCalls[name]++; };
+                    child.Controls.Add(confirm);
+                    child.Show(this);
+                }
                 list.Invalidate(list.GetItemRectangle(i));
             }
         };
@@ -84,7 +96,7 @@ sealed class PaintedRowsFixture : Form {
             points.Add(new int[] {p.X,p.Y});
         }
         Console.WriteLine(json.Serialize(new {kind=kind, title=Text, pid=Process.GetCurrentProcess().Id,
-            hwnd=Handle.ToInt64(), calls=calls, points=points, order=order}));
+            hwnd=Handle.ToInt64(), calls=calls, childCalls=childCalls, points=points, order=order}));
         Console.Out.Flush();
     }
 
@@ -105,10 +117,10 @@ sealed class PaintedRowsFixture : Form {
             })); } catch (InvalidOperationException) { return; }
         }
     }
-    [STAThread] static void Main() {
+    [STAThread] static void Main(string[] args) {
         SetProcessDPIAware();
         Console.OutputEncoding=new UTF8Encoding(false);
         Application.EnableVisualStyles();
-        Application.Run(new PaintedRowsFixture());
+        Application.Run(new PaintedRowsFixture(Array.IndexOf(args, "--linked") >= 0));
     }
 }

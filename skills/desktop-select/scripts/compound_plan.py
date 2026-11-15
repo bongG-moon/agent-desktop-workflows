@@ -181,8 +181,12 @@ def load(task, directory):
 def save(task, instructions, directory):
     """Publish only complete, compilable interpretations. Source recordings are immutable."""
     from recorded_plan import compile_plan, fingerprint, get_plan
+    from grounding import row_replacements
     replacements = prepare(task, instructions, directory)
-    preview = compile_plan(task, replacements=replacements)
+    rows = row_replacements(task, directory)
+    require(not any(replacements.get(n, {}).get('action') == 'conditional-open' for n in rows),
+            'row_binding_conflicts_with_interpretation')
+    preview = compile_plan(task, replacements=replacements | rows)
     if preview['status'] != 'compiled':
         return preview
     document = dict(schema=1, source_fingerprint=fingerprint(task), instructions=instructions,

@@ -120,18 +120,91 @@ def _usable(step):
             or (step.get('action')=='open' and step.get('match')=='query'))
 
 
+def _children(plan, number):
+    return [s['window_context'] for s in plan['steps'] if s.get('window_context', {}).get('after_step') == number]
+
+
+def _row_candidate(plan, number):
+    from row_intent import conflicts_with_launch
+    step = plan['steps'][number-1]
+    children = {(s['exe'].casefold(),s['title']) for s in _children(plan,number)}
+    return (len(children)==1 and (step.get('action')=='row-launch' or _usable(step))
+            and not conflicts_with_launch(_instruction(step)))
+
+
+def _instruction(step):
+    return (step.get('instruction_draft') or step.get('description') or step.get('instruction',{}).get('text')
+            or step.get('label') or step.get('alias') or step.get('target'))
+
+
+def _row_directory(plan, store):
+    return tasks._directory(tasks._directory(store) / 'row-bindings' / tasks._name(plan['name']))
+
+
+def row_replacements(plan, store):
+    """Each grounded row is independent. Concurrent bindings of two rows never overwrite each other."""
+    from recorded_plan import fingerprint
+    from compound_plan import read_json
+    folder = _row_directory(plan, store)
+    if not folder.exists():
+        return {}
+    result = {}
+    for n, original in enumerate(plan['steps'], 1):
+        path = folder / f'{n}.json'
+        tasks._deny_redirect(path)
+        if not path.exists():
+            continue
+        import row_target
+        saved = read_json(path)
+        if (not isinstance(saved, dict) or set(saved) != {'source_fingerprint','number','row_target'}
+                or saved['number'] != n or saved['source_fingerprint'] != fingerprint(plan)
+                or not _row_candidate(plan,n)):
+            raise tasks.TaskError('row_binding_source_changed')
+        row_target.validate_spec(saved['row_target'])
+        result[n] = dict(action='row-open', label=_instruction(original), row_target=saved['row_target'])
+        if 'alias' in original:
+            result[n]['alias'] = original['alias']
+    return result
+
+
+def _save_row(plan, store, number, spec):
+    from recorded_plan import fingerprint
+    from compound_plan import load
+    if (any(step.get('instruction_draft') for step in plan['steps'])
+            and load(plan,store).get(number,{}).get('action') == 'conditional-open'):
+        raise tasks.TaskError('row_binding_conflicts_with_interpretation')
+    folder = _row_directory(plan, store)
+    folder.mkdir(parents=True,exist_ok=True)
+    path = folder / f'{number}.json'
+    signature = fingerprint(plan)
+    data = dict(number=number,source_fingerprint=signature,row_target=spec)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=folder, delete=False) as output:
+            temp = Path(output.name)
+            output.write(json.dumps(data,ensure_ascii=False).encode('utf8'))
+        _row_directory(plan,store)
+        tasks._deny_redirect(path)
+        if fingerprint(tasks.load_task(plan['name'],store)) != signature:
+            raise tasks.TaskError('row_binding_source_changed')
+        os.replace(temp,path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
 def run(app, args):
     from recorded_plan import fingerprint
     store = app.task_directory()
     plan = tasks.load_task(args.task,store)
     number = tasks._step_number(plan,args.only)
     step = plan['steps'][number-1]
-    children = [s['window_context'] for s in plan['steps']
-                if step['action'] == 'row-launch' and s.get('window_context', {}).get('after_step') == number]
+    children = _children(plan,number)
+    if args.command == 'bind-row' and not _row_candidate(plan,number):
+        raise tasks.TaskError('row_binding_requires_recorded_child')
     if not _usable(step) and not children:
         raise tasks.TaskError('grounding_requires_recoverable_target')
-    sentence = (step.get('instruction_draft') or step.get('description') or step.get('instruction',{}).get('text')
-                or (step.get('label') if step.get('action')=='visual-click' or children else None) or step.get('alias'))
+    sentence = _instruction(step)
     if not sentence or sentence==tasks.LEGACY_INSTRUCTION_HINT:
         raise tasks.TaskError('grounding_instruction_required')
     owner = app.bridge.Binding(app.pick_window(app.windows(plan['exe']),plan['window'],None))
@@ -164,8 +237,10 @@ def run(app, args):
             path.touch()
         return dict(status='observed',frame=token,image=str(path),width=window[2],height=window[3],
                     step=number,instruction=sentence,expires_seconds=TTL,input_dispatched=False,
-                    **({'expected_windows': children} if children else {}))
-    tasks.check_new_task(args.save_as,store)
+                    **({'expected_windows': children} if children else {}),
+                    **({'row_binding_command':'bind-row'} if _row_candidate(plan,number) else {}))
+    if args.command == 'bind-visual':
+        tasks.check_new_task(args.save_as,store)
     if not re.fullmatch('[a-f0-9]{64}',args.frame):
         raise tasks.TaskError('grounding_frame_invalid')
     path = folder/(args.frame+'.png')
@@ -179,10 +254,27 @@ def run(app, args):
         raise tasks.TaskError('grounding_frame_expired') from exc
     if sha256(scope+data).hexdigest()!=args.frame:
         raise tasks.TaskError('grounding_frame_changed')
+    if args.command == 'bind-row':
+        import row_target
+        check()
+        spec = row_target.bind(binding, data, tuple(args.row_point), tuple(args.point))
+        check()
+        _save_row(plan,store,number,spec)
+        return dict(status='bound',task=plan['name'],step=number,input_dispatched=False,
+                    execution_plan=app.execution_plan_info(app.saved_execution_plan(plan)))
     frame,pixels = _pixels(data)
-    spec = visual_target.from_frame(frame,pixels,tuple(args.point))
-    check()
-    visual_target.observe(binding,spec)
+    try:
+        spec = visual_target.from_frame(frame,pixels,tuple(args.point))
+        check()
+        visual_target.observe(binding,spec)
+    except visual_target.bridge.BridgeError as error:
+        if error.code != 'visual_target_ambiguous' or not _row_candidate(plan,number):
+            raise
+        return dict(status='needs_grounding', diagnostic=error.code, input_dispatched=False,
+                    host_action='ground_named_rows', grounding_steps=[
+                        dict(number=number, expected_windows=children, instruction=sentence, frame=args.frame,
+                             image=str(path),row_binding_command='bind-row',
+                             ground_args=['ground','--task',plan['name'],'--only',str(number)])])
     check()
     step = dict(action='visual-click',label=sentence,visual=spec,**tasks._annotations(step))
     plan['steps'][number-1] = step

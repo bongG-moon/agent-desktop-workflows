@@ -452,27 +452,26 @@ def save_instruction(args):
 
 def fast_replay(plan, args, overrides):
     """Use a saved literal plan only when the entire original task is compatible."""
-    has_draft = any(s.get('instruction_draft') for s in plan['steps'])
     legacy_values = any(s['action'] in ('select', 'fill') and 'instruction' not in s and 'instruction_draft' not in s
                         for s in plan['steps'])
-    if not has_draft and (args.only is not None or legacy_values):
-        return None
     tasks.check_binding(plan, args.exe, args.window)
     saved = saved_execution_plan(plan)
     recipe = saved.get('envelope', {}).get('recipe')
     if recipe is None:
+        if saved.get('status')=='plan_unavailable':
+            return dict(status='blocked',diagnostic=saved.get('diagnostic'),steps=[],input_dispatched=False)
         return None
     source_steps = saved['envelope']['source_steps']
-    conditional = any(step['action'] == 'conditional-open' for step in recipe['steps'])
-    if legacy_values and not conditional:
+    has_host_binding = any(step['action'] in ('conditional-open', 'row-open') for step in recipe['steps'])
+    if legacy_values and not has_host_binding:
         return None
-    if conditional:
+    if has_host_binding:
         # A host interpretation can coexist with 0.4 recorded defaults. A raw
         # field whose prose now describes a conditional is no longer an input.
         recipe = deepcopy(recipe)
         selected = tasks._step_number(plan, args.only) if args.only is not None else None
         source_numbers = {n for n, step in zip(source_steps, recipe['steps'])
-                          if step['action'] != 'conditional-open' and (selected is None or n == selected)}
+                          if step['action'] not in ('row-open', 'conditional-open') and (selected is None or n == selected)}
         sequence = [(n, plan['steps'][n - 1]) for n in sorted(source_numbers)]
         supplied = tasks.recorded_overrides(sequence, overrides)
         for n, step in zip(source_steps, recipe['steps']):
@@ -490,7 +489,7 @@ def fast_replay(plan, args, overrides):
     if args.only is not None:
         number = tasks._step_number(plan, args.only)
         matches = [i for i, n in enumerate(source_steps) if n == number]
-        if len(matches) != 1 or recipe['steps'][matches[0]]['action'] != 'conditional-open':
+        if len(matches) != 1 or recipe['steps'][matches[0]]['action'] not in ('conditional-open','row-open'):
             return None
         only = str(matches[0] + 1)
         active = dict(recipe, steps=[recipe['steps'][matches[0]]])
@@ -514,6 +513,11 @@ def fast_replay(plan, args, overrides):
     stopped = result.get('stopped_at')
     if type(stopped) is int and 1 <= stopped <= len(source_steps):
         result['source_stopped_at'] = source_steps[stopped - 1]
+    for item in result.get('grounding_steps', []):
+        number = item.get('number')
+        if type(number) is int and 1 <= number <= len(source_steps):
+            item['source_step'] = source_steps[number - 1]
+            item['ground_args'] = ['ground','--task',plan['name'],'--only',str(item['source_step'])]
     return dict(result, execution_engine='saved_python_plan', execution_plan=execution_plan_info(saved))
 
 
@@ -628,7 +632,7 @@ def run(args):
     if args.command == 'storage':
         return storage_info()
     bridge.set_dpi_awareness()
-    if args.command in ('ground','bind-visual'):
+    if args.command in ('ground','bind-visual','bind-row'):
         import grounding
         return grounding.run(sys.modules[__name__],args)
     if args.command == 'instruct':
@@ -800,13 +804,17 @@ def parser():
     interpret = commands.add_parser('interpret', help='compile host-interpreted conditional steps for an existing recording')
     interpret.add_argument('--task', required=True)
     interpret.add_argument('--plan-file', type=Path, required=True, help='local declarative instruction JSON')
-    for name in ('ground','bind-visual'):
+    for name in ('ground','bind-visual','bind-row'):
         tool = commands.add_parser(name, help='inspect or bind a visible target for one recorded instruction, without input')
         tool.add_argument('--task', required=True)
         tool.add_argument('--only', required=True)
-        if name == 'bind-visual':
+        if name != 'ground':
             tool.add_argument('--frame', required=True, help='frame receipt from ground for this task and step')
             tool.add_argument('--point', nargs=2, type=int, required=True, metavar=('IMAGE_X','IMAGE_Y'))
+        if name == 'bind-row':
+            tool.add_argument('--row-point', nargs=2, type=int, required=True, metavar=('LABEL_X','LABEL_Y'),
+                              help='point inside the identifying text on the same row as --point')
+        if name == 'bind-visual':
             tool.add_argument('--save-as', required=True, help='new task name; preserves original')
     edit = commands.add_parser('instruct', help='save an interpreted instruction as a new task, preserving its source')
     edit.add_argument('--task', required=True)
@@ -872,7 +880,7 @@ def worker(args):
 
 
 def result_code(result):
-    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed', 'planned'):
+    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'bound', 'completed', 'planned'):
         return 0
     return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review',
                                      'needs_grounding', 'needs_scene') else 3

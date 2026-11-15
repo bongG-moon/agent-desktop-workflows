@@ -113,6 +113,12 @@ def validate(recipe):
         if step.get('action') == 'conditional-open':
             conditional_action.validate_conditional(step)
             continue
+        if step.get('action') == 'row-open':
+            need(set(step) - {'alias'} == {'action','label','row_target'} and text(step['label'],1000)
+                 and ('alias' not in step or text(step['alias'],200)), 'invalid_row_step')
+            import row_target
+            row_target.validate_spec(step['row_target'])
+            continue
         if step.get('action') == 'visual-click':
             from visual_target import validate_spec
             need(set(step) - {'alias'} == {'action', 'label', 'visual'}
@@ -306,9 +312,9 @@ def confirm_opened_window(report, routes, number):
     if number is None or not routes.origins[number].keys() <= routes.bindings.keys():
         return
     receipt = routes.outcomes.get(number)
-    if (routes.steps[number-1]['action'] == 'invoke' and receipt
-            and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True
-            and receipt.get('diagnostic') == 'business_result_not_verified'):
+    if (receipt and (routes.steps[number-1]['action'],receipt.get('diagnostic')) in (
+            ('invoke','business_result_not_verified'),('row-open','row_open_dispatched'))
+            and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True):
         receipt.update(status='verified', effect_verification='matched',
                        verification_scope='recorded_window_opened', business_commit='not_verified')
         receipt.pop('diagnostic')
@@ -321,10 +327,32 @@ _GROUNDING_DIAGNOSTICS = {'target_missing', 'target_ambiguous', 'scope_missing',
                           'workflow_pattern_unavailable'}
 
 
+def _grounding_step(recipe, number, step, reason):
+    request = dict(app.tasks.grounding_request(number, step), reason=reason)
+    if not request['instruction']:
+        request['instruction'] = step.get('label','')
+    children = [s['window_context'] for s in recipe['steps'] if s.get('window_context',{}).get('after_step')==number]
+    if children:
+        request['expected_windows'] = children
+        from row_intent import conflicts_with_launch
+        if (len({(c['exe'].casefold(), c['title']) for c in children}) == 1
+                and not conflicts_with_launch(request['instruction'])):
+            request['row_binding_command'] = 'bind-row'
+    return request
+
+
+def _grounding_report(report, requests):
+    return dict(report, status='needs_grounding', diagnostic='target_grounding_required',
+                host_action='ground_named_rows' if all(i.get('row_binding_command') for i in requests)
+                else 'ground_recorded_targets', grounding_steps=requests, stopped_at=requests[0]['number'],
+                prior_input_requires_observation=report.get('input_dispatched') is not False)
+
+
 def _missing_groundings(recipe, entries, owner, uia):
     """Check already-open scopes of recovered click instructions before dispatch."""
+    openers = {s.get('window_context',{}).get('after_step') for s in recipe['steps']}
     candidates = [(n, step) for n, step in entries if step.get('grounding_text') and (
-                  n == entries[0][0] or step.get('window_context'))]
+                  n == entries[0][0] or n in openers or step.get('window_context'))]
     if not candidates:
         return []
     lookup_routes = window_context.WindowRoutes(recipe['steps'], owner, recipe['window'], read_only=True,
@@ -332,16 +360,20 @@ def _missing_groundings(recipe, entries, owner, uia):
     missing = []
     for number, step in candidates:
         scope = step.get('window_context')
+        if number != entries[0][0] and not scope and not missing:
+            # A later control may be created by an earlier action. Batch the
+            # still-visible manager rows only after there is already a handoff.
+            continue
         binding = lookup_routes.resolve(scope) if scope else owner
         if binding is None:
             continue
         try:
             element, _, _ = resolve_step(binding, uia, uia.from_handle(binding.hwnd), step['selector'])
             need('Click' in uia.actions(element), 'workflow_pattern_unavailable')
-        except (app.SelectionError, WorkflowError) as error:
+        except (app.SelectionError, app.bridge.BridgeError, WorkflowError) as error:
             if error.code not in _GROUNDING_DIAGNOSTICS:
                 raise
-            missing.append(dict(app.tasks.grounding_request(number, step), reason=error.code))
+            missing.append(_grounding_step(recipe, number, step, error.code))
     return missing
 
 
@@ -364,15 +396,16 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     if not read_only:
         requested = dict(entries)
         unresolved = []
-        for number, step in entries:
+        for number, step in enumerate(recipe['steps'],1):
             scope = step.get('window_context', {})
             opener = scope.get('after_step')
-            if (step['action'] == 'conditional-open'
-                    and requested.get(opener, {}).get('action') == 'row-launch'):
+            source = requested.get(opener, {})
+            if step['action'] == 'conditional-open' and source.get('action') == 'row-launch':
                 unresolved.append(dict(number=opener, child_step=number, expected_window=scope['title'],
-                                       expected_exe=scope['exe'], instruction=requested[opener]['label']))
+                                       expected_exe=scope['exe'], instruction=source['label'],
+                                       row_binding_command='bind-row'))
         if unresolved:
-            return dict(status='needs_grounding', diagnostic='named_window_row_identity_required',
+            return dict(status='needs_grounding', diagnostic='named_window_row_identity_required', host_action='ground_named_rows',
                         grounding_steps=unresolved, stopped_at=unresolved[0]['number'], steps=[],
                         input_dispatched=False)
     if not read_only and scene_session is None and any(s['action']=='conditional-open' for s in active):
@@ -391,8 +424,11 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         owner = bind(recipe['exe'], recipe['window'], hwnd)
         if background_only and not read_only:
             input_policy.window_ready(owner)
+        active_scopes = {n for n,_ in entries}
+        row_openers = {n for n,step in entries if step['action']=='row-open'}
+        active_scopes.update(n for n,s in enumerate(recipe['steps'],1) if s.get('window_context',{}).get('after_step') in row_openers)
         routes = window_context.WindowRoutes(recipe['steps'], owner, recipe['window'], read_only=read_only,
-                                              active=[n for n, _ in entries])
+                                              active=sorted(active_scopes))
         # Capture every requested output before window restoration or any input.
         baselines = {i: export_evidence.baseline(step['output']) for i, step in entries
                      if step['action'] == 'verify-file'} if not read_only else {}
@@ -404,8 +440,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 input_policy.configure_uia(uia)
             missing = _missing_groundings(recipe, entries, owner, uia)
             if missing:
-                return dict(report, status='needs_grounding', diagnostic='target_grounding_required',
-                            stopped_at=missing[0]['number'], grounding_steps=missing)
+                return _grounding_report(report, missing)
             for number, step in entries:
                 stage_started = time.monotonic()
                 app.guard(owner, owner, recipe['window'])
@@ -445,7 +480,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 # require it to be enabled/restored; missing popups never do.
                 if (not read_only and binding.hwnd not in prepared and 'popup' not in step
                         and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action',
-                                               'row-launch', 'visual-click', 'conditional-open')):
+                                               'row-launch', 'row-open', 'visual-click', 'conditional-open')):
                     if background_only:
                         input_policy.window_ready(binding)
                     else:
@@ -492,6 +527,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         dispatching = getattr(error, 'input_dispatched', False) is not False
                         raise
                     dispatching = False
+                elif step['action'] == 'row-open':
+                    import row_target
+                    receipt = row_target.execute(binding,step['row_target'],lambda:check_target(binding,mutate=not read_only),
+                                                 read_only=read_only,child_open=lambda:routes.existing_for_row(number))
                 elif step['action'] in ('row-action', 'row-launch'):
                     dispatching = not read_only
                     try:
@@ -605,7 +644,17 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 report['input_dispatched'] = combine(report['input_dispatched'], receipt['input_dispatched'])
                 if receipt.get('physical_input'):
                     report['physical_input'] = True
-                if read_only and step['action'] == 'visual-click' and receipt['status'] != 'observed':
+                if (step['action']=='row-open' and receipt['status']=='blocked' and receipt['input_dispatched'] is False
+                        and receipt.get('diagnostic') in ('row_identity_missing','row_identity_ambiguous',
+                                                         'row_launch_button_not_found','row_launch_button_ambiguous',
+                                                         'row_launch_button_outside_recorded_column')):
+                    return _grounding_report(report, [_grounding_step(recipe, number, step, receipt['diagnostic'])])
+                if (not read_only and step['action']=='row-open' and (receipt['status']=='verified' or
+                        (receipt.get('diagnostic')=='row_open_dispatched' and receipt['input_dispatched'] is True))):
+                    for expected in routes.origins[number].values():
+                        routes.resolve(expected)
+                    confirm_opened_window(report,routes,number)
+                if read_only and step['action'] in ('visual-click','row-open') and receipt['status'] != 'observed':
                     report.update(status=receipt['status'], stopped_at=number,
                                   diagnostic=receipt.get('diagnostic', 'visual_target_unavailable'))
                     break
@@ -641,15 +690,15 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         diagnostic = getattr(error, 'code', 'provider_error')
         failure = dict(status='uncertain' if dispatching else 'blocked',
                        input_dispatched=None if dispatching else False, diagnostic=diagnostic)
+        if number:
+            report['stopped_at'] = number
         if number and (not report['steps'] or report['steps'][-1]['number'] != number):
             report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=failure,
                                         elapsed_seconds=round(time.monotonic() - stage_started, 4)))
-            report['stopped_at'] = number
         report['input_dispatched'] = combine(report['input_dispatched'], failure['input_dispatched'])
         report.update(status=failure['status'], diagnostic=diagnostic)
         if not dispatching and number and step.get('grounding_text') and diagnostic in _GROUNDING_DIAGNOSTICS:
-            report.update(status='needs_grounding', diagnostic='target_grounding_required',
-                          grounding_steps=[dict(app.tasks.grounding_request(number, step), reason=diagnostic)])
+            report = _grounding_report(report, [_grounding_step(recipe, number, step, diagnostic)])
     finally:
         if anchor_proof is not None:
             anchor_proof.close()
@@ -719,13 +768,14 @@ def _registered_runner(destination):
 def _recorded_targets(recipe, source_task):
     has_conditional = any(s['action']=='conditional-open' for s in recipe['steps'])
     if source_task is None or not all(
-            step['action'] in ('visual-click', 'row-action', 'conditional-open')
+            step['action'] in ('visual-click', 'row-action', 'conditional-open') or
+            (step['action']=='row-open' and 'row_target' in step)
             or (step['action'] == 'row-launch' and ('row_hint' in step or has_conditional))
             for step in recipe['steps']):
         return False
     import recorded_plan
     compiled = (recorded_plan.compile_saved(source_task, app.task_directory())
-                if has_conditional else recorded_plan.compile_plan(source_task))
+                if has_conditional or any(s['action']=='row-open' for s in recipe['steps']) else recorded_plan.compile_plan(source_task))
     need(compiled.get('envelope', {}).get('recipe') == recipe, 'recorded_workflow_mismatch')
     return True
 
@@ -745,7 +795,7 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     rows = {row['number']: row for row in observed['steps']}
     for number, step in enumerate(recipe['steps'], 1):
-        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch', 'visual-click','conditional-open'):
+        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch','row-open', 'visual-click','conditional-open'):
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
@@ -824,9 +874,11 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     if any(step['action'] == 'visual-click' for step in active):
         guide += ('\n화면으로 녹화한 클릭은 지정한 창에서 녹화된 모양을 다시 찾고 실제 마우스로 한 번 누른다. '
                   'delivered_unverified는 클릭 전달을 뜻한다. 앱 실행 등 결과는 해당 창에서 별도로 확인한다.\n')
-    if any('grounding_text' in step for step in active):
+    if any('grounding_text' in step or step['action']=='row-open' for step in active):
         guide += ('\n설명 속 이름이 현재 창에서 보이지 않으면 grounding_steps의 단계와 원문으로 '
-                  'desktop-select의 ground에서 같은 창을 확인하고 bind-visual로 대상을 연결한다.\n')
+                  'desktop-select의 ground에서 같은 창을 확인한다. 여러 행에 같은 실행 버튼이 있으면 '
+                  '원본 녹화의 해당 단계에 bind-row --row-point X Y --point X Y로 행 이름과 그 행의 실행 버튼을 연결한다. '
+                  '고유한 단일 대상은 bind-visual로 연결한다. 연결한 뒤 등록한 스킬을 갱신한다.\n')
     if any('popup' in pending for pending in observed.get('pending_scopes', [])):
         guide += ('\n등록 시 아직 열리지 않은 팝업의 대상은 미확인 상태로 보존했다. '
                   '실행할 때 지정된 제목의 소속 팝업이 하나로 확인된 뒤에만 해당 단계에 입력한다. '

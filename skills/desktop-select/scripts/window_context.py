@@ -106,6 +106,21 @@ class WindowRoutes:
         if number in self.origins:
             self.outcomes[number] = receipt
 
+    def existing_for_row(self, number):
+        """Check the linked title, process, relationship and original lifetime before skipping a button."""
+        specs = self.origins.get(number, {})
+        if len(specs) != 1:
+            raise ContextError('row_requires_one_linked_window')
+        key, spec = next(iter(specs.items()))
+        current = self._match(spec,self._rows(spec))
+        identity = _identity(current) if current is not None else None
+        if not self.read_only and identity != self.baselines[key][1]:
+            raise ContextError('recorded_window_lifetime_changed')
+        if current is None:
+            return False
+        self.check(spec,self._bind(current))
+        return True
+
     def check(self, spec, binding):
         row = self._match(spec, self._rows(spec))
         if row is None or _identity(row) != (binding.hwnd, binding.pid, binding.created):
@@ -139,6 +154,7 @@ class WindowRoutes:
                 raise ContextError('window_origin_not_confirmed')
             opener = self.steps[source-1]['action']
             same_demonstrated_row = (opener == 'row-action' or
+                                     (opener == 'row-open' and outcome.get('evidence') == 'recorded_row_and_window') or
                                      (opener == 'row-launch' and outcome.get('evidence') == 'recorded_row_hint'))
             already_running = (same_demonstrated_row
                                and outcome.get('status') == 'verified'

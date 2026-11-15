@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 8
+COMPILER = 9
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -60,7 +60,7 @@ def compile_plan(task, *, replacements=None):
             return _result('not_compatible', diagnostic='instruction_requires_structure', step=number,
                            grounding_steps=[tasks.grounding_request(i, s) for i, s in enumerate(steps, 1)
                                             if s.get('instruction_draft')])
-        elif step['action'] in ('row-action', 'row-launch', 'visual-click', 'conditional-open'):
+        elif step['action'] in ('row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open'):
             continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
@@ -79,7 +79,7 @@ def compile_plan(task, *, replacements=None):
         context = deepcopy(step.get('window_context'))
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
-        if step['action'] == 'conditional-open':
+        if step['action'] in ('conditional-open','row-open'):
             current = deepcopy(step)
             if context is not None:
                 current['window_context'] = context
@@ -176,13 +176,19 @@ def plan_path(task, directory=None):
 
 def compile_saved(task, directory=None):
     """Compile using this original's locally registered interpretation, if any."""
-    if any(step.get('instruction_draft') for step in task.get('steps', ())):
-        import compound_plan
-        try:
-            return compile_plan(task, replacements=compound_plan.load(task, directory))
-        except (ValueError, OSError) as error:
-            return _result('plan_unavailable', diagnostic=getattr(error, 'code', 'invalid_interpretation'))
-    return compile_plan(task)
+    import compound_plan
+    import grounding
+    try:
+        replacements = (compound_plan.load(task, directory) if any(
+            step.get('instruction_draft') for step in task.get('steps', ())) else {})
+        if any(s.get('window_context',{}).get('after_step') for s in task.get('steps', ())):
+            rows = grounding.row_replacements(task, directory)
+            compound_plan.require(not any(replacements.get(n, {}).get('action') == 'conditional-open' for n in rows),
+                                  'row_binding_conflicts_with_interpretation')
+            replacements.update(rows)
+        return compile_plan(task,replacements=replacements)
+    except (ValueError,OSError,RuntimeError) as error:
+        return _result('plan_unavailable',diagnostic=getattr(error,'code','invalid_interpretation'))
 
 
 def save_plan(task, directory=None):
