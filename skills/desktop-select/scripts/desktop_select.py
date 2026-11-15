@@ -394,7 +394,7 @@ def saved_execution_plan(plan):
 
 
 def execution_plan_info(result):
-    info = {key: result[key] for key in ('status', 'path', 'diagnostic', 'step') if key in result}
+    info = {key: result[key] for key in ('status', 'path', 'diagnostic', 'step', 'grounding_steps') if key in result}
     envelope = result.get('envelope', {})
     recipe = envelope.get('recipe')
     if recipe:
@@ -583,10 +583,13 @@ def run(args):
     if args.command == 'storage':
         return storage_info()
     bridge.set_dpi_awareness()
+    if args.command in ('ground','bind-visual'):
+        import grounding
+        return grounding.run(sys.modules[__name__],args)
     if args.command == 'instruct':
         return save_instruction(args)
     if args.command == 'plan':
-        plan = tasks.resolve_saved_intents(tasks.load_task(args.task, task_directory()))
+        plan = tasks.load_task(args.task, task_directory())
         result = saved_execution_plan(plan)
         return dict(status='planned' if result.get('envelope') else 'needs_review',
                     task=tasks.summary(plan), execution_plan=execution_plan_info(result), input_dispatched=False)
@@ -596,7 +599,8 @@ def run(args):
         return {'status': 'observed', 'task': tasks.summary(tasks.load_task(args.task, task_directory())),
                 'input_dispatched': False}
     if args.command == 'replay':
-        plan = tasks.resolve_saved_intents(tasks.load_task(args.task, task_directory()))
+        original = tasks.load_task(args.task, task_directory())
+        plan = tasks.resolve_saved_intents(original)
         requirements = replay_input_requirements(plan, args.only)
         if getattr(args, 'input_plan', False):
             return dict(status='observed', input_dispatched=False, input_requirements=requirements)
@@ -606,7 +610,7 @@ def run(args):
             if refusal:
                 return refusal
         overrides = tasks.parse_overrides(args.set)
-        quick = fast_replay(plan, args, overrides)
+        quick = fast_replay(original, args, overrides)
         if quick is not None:
             return quick
         return dict(_replay_recorded(plan, args, overrides, background),
@@ -704,6 +708,10 @@ def replay_step():
         owner.check()
     else:
         owner = bridge.Binding(binding)
+    if step['action'] == 'visual-click':
+        import visual_target
+        return visual_target.execute(owner, step['visual'], lambda:guard(owner,owner,binding['title'],mutate=True),
+                                     background_only=background)
     if step['action'] == 'row-launch':
         from row_intent import execute
         return execute(owner, binding['title'], step['ordinal'],
@@ -735,6 +743,14 @@ def parser():
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
     commands.add_parser('plan', help='save a literal execution plan from recorded instructions').add_argument('--task', required=True)
+    for name in ('ground','bind-visual'):
+        tool = commands.add_parser(name, help='inspect or bind a visible target for one recorded instruction, without input')
+        tool.add_argument('--task', required=True)
+        tool.add_argument('--only', required=True)
+        if name == 'bind-visual':
+            tool.add_argument('--frame', required=True, help='frame receipt from ground for this task and step')
+            tool.add_argument('--point', nargs=2, type=int, required=True, metavar=('IMAGE_X','IMAGE_Y'))
+            tool.add_argument('--save-as', required=True, help='new task name; preserves original')
     edit = commands.add_parser('instruct', help='save an interpreted instruction as a new task, preserving its source')
     edit.add_argument('--task', required=True)
     edit.add_argument('--only', required=True, help='recorded step number or alias')
@@ -801,7 +817,7 @@ def worker(args):
 def result_code(result):
     if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'completed', 'planned'):
         return 0
-    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review') else 3
+    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review','needs_grounding') else 3
 
 
 def worker_receipt(argv, mutating, payload=None):

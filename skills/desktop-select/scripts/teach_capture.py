@@ -41,6 +41,10 @@ def manual(reason, step_id=None):
 
 def capture_step(step):
     """Copy only data used by a Desktop Select command. All other inputs are review stops."""
+    if step['action'] == 'visual-click':
+        from visual_target import validate_spec
+        return dict(id=step['id'], action='visual-click', label=step['label'],
+                    visual=copy.deepcopy(validate_spec(step['visual'])))
     target = step['target']
     locator = target.get('locator', {})
     action, role = step['action'], locator.get('role')
@@ -153,7 +157,7 @@ class CaptureNotes:
 
 
 def default_text(step):
-    if step['action'] in ('row-action', 'result-menu'):
+    if step['action'] in ('row-action', 'result-menu', 'visual-click'):
         return step['label']
     if (step.get('recognition', {}).get('reason') == 'row_capture_requires_review'
             and step.get('label', '').endswith('번째 행 버튼')):
@@ -190,6 +194,8 @@ def instruction_view(step, instruction):
         return step['label'] + ' (버튼 선택 후 같은 행의 완료 표시 확인)'
     if instruction and instruction['mode'] == 'draft':
         return '설명은 저장됩니다. 실행 전 Claude가 문장을 해석하고 현재 화면에서 대상을 다시 찾습니다.'
+    if step['action'] == 'visual-click' and (not instruction or instruction['mode'] == 'visual-click'):
+        return '클릭 직전의 항목 모양을 저장했습니다. 재생할 때 해당 창에서 같은 모양을 찾아 한 번 누릅니다.'
     retry = '실행할 때 현재 화면에서 대상을 다시 찾습니다. ' if instruction and instruction.get('query') else ''
     if instruction and instruction['mode'] == 'fixed':
         role = instruction.get('role') or step.get('target', {}).get('locator', {}).get('role')
@@ -216,6 +222,8 @@ class StepEdits:
 
     @staticmethod
     def identity(step):
+        if step['action'] == 'visual-click':
+            return step['action'], step['visual']
         if step['action'] == 'row-action':
             return step['action'], step['row'], step['label']
         if step['action'] == 'result-menu':
@@ -245,7 +253,7 @@ class StepEdits:
         if '=' in alias or alias.isdecimal():
             raise ValueError('별칭에는 등호 또는 숫자만으로 된 이름을 사용할 수 없습니다.')
         data = {'alias': alias} if alias else {}
-        if step['action'] == 'row-action' and sentence.strip() == step['label'] and mode is None:
+        if step['action'] in ('row-action', 'visual-click') and sentence.strip() == step['label'] and mode is None:
             return data
         # A recorded literal can contain punctuation outside the sentence
         # parser. Persist our own generated draft as literal data, never code.
@@ -334,6 +342,22 @@ class _BoundWindow:
         return not self._other_recorder(hwnd) and self.binding.recording_candidate(hwnd)
 
 
+class _HookWindows:
+    """Only the mouse hook may consider a native embedded renderer as a candidate."""
+    def __init__(self, bound):
+        self.bound = bound
+        self.hwnd = bound.hwnd
+        self.contains_window = bound.contains_window
+
+    def embedded(self, hwnd):
+        from visual_target import native_child
+        return (native_child(self.bound, hwnd) and not self.bound._other_recorder(hwnd)
+                and bridge.hwnd_pid(hwnd) != self.bound.pid)
+
+    def recording_candidate(self, hwnd):
+        return self.bound.recording_candidate(hwnd) or self.embedded(hwnd)
+
+
 class _CaptureUIA(bridge.UIA):
     """Compatibility reads local to this recorder, leaving the pinned core intact."""
     def __init__(self, binding):
@@ -383,7 +407,13 @@ def _semantic_list_selection(node):
 
 
 class _RowHookPump(recorder.HookPump):
+    visual_tracker = None
+
     def _emit(self, event):
+        if self.visual_tracker is not None and (event.get('kind') in
+                ('scroll', 'candidate_scroll', 'typing', 'enter', 'tab', 'escape', 'shortcut', 'pause', 'outside')
+                or (event.get('kind') == 'down' and event.get('action') != 'click')):
+            self.visual_tracker.invalidate(event.get('at'))
         if event.get('kind') == 'down' and event.get('scope_proven'):
             self.last_scoped_down = event['at']
         if event.get('kind') == 'outside' and getattr(self, 'outside_marker', None):
@@ -395,23 +425,66 @@ class _RowHookPump(recorder.HookPump):
             except (bridge.BridgeError, OSError):
                 pass
         if (event.get('kind') == 'down' and event.get('action') == 'click'
-                and event.get('scope_proven') and event.get('window') == self.binding.hwnd):
-            self.row_tracker.pin_down(event)
+                and event.get('window') == self.binding.hwnd):
+            if event.get('scope_proven'):
+                self.row_tracker.pin_down(event)
+            elif isinstance(self.binding, _HookWindows) and self.binding.embedded(event.get('hit_window')):
+                # A native child relationship alone never authorizes UIA/keyboard
+                # capture. Only a protected-checked pre-click sample may match it.
+                event = dict(event, visual_embedded=True)
+            if self.visual_tracker is not None and (event.get('scope_proven') or event.get('visual_embedded')):
+                if self.visual_tracker.pin_down(event) and event.get('visual_embedded'):
+                    self.last_scoped_down = event['at']
         return super()._emit(event)
 
 
 class _Worker(recorder.CaptureWorker):
     pointed = None
     row_tracker = None
+    visual_tracker = None
 
     def observe_down(self, event):
         # Pin pixels completed BEFORE the hook reported mouse-down. The live
         # UIA lookup may finish after the application's click handler.
         tracker = self.row_tracker
+        if (self.visual_tracker is not None and event.get('kind') == 'down' and event.get('action') == 'click'
+                and (event.get('scope_proven') or event.get('visual_embedded'))
+                and event.get('window') == self.binding.hwnd):
+            # The sampler pins a pre-down crop. Never substitute pixels collected
+            # by the time the slower UIA lookup or mouse-up handler finishes.
+            visual = self.visual_tracker.before(event)
+            if visual is not None:
+                event['visual'] = visual
+            if event.get('visual_embedded'):
+                if visual is not None:
+                    self.binding.check()
+                    event['scope_proven'] = True
+                else:
+                    # A rapid click can precede the first pixel sample. Only
+                    # retain a description slot if the exact original native
+                    # receiver is still an exposed, non-editable canvas.
+                    from visual_target import _safe_patch, native_child
+                    point = event['x'], event['y']
+                    hit = event['hit_window']
+                    try:
+                        if (native_child(self.binding, hit) and
+                                _safe_patch(self.binding, self.uia, [*point, 1, 1], point, exposed=True) == hit):
+                            event['scope_proven'] = True
+                    except (bridge.BridgeError, OSError):
+                        pass
+                return None
         if tracker and event.get('kind') == 'down' and event.get('window') == self.binding.hwnd:
             tracker.next_press((event['x'],event['y']))
         frame = tracker.before(event['at'], event.get('token')) if tracker and event.get('action') == 'click' else None
-        observation = super().observe_down(event)
+        try:
+            observation = super().observe_down(event)
+        except (bridge.BridgeError, OSError):
+            if event.get('visual') is None:
+                raise
+            # An activating canvas can dispose its accessibility peer before
+            # this worker runs. Its pre-click sample was already scope-checked.
+            self.binding.check()
+            return None
         if (not tracker or not observation or event.get('window') != self.binding.hwnd
                 or not event.get('scope_proven') or observation.get('combo') is not None):
             return observation
@@ -664,6 +737,13 @@ class _Worker(recorder.CaptureWorker):
                 pointed = self.combo_for(observation)
                 if pointed is None and node.get('role') == 'textfield':
                     pointed = observation
+        if event.get('visual') is not None and pointed is None and self._use_visual(event, observation):
+            self.freeze_watch(event.get('at'))
+            self.binding.check()
+            step = dict(id=uuid.uuid4().hex, action='visual-click', label='녹화한 화면 항목 누르기',
+                        visual=event['visual'])
+            self.model.add(step)
+            return step['id']
         step = super().capture_action(event, observation)
         if pointed and self.watched and self.uia.same(pointed['element'], self.watched['element']):
             self.pointed = self.watched
@@ -683,6 +763,29 @@ class _Worker(recorder.CaptureWorker):
                 return point['id']
         return step
 
+    def _use_visual(self, event, observation):
+        if (event['action'] != 'click' or event.get('scope_proven') is not True
+                or event.get('window') != self.binding.hwnd):
+            return False
+        if observation is None:
+            # A valid sampled crop already has its own protected-element and
+            # window checks; the accessibility peer can disappear on click.
+            return True
+        node = observation['node']
+        role = node.get('role')
+        actions = set(node.get('available_actions', ()))
+        shell = role in ('window','group','custom')
+        if (observation.get('window') != self.binding.hwnd or node.get('secure') is not False
+                or role not in ('window','group','custom','statictext','image','button')
+                or actions.intersection(('Check','Select','Expand','Collapse'))):
+            return False
+        if ((node.get('enabled') is not True or 'SetValue' in actions)
+                and not (shell and event.get('visual') is not None)):
+            return False
+        locator = node.get('locator')
+        return not (role == 'button' and 'Click' in actions and recorder._locator_valid(locator)
+                    and learned_tasks._selector(locator))
+
 
 class CaptureSession:
     def __init__(self, binding, title):
@@ -691,9 +794,12 @@ class CaptureSession:
         self.events, self.notices = queue.Queue(maxsize=128), queue.Queue()
         self.worker = _Worker(self.binding, _CaptureBridge(self.binding), self.notes, self.events, self.notices)
         from row_capture import Tracker
+        from visual_target import HoverTracker
         self.rows = self.worker.row_tracker = Tracker(self.binding, self.notes)
-        self.pump = _RowHookPump(self.binding, bridge, self.events, self.notices)
+        self.visual = self.worker.visual_tracker = HoverTracker(self.binding)
+        self.pump = _RowHookPump(_HookWindows(self.binding), bridge, self.events, self.notices)
         self.pump.row_tracker = self.rows
+        self.pump.visual_tracker = self.visual
         self.started = self.ended = False
 
     def start(self, *, prime_rows=True):
@@ -705,6 +811,7 @@ class CaptureSession:
             if not self.worker.ready.wait(3) or self.worker.error:
                 raise bridge.BridgeError('accessibility_worker_unavailable')
             self.rows.start()
+            self.visual.start()
             # Prime the pre-click sample as the recorder opens. A slow or
             # unavailable row provider cannot hold up ordinary semantic capture.
             if prime_rows:
@@ -727,6 +834,7 @@ class CaptureSession:
                 break
             if kind in ('fatal', 'pause'):
                 self.pump.stop()
+                self.visual.stop()
                 self.worker.enabled.clear()
                 if (reason == 'target_lifetime_changed' and getattr(self, 'linked', False)
                         and not bridge.user32.IsWindow(self.binding.hwnd)):
@@ -744,11 +852,13 @@ class CaptureSession:
                     self.notes.manual('', reason or 'capture_interrupted')
         if self.started and not self.ended and self.pump.closed.is_set() and self.notes.state != 'paused':
             self.worker.enabled.clear()
+            self.visual.stop()
             self.notes.manual('', 'hook_stopped')
             self.notes.set_state('paused', partial=True)
         if self.notes.limit:
             self.worker.enabled.clear()
             self.pump.stop()
+            self.visual.stop()
 
     def finish(self, *, report_empty=True):
         if not self.started or self.ended:
@@ -772,11 +882,13 @@ class CaptureSession:
                 return {'status': 'recorded', 'steps': self.notes.snapshot(), 'input_dispatched': False}
         finally:
             self.rows.stop()
+            self.visual.stop()
             self.worker.abort.set()
 
     def cancel(self):
         self.ended = True
         self.rows.stop()
+        self.visual.stop()
         self.pump.stop()
         self.worker.enabled.clear()
         self.worker.abort.set()
@@ -1118,7 +1230,7 @@ def capture(binding, *, title):
 
     def load(step):
         sentence, chosen, arg = edits.form(step)
-        configured = step['action'] in ('row-action', 'result-menu')
+        configured = step['action'] in ('row-action', 'result-menu', 'visual-click')
         sentence_entry.configure(state='readonly' if step['action'] == 'result-menu' else 'normal')
         mode_box.configure(state='disabled' if configured else 'readonly')
         alias.set(edits.alias(step))

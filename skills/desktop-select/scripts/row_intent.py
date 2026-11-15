@@ -20,13 +20,19 @@ def parse(text):
     if not isinstance(text, str) or len(text) > 1000:
         return None
     words = ' '.join(text.strip().lower().rstrip('.!').split())
+    # A window name gives context and a numbered device may describe the
+    # effect of the launch. Only the ordinal attached to the row selects it.
     korean = re.fullmatch(
+        r'(?:(?:(?!\S*(?:하고|한뒤|한후)\s)[\w.-]{1,40}\s+)?'
+        r'(?:관리\s*창|관리자\s*창|목록\s*창|목록\s*화면|창|화면)(?:에서|의)\s+)?'
         r'(?:(?:현재|지금|화면의|화면에 보이는|목록에서|목록의)\s*)*'
         r'(?:(\d{1,2})\s*(?:번째|번(?:째)?)?|'
         r'(첫|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*(?:번째|째)?)\s*'
         r'(?:행|줄|항목|요소|기기|인스턴스|플레이어)(?:의|에서|에 있는|에|을|를)?\s*'
         r'(?:실행|시작|재생|켜기)(?:\s*버튼(?:을|를)?)?\s*'
-        r'(?:(?:클릭|선택|눌러|누르기|누른다|누름|하기|시켜|해|하|켜)?\s*'
+        r'(?:(?:눌러(?:서)?|클릭해(?:서)?)\s+\d{1,3}\s*(?:번\s*)?'
+        r'(?:기기|인스턴스|플레이어)(?:를|을)?\s*(?:열어|실행해|시작해|켜)\s*(?:줘|주세요)?'
+        r'|(?:클릭|선택|눌러|누르기|누른다|누름|하기|시켜|해|하|켜)?\s*'
         r'(?:해\s*)?(?:줘|주세요|주기|기 바랍니다|세요)?요?)?', words)
     if korean:
         n = int(korean[1]) if korean[1] else _ORDINALS[korean[2]]

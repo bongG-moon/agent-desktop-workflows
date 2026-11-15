@@ -42,6 +42,15 @@ class RowIntentTests(TestCase):
         for sentence in ('두 번째 행 실행하지 마세요','첫 번째 행 종료해줘','do not start the first item'):
             self.assertTrue(row_intent.conflicts_with_launch(sentence))
 
+    def test_device_number_describes_the_result_of_opening_the_requested_row(self):
+        self.assertEqual(row_intent.parse('MuMu 관리창에서 6번째 행의 실행 버튼을 눌러 04 기기를 열어줘.'), 6)
+        self.assertEqual(row_intent.parse('관리 창에서 7번째 행의 실행 버튼을 눌러서 05번 기기를 열어줘.'), 7)
+        for text in ('MuMu 관리창에서 6번째 행의 실행 버튼을 눌러 04 기기를 삭제해줘.',
+                     '관리창에서 6번째 행 말고 04 기기를 열어줘.',
+                     '관리창에서 6번째 행의 실행 버튼을 눌러 04번째 행의 실행 버튼도 눌러줘.',
+                     '저장하고 관리창에서 6번째 행의 실행 버튼을 눌러 04 기기를 열어줘.'):
+            self.assertIsNone(row_intent.parse(text), text)
+
     def test_distinct_lists_and_overlapping_rows_cannot_be_merged_into_one_ordinal(self):
         rows = [([0,30,100,20], {'viewport':(0,0,100,90)}),([0,5,100,20],{'viewport':(0,0,100,90)})]
         self.assertEqual(row_intent._at_ordinal(rows,1),rows[1][0])

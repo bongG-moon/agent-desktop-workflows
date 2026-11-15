@@ -1,10 +1,12 @@
-# Desktop Select 0.4.12 — 열린 창을 선택해 녹화하기
+# Desktop Select 0.4.13 — 녹화한 화면의 아이콘과 설명으로 재생하기
+
+이름이 노출되지 않는 아이콘도 일반 녹화 중에 클릭할 수 있습니다. 녹화기는 클릭 직전의 작은 이미지와 사용자가 적은 설명을 함께 보관하고, 재생할 때 해당 창에서 아이콘을 다시 찾습니다. 예전 녹화에 설명만 있으면 Claude Code가 현재 창에서 이름을 찾고, 필요할 때 해당 창의 이미지를 읽어 새 실행용 작업에 연결합니다. [사용 방법](skills/desktop-select/사용가이드.md#설명만-남은-단계와-화면-아이콘-재생하기)
 
 관리창에서 기기를 실행하고 새 기기창 안에서 작업한 뒤 관리창으로 돌아오는 과정을 한 번에 녹화할 수 있습니다. 이미 열려 있는 기기는 녹화기의 **열린 창 선택**에서 창 제목으로 고르세요. 기본 목록에는 관리창과 관련된 창이 표시됩니다. 다른 앱에서 이어서 작업할 때는 다른 프로그램의 창도 표시할 수 있습니다. 녹화한 동작으로 열린 관련 창은 앞으로 오면 자동 연결됩니다. 일반 재생과 등록한 Python 업무 스킬에서도 같은 창 순서를 사용합니다.
 
 0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 처음에는 위치를 녹화하고 설명 초안을 수정한 뒤 Python 업무 스킬로 등록합니다. 이후에는 Family 같은 선택값과 SearchText 같은 입력값을 받아 같은 순서로 실행합니다. 0.4.10은 목록 안 버튼을 일반 녹화 중에 인식하고, 단계마다 실제로 실행할 문장을 입력할 수 있게 합니다. 녹화한 위치에 버튼 이름이 없어도 `두번째 요소 실행버튼 누르기`라고 쓰면 실행 당시 보이는 목록의 두 번째 행에서 실행 버튼을 찾습니다. 기본 조회와 Excel 내보내기 흐름은 유지합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 Python 소스를 포함한 텍스트 파일만 있습니다.
 
-Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받아 줘. 조회 뒤 결과 표를 우클릭해서 Excel로 내보내고, 저장 창과 파일 확인까지 Python 업무 스킬로 연결해 줘”라고 요청하세요. 호스트 모델이 현재 화면을 확인해 실행안을 한 번 정리하고, 반복 실행은 저장한 동작을 Python으로 수행합니다. 외부 모델 호출은 없으며 업무 앱의 서버 처리 시간은 줄이지 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.12/desktop-select-0.4.12-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.12/skills/desktop-select/사용가이드.md)
+Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받아 줘. 조회 뒤 결과 표를 우클릭해서 Excel로 내보내고, 저장 창과 파일 확인까지 Python 업무 스킬로 연결해 줘”라고 요청하세요. 호스트 모델이 현재 화면을 확인해 실행안을 한 번 정리하고, 반복 실행은 저장한 동작을 Python으로 수행합니다. 외부 모델 호출은 없으며 업무 앱의 서버 처리 시간은 줄이지 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.13/desktop-select-0.4.13-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.13/skills/desktop-select/사용가이드.md)
 
 정확한 ID나 이름이 없는 입력란은 확인된 상위 영역과 그 안의 상대 위치를 기록할 수 있습니다. 실행 때 영역과 실제 UIA 대상의 역할, 클래스, 소속을 다시 확인합니다. 임시 HWND를 저장하거나 옛 절대좌표를 누르지 않습니다. 표준 Win32 우클릭 메뉴는 대상 창의 실제 메뉴 소유자를 확인한 뒤 읽습니다. 이름 있는 표 영역과 완료 표식, 메뉴 항목은 필요한 후보만 조회해 전체 화면 반복 탐색을 줄입니다.
 

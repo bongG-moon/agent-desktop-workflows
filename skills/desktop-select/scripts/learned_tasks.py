@@ -140,6 +140,46 @@ def is_recoverable(step):
             and converted.get('reason') in RECOVERABLE_CAPTURE_REASONS)
 
 
+def click_request(sentence):
+    """Extract the visible name from one affirmative click or launch instruction."""
+    if not isinstance(sentence, str):
+        return None
+    text = sentence.strip().rstrip('.!。').rstrip()
+    # A parenthesized label may follow either the target or the whole sentence.
+    alias = re.search(r'\s*[（(]([^()（）]{1,120})[)）]$', text)
+    if alias:
+        text = text[:alias.start()].rstrip()
+    verb = (r'(?:눌러(?:서?\s*(?:시행|실행|시작|열어|열기))?|누르기|클릭(?:해서\s*(?:시행|실행|시작|열어|열기))?'
+            r'|선택해서\s*(?:시행|실행|시작)|실행|시행|열어|열기)')
+    match = re.fullmatch(r'(.+?)\s*(?:을|를)?\s*' + verb + r'(?:해)?\s*(?:줘|주세요)?', text)
+    if match:
+        target = match[1].strip()
+    else:
+        english = re.fullmatch(r'(?:click|tap|open|launch)\s+(.+)', text, re.I)
+        if not english:
+            return None
+        target = english[1].strip()
+    embedded = re.search(r'\s*[（(]([^()（）]{1,120})[)）]$', target)
+    if embedded and not alias:
+        alias = embedded
+        target = target[:embedded.start()].rstrip()
+    # Compound, conditional, negative and non-left gestures require the host.
+    compound = (r'[,;!?\n]|누르[고지]|눌러서|누른\s*(?:뒤|후)|하고|(?:한|선택)\s*(?:뒤|후)|'
+                r'말고|대신|아니라|빼고|제외|다음|모두|둘\s*다|연속|두\s*번|더블|우클릭|오른쪽\s*버튼|'
+                r'하지\s*마|않|(?:하면|되면|라면|있으면|없으면)\s|'
+                r'\b(?:and|or|then|unless|except|not|double|right-click)\b')
+    if not target or re.search(compound, target, re.I):
+        return None
+    # Location prose identifies the window that owns the demonstrated click.
+    # The UIA lookup needs the caption inside this already-bound scope.
+    target = re.sub(r'^.+?(?:화면|창)에서\s+', '', target).strip()
+    role = 'menuitem' if target.endswith('메뉴') else 'button'
+    name = alias[1].strip() if alias else re.sub(r'\s*(?:버튼|메뉴|아이콘|항목)$', '', target).strip()
+    if not _text(name, 200) or name in {'이', '그', '해당', '여기', '거기'}:
+        return None
+    return name, role
+
+
 def instruction_subject(sentence):
     """Return the field named in a supported sentence for an explicit alias link."""
     if not isinstance(sentence, str):
@@ -288,6 +328,10 @@ def _parse_sentence(step, sentence):
         if step.get('action') != 'open' or (command[2] in ('펼치기', '펼쳐') and not step.get('expand')):
             raise TaskError('instruction_action_mismatch')
         return 'recorded', None
+    click = click_request(sentence)
+    if click and step.get('action') == 'open' and not step.get('expand'):
+        _instruction_subject(step, click[0])
+        return 'recorded', None
     return None
 
 
@@ -327,6 +371,9 @@ def _semantic_instruction(raw_step, sentence, mode, argument, target, role, with
         raise TaskError('instruction_target_unavailable')
     explicit = any(value is not None for value in (mode, argument, target, role, within))
     subject = instruction_subject(sentence)
+    click = click_request(sentence)
+    if click:
+        subject = click[0]
     query = target if target is not None else subject
     if query is None and _text(raw_step.get('alias')):
         query = raw_step['alias']
@@ -342,8 +389,8 @@ def _semantic_instruction(raw_step, sentence, mode, argument, target, role, with
     # parser below still checks the subject, operation, and bound argument.
     command = re.fullmatch(r'(.+?)(?:을|를)\s*(누르기|눌러|클릭|펼치기|펼쳐|선택|실행)'
                            r'(?:해)?\s*(?:줘|주세요)?(?:[.!。])?', sentence)
-    action = 'open' if mode == 'recorded' or (mode is None and command) else 'select'
-    inferred_role = ('menuitem' if command and re.search(r'메뉴\s*$', command[1]) else 'button')
+    action = 'open' if mode == 'recorded' or (mode is None and (command or click)) else 'select'
+    inferred_role = click[1] if click else ('menuitem' if command and re.search(r'메뉴\s*$', command[1]) else 'button')
     inferred_input = 'textfield' if re.search(r'입력란\s*(?:에|을|를)', sentence) else 'combobox'
     role = role if role is not None else (inferred_input if action == 'select' else inferred_role)
     if action == 'select' and role == 'textfield':
@@ -393,6 +440,14 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         raise TaskError('invalid_step_instruction')
     if not sentence and all(value is None for value in (mode, argument, target, role, within)):
         return None
+    if ('visual_hint' in raw_step and is_recoverable(raw_step) and click_request(sentence)
+            and all(value is None for value in (mode, argument, target, role, within))):
+        return {'mode': 'visual-click', 'text': sentence}
+    if raw_step.get('action') == 'visual-click':
+        if all(value is None for value in (mode, argument, target, role, within)):
+            if sentence == raw_step.get('label') or click_request(sentence):
+                return {'mode': 'visual-click', 'text': sentence}
+        raw_step = {**_manual('capture_target_unavailable'), **_annotations(raw_step)}
     if raw_step.get('action') in ('row-action', 'row-launch'):
         # A taught gesture is the default. An explicit edit supplies a new
         # intent rather than authorizing the old gesture under another label.
@@ -445,6 +500,20 @@ def instructed_step(raw_step, spec):
     """
     if not isinstance(raw_step, dict) or not isinstance(spec, dict):
         raise TaskError('invalid_step_instruction')
+    if spec.get('mode') == 'visual-click' and 'visual_hint' in raw_step and is_recoverable(raw_step):
+        if compile_instruction(raw_step, spec.get('text')) != spec:
+            raise TaskError('invalid_step_instruction')
+        return _visual_step(dict(raw_step, visual=raw_step['visual_hint']), spec['text'])
+    if raw_step.get('action') == 'visual-click':
+        if spec.get('mode') == 'visual-click':
+            if compile_instruction(raw_step, spec.get('text')) != spec:
+                raise TaskError('invalid_step_instruction')
+            return _visual_step(raw_step, spec['text'])
+        if spec.get('mode') == 'draft':
+            marker = _visual_step(raw_step, raw_step.get('label'))['visual']
+            step = instructed_step({**_manual('capture_target_unavailable'), **_annotations(raw_step)}, spec)
+            return dict(step, visual_hint=marker)
+        raw_step = {**_manual('capture_target_unavailable'), **_annotations(raw_step)}
     row_hint = None
     if raw_step.get('action') in ('row-action', 'row-launch'):
         row_hint = raw_step.get('row') if raw_step['action'] == 'row-action' else raw_step.get('row_hint')
@@ -470,7 +539,10 @@ def instructed_step(raw_step, spec):
                 or spec['text'] != spec['text'].strip()):
             raise TaskError('invalid_step_instruction')
         if step.get('action') == 'manual':
-            return {**_manual(step['reason']), **_annotations(raw_step), 'instruction_draft': spec['text']}
+            result = {**_manual(step['reason']), **_annotations(raw_step), 'instruction_draft': spec['text']}
+            if 'visual_hint' in raw_step:
+                result['visual_hint'] = raw_step['visual_hint']
+            return result
         step.pop('instruction', None)
         step['instruction_draft'] = spec['text']
         if 'wait_after' in raw_step:
@@ -504,6 +576,10 @@ def instructed_step(raw_step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    if raw.get('action') == 'visual-click':
+        if 'instruction' in raw:
+            return instructed_step(raw, raw['instruction'])
+        return _visual_step(raw, raw.get('label'))
     if raw.get('action') == 'result-menu':
         step = {'action': 'result-menu', 'label': raw.get('label'), 'context': raw.get('context'), **_annotations(raw)}
         _validate_context(step)
@@ -546,6 +622,14 @@ def from_recording(name, exe, window, steps):
     return {'schema': 1, 'name': name, 'exe': exe, 'window': window, 'steps': converted}
 
 
+def _visual_step(raw, label):
+    from visual_target import validate_spec
+    if not _text(label, 1000) or len(label.encode('utf8')) > 1000:
+        raise TaskError('invalid_visual_label')
+    validate_spec(raw.get('visual'))
+    return dict(action='visual-click', label=label, visual=raw['visual'], **_annotations(raw))
+
+
 def _validate_row(step):
     from row_vision import validate_spec
     from win_bridge import BridgeError
@@ -566,7 +650,8 @@ def _validate_context(step):
 
 def summary(plan):
     """The local row patches are used by the player and stay out of CLI responses."""
-    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'row_hint', 'context')},
+    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'row_hint', 'context', 'visual', 'visual_hint')},
+                              **({'has_visual_hint': True} if 'visual_hint' in step else {}),
                               **({'menu_path': step['context']['menu']['path']} if 'context' in step else {})}
                              for step in plan['steps']])
 
@@ -580,7 +665,7 @@ def resolve_saved_intents(plan):
             text = step.get('instruction_draft', '')
             is_user_text = bool(text and text != LEGACY_INSTRUCTION_HINT)
             if not is_user_text:
-                text = step.get('alias', '')
+                text = step.get('alias') or step.get('description', '')
             if text:
                 # Only a complete instruction is executable. A legacy alias
                 # like '조회 단계' remains the name of the step.
@@ -598,6 +683,19 @@ def resolve_saved_intents(plan):
     return resolved
 
 
+def grounding_request(number, step):
+    """Report a local, scoped host handoff; exclude screenshots and recorded data."""
+    sentence = (step.get('grounding_text') or step.get('instruction_draft')
+                or step.get('instruction', {}).get('text') or step.get('description') or step.get('alias'))
+    result = dict(number=number, instruction=sentence or '', reason=step.get('reason', 'target_unavailable'))
+    if 'window_context' in step:
+        result['window_context'] = dict(step['window_context'])
+    query = step.get('selector', {}).get('query') or (step.get('target') if step.get('match') == 'query' else None)
+    if query:
+        result['query'] = query
+    return result
+
+
 def _validate(plan):
     if (not isinstance(plan, dict) or set(plan) != {'schema', 'name', 'exe', 'window', 'steps'}
             or type(plan['schema']) is not int or plan['schema'] != 1):
@@ -613,6 +711,10 @@ def _validate(plan):
         annotation = _annotations(s)
         if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
             raise TaskError('invalid_step_annotation')
+        if s['action'] == 'visual-click':
+            if _visual_step(s, s.get('label')) != s:
+                raise TaskError('invalid_visual_step')
+            continue
         if s.get('action') == 'row-action':
             _validate_row(s)
             continue
@@ -630,6 +732,12 @@ def _validate(plan):
             continue
         if s.get('action') == 'manual':
             expected = {'action', 'reason'}
+            if 'visual_hint' in s:
+                from visual_target import validate_spec
+                if not is_recoverable(s) or 'instruction_draft' not in s:
+                    raise TaskError('invalid_visual_step')
+                validate_spec(s['visual_hint'])
+                expected.add('visual_hint')
             if 'instruction_draft' in s:
                 expected.add('instruction_draft')
                 draft = s['instruction_draft']
@@ -932,10 +1040,12 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
     results = []
     report = {'status': 'verified', 'steps': results, 'input_dispatched': False}
     for number, s in sequence:
+        if s.get('instruction_draft'):
+            unresolved = [grounding_request(i, step) for i, step in sequence if step.get('instruction_draft')]
+            return dict(report, status='needs_review', stopped_at=number, diagnostic='instruction_requires_structure',
+                        grounding_steps=unresolved)
         if s['action'] == 'manual':
             return dict(report, status='needs_review', stopped_at=number, diagnostic=s['reason'])
-        if 'instruction_draft' in s:
-            return dict(report, status='needs_review', stopped_at=number, diagnostic='instruction_requires_structure')
     missing = [s['instruction']['parameter'] for number, s in sequence if number not in values
                and s.get('instruction', {}).get('mode') == 'required']
     if missing:

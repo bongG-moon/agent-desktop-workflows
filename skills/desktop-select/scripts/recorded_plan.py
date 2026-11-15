@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 6
+COMPILER = 7
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -50,8 +50,10 @@ def compile_plan(task):
     for number, step in enumerate(steps, 1):
         reason = None
         if step.get('instruction_draft'):
-            reason = 'instruction_requires_structure'
-        elif step['action'] in ('row-action', 'row-launch'):
+            return _result('not_compatible', diagnostic='instruction_requires_structure', step=number,
+                           grounding_steps=[tasks.grounding_request(i, s) for i, s in enumerate(steps, 1)
+                                            if s.get('instruction_draft')])
+        elif step['action'] in ('row-action', 'row-launch', 'visual-click'):
             continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
@@ -70,10 +72,10 @@ def compile_plan(task):
         context = deepcopy(step.get('window_context'))
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
-        if step['action'] in ('row-action', 'row-launch'):
+        if step['action'] in ('row-action', 'row-launch', 'visual-click'):
             # Preserve demonstrated identity versus a live ordinal request.
             # A relative row instruction must still select the current Nth row.
-            fields = ('action', 'label', 'row', 'row_hint', 'ordinal', 'alias')
+            fields = ('action', 'label', 'row', 'row_hint', 'ordinal', 'alias', 'visual')
             converted.append({k: deepcopy(step[k]) for k in fields if k in step})
             if context is not None:
                 converted[-1]['window_context'] = context
@@ -82,7 +84,15 @@ def compile_plan(task):
         # Original recorded playback stopped at a command whose business result
         # was unverified. Do not silently turn that into immediate continuation.
         if step['action'] == 'open' and number < len(steps) and not step.get('wait_after') and number not in openers:
-            return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
+            # Independent clicks in two separately recorded device windows do not
+            # make the next device depend on the first one's business outcome.
+            next_step = steps[number]
+            current_scope, next_scope = step.get('window_context'), next_step.get('window_context')
+            independent = (current_scope and next_scope and next_step['action'] in ('visual-click', 'open')
+                           and (current_scope['exe'].casefold(), current_scope['title']) !=
+                               (next_scope['exe'].casefold(), next_scope['title']))
+            if not independent:
+                return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])
         if step['match'] == 'query':
             selector['query'] = step['target']
@@ -93,6 +103,8 @@ def compile_plan(task):
         if step.get('ancestors') and step['match'] != 'query':
             selector['ancestors'] = deepcopy(step['ancestors'])
         current = dict(action='set-value' if step['action'] in tasks.VALUE_ACTIONS else 'invoke', selector=selector)
+        if step['match'] == 'query' and step['action'] == 'open' and step.get('instruction', {}).get('text'):
+            current['grounding_text'] = step['instruction']['text']
         if context is not None:
             current['window_context'] = context
         label = step.get('alias') or step.get('label') or step['target']

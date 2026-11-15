@@ -134,7 +134,7 @@ class CaptureTrail:
                     if not 0 <= at-when <= 90:
                         continue
                     reason = step.get('recognition', {}).get('reason')
-                    if (step['action'] in ('click','select','expand','row-action','result-menu')
+                    if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click')
                             or reason in ('row_capture_requires_review', 'stable_locator_unavailable',
                                           'capture_target_unavailable', 'unsupported_recorded_action')):
                         result.append((when, part, key))

@@ -26,6 +26,9 @@ import row_vision
 import window_context
 
 
+CHILD_VISUAL_TIMEOUT = 30
+
+
 class WorkflowError(ValueError):
     def __init__(self, code):
         super().__init__(code)
@@ -106,6 +109,12 @@ def validate(recipe):
         if isinstance(raw, dict) and 'window_context' in raw:
             step = {key: value for key, value in raw.items() if key != 'window_context'}
         need(isinstance(step, dict), 'invalid_workflow_step')
+        if step.get('action') == 'visual-click':
+            from visual_target import validate_spec
+            need(set(step) - {'alias'} == {'action', 'label', 'visual'}
+                 and text(step['label']) and ('alias' not in step or text(step['alias'], 200)), 'invalid_visual_step')
+            validate_spec(step['visual'])
+            continue
         if step.get('action') in ('row-action', 'row-launch'):
             ordinary = step['action'] == 'row-action'
             key = 'row' if ordinary else 'ordinal'
@@ -136,7 +145,8 @@ def validate(recipe):
             timeout = step.get('timeout', 26)
             need(type(timeout) in (int, float) and 0 <= timeout <= 120, 'invalid_file_timeout')
             continue
-        need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label', 'popup'}, 'unknown_step_field')
+        need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label', 'popup',
+                              'grounding_text'}, 'unknown_step_field')
         need(step.get('action') in ('set-value', 'invoke', 'submit'), 'unsupported_workflow_action')
         if 'popup' in step:
             popup = step['popup']
@@ -147,6 +157,9 @@ def validate(recipe):
             need(type(timeout) in (int, float) and 0 <= timeout <= 10, 'invalid_popup_timeout')
         selector = step.get('selector')
         validate_selector(selector)
+        if 'grounding_text' in step:
+            need(step['action'] == 'invoke' and 'query' in selector and text(step['grounding_text']),
+                 'invalid_grounding_instruction')
         need(text(step.get('label', 'step'), 200), 'invalid_step_label')
         need('command_name' not in step or (step['action'] == 'invoke' and text(step['command_name'])),
              'invalid_command_name')
@@ -196,6 +209,8 @@ def worker_timeout(recipe):
                     + (step.get('timeout', 26) if step['action'] == 'verify-file' else 0)
                     + (3 * len(step['spec']['path']) + 3 if step['action'] == 'context-menu' else 0)
                     + (120 if step['action'] in ('row-action', 'row-launch') else 0)
+                    + (CHILD_VISUAL_TIMEOUT if step['action'] == 'visual-click'
+                       and 'after_step' in step.get('window_context', {}) else 0)
                     for step in recipe['steps']) + window_context.OPEN_TIMEOUT * len({
                         (spec['exe'].casefold(), spec['title'], spec['after_step'])
                         for step in recipe['steps'] if 'after_step' in (spec := step.get('window_context', {}))})
@@ -298,6 +313,34 @@ def confirm_opened_window(report, routes, number):
             report['status'] = 'verified'
 
 
+_GROUNDING_DIAGNOSTICS = {'target_missing', 'target_ambiguous', 'scope_missing', 'scope_ambiguous',
+                          'workflow_pattern_unavailable'}
+
+
+def _missing_groundings(recipe, entries, owner, uia):
+    """Check already-open scopes of recovered click instructions before dispatch."""
+    candidates = [(n, step) for n, step in entries if step.get('grounding_text') and (
+                  n == entries[0][0] or step.get('window_context'))]
+    if not candidates:
+        return []
+    lookup_routes = window_context.WindowRoutes(recipe['steps'], owner, recipe['window'], read_only=True,
+                                                active=[n for n, _ in candidates])
+    missing = []
+    for number, step in candidates:
+        scope = step.get('window_context')
+        binding = lookup_routes.resolve(scope) if scope else owner
+        if binding is None:
+            continue
+        try:
+            element, _, _ = resolve_step(binding, uia, uia.from_handle(binding.hwnd), step['selector'])
+            need('Click' in uia.actions(element), 'workflow_pattern_unavailable')
+        except (app.SelectionError, WorkflowError) as error:
+            if error.code not in _GROUNDING_DIAGNOSTICS:
+                raise
+            missing.append(dict(app.tasks.grounding_request(number, step), reason=error.code))
+    return missing
+
+
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
         background_only=False, only=None):
     recipe = validate(recipe)
@@ -333,6 +376,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
+            missing = _missing_groundings(recipe, entries, owner, uia)
+            if missing:
+                return dict(report, status='needs_grounding', diagnostic='target_grounding_required',
+                            stopped_at=missing[0]['number'], grounding_steps=missing)
             for number, step in entries:
                 stage_started = time.monotonic()
                 app.guard(owner, owner, recipe['window'])
@@ -352,6 +399,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     confirm_opened_window(report, routes, context.get('after_step'))
                 if binding is None:
                     pending = dict(window_context=deepcopy(context), diagnostic='recorded_window_not_open')
+                    if step.get('grounding_text'):
+                        pending.update(instruction=step['grounding_text'], query=step['selector']['query'])
                     report.setdefault('pending_scopes', []).append(dict(number=number, **pending))
                     receipt = dict(status='deferred', input_dispatched=False, scope_validation='pending', **pending)
                     report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
@@ -369,7 +418,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
                 if (not read_only and binding.hwnd not in prepared and 'popup' not in step
-                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action', 'row-launch')):
+                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action',
+                                               'row-launch', 'visual-click')):
                     if background_only:
                         input_policy.window_ready(binding)
                     else:
@@ -394,6 +444,22 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         receipt = dict(status='verified' if ok else 'blocked', input_dispatched=False,
                                        diagnostic=diagnostic, file_verified=ok,
                                        baseline_scope='before_workflow', business_commit='not_verified')
+                elif step['action'] == 'visual-click':
+                    import visual_target
+                    def click_guard():
+                        check_target(binding, mutate=not read_only)
+                    click_guard()
+                    dispatching = not read_only
+                    try:
+                        opener = routes.outcomes.get((context or {}).get('after_step'), {})
+                        first_match_timeout = CHILD_VISUAL_TIMEOUT if not read_only and opener.get('input_dispatched') is True else 0
+                        receipt = visual_target.execute(binding, step['visual'], click_guard,
+                                                        read_only=read_only, background_only=background_only,
+                                                        first_match_timeout=first_match_timeout)
+                    except app.bridge.BridgeError as error:
+                        dispatching = getattr(error, 'input_dispatched', False) is not False
+                        raise
+                    dispatching = False
                 elif step['action'] in ('row-action', 'row-launch'):
                     dispatching = not read_only
                     try:
@@ -445,6 +511,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         element, stable, resolution = anchor_proof.element, None, None
                     else:
                         element, stable, resolution = resolve_step(surface, uia, root, selector)
+                    if step.get('grounding_text'):
+                        need('Click' in uia.actions(element), 'workflow_pattern_unavailable')
                     need('command_name' not in step or element.property(30005) == step['command_name'],
                          'command_name_changed')
                     if step.get('field_label'):
@@ -505,6 +573,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 report['input_dispatched'] = combine(report['input_dispatched'], receipt['input_dispatched'])
                 if receipt.get('physical_input'):
                     report['physical_input'] = True
+                if read_only and step['action'] == 'visual-click' and receipt['status'] != 'observed':
+                    report.update(status=receipt['status'], stopped_at=number,
+                                  diagnostic=receipt.get('diagnostic', 'visual_target_unavailable'))
+                    break
                 if read_only or (step['action'] not in ('context-menu', 'submit') and receipt['status'] in ('verified', 'waited')):
                     continue
                 delivered = (step['action'] == 'invoke' and receipt['status'] == 'delivered_unverified'
@@ -517,7 +589,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 delivered_submit = (step['action'] == 'submit' and receipt['status'] == 'delivered_unverified'
                                     and receipt['input_dispatched'] is True and receipt.get('keyboard_events_sent') == 2
                                     and receipt.get('diagnostic') == 'submit_enter_sent')
-                if delivered or delivered_menu or delivered_submit:
+                delivered_visual = (step['action'] == 'visual-click' and receipt['status'] == 'delivered_unverified'
+                                    and receipt['input_dispatched'] is True
+                                    and receipt.get('diagnostic') == 'visual_click_dispatched')
+                if delivered or delivered_menu or delivered_submit or delivered_visual:
                     report['status'] = 'completed_unverified'
                     if delivered and routes.origins.get(number):
                         pending_opener = number
@@ -537,6 +612,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             report['stopped_at'] = number
         report['input_dispatched'] = combine(report['input_dispatched'], failure['input_dispatched'])
         report.update(status=failure['status'], diagnostic=diagnostic)
+        if not dispatching and number and step.get('grounding_text') and diagnostic in _GROUNDING_DIAGNOSTICS:
+            report.update(status='needs_grounding', diagnostic='target_grounding_required',
+                          grounding_steps=[dict(app.tasks.grounding_request(number, step), reason=diagnostic)])
     finally:
         if anchor_proof is not None:
             anchor_proof.close()
@@ -574,35 +652,61 @@ def discover(exe, title, hwnd=None):
     return dict(status='observed', targets=found, input_dispatched=False)
 
 
-RUNNER = '''"""Run the locally registered workflow with the sibling Desktop Select skill."""
+RUNNER = '''"""Run this project workflow with its shared Desktop Select runtime."""
 from pathlib import Path
 import sys
 
 HERE = Path(__file__).resolve()
-RUNTIME = HERE.parents[2] / "desktop-select" / "scripts"
+RUNTIME = HERE.parents[RUNTIME_PARENT] / "desktop-select" / "scripts"
 if not (RUNTIME / "python_workflow.py").is_file():
-    raise SystemExit("Install the Desktop Select version used to register this workflow beside this skill.")
+    raise SystemExit(f"Desktop Select runtime missing: {RUNTIME}")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))
 '''
 
 
+def _registered_runner(destination):
+    skill_root = destination.parent
+    # Installed Claude skills are siblings. In the Windows ZIP layout the
+    # engine remains in <project>/desktop-select, outside .claude/skills.
+    relative_parent = 2
+    if skill_root.name == 'skills' and skill_root.parent.name == '.claude':
+        portable = skill_root.parent.parent / 'desktop-select/scripts'
+        sibling = skill_root / 'desktop-select/scripts/python_workflow.py'
+        if portable == Path(__file__).resolve().parent or (not sibling.is_file() and (portable / 'python_workflow.py').is_file()):
+            relative_parent = 4
+    return RUNNER.replace('RUNTIME_PARENT', str(relative_parent))
+
+
+def _recorded_targets(recipe, source_task):
+    if source_task is None or not all(
+            step['action'] in ('visual-click', 'row-action')
+            or (step['action'] == 'row-launch' and 'row_hint' in step)
+            for step in recipe['steps']):
+        return False
+    import recorded_plan
+    compiled = recorded_plan.compile_plan(source_task)
+    need(compiled.get('envelope', {}).get('recipe') == recipe, 'recorded_workflow_mismatch')
+    return True
+
+
 def register(recipe, destination, hwnd=None, *, source_task=None):
-    """Validate current targets read-only, then create three local text files."""
+    """Register demonstrated targets offline, or resolve other selectors read-only."""
     recipe = deepcopy(validate(recipe))
     if source_task is not None:
         app.tasks._validate(source_task)
     destination = Path(destination).resolve()
     need(not destination.exists(), 'workflow_destination_exists')
     need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', destination.name), 'workflow_folder_name_required')
-    observed = run(recipe, read_only=True, hwnd=hwnd)
+    recorded = _recorded_targets(recipe, source_task)
+    observed = dict(status='observed', steps=[]) if recorded else run(recipe, read_only=True, hwnd=hwnd)
     if observed['status'] != 'observed':
         return observed
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     rows = {row['number']: row for row in observed['steps']}
     for number, step in enumerate(recipe['steps'], 1):
-        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch'):
+        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch', 'visual-click'):
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
@@ -613,6 +717,7 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
              'workflow_pattern_unavailable')
         if row['receipt'].get('resolved_selector'):
             step['selector'] = row['receipt']['resolved_selector']
+            step.pop('grounding_text', None)
         resolution = row['receipt'].get('target_resolution', {})
         if step['action'] == 'set-value' and resolution.get('semantic_label'):
             step['field_label'] = resolution['semantic_label']
@@ -622,15 +727,18 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     destination.mkdir(parents=True, exist_ok=False)
     (destination / 'scripts').mkdir()
     (destination / 'workflow.json').write_text(json.dumps(recipe, ensure_ascii=False, indent=2) + '\n', encoding='utf8')
-    (destination / 'scripts/run.py').write_text(RUNNER, encoding='utf8')
+    (destination / 'scripts/run.py').write_text(_registered_runner(destination), encoding='utf8')
     if source_task is not None:
         (destination / 'source-task.json').write_text(json.dumps(source_task, ensure_ascii=False, indent=2) + '\n',
                                                      encoding='utf8')
-    guide = ('---\nname: ' + destination.name + '\ndescription: 로컬에 등록한 Windows 업무 순서를 실행한다.\n---\n\n'
+    description = json.dumps(recipe['name'] + ' 녹화 순서를 Windows에서 실행한다.', ensure_ascii=False)
+    command = 'python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/run.py"'
+    guide = ('---\nname: ' + destination.name + '\ndescription: ' + description + '\n---\n\n'
              '# 등록된 업무 실행\n\n'
              '업무명, 대상 창과 순서는 `workflow.json`에 있다. 사용자의 실행 요청 범위와 대조한다. '
-             '필수 입력은 ' + json.dumps(required, ensure_ascii=False) + '이다. 값을 받지 않으면 실행하지 않는다.\n\n'
-             '`python -X utf8 -B scripts/run.py --set "변수명=값"`으로 실행한다. '
+             + ('필수 입력은 ' + json.dumps(required, ensure_ascii=False) + '이다. 각 값을 받아 `--set "이름=값"`으로 전달한다.'
+                if required else '이 작업은 실행 시 입력할 변수가 없다.') + '\n\n'
+             '`' + command + '`으로 실행한다. '
              '현재 상태만 확인할 때는 `--read-only`를 붙인다. 이 명령은 대상 창을 복원하지 않는다.\n\n'
              '`--input-plan`은 앱을 조회하지 않고 전체 단계의 입력 방식을 표시한다. '
              '`--background-only`는 도구의 실제 마우스/키보드 입력과 전면화 요청을 금지한다. '
@@ -642,19 +750,31 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
              '입력란을 비우라는 요청은 해당 변수에 `--set "검색어="`를 준다. 콤보에는 빈 값을 쓰지 않는다. '
              '값 확인 실패 또는 불확실한 전달이면 다음 단계로 진행하지 않는다. '
              '조회/내보내기 버튼 전달과 대기는 업무 완료나 파일 생성의 증거가 아니다. 재클릭하지 않는다. '
-             '동일 폴더 아래 `desktop-select`가 필요하며 외부 통신과 CUA 드라이버는 사용하지 않는다.\n')
+             '프로젝트의 Desktop Select 엔진을 사용한다.\n')
     if source_task is not None:
         guide += '\n녹화한 위치와 자연어 지시 원문은 `source-task.json`에 보관되어 있다. 실행에는 `workflow.json`을 사용한다.\n'
+        guide += '\n## 녹화한 순서\n\n'
+        for index, step in enumerate(source_task['steps'], 1):
+            caption = (step.get('description') or step.get('instruction', {}).get('text') or step.get('instruction_draft')
+                       or step.get('alias') or step.get('label') or step.get('target') or step['action'])
+            guide += f'{index}. {caption}\n'
     if any(step['action'] in ('row-action', 'row-launch') for step in active):
         guide += ('\n녹화한 행 버튼은 저장된 행 표시와 버튼을 다시 찾아 실행한다. '
                   '“두 번째 행 실행”처럼 순번으로 등록한 동작은 현재 목록의 순서를 따른다. '
                   '이미 확인한 실행 상태라면 클릭을 생략한다. 행 버튼을 누르는 동안 실제 마우스를 사용한다. '
-                  '한 단계의 현재 상태는 `python -X utf8 -B scripts/run.py --only 1 --read-only`로 확인한다.\n')
+                  f'한 단계의 현재 상태는 `{command} --only 1 --read-only`로 확인한다.\n')
     if any('window_context' in step for step in active):
         guide += ('\n다른 창에서 수행하는 단계는 등록한 실행 파일과 창 제목으로 대상을 찾는다. '
                   '기존 창으로 연결한 경우 작업 시작 때 그 창을 열어 둔다. 새 창으로 연결한 경우 '
-                  '앞 단계가 실행된 뒤 해당 창이 열리면 이어서 처리한다. 같은 제목의 창이 둘이면 '
+                  '앞 단계가 실행된 뒤 해당 창이 열리면 이어서 처리한다. 녹화한 행이 이미 실행 중이면 '
+                  '시작 버튼을 생략하고 같은 행에 연결된 기존 창을 확인한다. 같은 제목의 창이 둘이면 '
                   '단계 번호와 이유를 확인한다. --read-only에서 아직 열리지 않은 창은 deferred로 표시된다.\n')
+    if any(step['action'] == 'visual-click' for step in active):
+        guide += ('\n화면으로 녹화한 클릭은 지정한 창에서 녹화된 모양을 다시 찾고 실제 마우스로 한 번 누른다. '
+                  'delivered_unverified는 클릭 전달을 뜻한다. 앱 실행 등 결과는 해당 창에서 별도로 확인한다.\n')
+    if any('grounding_text' in step for step in active):
+        guide += ('\n설명 속 이름이 현재 창에서 보이지 않으면 grounding_steps의 단계와 원문으로 '
+                  'desktop-select의 ground에서 같은 창을 확인하고 bind-visual로 대상을 연결한다.\n')
     if any('popup' in pending for pending in observed.get('pending_scopes', [])):
         guide += ('\n등록 시 아직 열리지 않은 팝업의 대상은 미확인 상태로 보존했다. '
                   '실행할 때 지정된 제목의 소속 팝업이 하나로 확인된 뒤에만 해당 단계에 입력한다. '
@@ -677,7 +797,12 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     (destination / 'SKILL.md').write_text(guide, encoding='utf8')
     result = dict(status='registered', path=str(destination), required_parameters=required, input_dispatched=False,
                   input_requirements=input_policy.profile(active))
-    if observed.get('pending_scopes'):
+    if recorded:
+        result['target_validation'] = 'recorded_evidence'
+        result['pending_scopes'] = [dict(number=i, window_context=deepcopy(s['window_context']),
+                                         diagnostic='validate_on_execution')
+                                    for i, s in enumerate(recipe['steps'], 1) if 'window_context' in s]
+    elif observed.get('pending_scopes'):
         result.update(target_validation='pending_scopes', pending_scopes=observed['pending_scopes'])
     return result
 
@@ -719,6 +844,11 @@ def main(argv=None):
                 import recorded_plan
                 source_task = app.tasks.load_task(args.task, app.task_directory())
                 planned = recorded_plan.get_plan(source_task, app.task_directory())
+                if planned.get('grounding_steps'):
+                    print(json.dumps(dict(status='needs_grounding', diagnostic='target_grounding_required',
+                                          input_dispatched=False, grounding_steps=planned['grounding_steps']),
+                                     ensure_ascii=False))
+                    return 2
                 need(bool(planned.get('envelope')), 'recorded_task_not_compatible')
                 recipe = planned['envelope']['recipe']
             else:

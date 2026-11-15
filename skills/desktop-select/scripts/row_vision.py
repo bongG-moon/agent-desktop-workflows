@@ -92,11 +92,13 @@ def visible_rows(binding):
     return sorted((r for r, _ in _row_layout(binding)[1]), key=lambda r: (r[1], r[0]))
 
 
-def _frame(binding, window):
+def _frame(binding, window, *, crop=None):
     """Print the target HWND into a private DIB. Occluding apps never enter this image."""
     w, h = window[2:]
     if not (0 < w <= 12000 and 0 < h <= 12000 and w*h <= 16_777_216):
         _reject('row_window_size_unsupported')
+    if crop is not None and not _inside(crop, window):
+        _reject('row_patch_outside_window')
     user = bridge.user32
     gdi = C.WinDLL('gdi32', use_last_error=True)
     sig, handle = bridge._sig, W.HANDLE
@@ -123,7 +125,13 @@ def _frame(binding, window):
             _reject('row_pixels_unavailable')
         if not paint(binding.hwnd, dc, 2) or not flush():
             _reject('row_pixels_unavailable')
-        raw = C.string_at(bits.value, w*h*4)
+        if crop is None:
+            raw = C.string_at(bits.value, w*h*4)
+        else:
+            # The recorder retains only the pixels surrounding the pointer.
+            left, top, width, height = crop
+            start = bits.value + ((top-window[1])*w + left-window[0])*4
+            raw = b''.join(C.string_at(start+y*w*4, width*4) for y in range(height))
     finally:
         if old and old != C.c_void_p(-1).value:
             select(dc, old)
