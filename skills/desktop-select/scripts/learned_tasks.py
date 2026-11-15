@@ -83,6 +83,12 @@ def _annotations(raw):
         if key == 'alias' and (value.isdecimal() or '=' in value):
             raise TaskError('invalid_step_alias')
         fields[key] = value
+    if 'window_context' in raw:
+        from window_context import validate_context, ContextError
+        try:
+            fields['window_context'] = dict(validate_context(raw['window_context']))
+        except ContextError as error:
+            raise TaskError(error.code) from error
     return fields
 
 
@@ -543,7 +549,7 @@ def from_recording(name, exe, window, steps):
 def _validate_row(step):
     from row_vision import validate_spec
     from win_bridge import BridgeError
-    if not _text(step.get('label'), 200) or set(step) - {'action', 'label', 'alias', 'description', 'row'}:
+    if not _text(step.get('label'), 200) or set(step) - {'action', 'label', 'alias', 'description', 'row', 'window_context'}:
         raise TaskError('invalid_row_step')
     try:
         validate_spec(step.get('row'))
@@ -553,7 +559,7 @@ def _validate_row(step):
 
 def _validate_context(step):
     import result_menu
-    if not _text(step.get('label'), 200) or set(step) - {'action', 'label', 'alias', 'description', 'context'}:
+    if not _text(step.get('label'), 200) or set(step) - {'action', 'label', 'alias', 'description', 'context', 'window_context'}:
         raise TaskError('invalid_result_menu_step')
     result_menu.validate_spec(step.get('context'))
 
@@ -698,6 +704,12 @@ def _validate(plan):
             raise TaskError('invalid_task_action')
         if set(s) - allowed:
             raise TaskError('unexpected_task_step_data')
+    if any('window_context' in s for s in plan['steps']):
+        from window_context import validate_sequence, ContextError
+        try:
+            validate_sequence(plan['steps'])
+        except ContextError as error:
+            raise TaskError(error.code) from error
 
 
 def check_display(step, observed):

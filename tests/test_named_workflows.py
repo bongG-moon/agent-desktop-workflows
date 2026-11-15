@@ -139,7 +139,7 @@ class NamedWorkflowTests(unittest.TestCase):
             self.addCleanup(handle.stop)
 
     def test_compilation_preserves_exact_names_ancestors_and_variables(self):
-        self.assertEqual(plans.COMPILER, 5)
+        self.assertEqual(plans.COMPILER, 6)
         first, second, last = self.recipe['steps']
         self.assertEqual(first['selector'], dict(name='Find what:', role='combobox',
                                                ancestors=[dict(name='Conditions', role='group')]))

@@ -14,6 +14,7 @@ import win_bridge as bridge
 from live_action import combo_readback
 import live_action
 import learned_tasks
+from capture_trail import CaptureTrail, finalize_contexts
 from runtime_integrity import checked_path
 
 
@@ -94,6 +95,8 @@ class CaptureNotes:
     """Keep final revisions in memory until the user finishes or cancels."""
     def __init__(self):
         self.steps = {}
+        self.times = {}
+        self.event_at = None
         self.row_selections = {}
         self.lock = threading.RLock()
         self.state = 'ready'
@@ -115,6 +118,7 @@ class CaptureNotes:
             if step['id'] not in self.steps and len(self.steps) >= self.max_steps - 1:
                 self.limit = self.partial = True
                 step = manual('recording_step_limit')
+            self.times.setdefault(step['id'], self.event_at or time.monotonic())
             self.steps[step['id']] = capture_step(step)
 
     def manual(self, label, reason):
@@ -136,6 +140,7 @@ class CaptureNotes:
             label = f'{number}번째 행 버튼' if number else '선택한 행 버튼'
             if selection is not None:
                 self.row_selections[step_id] = capture_step(selection)
+            self.times.setdefault(step_id, self.event_at or time.monotonic())
             if spec is None:
                 self.steps[step_id] = (self.row_selections.get(step_id) or
                                        dict(manual('row_capture_requires_review', step_id), label=label))
@@ -300,6 +305,7 @@ class StepEdits:
 class _BoundWindow:
     def __init__(self, binding, title):
         self.binding, self.title = binding, title
+        self.other_roots = frozenset()
 
     def __getattr__(self, key):
         return getattr(self.binding, key)
@@ -308,6 +314,24 @@ class _BoundWindow:
         self.binding.check()
         if bridge.window_text(self.hwnd) != self.title:
             raise bridge.BridgeError('business_window_changed')
+
+    def _other_recorder(self, hwnd):
+        if not self.other_roots or not hwnd:
+            return False
+        root = bridge.root_window(hwnd)
+        for _ in range(12):
+            if not root or root == self.hwnd:
+                return False
+            if root in self.other_roots:
+                return True
+            root = int(bridge.user32.GetWindow(root, 4) or 0)
+        return False
+
+    def contains_window(self, hwnd):
+        return not self._other_recorder(hwnd) and self.binding.contains_window(hwnd)
+
+    def recording_candidate(self, hwnd):
+        return not self._other_recorder(hwnd) and self.binding.recording_candidate(hwnd)
 
 
 class _CaptureUIA(bridge.UIA):
@@ -360,6 +384,16 @@ def _semantic_list_selection(node):
 
 class _RowHookPump(recorder.HookPump):
     def _emit(self, event):
+        if event.get('kind') == 'down' and event.get('scope_proven'):
+            self.last_scoped_down = event['at']
+        if event.get('kind') == 'outside' and getattr(self, 'outside_marker', None):
+            # Track only the surface and timestamp of a possible first click.
+            # Coordinates, captions, keys and contents from other apps are discarded.
+            try:
+                hit = bridge.root_window(bridge.window_from_point(*bridge.cursor()))
+                self.outside_marker((hit, bridge.hwnd_pid(hit)), event['at'])
+            except (bridge.BridgeError, OSError):
+                pass
         if (event.get('kind') == 'down' and event.get('action') == 'click'
                 and event.get('scope_proven') and event.get('window') == self.binding.hwnd):
             self.row_tracker.pin_down(event)
@@ -418,7 +452,15 @@ class _Worker(recorder.CaptureWorker):
     def handle(self, event):
         if self.row_tracker and event['kind'] in ('scroll','candidate_scroll'):
             self.row_tracker.invalidate(event['at'])
-        return super().handle(event)
+        self.model.event_at = event.get('at')
+        if event['kind'] == 'up':
+            down, _ = self.captures.get(event.get('token'), (None, None))
+            if down:
+                self.model.event_at = down.get('at', self.model.event_at)
+        try:
+            return super().handle(event)
+        finally:
+            self.model.event_at = None
 
     def tick(self):
         super().tick()
@@ -654,7 +696,7 @@ class CaptureSession:
         self.pump.row_tracker = self.rows
         self.started = self.ended = False
 
-    def start(self):
+    def start(self, *, prime_rows=True):
         if self.started or self.ended:
             raise bridge.BridgeError('recording_already_started')
         self.binding.check()
@@ -665,8 +707,10 @@ class CaptureSession:
             self.rows.start()
             # Prime the pre-click sample as the recorder opens. A slow or
             # unavailable row provider cannot hold up ordinary semantic capture.
-            self.rows.initial_sample.wait(1.8)
+            if prime_rows:
+                self.rows.initial_sample.wait(1.8)
             self.worker.enabled.set()
+            self.hook_installing_at = time.monotonic()
             self.pump.start()
         except BaseException:
             self.cancel()
@@ -684,6 +728,17 @@ class CaptureSession:
             if kind in ('fatal', 'pause'):
                 self.pump.stop()
                 self.worker.enabled.clear()
+                if (reason == 'target_lifetime_changed' and getattr(self, 'linked', False)
+                        and not bridge.user32.IsWindow(self.binding.hwnd)):
+                    with self.notes.lock:
+                        if getattr(self.pump, 'last_scoped_down', 0) > max(self.notes.times.values(), default=0):
+                            self.notes.manual('', 'capture_target_unavailable')
+                        self.notes.closed = True
+                        self.notes.set_state('closed')
+                    self.rows.stop()
+                    self.worker.abort.set()
+                    self.ended = True
+                    return
                 self.notes.set_state('paused', partial=True)
                 if kind == 'fatal':
                     self.notes.manual('', reason or 'capture_interrupted')
@@ -737,7 +792,11 @@ def capture(binding, *, title):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
     from tkinter import font as tkfont, ttk
-    session = CaptureSession(binding, title)
+    def new_session():
+        return (CaptureTrail(binding, title) if type(getattr(binding, 'hwnd', None)) is int
+                else CaptureSession(binding, title))
+
+    session = new_session()
     session.binding.check()
     root = tk.Tk()
     root.title('Desktop Select 녹화')
@@ -746,6 +805,8 @@ def capture(binding, *, title):
     editing = None
     edits = StepEdits()
     completed_steps = []
+    bound_windows = {}
+    picking_window = False
     previous_columns = None
     style = ttk.Style(root)
     if 'clam' in style.theme_names():
@@ -781,7 +842,8 @@ def capture(binding, *, title):
     ttk.Label(header, textvariable=phase, style='Title.TLabel').pack(side='left')
     primary = ttk.Frame(header)
     primary.pack(side='right')
-    ttk.Label(frame, text=title, wraplength=540, style='Muted.TLabel').pack(anchor='w', pady=(0, 6))
+    active_title = tk.StringVar(value=title)
+    ttk.Label(frame, textvariable=active_title, wraplength=540, style='Muted.TLabel').pack(anchor='w', pady=(0, 6))
     status_line = ttk.Label(frame, textvariable=message, wraplength=540, style='Muted.TLabel')
     status_line.pack(anchor='w', pady=(0, 10))
     table = ttk.Frame(frame)
@@ -834,6 +896,8 @@ def capture(binding, *, title):
                 or step.get('recognition', {}).get('reason') == 'row_capture_requires_review')
 
     def step_status(step, directive):
+        if '_openers' in step.get('_capture_window', {}):
+            return '창을 연 단계 지정'
         if directive:
             return '설명 초안' if directive['mode'] == 'draft' else '준비됨'
         if step['action'] == 'manual':
@@ -897,7 +961,13 @@ def capture(binding, *, title):
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
         selected_number = next((i for i, s in enumerate(steps_now(), 1) if s['id'] == step['id']), '')
-        edit_title.set(f'{selected_number}단계   {step["label"]}')
+        scope = step.get('_capture_window')
+        if scope and '_openers' in scope:
+            opener_btn.pack(side='left', padx=(0, 5), before=details_btn)
+        else:
+            opener_btn.pack_forget()
+        caption = f'   ·   {scope["title"]}' if scope else ''
+        edit_title.set(f'{selected_number}단계   {step["label"]}{caption}')
         if row_repairable(step):
             repair_btn.configure(text='행 버튼 다시 지정' if step['action'] == 'row-action' else '행 버튼으로 지정')
             repair_btn.pack(side='left', padx=(0, 5), before=details_btn)
@@ -931,9 +1001,11 @@ def capture(binding, *, title):
                 missing += int(compiled['action'] == 'manual' or 'instruction_draft' in compiled)
             except ValueError:
                 missing += 1
-        save.configure(text='초안 저장' if missing else '저장', state='normal' if steps else 'disabled')
+        unlinked = next((i for i, step in enumerate(steps, 1) if '_openers' in step.get('_capture_window', {})), None)
+        save.configure(text='초안 저장' if missing else '저장', state='normal' if steps and not unlinked else 'disabled')
         phase.set(f'단계 검토   {len(steps)}')
-        message.set(f'{missing}단계는 실행 전 보완해야 합니다. 해당 행을 선택해 수정하세요.' if missing
+        message.set(f'{unlinked}단계를 선택하고 ‘창을 연 단계 지정’을 누르세요.' if unlinked else
+                    f'{missing}단계는 실행 전 보완해야 합니다. 해당 행을 선택해 수정하세요.' if missing
                     else '단계를 선택해 실행 문장을 수정하세요.' if steps else '단계를 추가하거나 취소하세요.')
 
     def render(steps):
@@ -956,6 +1028,8 @@ def capture(binding, *, title):
             text = directive.get('text') if directive else default_text(step)
             if not text:
                 text = step['label'] if step['label'] != '설명으로 다시 찾을 단계' else '대상 이름을 읽지 못한 클릭'
+            if step.get('_capture_window'):
+                text = f'[{step["_capture_window"]["title"]}] {text}'
             state = step_status(step, directive)
             row = (i, text, state)
             if shown_rows.get(step['id']) != row:
@@ -1006,6 +1080,9 @@ def capture(binding, *, title):
             message.set('마치고 검토를 누른 뒤 불필요한 단계를 삭제하세요.')
             return
         removed = editing['id']
+        if any(step.get('_capture_window', {}).get('after_id') == removed for step in review['steps']):
+            message.set('이 단계가 연 창에 녹화된 동작이 있습니다. 그 창의 단계를 먼저 삭제하세요.')
+            return
         old_index = next(i for i, s in enumerate(review['steps']) if s['id'] == removed)
         review['steps'][:] = [step for step in review['steps'] if step['id'] != removed]
         edits.forget(removed)
@@ -1041,6 +1118,36 @@ def capture(binding, *, title):
     # remain available without competing with the step description.
     details_btn = ttk.Button(editing_controls, text='상세 설정', command=toggle_details)
     details_btn.pack(side='left')
+    def choose_opener():
+        if not editing:
+            return
+        scope = editing.get('_capture_window', {})
+        choices = [(step['id'], f'{number}단계   {step["label"]}')
+                   for number, step in enumerate(steps_now(), 1) if step['id'] in scope.get('_openers', ())]
+        if not choices:
+            message.set('창을 연 단계가 남아 있지 않습니다. 이 창의 단계를 다시 녹화하세요.')
+            return
+        dialog = tk.Toplevel(root)
+        dialog.title('창을 연 단계 지정')
+        dialog.transient(root)
+        panel = ttk.Frame(dialog, padding=14)
+        panel.pack(fill='both', expand=True)
+        ttk.Label(panel, text=f'{scope["title"]} 창을 연 동작을 선택하세요.').pack(anchor='w')
+        picker = ttk.Combobox(panel, state='readonly', width=44, values=[label for _, label in choices])
+        picker.pack(fill='x', pady=8)
+        def select():
+            if picker.current() < 0:
+                return
+            scope['after_id'] = choices[picker.current()][0]
+            scope.pop('_openers')
+            dialog.destroy()
+            load(editing)
+            render(steps_now())
+            message.set('이 창의 모든 단계에 반영했습니다.')
+        ttk.Button(panel, text='연결', command=select).pack(side='right')
+        dialog.grab_set()
+        picker.focus_set()
+    opener_btn = ttk.Button(editing_controls, text='창을 연 단계 지정', command=choose_opener)
     repair_btn = ttk.Button(editing_controls, command=lambda: teach_extra('row', replace=True))
     ttk.Button(editing_controls, text='선택 단계 삭제', command=delete_step).pack(side='left', padx=4)
     ttk.Button(editing_controls, text='적용하고 다음 단계', command=apply_next).pack(side='right')
@@ -1076,10 +1183,37 @@ def capture(binding, *, title):
         render(review['steps'])
         update_phase()
 
+    def choose_window():
+        nonlocal picking_window
+        if not isinstance(session, CaptureTrail) or review is not None or picking_window:
+            return
+        from capture_windows import pointed_key
+        picking_window = True
+        message.set('3초 동안 이어서 녹화할 창 위에 마우스를 두세요. 클릭할 필요가 없습니다.')
+        def connect_pointed():
+            nonlocal picking_window
+            picking_window = False
+            if review is not None or session.ended:
+                return
+            try:
+                session.active_hint = ''
+                if not session.connect(pointed_key()):
+                    session.active_hint = session.active_hint or '창을 구분할 수 없습니다. 열린 창의 제목을 확인하고 다시 가리키세요.'
+                    message.set(session.active_hint)
+                    return
+                active_title.set(session.binding.title)
+                message.set(f'{session.binding.title} 창이 연결됐습니다. 이 창에서 작업하세요.')
+            except (bridge.BridgeError, OSError, ValueError):
+                session.active_hint = '선택한 창이 바뀌었습니다. 이어갈 창을 다시 선택하세요.'
+                message.set(session.active_hint)
+        root.after(3000, connect_pointed)
+
     def add_instruction():
         nonlocal review
         if not flush():
             return
+        scope = (editing.get('_capture_window') if review is not None and editing is not None
+                 else getattr(session, 'scope', None))
         if review is None:
             if session.started:
                 completed_steps.extend(session.finish(report_empty=False)['steps'])
@@ -1088,6 +1222,8 @@ def capture(binding, *, title):
             message.set(f'작업에는 최대 {learned_tasks.MAX_STEPS}단계를 저장할 수 있습니다.')
             return
         step = dict(manual('capture_target_unavailable'), label='직접 입력한 단계')
+        if scope:
+            step['_capture_window'] = scope
         review['steps'].append(step)
         render(review['steps'])
         update_phase()
@@ -1104,29 +1240,46 @@ def capture(binding, *, title):
             return
         replace_id = editing['id'] if replace else None
         if review is None and session.started:
+            if isinstance(session, CaptureTrail):
+                for part, scope in session.parts:
+                    if scope:
+                        bound_windows[id(scope)] = part.binding
             completed_steps.extend(session.finish(report_empty=False)['steps'])
-            session = CaptureSession(binding, title)
+            last_binding, last_scope = session.binding, getattr(session, 'scope', None)
+            session = session.successor() if isinstance(session, CaptureTrail) else new_session()
             render(completed_steps)
             update_phase()
+        else:
+            last_binding, last_scope = session.binding, getattr(session, 'scope', None)
+        if replace:
+            last_scope = editing.get('_capture_window')
+            remembered = bound_windows.get(id(last_scope))
+            last_binding = remembered or (session.binding_for(editing) if isinstance(session, CaptureTrail) else session.binding)
+            if last_binding is None:
+                message.set('해당 단계를 녹화한 창을 다시 연결해야 합니다.')
+                return
         steps = review['steps'] if review is not None else completed_steps
         if not replace and len(steps) >= learned_tasks.MAX_STEPS:
             message.set(f'작업에는 최대 {learned_tasks.MAX_STEPS}단계를 저장할 수 있습니다.')
             return
         if kind == 'row':
             from row_teach import teach_row_dialog
-            answer = teach_row_dialog(root, session.binding, previous_columns)
+            answer = teach_row_dialog(root, last_binding, previous_columns)
             step = None
             if answer:
                 step, previous_columns = answer
         else:
             from context_teach import previous_trigger, teach_context_dialog
             from tkinter import messagebox
-            step = teach_context_dialog(root, session.binding)
-            if step and steps and previous_trigger(steps[-1], step['context']):
+            step = teach_context_dialog(root, last_binding)
+            if (step and steps and steps[-1].get('_capture_window') == last_scope
+                    and previous_trigger(steps[-1], step['context'])):
                 if messagebox.askyesno('조회 한 번으로 합치기',
                         '바로 앞 단계에서 같은 조회 버튼을 눌렀습니다. 기존 조회 단계를 이번 조회와 우클릭 단계로 교체할까요?',
                         parent=root):
                     previous = steps.pop()
+                    step = dict(step, id=previous['id'])
+                    edits.forget(previous['id'])
                     if editing is not None and editing['id'] == previous['id']:
                         editing = None
                     if listing.exists(previous['id']):
@@ -1135,6 +1288,8 @@ def capture(binding, *, title):
                 else:
                     step = None
         if step is not None:
+            if last_scope:
+                step['_capture_window'] = last_scope
             if replace:
                 index = next(i for i, s in enumerate(steps) if s['id'] == replace_id)
                 # Keep the demonstrated position and identity. Only the step the
@@ -1159,7 +1314,7 @@ def capture(binding, *, title):
             message.set('저장할 단계가 없습니다. 취소 후 필요한 위치를 다시 녹화하세요.')
             return
         try:
-            final_steps = edits.apply(review['steps'])
+            final_steps = finalize_contexts(edits.apply(review['steps']))
         except ValueError as exc:
             if edits.failed_step and listing.exists(edits.failed_step):
                 listing.selection_set(edits.failed_step)
@@ -1177,11 +1332,16 @@ def capture(binding, *, title):
     def tick():
         if session.started and review is None:
             session.poll()
+            if isinstance(session, CaptureTrail):
+                active_title.set(session.binding.title)
             steps = steps_now()
             render(steps)
             warnings = sum(step_status(s, edits.get(s).get('instruction')) != '준비됨' for s in steps)
             phase.set('녹화 일시 정지' if session.notes.state == 'paused' or session.notes.limit else '녹화 중')
-            message.set(f'{len(steps)}단계 기록' + (f'   ·   확인 필요 {warnings}개' if warnings else ''))
+            if not picking_window:
+                hint = getattr(session, 'active_hint', '')
+                message.set(f'{len(steps)}단계 기록' + (f'   ·   확인 필요 {warnings}개' if warnings else '')
+                            + (f'   {hint}' if hint else ''))
             if steps and steps[-1]['id'] != tick.last_id:
                 listing.see(steps[-1]['id'])
                 tick.last_id = steps[-1]['id']
@@ -1189,6 +1349,7 @@ def capture(binding, *, title):
 
     tick.last_id = None
     begin = ttk.Button(primary, text='시작', command=start, style='Primary.TButton')
+    link_window = ttk.Button(primary, text='이어갈 창 선택', command=choose_window)
     end = ttk.Button(primary, text='마치고 검토', command=finish, style='Primary.TButton')
     save = ttk.Button(primary, text='저장', command=save_review, style='Primary.TButton')
     add_button = ttk.Menubutton(controls, text='단계 추가 ▾')
@@ -1201,7 +1362,7 @@ def capture(binding, *, title):
     ttk.Button(controls, text='취소', command=cancel).pack(side='right')
 
     def update_phase():
-        for button in (begin, end, save):
+        for button in (begin, end, save, link_window):
             button.pack_forget()
         if review is not None:
             count = len(review['steps'])
@@ -1214,7 +1375,9 @@ def capture(binding, *, title):
         elif session.started:
             phase.set('녹화 중')
             message.set('대상 창에서 동작을 수행한 뒤 마치고 검토를 누르세요.')
-            end.pack()
+            if isinstance(session, CaptureTrail):
+                link_window.pack(side='left', padx=(0, 5))
+            end.pack(side='left')
         else:
             phase.set('녹화 준비' if not completed_steps else '녹화 일시 정지')
             if completed_steps:

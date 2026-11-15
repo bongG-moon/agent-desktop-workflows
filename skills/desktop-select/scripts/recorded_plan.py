@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 5
+COMPILER = 6
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -62,17 +62,26 @@ def compile_plan(task):
         if reason:
             return _result('not_compatible', diagnostic=reason, step=number)
     converted, source_steps, notes = [], [], []
+    recipe_numbers = {}
+    openers = {step['window_context']['after_step'] for step in steps
+               if 'after_step' in step.get('window_context', {})}
     for number, step in enumerate(steps, 1):
+        recipe_numbers[number] = len(converted) + 1
+        context = deepcopy(step.get('window_context'))
+        if context is not None and 'after_step' in context:
+            context['after_step'] = recipe_numbers[context['after_step']]
         if step['action'] in ('row-action', 'row-launch'):
             # Preserve demonstrated identity versus a live ordinal request.
             # A relative row instruction must still select the current Nth row.
             fields = ('action', 'label', 'row', 'row_hint', 'ordinal', 'alias')
             converted.append({k: deepcopy(step[k]) for k in fields if k in step})
+            if context is not None:
+                converted[-1]['window_context'] = context
             source_steps.append(number)
             continue
         # Original recorded playback stopped at a command whose business result
         # was unverified. Do not silently turn that into immediate continuation.
-        if step['action'] == 'open' and number < len(steps) and not step.get('wait_after'):
+        if step['action'] == 'open' and number < len(steps) and not step.get('wait_after') and number not in openers:
             return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])
         if step['match'] == 'query':
@@ -84,6 +93,8 @@ def compile_plan(task):
         if step.get('ancestors') and step['match'] != 'query':
             selector['ancestors'] = deepcopy(step['ancestors'])
         current = dict(action='set-value' if step['action'] in tasks.VALUE_ACTIONS else 'invoke', selector=selector)
+        if context is not None:
+            current['window_context'] = context
         label = step.get('alias') or step.get('label') or step['target']
         if label:
             current['label'] = label
@@ -104,7 +115,10 @@ def compile_plan(task):
         converted.append(current)
         source_steps.append(number)
         if step['action'] == 'open' and 'wait_after' in step:
-            converted.append(dict(action='wait', seconds=step['wait_after']))
+            wait = dict(action='wait', seconds=step['wait_after'])
+            if context is not None:
+                wait['window_context'] = deepcopy(context)
+            converted.append(wait)
             source_steps.append(number)
     if len(converted) > 100:
         return _result('not_compatible', diagnostic='execution_plan_step_limit')

@@ -23,6 +23,7 @@ import live_action as live
 import row_action
 import row_intent
 import row_vision
+import window_context
 
 
 class WorkflowError(ValueError):
@@ -99,7 +100,11 @@ def validate(recipe):
     need(text(recipe.get('name'), 200), 'workflow_name_required')
     steps = recipe.get('steps')
     need(isinstance(steps, list) and 0 < len(steps) <= 100, 'invalid_workflow_steps')
-    for step in steps:
+    window_context.validate_sequence(steps)
+    for raw in steps:
+        step = raw
+        if isinstance(raw, dict) and 'window_context' in raw:
+            step = {key: value for key, value in raw.items() if key != 'window_context'}
         need(isinstance(step, dict), 'invalid_workflow_step')
         if step.get('action') in ('row-action', 'row-launch'):
             ordinary = step['action'] == 'row-action'
@@ -191,7 +196,9 @@ def worker_timeout(recipe):
                     + (step.get('timeout', 26) if step['action'] == 'verify-file' else 0)
                     + (3 * len(step['spec']['path']) + 3 if step['action'] == 'context-menu' else 0)
                     + (120 if step['action'] in ('row-action', 'row-launch') else 0)
-                    for step in recipe['steps'])
+                    for step in recipe['steps']) + window_context.OPEN_TIMEOUT * len({
+                        (spec['exe'].casefold(), spec['title'], spec['after_step'])
+                        for step in recipe['steps'] if 'after_step' in (spec := step.get('window_context', {}))})
 
 
 def values_for(recipe, overrides):
@@ -259,8 +266,10 @@ def check_surface(owner, surface, title, popup=None, *, mutate=False):
         need(len(matches) == 1 and matches[0]['hwnd'] == surface.hwnd, 'popup_scope_changed')
 
 
-def row_receipt(binding, title, step, *, read_only):
+def row_receipt(binding, title, step, *, read_only, context_guard=None):
     def guard():
+        if context_guard is not None:
+            context_guard()
         check_surface(binding, binding, title, mutate=not read_only)
 
     guard()
@@ -272,6 +281,21 @@ def row_receipt(binding, title, step, *, read_only):
         need(state in ('before', 'after'), 'row_' + state)
         return dict(status='observed', observed_state=state, input_dispatched=False)
     return row_action.execute(binding, step['row'], guard)
+
+
+def confirm_opened_window(report, routes, number):
+    if number is None or not routes.origins[number].keys() <= routes.bindings.keys():
+        return
+    receipt = routes.outcomes.get(number)
+    if (routes.steps[number-1]['action'] == 'invoke' and receipt
+            and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True
+            and receipt.get('diagnostic') == 'business_result_not_verified'):
+        receipt.update(status='verified', effect_verification='matched',
+                       verification_scope='recorded_window_opened', business_commit='not_verified')
+        receipt.pop('diagnostic')
+        if report['status'] == 'completed_unverified' and all(
+                item['receipt']['status'] in ('verified','waited') for item in report['steps']):
+            report['status'] = 'verified'
 
 
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
@@ -295,33 +319,67 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     anchor_proof = None
     stage_started = started
     try:
-        binding = bind(recipe['exe'], recipe['window'], hwnd)
+        owner = bind(recipe['exe'], recipe['window'], hwnd)
         if background_only and not read_only:
-            input_policy.window_ready(binding)
+            input_policy.window_ready(owner)
+        routes = window_context.WindowRoutes(recipe['steps'], owner, recipe['window'], read_only=read_only,
+                                              active=[n for n, _ in entries])
         # Capture every requested output before window restoration or any input.
         baselines = {i: export_evidence.baseline(step['output']) for i, step in entries
                      if step['action'] == 'verify-file'} if not read_only else {}
         report['window_restored'] = False
-        owner_prepared = False
+        prepared = set()
+        pending_opener = None
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
             for number, step in entries:
                 stage_started = time.monotonic()
-                app.guard(binding, binding, recipe['window'])
+                app.guard(owner, owner, recipe['window'])
+                context = step.get('window_context')
+                if pending_opener is not None and (step['action'] not in ('wait', 'verify-file')
+                        or number == entries[-1][0] or (context or {}).get('after_step') == pending_opener):
+                    # Two launch buttons may have been recorded before work in
+                    # either child. Prove the first result before sending the
+                    # second command; its eventual target lookup is too late.
+                    for expected in routes.origins[pending_opener].values():
+                        routes.resolve(expected)
+                    confirm_opened_window(report, routes, pending_opener)
+                    pending_opener = None
+                binding = routes.resolve(context) if context else owner
+                title = context['title'] if context else recipe['window']
+                if context and binding is not None and not read_only:
+                    confirm_opened_window(report, routes, context.get('after_step'))
+                if binding is None:
+                    pending = dict(window_context=deepcopy(context), diagnostic='recorded_window_not_open')
+                    report.setdefault('pending_scopes', []).append(dict(number=number, **pending))
+                    receipt = dict(status='deferred', input_dispatched=False, scope_validation='pending', **pending)
+                    report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
+                                                elapsed_seconds=round(time.monotonic() - stage_started, 4)))
+                    continue
+                routes.before(number, binding)
+
+                def check_context():
+                    if context is not None:
+                        routes.check(context, binding)
+
+                def check_target(surface, popup=None, *, mutate=False):
+                    check_context()
+                    check_surface(binding, surface, title, popup, mutate=mutate)
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
-                if (not read_only and not owner_prepared and 'popup' not in step
+                if (not read_only and binding.hwnd not in prepared and 'popup' not in step
                         and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action', 'row-launch')):
                     if background_only:
                         input_policy.window_ready(binding)
                     else:
-                        report['window_restored'] = app.visibility.restore_for_action(binding, recipe['window'])
-                    owner_prepared = True
+                        restored = app.visibility.restore_for_action(binding, title)
+                        report['window_restored'] = bool(restored) or report['window_restored']
+                    prepared.add(binding.hwnd)
                 if step['action'] == 'wait':
                     if read_only:
                         continue
-                    wait(binding, recipe['window'], step['seconds'])
+                    wait(binding, title, step['seconds'])
                     receipt = dict(status='waited', seconds=step['seconds'], input_dispatched=False,
                                    business_result='not_verified')
                 elif step['action'] == 'verify-file':
@@ -332,14 +390,14 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     else:
                         ok, diagnostic = export_evidence.wait(step['output'], baselines[number],
                                                               timeout=step.get('timeout', 26))
-                        app.guard(binding, binding, recipe['window'])
+                        app.guard(binding, binding, title)
                         receipt = dict(status='verified' if ok else 'blocked', input_dispatched=False,
                                        diagnostic=diagnostic, file_verified=ok,
                                        baseline_scope='before_workflow', business_commit='not_verified')
                 elif step['action'] in ('row-action', 'row-launch'):
                     dispatching = not read_only
                     try:
-                        receipt = row_receipt(binding, recipe['window'], step, read_only=read_only)
+                        receipt = row_receipt(binding, title, step, read_only=read_only, context_guard=check_context)
                     except app.bridge.BridgeError as error:
                         # Both shared row engines report any input they already
                         # sent in their receipt. Guard/lookup failures precede it.
@@ -347,21 +405,21 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         raise
                     dispatching = False
                 elif step['action'] == 'context-menu':
-                    check_surface(binding, binding, recipe['window'], mutate=not read_only)
+                    check_target(binding, mutate=not read_only)
                     if read_only:
                         context_menu._region(binding, uia, step['spec']['target'])
                         receipt = dict(status='observed', input_dispatched=False,
                                        region_observed=True, menu_verification='pending_execution')
                     else:
                         def context_guard():
-                            check_surface(binding, binding, recipe['window'], mutate=True)
+                            check_target(binding, mutate=True)
                         dispatching = True
                         receipt = context_menu.execute(binding, step['spec'], context_guard)
                         dispatching = False
                 else:
                     lookup_started = time.monotonic()
                     popup = step.get('popup')
-                    surface = popup_surface(binding, recipe['window'], popup, read_only=read_only) if popup else binding
+                    surface = popup_surface(binding, title, popup, read_only=read_only) if popup else binding
                     if surface is None:
                         pending = dict(number=number, popup=deepcopy(popup), diagnostic='popup_not_open')
                         report.setdefault('pending_scopes', []).append(pending)
@@ -370,7 +428,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
                                                     elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                         continue
-                    check_surface(binding, surface, recipe['window'], popup, mutate=not read_only)
+                    check_target(surface, popup, mutate=not read_only)
                     if background_only and not read_only:
                         input_policy.window_ready(surface)
                     root = uia.from_handle(surface.hwnd)
@@ -382,7 +440,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         from row_action import foreground
                         foreground(surface)
                         report['foreground_requested'] = True
-                        check_surface(binding, surface, recipe['window'], popup, mutate=True)
+                        check_target(surface, popup, mutate=True)
                         anchor_proof = lookup.bind_anchored(surface, uia, selector, root=root)
                         element, stable, resolution = anchor_proof.element, None, None
                     else:
@@ -409,7 +467,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             receipt['command_name'] = element.property(30005) or ''
                     else:
                         def check():
-                            check_surface(binding, surface, recipe['window'], popup, mutate=True)
+                            check_target(surface, popup, mutate=True)
                             if background_only:
                                 input_policy.window_ready(surface)
                             current = (anchor_proof.revalidate() if anchor_proof is not None else
@@ -439,6 +497,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     receipt['lookup_seconds'] = lookup_elapsed
                     if popup:
                         receipt['popup'] = dict(title=popup['title'])
+                routes.after(number, receipt)
+                if context:
+                    receipt['window_context'] = deepcopy(context)
                 report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
                                             elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                 report['input_dispatched'] = combine(report['input_dispatched'], receipt['input_dispatched'])
@@ -458,6 +519,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                     and receipt.get('diagnostic') == 'submit_enter_sent')
                 if delivered or delivered_menu or delivered_submit:
                     report['status'] = 'completed_unverified'
+                    if delivered and routes.origins.get(number):
+                        pending_opener = number
                 else:
                     report.update(status=receipt['status'], stopped_at=number,
                                   diagnostic=receipt.get('diagnostic', 'step_not_verified'))
@@ -543,7 +606,7 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
-            need('popup' in step, 'invalid_deferred_scope')
+            need('popup' in step or 'window_context' in step, 'invalid_deferred_scope')
             continue
         capability = {'set-value': 'SetValue', 'invoke': 'Click', 'submit': 'SetFocus'}[step['action']]
         need(capability in row['receipt']['actions'],
@@ -587,7 +650,12 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
                   '“두 번째 행 실행”처럼 순번으로 등록한 동작은 현재 목록의 순서를 따른다. '
                   '이미 확인한 실행 상태라면 클릭을 생략한다. 행 버튼을 누르는 동안 실제 마우스를 사용한다. '
                   '한 단계의 현재 상태는 `python -X utf8 -B scripts/run.py --only 1 --read-only`로 확인한다.\n')
-    if observed.get('pending_scopes'):
+    if any('window_context' in step for step in active):
+        guide += ('\n다른 창에서 수행하는 단계는 등록한 실행 파일과 창 제목으로 대상을 찾는다. '
+                  '기존 창으로 연결한 경우 작업 시작 때 그 창을 열어 둔다. 새 창으로 연결한 경우 '
+                  '앞 단계가 실행된 뒤 해당 창이 열리면 이어서 처리한다. 같은 제목의 창이 둘이면 '
+                  '단계 번호와 이유를 확인한다. --read-only에서 아직 열리지 않은 창은 deferred로 표시된다.\n')
+    if any('popup' in pending for pending in observed.get('pending_scopes', [])):
         guide += ('\n등록 시 아직 열리지 않은 팝업의 대상은 미확인 상태로 보존했다. '
                   '실행할 때 지정된 제목의 소속 팝업이 하나로 확인된 뒤에만 해당 단계에 입력한다. '
                   '팝업이 없거나 모호하면 멈추며 원래 창에 대신 입력하지 않는다.\n')

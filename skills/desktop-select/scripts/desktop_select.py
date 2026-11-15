@@ -488,6 +488,97 @@ def replay_input_requirements(plan, only=None):
     return input_policy.profile(plan['steps'])
 
 
+class _LinkedBinding(bridge.Binding):
+    """Keep the primary window and the chosen companion pinned inside the action worker."""
+    def __init__(self, record, main, opener=None):
+        super().__init__(record)
+        self.title = record['title']
+        self.main = bridge.Binding(main)
+        self.main_title = main['title']
+        self.opener = bridge.Binding(opener) if opener else None
+        self.opener_title = opener['title'] if opener else None
+        self.companion = bridge.Binding(record) if opener else None
+
+    def check(self):
+        super().check()
+        guard(self.main, self.main, self.main_title)
+        selected = pick_window(windows(self.exe), self.title, None)
+        if (selected['hwnd'], selected['pid'], selected['process_started_utc_ticks']) != (
+                self.hwnd, self.pid, self.created):
+            raise SelectionError('recorded_window_lifetime_changed')
+        if self.opener is not None:
+            from capture_windows import related
+            guard(self.opener, self.opener, self.opener_title)
+            if not related(self.companion, self.opener):
+                raise SelectionError('recorded_window_relationship_changed')
+
+
+def _linked_record(binding, title):
+    return dict(hwnd=binding.hwnd, pid=binding.pid, exe_name=binding.exe, title=title,
+                process_started_utc_ticks=binding.created)
+
+
+def _opener_record(routes, context):
+    if context.get('related'):
+        number = context['after_step']
+        source = routes.openers[number]
+        title = routes.steps[number-1].get('window_context', {}).get('title', routes.title)
+        return _linked_record(source, title)
+    return None
+
+
+def _replay_recorded(plan, args, overrides, background):
+    # Specialized steps may use individual action workers. Their window routing
+    # must follow the same lifetime checks as a compiled Python workflow.
+    from window_context import WindowRoutes, ContextError
+    steps = plan['steps']
+    active = [tasks._step_number(plan,args.only)] if args.only is not None else range(1,len(steps)+1)
+    numbers = iter(active)
+    linked = any('window_context' in steps[n-1] for n in active)
+    main = routes = None
+
+    def invoke(step):
+        nonlocal main, routes
+        number = next(numbers)
+        try:
+            if main is None:
+                main = pick_window(windows(args.exe), args.window, args.hwnd)
+                if linked:
+                    routes = WindowRoutes(steps,bridge.Binding(main),args.window,active=active)
+            target = main
+            context = step.get('window_context')
+            if routes:
+                source_window = None
+                if context:
+                    source_window = routes.resolve(context)
+                    target = _linked_record(source_window,context['title'])
+                routes.before(number,source_window)
+        except (SelectionError, bridge.BridgeError, ContextError) as error:
+            return dict(status='blocked',diagnostic=error.code,input_dispatched=False)
+        payload = dict(binding=target, step=step, background_only=background)
+        if context:
+            payload['main_window'] = main
+            payload['opener_window'] = _opener_record(routes, context)
+        receipt = worker_receipt(['_step'], mutating=True, payload=payload)
+        if routes:
+            routes.after(number,receipt)
+            if (routes.origins.get(number) and step['action']=='open' and not step.get('expand')
+                    and receipt.get('status')=='delivered_unverified' and receipt.get('input_dispatched') is True
+                    and receipt.get('diagnostic')=='business_result_not_verified'):
+                # Only the appearance of the specifically recorded window is
+                # verified here. The application's business outcome is separate.
+                try:
+                    for spec in routes.origins[number].values():
+                        routes.resolve(spec)
+                except (SelectionError,bridge.BridgeError,ContextError) as error:
+                    return dict(receipt,diagnostic=error.code)
+                receipt = dict(receipt,status='verified',effect_verification='matched',
+                               verification_scope='recorded_window_opened',business_commit='not_verified')
+                receipt.pop('diagnostic',None)
+        return receipt
+    return tasks.replay(plan,args.exe,args.window,overrides,invoke,only=args.only)
+
+
 def run(args):
     if args.command == 'storage':
         return storage_info()
@@ -518,17 +609,7 @@ def run(args):
         quick = fast_replay(plan, args, overrides)
         if quick is not None:
             return quick
-        binding = None
-        def invoke(step):
-            nonlocal binding
-            if binding is None:
-                try:
-                    binding = pick_window(windows(args.exe), args.window, args.hwnd)
-                except (SelectionError, bridge.BridgeError) as error:
-                    return {'status': 'blocked', 'diagnostic': error.code, 'input_dispatched': False}
-            return worker_receipt(['_step'], mutating=True,
-                                  payload={'binding': binding, 'step': step, 'background_only': background})
-        return dict(tasks.replay(plan, args.exe, args.window, overrides, invoke, only=args.only),
+        return dict(_replay_recorded(plan, args, overrides, background),
                     input_policy='background_only' if background else 'auto', input_requirements=requirements)
     rows = windows(args.exe)
     if args.command == 'windows':
@@ -554,13 +635,23 @@ def run(args):
             n for n, step in enumerate(plan['steps'], 1) if step['action'] == 'row-action']
         if not numbers:
             raise SelectionError('task_has_no_row_steps')
+        from window_context import WindowRoutes
+        routes = WindowRoutes(plan['steps'], owner, args.window, read_only=True, active=numbers)
         result = []
         for number in numbers:
             step = plan['steps'][number - 1]
             if step['action'] != 'row-action':
                 raise SelectionError('not_a_row_step')
+            context = step.get('window_context')
+            target = routes.resolve(context) if context else owner
+            if target is None:
+                result.append(dict(number=number, label=step['label'], observed_state='unavailable',
+                                   diagnostic='recorded_window_not_open'))
+                continue
             guard(owner, owner, args.window)
-            state = observe_row(owner, step['row'])['kind']
+            state = observe_row(target, step['row'])['kind']
+            if context:
+                routes.check(context, target)
             guard(owner, owner, args.window)
             result.append({'number': number, 'label': step['label'], 'observed_state': state})
         return {'status': 'observed', 'steps': result, 'input_dispatched': False}
@@ -580,6 +671,16 @@ def run(args):
         plan = tasks.load_task(args.task, task_directory())
         tasks.check_binding(plan, args.exe, args.window)
         anchor = tasks.get_step(plan, args.near)
+        context = anchor.get('window_context')
+        if context:
+            from window_context import WindowRoutes
+            routes = WindowRoutes(plan['steps'],owner,args.window,read_only=args.command=='inspect',
+                                  active=[tasks._step_number(plan,args.near)])
+            found = routes.resolve(context)
+            if found is None:
+                raise SelectionError('recorded_window_not_open')
+            owner = _LinkedBinding(_linked_record(found,context['title']),binding,_opener_record(routes,context))
+            args = argparse.Namespace(**{**vars(args), 'window':context['title']})
     return action(args, owner, anchor=anchor)
 
 
@@ -592,7 +693,17 @@ def replay_step():
         if refusal:
             return refusal
     bridge.set_dpi_awareness()
-    owner = bridge.Binding(binding)
+    if step.get('window_context'):
+        if 'main_window' not in request or binding['title'] != step['window_context']['title'] or (
+                binding['exe_name'].casefold() != step['window_context']['exe'].casefold()):
+            raise SelectionError('recorded_window_context_required')
+        opener = request.get('opener_window')
+        if step['window_context'].get('related') and not opener:
+            raise SelectionError('recorded_window_origin_required')
+        owner = _LinkedBinding(binding,request['main_window'],opener)
+        owner.check()
+    else:
+        owner = bridge.Binding(binding)
     if step['action'] == 'row-launch':
         from row_intent import execute
         return execute(owner, binding['title'], step['ordinal'],
