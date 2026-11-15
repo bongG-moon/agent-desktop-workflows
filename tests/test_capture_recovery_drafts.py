@@ -13,6 +13,44 @@ from test_teach_capture import combo
 
 
 class RecoveryDraftTests(unittest.TestCase):
+    def test_legacy_alias_recovery_prefers_actual_instruction_and_keeps_original(self):
+        first = '첫번째 요소 실행버튼 누르기'
+        second = '두번째 요소 실행버튼 누르기'
+        unsupported = '지금 열린 목록을 살펴보고 결정해줘'
+        base = {'action': 'manual', 'reason': 'row_capture_requires_review', 'alias': first}
+        plan = {'schema': 1, 'name': 'MuMu', 'exe': 'App.exe', 'window': 'App', 'steps': [
+            dict(base, instruction_draft=tasks.LEGACY_INSTRUCTION_HINT),
+            dict(base, instruction_draft=second), dict(base, instruction_draft=unsupported),
+            dict(base, alias='목록 확인'), dict(base, reason='target_protected')]}
+        original = copy.deepcopy(plan)
+        resolved = tasks.resolve_saved_intents(plan)
+        self.assertEqual(plan, original)
+        a, b, *rest = resolved['steps']
+        self.assertEqual((a['label'], a['ordinal']), (first, 1))
+        self.assertEqual((b['label'], b['ordinal'], b['alias']), (second, 2, first))
+        self.assertEqual(rest, original['steps'][2:])
+        self.assertEqual(tasks.resolve_saved_intents(resolved), resolved)
+        broken = copy.deepcopy(resolved)
+        broken['steps'][1]['ordinal'] = 1
+        with self.assertRaises(tasks.TaskError):
+            tasks._validate(broken)
+
+    def test_explicit_instruction_overrides_a_taught_gesture(self):
+        import row_teach
+        row_spec = {'version': 1, 'role': 'listitem', 'scope': [], 'size': [20, 8],
+                    'boxes': {'key': [0, 0, 4, 4], 'button': [7, 0, 4, 4], 'state': [14, 0, 4, 4]},
+                    'key': 'qlU=', 'button': 'Vao=', 'before': 'qlU=', 'after': 'Vao='}
+        row = row_teach.raw_row_step('1번째 행 버튼 누르기', row_spec)
+        edits = capture.StepEdits()
+        self.assertEqual(tasks.recorded_step(edits.apply([row])[0])['action'], 'row-action')
+        edits.store(row, '', '두번째 요소 실행버튼 누르기')
+        command = tasks.recorded_step(edits.apply([row])[0])
+        self.assertEqual((command['action'], command['ordinal']), ('row-launch', 2))
+        edits.store(row, '', '이번에 필요한 항목을 검토해줘')
+        draft = tasks.recorded_step(edits.apply([row])[0])
+        self.assertEqual(draft['action'], 'manual')
+        self.assertEqual(draft['instruction_draft'], '이번에 필요한 항목을 검토해줘')
+
     def test_known_value_draft_names_the_actual_field(self):
         step = capture.capture_step(combo('Family', 'Hybrid'))
         self.assertEqual(capture.default_text(step), 'Family 조건을 Hybrid로 설정해줘')
@@ -50,13 +88,13 @@ class RecoveryDraftTests(unittest.TestCase):
         saved = capture.StepEdits().apply([step])[0]
         self.assertEqual(saved['instruction']['value'], 'A&B')
 
-    def test_unknown_target_keeps_a_description_template_not_a_fake_target(self):
+    def test_unknown_target_does_not_save_placeholder_as_instruction(self):
         step = capture.manual('capture_target_unavailable', 'lost')
         draft = capture.default_text(step)
-        self.assertIn('대상 이름', draft)
+        self.assertEqual('', draft)
         final = tasks.recorded_step(capture.StepEdits().apply([step])[0])
         self.assertEqual(final['action'], 'manual')
-        self.assertEqual(final['instruction_draft'], draft)
+        self.assertNotIn('instruction_draft', final)
         self.assertNotIn('target', final)
 
     def test_unknown_target_named_instruction_becomes_a_live_query(self):

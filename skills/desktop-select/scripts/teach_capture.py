@@ -94,6 +94,7 @@ class CaptureNotes:
     """Keep final revisions in memory until the user finishes or cancels."""
     def __init__(self):
         self.steps = {}
+        self.row_selections = {}
         self.lock = threading.RLock()
         self.state = 'ready'
         self.partial = False
@@ -119,6 +120,28 @@ class CaptureNotes:
     def manual(self, label, reason):
         self.add(manual(reason))
 
+    def row_step(self, step_id, number, spec, selection=None):
+        """Keep the click's original order while the observed row state settles."""
+        with self.lock:
+            if self.closed or self.limit:
+                return
+            if step_id not in self.steps and len(self.steps) >= self.max_steps - 1:
+                self.add(manual('recording_step_limit'))
+                return
+            # A queued double click or deleted/invalidated event owns its ID.
+            existing = self.steps.get(step_id)
+            if existing and existing != self.row_selections.get(step_id) and existing.get('action') != 'row-action' and (
+                    existing.get('recognition', {}).get('reason') != 'row_capture_requires_review'):
+                return
+            label = f'{number}번째 행 버튼' if number else '선택한 행 버튼'
+            if selection is not None:
+                self.row_selections[step_id] = capture_step(selection)
+            if spec is None:
+                self.steps[step_id] = (self.row_selections.get(step_id) or
+                                       dict(manual('row_capture_requires_review', step_id), label=label))
+            else:
+                self.steps[step_id] = dict(id=step_id, action='row-action', row=spec, label=label + ' 누르기')
+
     def snapshot(self):
         with self.lock:
             return copy.deepcopy(list(self.steps.values()))
@@ -127,6 +150,9 @@ class CaptureNotes:
 def default_text(step):
     if step['action'] in ('row-action', 'result-menu'):
         return step['label']
+    if (step.get('recognition', {}).get('reason') == 'row_capture_requires_review'
+            and step.get('label', '').endswith('번째 행 버튼')):
+        return step['label'] + '을 눌러줘'
     command = learned_tasks.recorded_step(step)
     field = (step.get('alias') or command.get('label') or command.get('command_name')
              or command.get('target') or step['label'])
@@ -142,8 +168,6 @@ def default_text(step):
         kind = '버튼' if command.get('role') in {'button', 'splitbutton'} else '항목'
         verb = '펼쳐줘' if command.get('expand') else '눌러줘'
         return f'{field} {kind}을 {verb}'
-    if learned_tasks.is_recoverable(step):
-        return '화면의 대상 이름과 실행할 동작을 입력하세요.'
     return ''
 
 
@@ -155,7 +179,9 @@ def instruction_view(step, instruction):
         route = (['조회 완료 확인'] if spec['trigger'] else []) + ['표 우클릭', *spec['menu']['path']]
         route.append('Excel 파일 확인' if spec['output'] else '메뉴 전달까지만 확인')
         return ' → '.join(route)
-    if step['action'] == 'row-action':
+    if instruction and instruction['mode'] == 'row-launch':
+        return f"{instruction['ordinal']}번째 행의 실행 버튼을 찾고, 실행 후 같은 행의 상태를 확인합니다."
+    if step['action'] == 'row-action' and not instruction:
         return step['label'] + ' (버튼 선택 후 같은 행의 완료 표시 확인)'
     if instruction and instruction['mode'] == 'draft':
         return '설명은 저장됩니다. 실행 전 Claude가 문장을 해석하고 현재 화면에서 대상을 다시 찾습니다.'
@@ -214,6 +240,8 @@ class StepEdits:
         if '=' in alias or alias.isdecimal():
             raise ValueError('별칭에는 등호 또는 숫자만으로 된 이름을 사용할 수 없습니다.')
         data = {'alias': alias} if alias else {}
+        if step['action'] == 'row-action' and sentence.strip() == step['label'] and mode is None:
+            return data
         # A recorded literal can contain punctuation outside the sentence
         # parser. Persist our own generated draft as literal data, never code.
         if (mode is None and argument is None and step['action'] == 'set-value'
@@ -257,7 +285,7 @@ class StepEdits:
             draft = self.drafts.get(step['id'])
             # Persist the visible generated instructions too. Otherwise an
             # untouched row can silently keep old recording-only semantics.
-            if (step['action'] not in ('row-action', 'result-menu')
+            if (step['action'] != 'result-menu'
                     and (saved or (draft and draft[0] == self.identity(step)) or default_text(step))):
                 sentence, mode, argument = self.form(step)
                 try:
@@ -324,8 +352,86 @@ class _CaptureBridge:
         return _CaptureUIA(self.binding)
 
 
+def _semantic_list_selection(node):
+    actions = node.get('available_actions', ())
+    return (node.get('role') == 'listitem' and recorder._locator_valid(node.get('locator'))
+            and 'Select' in actions and 'Click' not in actions)
+
+
+class _RowHookPump(recorder.HookPump):
+    def _emit(self, event):
+        if (event.get('kind') == 'down' and event.get('action') == 'click'
+                and event.get('scope_proven') and event.get('window') == self.binding.hwnd):
+            self.row_tracker.pin_down(event)
+        return super()._emit(event)
+
+
 class _Worker(recorder.CaptureWorker):
     pointed = None
+    row_tracker = None
+
+    def observe_down(self, event):
+        # Pin pixels completed BEFORE the hook reported mouse-down. The live
+        # UIA lookup may finish after the application's click handler.
+        tracker = self.row_tracker
+        if tracker and event.get('kind') == 'down' and event.get('window') == self.binding.hwnd:
+            tracker.next_press((event['x'],event['y']))
+        frame = tracker.before(event['at'], event.get('token')) if tracker and event.get('action') == 'click' else None
+        observation = super().observe_down(event)
+        if (not tracker or not observation or event.get('window') != self.binding.hwnd
+                or not event.get('scope_proven') or observation.get('combo') is not None):
+            return observation
+        node = observation['node']
+        role = node.get('role')
+        if (node.get('secure') is not False or node.get('enabled') is not True
+                or role not in ('list', 'listitem', 'row', 'table', 'image', 'statictext', 'custom', 'group')
+                or event.get('action') != 'click'):
+            return observation
+        if 'combo' not in observation and self.combo_for(observation) is not None:
+            return observation
+        import row_capture
+        import row_vision
+        point = [event['x'],event['y']]
+        press, number = None,None
+        if frame is not None or role in ('row', 'listitem', 'list', 'table'):
+            try:
+                # A first click may precede the first usable pixel sample. Its
+                # current owned row can still supply an editable ordinal hint.
+                # A post-click image must never supply the before-state.
+                layout = frame.rows if frame else row_vision._row_layout(self.binding)[1]
+                rect, meta = row_vision._point_row(layout, point)
+                if not row_vision.recorded_row_hit(self.uia, observation['element'], observation['root'],
+                                                   self.binding.pid, point, rect):
+                    return observation
+                peers = [r for r,m in layout if m['scope'] == meta['scope'] and m['role'] == meta['role']]
+                number = sorted(peers,key=lambda r:(r[1],r[0])).index(rect)+1
+                if frame is not None:
+                    press = row_capture.prepare(frame, point, event['at'])
+            except bridge.BridgeError:
+                pass
+        if not press and _semantic_list_selection(node):
+            return observation
+        if press or number or role in ('row','listitem'):
+            return dict(observation, painted_row=(number,press))
+        return observation
+
+    def handle(self, event):
+        if self.row_tracker and event['kind'] in ('scroll','candidate_scroll'):
+            self.row_tracker.invalidate(event['at'])
+        return super().handle(event)
+
+    def tick(self):
+        super().tick()
+        if (self.row_tracker and self.hovered and self.hovered.get('window') == self.binding.hwnd
+                and self.hovered['node'].get('role') in ('list','listitem','row','table')):
+            self.row_tracker.interest.set()
+
+    def capture_double(self, down, observation):
+        previous_id = (self.recent_click or {}).get('step_id')
+        result = super().capture_double(down,observation)
+        if result and previous_id and self.row_tracker:
+            self.row_tracker.cancel_step(previous_id)
+        return result
 
     def _drop_watch(self):
         self.pointed = None
@@ -482,6 +588,21 @@ class _Worker(recorder.CaptureWorker):
             self.model.manual('', 'right_click_requires_menu_teaching')
             return
         if observation:
+            if event['action'] == 'click' and 'painted_row' in observation:
+                self.freeze_watch(event.get('at'))
+                number, press = observation['painted_row']
+                node = observation['node']
+                selection = None
+                # An ordinary list item can both support semantic selection and
+                # paint an independent action button. Keep any supported original
+                # selection unless the demonstrated button's own effect settles.
+                if _semantic_list_selection(node):
+                    selection = self.step('select', observation)
+                step_id = selection['id'] if selection else uuid.uuid4().hex
+                self.model.row_step(step_id, number, None, selection)
+                if press:
+                    self.row_tracker.follow(step_id,press)
+                return step_id
             observation = self._command_owner(event, observation)
             node = observation['node']
             if node.get('secure') is not False:
@@ -527,7 +648,10 @@ class CaptureSession:
         self.notes = CaptureNotes()
         self.events, self.notices = queue.Queue(maxsize=128), queue.Queue()
         self.worker = _Worker(self.binding, _CaptureBridge(self.binding), self.notes, self.events, self.notices)
-        self.pump = recorder.HookPump(self.binding, bridge, self.events, self.notices)
+        from row_capture import Tracker
+        self.rows = self.worker.row_tracker = Tracker(self.binding, self.notes)
+        self.pump = _RowHookPump(self.binding, bridge, self.events, self.notices)
+        self.pump.row_tracker = self.rows
         self.started = self.ended = False
 
     def start(self):
@@ -538,6 +662,10 @@ class CaptureSession:
         try:
             if not self.worker.ready.wait(3) or self.worker.error:
                 raise bridge.BridgeError('accessibility_worker_unavailable')
+            self.rows.start()
+            # Prime the pre-click sample as the recorder opens. A slow or
+            # unavailable row provider cannot hold up ordinary semantic capture.
+            self.rows.initial_sample.wait(1.8)
             self.worker.enabled.set()
             self.pump.start()
         except BaseException:
@@ -588,16 +716,19 @@ class CaptureSession:
                 self.notes.closed = True
                 return {'status': 'recorded', 'steps': self.notes.snapshot(), 'input_dispatched': False}
         finally:
+            self.rows.stop()
             self.worker.abort.set()
 
     def cancel(self):
         self.ended = True
+        self.rows.stop()
         self.pump.stop()
         self.worker.enabled.clear()
         self.worker.abort.set()
         with self.notes.lock:
             self.notes.closed = True
             self.notes.steps.clear()
+            self.notes.row_selections.clear()
             self.notes.hover_target = None
         return {'status': 'cancelled', 'steps': [], 'input_dispatched': False}
 
@@ -605,7 +736,7 @@ class CaptureSession:
 def capture(binding, *, title):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import font as tkfont, ttk
     session = CaptureSession(binding, title)
     session.binding.check()
     root = tk.Tk()
@@ -616,52 +747,105 @@ def capture(binding, *, title):
     edits = StepEdits()
     completed_steps = []
     previous_columns = None
-    message = tk.StringVar(value='위치를 누르면 설명 초안이 생깁니다. 원하는 동작과 변수로 고친 뒤 ‘적용하고 다음 단계’를 누르세요. 대상을 못 읽은 단계도 설명을 저장할 수 있습니다.')
-    frame = ttk.Frame(root, padding=14)
+    style = ttk.Style(root)
+    if 'clam' in style.theme_names():
+        style.theme_use('clam')
+    bg, surface, ink, muted, accent = '#F5F7FA', '#FFFFFF', '#182435', '#55677A', '#1556AC'
+    font = tkfont.nametofont('TkDefaultFont')
+    text_size = abs(font.cget('size')) or 10
+    family = '맑은 고딕'
+    style.configure('TFrame', background=bg)
+    style.configure('TLabel', background=bg, foreground=ink, font=(family, text_size))
+    style.configure('TButton', font=(family, text_size), padding=(10, 5))
+    style.configure('Card.TFrame', background=surface)
+    style.configure('Card.TLabel', background=surface)
+    style.configure('Title.TLabel', font=(family, text_size + 4, 'bold'))
+    style.configure('Muted.TLabel', foreground=muted)
+    style.configure('Note.TLabel', background=surface, foreground=muted)
+    style.configure('Primary.TButton', background=accent, foreground='white', borderwidth=0, padding=(16, 7))
+    style.map('Primary.TButton', background=[('disabled', '#D2DBE5'), ('active', '#104888')],
+              foreground=[('disabled', '#5F7082'), ('!disabled', 'white')])
+    style.configure('Steps.Treeview', font=(family, text_size), background=surface,
+                    fieldbackground=surface, foreground=ink, rowheight=font.metrics('linespace') + 14,
+                    borderwidth=0)
+    style.map('Steps.Treeview', background=[('selected', '#DCEAFE')], foreground=[('selected', '#123D74')])
+    style.configure('Steps.Treeview.Heading', font=(family, text_size, 'bold'), anchor='w',
+                    background='#E9EEF4', foreground=muted, padding=(6, 6), borderwidth=0)
+    root.configure(background=bg)
+    message = tk.StringVar(value='시작을 누른 뒤 대상 창에서 원하는 순서대로 조작하세요.')
+    phase = tk.StringVar(value='녹화 준비')
+    frame = ttk.Frame(root, padding=(16, 12))
     frame.pack(fill='both', expand=True)
-    ttk.Label(frame, text=title, wraplength=460).pack(anchor='w')
-    ttk.Label(frame, textvariable=message, wraplength=460, padding=(0, 8)).pack(anchor='w')
+    header = ttk.Frame(frame)
+    header.pack(fill='x')
+    ttk.Label(header, textvariable=phase, style='Title.TLabel').pack(side='left')
+    primary = ttk.Frame(header)
+    primary.pack(side='right')
+    ttk.Label(frame, text=title, wraplength=540, style='Muted.TLabel').pack(anchor='w', pady=(0, 6))
+    status_line = ttk.Label(frame, textvariable=message, wraplength=540, style='Muted.TLabel')
+    status_line.pack(anchor='w', pady=(0, 10))
     table = ttk.Frame(frame)
     table.pack(fill='both', expand=True)
-    listing = ttk.Treeview(table, name='steps', columns=('number', 'target', 'alias', 'instruction'),
-                           show='headings', selectmode='browse', height=7)
-    for key, heading, width in [('number', '단계', 40), ('target', '녹화한 대상', 150),
-                                ('alias', '별칭', 105), ('instruction', '실행할 동작', 290)]:
-        listing.heading(key, text=heading)
-        listing.column(key, width=width, minwidth=32, stretch=key in ('target', 'instruction'))
+    listing = ttk.Treeview(table, name='steps', columns=('number', 'instruction', 'status'),
+                           show='headings', selectmode='browse', height=5, style='Steps.Treeview')
+    for key, heading, chars in [('number', '단계', 4), ('instruction', '실행할 동작', 29), ('status', '상태', 8)]:
+        width = font.measure('가') * chars + 12
+        listing.heading(key, text=heading, anchor='w')
+        listing.column(key, width=width, minwidth=min(width, 60), stretch=key == 'instruction', anchor='w')
+    listing.tag_configure('unresolved', foreground='#805110')
     scroll = ttk.Scrollbar(table, command=listing.yview)
     listing.configure(yscrollcommand=scroll.set)
     scroll.pack(side='right', fill='y')
     listing.pack(side='left', fill='both', expand=True)
-    form = ttk.Frame(frame, padding=(0, 6))
-    form.pack(fill='x')
+    form = ttk.Frame(frame, padding=12, style='Card.TFrame')
     form.columnconfigure(1, weight=1)
     alias, instruction, argument = tk.StringVar(), tk.StringVar(), tk.StringVar()
     mode = tk.StringVar(value='문장 해석')
     modes = {'문장 해석': None, '고정값': 'fixed', '필수 변수': 'required'}
-    for row, (key, label, var) in enumerate((('alias', '단계 별칭', alias), ('instruction', '실행할 동작', instruction))):
-        ttk.Label(form, text=label).grid(row=row, column=0, padx=(0, 6), sticky='w')
-        ttk.Entry(form, name=key, textvariable=var, width=42).grid(row=row, column=1, sticky='ew')
-    ttk.Label(form, text='값 지정').grid(row=2, column=0, padx=(0, 6), sticky='w')
-    choices = ttk.Frame(form)
-    choices.grid(row=2, column=1, sticky='w')
+    edit_title = tk.StringVar(value='선택한 단계')
+    ttk.Label(form, textvariable=edit_title, style='Card.TLabel').grid(row=0, column=0, columnspan=3, sticky='w')
+    sentence_entry = ttk.Entry(form, name='instruction', textvariable=instruction, width=32)
+    sentence_entry.grid(row=1, column=0, columnspan=3, pady=(5, 2), sticky='ew')
+    advanced_form = ttk.Frame(form, style='Card.TFrame')
+    advanced_form.columnconfigure(1, weight=1)
+    ttk.Label(advanced_form, text='단계 별칭', style='Card.TLabel').grid(row=0, column=0, padx=(0, 8), sticky='w')
+    ttk.Entry(advanced_form, name='alias', textvariable=alias, width=20).grid(row=0, column=1, sticky='ew')
+    ttk.Label(advanced_form, text='값 지정', style='Card.TLabel').grid(row=1, column=0, padx=(0, 8), sticky='w')
+    choices = ttk.Frame(advanced_form, style='Card.TFrame')
+    choices.grid(row=1, column=1, sticky='w', pady=4)
     mode_box = ttk.Combobox(choices, name='mode', values=list(modes), state='readonly', textvariable=mode, width=11)
     mode_box.pack(side='left')
-    arg_label = ttk.Label(choices, text='값 또는 변수 이름')
+    arg_label = ttk.Label(choices, text='값 또는 변수 이름', style='Card.TLabel')
     arg_label.pack(side='left', padx=(6, 2))
     arg_box = ttk.Entry(choices, name='argument', textvariable=argument, width=22)
     arg_box.pack(side='left')
     preview = tk.StringVar()
-    ttk.Label(form, name='preview', textvariable=preview, wraplength=560).grid(
-        row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
+    preview_label = ttk.Label(form, name='preview', textvariable=preview, wraplength=520, style='Note.TLabel')
+    preview_label.grid(row=2, column=0, columnspan=3, sticky='w', pady=(3, 4))
     controls = ttk.Frame(frame)
-    controls.pack(anchor='w')
+    controls.pack(fill='x', pady=(8, 0))
+    shown_rows = {}
 
     def steps_now():
         return review['steps'] if review is not None else completed_steps + session.notes.snapshot()
 
+    def row_repairable(step):
+        return (step['action'] == 'row-action' or learned_tasks.is_recoverable(step)
+                or step.get('recognition', {}).get('reason') == 'row_capture_requires_review')
+
+    def step_status(step, directive):
+        if directive:
+            return '설명 초안' if directive['mode'] == 'draft' else '준비됨'
+        if step['action'] == 'manual':
+            return '확인 필요'
+        if step['action'] == 'teach-target':
+            return '값 확인'
+        if step.get('recognition', {}).get('result') == 'mismatch':
+            return '값 확인'
+        return '준비됨'
+
     def fields():
-        if editing is not None and editing['action'] in ('row-action', 'result-menu'):
+        if editing is not None and editing['action'] == 'result-menu':
             return alias.get(), '', None, None
         chosen = modes[mode.get()]
         return alias.get(), instruction.get(), chosen, argument.get() if chosen else None
@@ -683,7 +867,14 @@ def capture(binding, *, title):
         if editing is not None:
             try:
                 data = edits.compile(editing, *fields())
-                preview.set('실행 미리보기: ' + instruction_view(editing, data.get('instruction')))
+                if (editing['action'] == 'manual' and not instruction.get().strip()
+                        and row_repairable(editing)):
+                    if editing.get('recognition', {}).get('reason') == 'row_capture_requires_review':
+                        preview.set('행은 찾았습니다. 예를 들어 “첫 번째 행의 실행 버튼을 눌러줘”라고 적거나, 행 버튼과 완료 표시를 지정하세요.')
+                    else:
+                        preview.set('화면에 보이는 이름과 동작을 적거나, 목록 안의 버튼이면 행 버튼으로 지정하세요.')
+                else:
+                    preview.set(instruction_view(editing, data.get('instruction')))
             except ValueError as exc:
                 show_error(exc)
 
@@ -699,12 +890,20 @@ def capture(binding, *, title):
     def load(step):
         sentence, chosen, arg = edits.form(step)
         configured = step['action'] in ('row-action', 'result-menu')
-        form.children['instruction'].configure(state='readonly' if configured else 'normal')
+        sentence_entry.configure(state='readonly' if step['action'] == 'result-menu' else 'normal')
         mode_box.configure(state='disabled' if configured else 'readonly')
         alias.set(edits.alias(step))
-        instruction.set(step['label'] if configured else sentence)
+        instruction.set(step['label'] if step['action'] == 'result-menu' else sentence)
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
+        selected_number = next((i for i, s in enumerate(steps_now(), 1) if s['id'] == step['id']), '')
+        edit_title.set(f'{selected_number}단계   {step["label"]}')
+        if row_repairable(step):
+            repair_btn.configure(text='행 버튼 다시 지정' if step['action'] == 'row-action' else '행 버튼으로 지정')
+            repair_btn.pack(side='left', padx=(0, 5), before=details_btn)
+        else:
+            repair_btn.pack_forget()
+        alias_btn.configure(state='disabled' if configured else 'normal')
         refresh_preview()
 
     def select_row(*_):
@@ -717,6 +916,25 @@ def capture(binding, *, title):
         editing = next((step for step in steps_now() if step['id'] == selected[0]), None)
         if editing is not None:
             load(editing)
+            if review is not None:
+                render(review['steps'])
+
+    def update_review_status(steps):
+        """Name a draft as such when its saved instructions still require review."""
+        missing = 0
+        for step in steps:
+            if step['action'] == 'result-menu':
+                continue
+            try:
+                raw = edits.compile(step, edits.alias(step), *edits.form(step))
+                compiled = learned_tasks.recorded_step(dict(step, **raw))
+                missing += int(compiled['action'] == 'manual' or 'instruction_draft' in compiled)
+            except ValueError:
+                missing += 1
+        save.configure(text='초안 저장' if missing else '저장', state='normal' if steps else 'disabled')
+        phase.set(f'단계 검토   {len(steps)}')
+        message.set(f'{missing}단계는 실행 전 보완해야 합니다. 해당 행을 선택해 수정하세요.' if missing
+                    else '단계를 선택해 실행 문장을 수정하세요.' if steps else '단계를 추가하거나 취소하세요.')
 
     def render(steps):
         nonlocal editing
@@ -724,6 +942,7 @@ def capture(binding, *, title):
         for row_id in listing.get_children():
             if row_id not in keep:
                 listing.delete(row_id)
+                shown_rows.pop(row_id, None)
         for i, step in enumerate(steps, 1):
             saved = edits.get(step)
             if editing is not None and step['id'] == editing['id'] and editing != step:
@@ -735,14 +954,21 @@ def capture(binding, *, title):
                     refresh_preview()
             directive = saved.get('instruction')
             text = directive.get('text') if directive else default_text(step)
-            text = text or instruction_view(step, directive)
-            row = (i, step['label'], saved.get('alias', ''), text)
-            if listing.exists(step['id']):
-                listing.item(step['id'], values=row)
-            else:
-                listing.insert('', 'end', iid=step['id'], values=row)
+            if not text:
+                text = step['label'] if step['label'] != '설명으로 다시 찾을 단계' else '대상 이름을 읽지 못한 클릭'
+            state = step_status(step, directive)
+            row = (i, text, state)
+            if shown_rows.get(step['id']) != row:
+                tags = () if state == '준비됨' else ('unresolved',)
+                if listing.exists(step['id']):
+                    listing.item(step['id'], values=row, tags=tags)
+                else:
+                    listing.insert('', i - 1, iid=step['id'], values=row, tags=tags)
+                shown_rows[step['id']] = row
         if steps and not listing.selection():
             listing.selection_set(steps[0]['id'])
+        if review is not None:
+            update_review_status(steps)
 
     def apply_text():
         if flush():
@@ -759,7 +985,8 @@ def capture(binding, *, title):
             listing.selection_set(steps[index + 1]['id'])
             listing.see(steps[index + 1]['id'])
         else:
-            message.set('마지막 단계까지 적용했습니다. 마치고 검토한 뒤 저장하세요.' if review is None else '마지막 단계까지 적용했습니다. 저장을 누르면 완료됩니다.')
+            if save.cget('text') == '저장':
+                message.set('마지막 단계까지 적용했습니다. 저장을 누르면 완료됩니다.')
 
     def link_subject():
         if editing is None:
@@ -779,6 +1006,7 @@ def capture(binding, *, title):
             message.set('마치고 검토를 누른 뒤 불필요한 단계를 삭제하세요.')
             return
         removed = editing['id']
+        old_index = next(i for i, s in enumerate(review['steps']) if s['id'] == removed)
         review['steps'][:] = [step for step in review['steps'] if step['id'] != removed]
         edits.forget(removed)
         editing = None
@@ -787,22 +1015,42 @@ def capture(binding, *, title):
         argument.set('')
         preview.set('')
         render(review['steps'])
-        message.set('선택한 단계를 삭제했습니다. 남은 단계를 확인하고 저장하세요.')
+        if review['steps']:
+            key = review['steps'][min(old_index, len(review['steps']) - 1)]['id']
+            listing.selection_set(key)
+            listing.see(key)
+        else:
+            form.pack_forget()
+            save.configure(state='disabled')
 
     listing.bind('<<TreeviewSelect>>', select_row)
     for variable in (alias, instruction, mode, argument):
         variable.trace_add('write', refresh_preview)
     refresh_preview()
-    ttk.Button(form, text='동작 적용', command=apply_text).grid(row=0, column=2, rowspan=2, padx=6)
-    editing_controls = ttk.Frame(form)
-    editing_controls.grid(row=4, column=0, columnspan=3, sticky='w', pady=(6, 2))
-    for label, callback in [('적용하고 다음 단계', apply_next), ('문장의 이름을 이 대상에 연결', link_subject),
-                            ('선택 단계 삭제', delete_step)]:
-        ttk.Button(editing_controls, text=label, command=callback).pack(side='left', padx=(0, 5))
+    editing_controls = ttk.Frame(form, style='Card.TFrame')
+    editing_controls.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(4, 0))
+    def toggle_details():
+        if advanced_form.winfo_manager():
+            advanced_form.grid_remove()
+            details_btn.configure(text='상세 설정')
+        else:
+            advanced_form.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(8, 0))
+            details_btn.configure(text='상세 닫기')
+
+    # The instruction is the first editable field. Alias and parameter controls
+    # remain available without competing with the step description.
+    details_btn = ttk.Button(editing_controls, text='상세 설정', command=toggle_details)
+    details_btn.pack(side='left')
+    repair_btn = ttk.Button(editing_controls, command=lambda: teach_extra('row', replace=True))
+    ttk.Button(editing_controls, text='선택 단계 삭제', command=delete_step).pack(side='left', padx=4)
+    ttk.Button(editing_controls, text='적용하고 다음 단계', command=apply_next).pack(side='right')
+    alias_btn = ttk.Button(advanced_form, text='문장의 이름을 이 대상에 연결', command=link_subject)
+    alias_btn.grid(row=0, column=2, padx=(5, 0))
+    sentence_entry.bind('<Return>', lambda _e: apply_next())
 
     def start(*_):
         nonlocal result
-        if session.started:
+        if review is not None or session.started:
             return
         remaining = learned_tasks.MAX_STEPS - len(completed_steps)
         if remaining < 1:
@@ -816,8 +1064,7 @@ def capture(binding, *, title):
             result = {'status': 'blocked', 'diagnostic': diagnostic, 'input_dispatched': False}
             root.destroy()
             return
-        begin.configure(state='disabled')
-        end.configure(state='normal')
+        update_phase()
 
     def finish(*_):
         nonlocal review
@@ -827,22 +1074,42 @@ def capture(binding, *, title):
         if session.started:
             review['steps'].extend(session.finish(report_empty=not completed_steps)['steps'])
         render(review['steps'])
-        begin.configure(state='disabled')
-        end.configure(state='disabled')
-        save.configure(state='normal')
-        message.set('단계를 선택하고 실행할 동작을 입력하세요. 예: 이 항목을 N으로 설정')
+        update_phase()
 
-    def teach_extra(kind):
-        nonlocal session, previous_columns, editing
+    def add_instruction():
+        nonlocal review
         if not flush():
             return
+        if review is None:
+            if session.started:
+                completed_steps.extend(session.finish(report_empty=False)['steps'])
+            review = {'status': 'recorded', 'steps': completed_steps.copy(), 'input_dispatched': False}
+        if len(review['steps']) >= learned_tasks.MAX_STEPS:
+            message.set(f'작업에는 최대 {learned_tasks.MAX_STEPS}단계를 저장할 수 있습니다.')
+            return
+        step = dict(manual('capture_target_unavailable'), label='직접 입력한 단계')
+        review['steps'].append(step)
+        render(review['steps'])
+        update_phase()
+        listing.selection_set(step['id'])
+        listing.see(step['id'])
+        select_row()
+        sentence_entry.focus_set()
+
+    def teach_extra(kind, *, replace=False):
+        nonlocal session, previous_columns, editing
+        if replace and (review is None or editing is None or not row_repairable(editing)):
+            return
+        if not replace and not flush():
+            return
+        replace_id = editing['id'] if replace else None
         if review is None and session.started:
             completed_steps.extend(session.finish(report_empty=False)['steps'])
             session = CaptureSession(binding, title)
-            begin.configure(state='normal')
             render(completed_steps)
+            update_phase()
         steps = review['steps'] if review is not None else completed_steps
-        if len(steps) >= learned_tasks.MAX_STEPS:
+        if not replace and len(steps) >= learned_tasks.MAX_STEPS:
             message.set(f'작업에는 최대 {learned_tasks.MAX_STEPS}단계를 저장할 수 있습니다.')
             return
         if kind == 'row':
@@ -864,16 +1131,25 @@ def capture(binding, *, title):
                         editing = None
                     if listing.exists(previous['id']):
                         listing.delete(previous['id'])
+                        shown_rows.pop(previous['id'], None)
                 else:
                     step = None
         if step is not None:
-            steps.append(step)
+            if replace:
+                index = next(i for i, s in enumerate(steps) if s['id'] == replace_id)
+                # Keep the demonstrated position and identity. Only the step the
+                # user explicitly repaired gets a new executable definition.
+                step = dict(step, id=replace_id)
+                steps[index] = step
+                edits.forget(replace_id)
+                editing = None
+            else:
+                steps.append(step)
             render(steps)
             listing.selection_set(step['id'])
             listing.see(step['id'])
-        if review is None:
-            end.configure(state='normal' if steps else 'disabled')
-            message.set('단계를 더 가르치거나 시작을 눌러 이어서 녹화하세요. 끝나면 마치고 검토를 누르세요.')
+            select_row()
+        update_phase()
 
     def save_review():
         nonlocal result
@@ -903,20 +1179,59 @@ def capture(binding, *, title):
             session.poll()
             steps = steps_now()
             render(steps)
-            warnings = sum((s['action'] == 'teach-target' and not edits.get(s).get('instruction'))
-                           or s['action'] == 'manual' or s.get('recognition', {}).get('result') == 'mismatch' for s in steps)
-            state = '녹화가 멈췄습니다. 마치고 검토하세요' if session.notes.state == 'paused' or session.notes.limit else '녹화 중'
-            message.set(f'{state} / {len(steps)}단계 / 확인 필요 {warnings}개'
-                        + ('\n최근 단계: ' + steps[-1]['label'] if steps else ''))
+            warnings = sum(step_status(s, edits.get(s).get('instruction')) != '준비됨' for s in steps)
+            phase.set('녹화 일시 정지' if session.notes.state == 'paused' or session.notes.limit else '녹화 중')
+            message.set(f'{len(steps)}단계 기록' + (f'   ·   확인 필요 {warnings}개' if warnings else ''))
+            if steps and steps[-1]['id'] != tick.last_id:
+                listing.see(steps[-1]['id'])
+                tick.last_id = steps[-1]['id']
         root.after(200, tick)
 
-    begin = ttk.Button(controls, text='시작', command=start)
-    end = ttk.Button(controls, text='마치고 검토', command=finish, state='disabled')
-    save = ttk.Button(controls, text='저장', command=save_review, state='disabled')
-    for button in (begin, ttk.Button(controls, text='행 버튼 가르치기', command=lambda: teach_extra('row')),
-                   ttk.Button(controls, text='조회 후 우클릭 메뉴 가르치기', command=lambda: teach_extra('menu')), end, save,
-                   ttk.Button(controls, text='취소', command=cancel)):
-        button.pack(side='left', padx=3)
+    tick.last_id = None
+    begin = ttk.Button(primary, text='시작', command=start, style='Primary.TButton')
+    end = ttk.Button(primary, text='마치고 검토', command=finish, style='Primary.TButton')
+    save = ttk.Button(primary, text='저장', command=save_review, style='Primary.TButton')
+    add_button = ttk.Menubutton(controls, text='단계 추가 ▾')
+    add_menu = tk.Menu(add_button, tearoff=False)
+    add_menu.add_command(label='직접 설명 입력', command=add_instruction)
+    add_menu.add_command(label='행 버튼 가르치기', command=lambda: teach_extra('row'))
+    add_menu.add_command(label='조회 후 우클릭 메뉴 가르치기', command=lambda: teach_extra('menu'))
+    add_button.configure(menu=add_menu)
+    add_button.pack(side='left')
+    ttk.Button(controls, text='취소', command=cancel).pack(side='right')
+
+    def update_phase():
+        for button in (begin, end, save):
+            button.pack_forget()
+        if review is not None:
+            count = len(review['steps'])
+            update_review_status(review['steps'])
+            save.pack()
+            if count:
+                form.pack(fill='x', before=controls, pady=(8, 0))
+            else:
+                form.pack_forget()
+        elif session.started:
+            phase.set('녹화 중')
+            message.set('대상 창에서 동작을 수행한 뒤 마치고 검토를 누르세요.')
+            end.pack()
+        else:
+            phase.set('녹화 준비' if not completed_steps else '녹화 일시 정지')
+            if completed_steps:
+                begin.configure(text='이어 녹화')
+                begin.pack(side='left', padx=(0, 4))
+                end.pack(side='left')
+                message.set(f'{len(completed_steps)}단계 기록')
+            else:
+                begin.configure(text='시작')
+                begin.pack()
+
+    update_phase()
+    def resize(event):
+        if event.widget is root:
+            status_line.configure(wraplength=max(210, event.width - 40))
+            preview_label.configure(wraplength=max(190, event.width - 72))
+    root.bind('<Configure>', resize)
     root.bind('<Alt-s>', start)
     root.bind('<Alt-f>', finish)
     root.protocol('WM_DELETE_WINDOW', cancel)

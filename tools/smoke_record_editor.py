@@ -96,6 +96,10 @@ def main():
 
         def first():
             assert len(named('steps').get_children()) == 4
+            assert not named('alias').winfo_viewable()
+            button('상세 설정').invoke()
+            root.update_idletasks()
+            assert named('alias').winfo_viewable()
             write('instruction', 'MES Setup조건을 N으로 설정')
             button('문장의 이름을 이 대상에 연결').invoke()
             assert named('alias').get() == 'MES Setup'

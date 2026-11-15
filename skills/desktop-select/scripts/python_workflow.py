@@ -20,6 +20,9 @@ import context_menu
 import export_evidence
 import input_policy
 import live_action as live
+import row_action
+import row_intent
+import row_vision
 
 
 class WorkflowError(ValueError):
@@ -98,6 +101,20 @@ def validate(recipe):
     need(isinstance(steps, list) and 0 < len(steps) <= 100, 'invalid_workflow_steps')
     for step in steps:
         need(isinstance(step, dict), 'invalid_workflow_step')
+        if step.get('action') in ('row-action', 'row-launch'):
+            ordinary = step['action'] == 'row-action'
+            key = 'row' if ordinary else 'ordinal'
+            optional = {'alias'} if ordinary else {'alias', 'row_hint'}
+            need(set(step) - optional == {'action', 'label', key}, 'invalid_row_step')
+            need(text(step['label'], 1000) and ('alias' not in step or text(step['alias'], 200)), 'invalid_row_step')
+            if ordinary:
+                row_vision.validate_spec(step['row'])
+            else:
+                need(type(step['ordinal']) is int and row_intent.parse(step['label']) == step['ordinal'],
+                     'invalid_row_step')
+                if 'row_hint' in step:
+                    row_vision.validate_spec(step['row_hint'])
+            continue
         if step.get('action') == 'wait':
             need(set(step) == {'action', 'seconds'} and type(step.get('seconds')) in (int, float)
                  and 0 <= step['seconds'] <= 120, 'invalid_wait')
@@ -150,8 +167,31 @@ def validate(recipe):
 
 def load(path):
     path = Path(path)
-    need(path.is_file() and path.stat().st_size <= 256000, 'workflow_file_unavailable')
-    return validate(json.loads(path.read_text(encoding='utf-8-sig')))
+    # A recorded row can contain four bounded masks. A complete valid recording
+    # and its exported workflow share the same maximum size.
+    need(path.is_file() and path.stat().st_size <= app.tasks.MAX_FILE_BYTES, 'workflow_file_unavailable')
+    return validate(json.loads(path.read_text(encoding='utf-8-sig'), object_pairs_hook=app.tasks._unique_keys))
+
+
+def selected_steps(recipe, only):
+    entries = list(enumerate(recipe['steps'], 1))
+    if only is None:
+        return entries
+    key = str(only).strip()
+    if key.isdecimal():
+        selected = [(n, s) for n, s in entries if n == int(key)]
+    else:
+        selected = [(n, s) for n, s in entries if key and key in (s.get('alias'), s.get('label'))]
+    need(len(selected) == 1, 'workflow_step_ambiguous' if selected else 'workflow_step_not_found')
+    return selected
+
+
+def worker_timeout(recipe):
+    return 90 + sum(step.get('seconds', 0) + step.get('popup', {}).get('timeout', 3 if 'popup' in step else 0)
+                    + (step.get('timeout', 26) if step['action'] == 'verify-file' else 0)
+                    + (3 * len(step['spec']['path']) + 3 if step['action'] == 'context-menu' else 0)
+                    + (120 if step['action'] in ('row-action', 'row-launch') else 0)
+                    for step in recipe['steps'])
 
 
 def values_for(recipe, overrides):
@@ -219,15 +259,32 @@ def check_surface(owner, surface, title, popup=None, *, mutate=False):
         need(len(matches) == 1 and matches[0]['hwnd'] == surface.hwnd, 'popup_scope_changed')
 
 
+def row_receipt(binding, title, step, *, read_only):
+    def guard():
+        check_surface(binding, binding, title, mutate=not read_only)
+
+    guard()
+    if step['action'] == 'row-launch':
+        return row_intent.execute(binding, title, step['ordinal'], guard, directory=app.task_directory(),
+                                  preview=read_only, hint=step.get('row_hint'))
+    if read_only:
+        state = row_vision.observe_row(binding, step['row'])['kind']
+        need(state in ('before', 'after'), 'row_' + state)
+        return dict(status='observed', observed_state=state, input_dispatched=False)
+    return row_action.execute(binding, step['row'], guard)
+
+
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
-        background_only=False):
+        background_only=False, only=None):
     recipe = validate(recipe)
-    requirements = input_policy.profile(recipe['steps'])
+    entries = selected_steps(recipe, only)
+    active = [step for _, step in entries]
+    requirements = input_policy.profile(active, [n for n, _ in entries])
     if background_only and not read_only:
         refusal = input_policy.blocked(requirements)
         if refusal:
             return refusal
-    values, missing = values_for(recipe, overrides or {})
+    values, missing = values_for(dict(recipe, steps=active), overrides or {})
     if missing and not read_only:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     report = dict(status='observed' if read_only else 'verified', steps=[], input_dispatched=False,
@@ -242,20 +299,20 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         if background_only and not read_only:
             input_policy.window_ready(binding)
         # Capture every requested output before window restoration or any input.
-        baselines = {i: export_evidence.baseline(step['output']) for i, step in enumerate(recipe['steps'], 1)
+        baselines = {i: export_evidence.baseline(step['output']) for i, step in entries
                      if step['action'] == 'verify-file'} if not read_only else {}
         report['window_restored'] = False
         owner_prepared = False
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
-            for number, step in enumerate(recipe['steps'], 1):
+            for number, step in entries:
                 stage_started = time.monotonic()
                 app.guard(binding, binding, recipe['window'])
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
                 if (not read_only and not owner_prepared and 'popup' not in step
-                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu')):
+                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action', 'row-launch')):
                     if background_only:
                         input_policy.window_ready(binding)
                     else:
@@ -279,6 +336,16 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         receipt = dict(status='verified' if ok else 'blocked', input_dispatched=False,
                                        diagnostic=diagnostic, file_verified=ok,
                                        baseline_scope='before_workflow', business_commit='not_verified')
+                elif step['action'] in ('row-action', 'row-launch'):
+                    dispatching = not read_only
+                    try:
+                        receipt = row_receipt(binding, recipe['window'], step, read_only=read_only)
+                    except app.bridge.BridgeError as error:
+                        # Both shared row engines report any input they already
+                        # sent in their receipt. Guard/lookup failures precede it.
+                        dispatching = getattr(error, 'input_dispatched', False) is not False
+                        raise
+                    dispatching = False
                 elif step['action'] == 'context-menu':
                     check_surface(binding, binding, recipe['window'], mutate=not read_only)
                     if read_only:
@@ -401,7 +468,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         diagnostic = getattr(error, 'code', 'provider_error')
         failure = dict(status='uncertain' if dispatching else 'blocked',
                        input_dispatched=None if dispatching else False, diagnostic=diagnostic)
-        if number and len(report['steps']) < number:
+        if number and (not report['steps'] or report['steps'][-1]['number'] != number):
             report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=failure,
                                         elapsed_seconds=round(time.monotonic() - stage_started, 4)))
             report['stopped_at'] = number
@@ -451,7 +518,7 @@ import sys
 HERE = Path(__file__).resolve()
 RUNTIME = HERE.parents[2] / "desktop-select" / "scripts"
 if not (RUNTIME / "python_workflow.py").is_file():
-    raise SystemExit("Install Desktop Select 0.4.8 or later beside this skill.")
+    raise SystemExit("Install the Desktop Select version used to register this workflow beside this skill.")
 sys.path.insert(0, str(RUNTIME))
 import python_workflow
 raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / "workflow.json"), *sys.argv[1:]]))
@@ -472,7 +539,7 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     rows = {row['number']: row for row in observed['steps']}
     for number, step in enumerate(recipe['steps'], 1):
-        if step['action'] in ('wait', 'context-menu', 'verify-file'):
+        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch'):
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
@@ -515,6 +582,11 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
              '동일 폴더 아래 `desktop-select`가 필요하며 외부 통신과 CUA 드라이버는 사용하지 않는다.\n')
     if source_task is not None:
         guide += '\n녹화한 위치와 자연어 지시 원문은 `source-task.json`에 보관되어 있다. 실행에는 `workflow.json`을 사용한다.\n'
+    if any(step['action'] in ('row-action', 'row-launch') for step in active):
+        guide += ('\n녹화한 행 버튼은 저장된 행 표시와 버튼을 다시 찾아 실행한다. '
+                  '“두 번째 행 실행”처럼 순번으로 등록한 동작은 현재 목록의 순서를 따른다. '
+                  '이미 확인한 실행 상태라면 클릭을 생략한다. 행 버튼을 누르는 동안 실제 마우스를 사용한다. '
+                  '한 단계의 현재 상태는 `python -X utf8 -B scripts/run.py --only 1 --read-only`로 확인한다.\n')
     if observed.get('pending_scopes'):
         guide += ('\n등록 시 아직 열리지 않은 팝업의 대상은 미확인 상태로 보존했다. '
                   '실행할 때 지정된 제목의 소속 팝업이 하나로 확인된 뒤에만 해당 단계에 입력한다. '
@@ -562,6 +634,7 @@ def main(argv=None):
             p.add_argument('--out', type=Path, required=True)
         else:
             p.add_argument('--set', action='append', default=[])
+            p.add_argument('--only', help='run or inspect one workflow step by number or label')
             p.add_argument('--read-only', action='store_true')
             p.add_argument('--input-plan', action='store_true', help='preview input modes without opening or inspecting an app')
             p.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and window restoration')
@@ -584,17 +657,20 @@ def main(argv=None):
                 recipe = load(args.recipe)
         overrides = {}
         if args.command == 'run':
+            entries = selected_steps(recipe, args.only)
+            active = dict(recipe, steps=[step for _, step in entries])
+            requirements = input_policy.profile(active['steps'], [n for n, _ in entries])
             if args.input_plan:
                 print(json.dumps(dict(status='observed', input_dispatched=False,
-                                      input_requirements=input_policy.profile(recipe['steps'])), ensure_ascii=False))
+                                      input_requirements=requirements), ensure_ascii=False))
                 return 0
             if args.background_only and not args.read_only:
-                refusal = input_policy.blocked(input_policy.profile(recipe['steps']))
+                refusal = input_policy.blocked(requirements)
                 if refusal:
                     print(json.dumps(refusal, ensure_ascii=False))
                     return 2
             overrides = app.tasks.parse_overrides(args.set)
-            _, missing = values_for(recipe, overrides)
+            _, missing = values_for(active, overrides)
             if missing and not args.read_only:
                 print(json.dumps(dict(status='needs_input', missing_parameters=missing,
                                       steps=[], input_dispatched=False), ensure_ascii=False))
@@ -607,12 +683,9 @@ def main(argv=None):
             else:
                 executing = mutating
                 result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd,
-                             background_only=args.background_only)
+                             background_only=args.background_only, only=args.only)
         else:
-            timeout = 90 + sum(s.get('seconds', 0) + s.get('popup', {}).get('timeout', 3 if 'popup' in s else 0)
-                               + (s.get('timeout', 26) if s['action'] == 'verify-file' else 0)
-                               + (3 * len(s['spec']['path']) + 3 if s['action'] == 'context-menu' else 0)
-                               for s in recipe['steps']) if recipe else 90
+            timeout = worker_timeout(active if args.command == 'run' else recipe) if recipe else 90
             launched = True
             child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),
                                     '--_worker', *argv], capture_output=True, encoding='utf8', timeout=timeout)

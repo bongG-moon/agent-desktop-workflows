@@ -66,6 +66,7 @@ def gui_driver(cli, work, argv):
             elif stage == "recording" and (work / "end-demonstration").exists():
                 finish = find(window, caption="마치고 검토")
                 if finish is not None and str(finish.cget("state")) != "disabled":
+                    window.deiconify()
                     finish.invoke()
                     stage = "review"
             elif stage == "review":
@@ -76,15 +77,20 @@ def gui_driver(cli, work, argv):
                     tree.focus(step)
                     stage = "annotate"
             elif stage == "annotate":
+                details = find(window, caption="상세 설정")
+                if details is not None:
+                    details.invoke()
+                    window.update_idletasks()
                 for field, value in (("alias", ALIAS if edited == 1 else "상태 조건"),
                                      ("instruction", INSTRUCTIONS[edited])):
                     entry = find(window, name=field)
+                    assert entry.winfo_viewable(), field
                     entry.delete(0, "end")
                     entry.insert(0, value)
-                find(window, caption="동작 적용").invoke()
                 preview = find(window, name="preview")
                 textvariable = preview.cget("textvariable")
                 previews.append(str(preview.getvar(textvariable) if textvariable else preview.cget("text")))
+                find(window, caption="적용하고 다음 단계").invoke()
                 edited += 1
                 if edited == 2:
                     (work / "ui-preview.json").write_text(json.dumps(previews), encoding="utf-8")

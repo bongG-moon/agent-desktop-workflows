@@ -94,6 +94,9 @@ def main():
 
         def search():
             assert named('instruction').get() == '검색어 입력란을 "00042"로 설정해줘', named('instruction').get()
+            button('상세 설정').invoke()
+            root.update_idletasks()
+            assert named('mode').winfo_viewable()
             assert any(isinstance(w, ttk.Label) and w.cget('text') == '값 지정' for w in widgets(root))
             write('instruction', '입력받은 변수를 검색어 입력란에 입력해줘')
             named('mode').set('필수 변수')

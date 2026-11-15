@@ -24,8 +24,9 @@ RECOVERABLE_CAPTURE_REASONS = {
     'capture_target_unavailable', 'stable_locator_unavailable', 'unsupported_recorded_action',
     'unsupported_demonstration', 'combo_value_unobserved', 'combo_choice_unproven',
     'combo_option_click_required', 'value_readback_unavailable', 'value_before_transition_unproven',
-    'combo_option_owner_required', 'text_value_unobserved',
+    'combo_option_owner_required', 'text_value_unobserved', 'row_capture_requires_review',
 }
+LEGACY_INSTRUCTION_HINT = '화면의 대상 이름과 실행할 동작을 입력하세요.'
 
 
 class TaskError(ValueError):
@@ -386,6 +387,15 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         raise TaskError('invalid_step_instruction')
     if not sentence and all(value is None for value in (mode, argument, target, role, within)):
         return None
+    if raw_step.get('action') in ('row-action', 'row-launch'):
+        # A taught gesture is the default. An explicit edit supplies a new
+        # intent rather than authorizing the old gesture under another label.
+        raw_step = {**_manual('row_capture_requires_review'), **_annotations(raw_step)}
+    if is_recoverable(raw_step) and all(value is None for value in (mode, argument, target, role, within)):
+        from row_intent import parse
+        ordinal = parse(sentence)
+        if ordinal is not None:
+            return {'mode': 'row-launch', 'ordinal': ordinal, 'text': sentence}
     if isinstance(raw_step.get('target'), dict):
         step = _convert(raw_step, allow_point=True)
         step.update(_annotations(raw_step))
@@ -429,6 +439,21 @@ def instructed_step(raw_step, spec):
     """
     if not isinstance(raw_step, dict) or not isinstance(spec, dict):
         raise TaskError('invalid_step_instruction')
+    row_hint = None
+    if raw_step.get('action') in ('row-action', 'row-launch'):
+        row_hint = raw_step.get('row') if raw_step['action'] == 'row-action' else raw_step.get('row_hint')
+        raw_step = {**_manual('row_capture_requires_review'), **_annotations(raw_step)}
+    if spec.get('mode') == 'row-launch':
+        text = spec.get('text')
+        if (not is_recoverable(raw_step) or type(spec.get('ordinal')) is not int
+                or compile_instruction(raw_step, text) != spec):
+            raise TaskError('invalid_step_instruction')
+        step = {'action': 'row-launch', 'ordinal': spec['ordinal'], 'label': text, **_annotations(raw_step)}
+        if row_hint is not None:
+            from copy import deepcopy
+            _validate_row({'action': 'row-action', 'label': 'row', 'row': row_hint})
+            step['row_hint'] = deepcopy(row_hint)
+        return step
     step = (_convert(raw_step, allow_point=True) if isinstance(raw_step.get('target'), dict)
             else dict(raw_step))
     step.update(_annotations(raw_step))
@@ -480,6 +505,8 @@ def recorded_step(raw):
     if raw.get('action') == 'row-action':
         step = {'action': 'row-action', 'label': raw.get('label'), 'row': raw.get('row'), **_annotations(raw)}
         _validate_row(step)
+        if 'instruction' in raw:
+            return instructed_step(raw, raw['instruction'])
         return step
     spec = raw.get('instruction')
     if spec is not None:
@@ -533,9 +560,36 @@ def _validate_context(step):
 
 def summary(plan):
     """The local row patches are used by the player and stay out of CLI responses."""
-    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'context')},
+    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'row_hint', 'context')},
                               **({'menu_path': step['context']['menu']['path']} if 'context' in step else {})}
                              for step in plan['steps']])
+
+
+def resolve_saved_intents(plan):
+    """Recover supported instructions in old tasks in memory, leaving the source file intact."""
+    _validate(plan)
+    steps = []
+    for step in plan['steps']:
+        if is_recoverable(step):
+            text = step.get('instruction_draft', '')
+            is_user_text = bool(text and text != LEGACY_INSTRUCTION_HINT)
+            if not is_user_text:
+                text = step.get('alias', '')
+            if text:
+                # Only a complete instruction is executable. A legacy alias
+                # like '조회 단계' remains the name of the step.
+                try:
+                    spec = compile_instruction(step, text)
+                except TaskError:
+                    # Older aliases and drafts were allowed to be arbitrary
+                    # notes. Keep them available for review if parsing fails.
+                    spec = None
+                if spec and spec['mode'] != 'draft':
+                    step = instructed_step(step, spec)
+        steps.append(step)
+    resolved = dict(plan, steps=steps)
+    _validate(resolved)
+    return resolved
 
 
 def _validate(plan):
@@ -555,6 +609,15 @@ def _validate(plan):
             raise TaskError('invalid_step_annotation')
         if s.get('action') == 'row-action':
             _validate_row(s)
+            continue
+        if s.get('action') == 'row-launch':
+            from row_intent import parse
+            if (set(s) - set(annotation) - {'row_hint'} != {'action', 'ordinal', 'label'}
+                    or not _text(s.get('label'), 1000) or len(s['label'].encode('utf-8')) > 1000
+                    or type(s.get('ordinal')) is not int or parse(s['label']) != s['ordinal']):
+                raise TaskError('invalid_row_step')
+            if 'row_hint' in s:
+                _validate_row({'action': 'row-action', 'label': 'row', 'row': s['row_hint']})
             continue
         if s.get('action') == 'result-menu':
             _validate_context(s)

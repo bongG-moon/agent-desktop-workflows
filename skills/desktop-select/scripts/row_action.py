@@ -79,11 +79,13 @@ def foreground(binding):
     raise bridge.BridgeError('target_not_foreground')
 
 
-def execute(binding, spec, guard, *, timeout=90):
+def execute(binding, spec, guard, *, timeout=90, required_bounds=None):
     from row_vision import confirm_pixels, confirm_point, observe_row
     guard()
     observed = observe_row(binding, spec)
     state = observed['kind']
+    if required_bounds is not None and observed['row_bounds'] != required_bounds:
+        return _result('blocked', False, state, diagnostic='row_order_changed')
     if state not in ('before', 'after'):
         return _result('blocked', False, state, diagnostic='row_' + state)
     # The independent second sample avoids treating transient rendering as a

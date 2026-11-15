@@ -41,7 +41,7 @@ def _window_rect(binding):
     return [r.left, r.top, r.right - r.left, r.bottom - r.top]
 
 
-def _row_layout(binding):
+def _row_layout(binding, *, include_viewport=False):
     """Enumerate full visible row peers; skip clipped and protected content."""
     window = _window_rect(binding)
     rows, protected = [], []
@@ -76,6 +76,8 @@ def _row_layout(binding):
                 if (_inside(rect, viewport) and _inside(rect, window) and
                         rect[2] <= 5000 and rect[3] <= 512):
                     identity = {'role': bridge.ROLES[control], 'scope': parent_scope}
+                    if include_viewport:
+                        identity['viewport'] = tuple(viewport)
                     if stable_id:
                         identity['row_id'] = aid
                     rows.append((rect, identity))
@@ -133,11 +135,12 @@ def _frame(binding, window):
     return raw
 
 
-def _snapshot(binding):
-    window, rows = _row_layout(binding)
+def _snapshot(binding, *, include_viewport=False):
+    options = {'include_viewport': True} if include_viewport else {}
+    window, rows = _row_layout(binding, **options)
     frame = _frame(binding, window)
     # A sort or scroll while PrintWindow was running invalidates row geometry.
-    if (window, rows) != _row_layout(binding):
+    if (window, rows) != _row_layout(binding, **options):
         _reject('row_layout_changed')
     return window, rows, frame
 
@@ -374,9 +377,10 @@ def transfer_after(draft,example_spec):
     return spec
 
 
-def observe_row(binding,spec):
+def observe_row(binding,spec, *, snapshot=None):
     validate_spec(spec)
-    snapshot = _snapshot(binding)
+    if snapshot is None:
+        snapshot = _snapshot(binding)
     kind,rect = _match(snapshot,spec)
     point = None
     if kind=='found':
@@ -413,6 +417,25 @@ def _list_hit_row(uia, element, pid, point, rect):
             return bounds == rect
         if role not in (50008, 50028, 50036, 50026, 50033):
             return False
+    return False
+
+
+def recorded_row_hit(uia, element, root, pid, point, rect):
+    """A provider can return the row, its list, or an inert child painted in it."""
+    if not uia.within(element, root):
+        return False
+    for _ in range(24):
+        if (element is None or uia.pid(element) != pid or uia.secure(element)
+                or element.property(30010) is not True):
+            return False
+        control = element.property(30003)
+        if control in (50007, 50029):
+            return _bounds(uia, element) == rect
+        if control in (50008, 50028, 50036):
+            return _list_hit_row(uia, element, pid, point, rect)
+        if control not in (50006, 50020, 50025, 50026, 50033) or set(uia.actions(element)) - {'SetFocus'}:
+            return False
+        element = uia.parent(element)
     return False
 
 

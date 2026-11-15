@@ -15,6 +15,7 @@ def main():
     import desktop_select
     import teach_capture as capture
     import learned_tasks as tasks
+    import row_teach
     import tkinter as tk
     from tkinter import ttk
 
@@ -33,6 +34,7 @@ def main():
            capture.manual('capture_target_unavailable', 'semantic'),
            capture.manual('capture_target_unavailable', 'prose'),
            combo('generationField', 'Generation', 'A'),
+           capture.manual('capture_target_unavailable', 'repair'),
            {'id': 'query', 'label': '조회', 'action': 'click',
             'target': {'kind': 'element', 'locator': {'role': 'button', 'automation_id': 'query', 'name': '조회'}},
             'recognition': {'target': 'identified', 'action': 'supported', 'result': 'manual'}},
@@ -62,6 +64,9 @@ def main():
     original_tk, errors, checks = tk.Tk, [], []
     freeform = '이번에 요청한 제품군에 맞춰 가운데 조건을 바꿔줘'
     known_prose = '이번에 요청한 세대에 맞춰 선택해줘'
+    row_spec = {'version': 1, 'role': 'listitem', 'scope': [], 'size': [20, 8],
+                'boxes': {'key': [0, 0, 4, 4], 'button': [7, 0, 4, 4], 'state': [14, 0, 4, 4]},
+                'key': 'qlU=', 'button': 'Vao=', 'before': 'qlU=', 'after': 'Vao='}
 
     def create():
         root = original_tk()
@@ -101,15 +106,16 @@ def main():
 
         def drafts():
             assert named('instruction').get() == '입력받은 변수를 Family 조건에 입력해줘'
-            assert 'MES Setup' in named('steps').item('stateField')['values'][3]
-            assert 'N' in named('steps').item('stateField')['values'][3]
+            assert 'MES Setup' in named('steps').set('stateField', 'instruction')
+            assert 'N' in named('steps').set('stateField', 'instruction')
             checks.append('generated_field_and_value_drafts')
             # Skip the observed-value row entirely: Save must persist its draft.
             named('steps').selection_set('semantic')
             later(semantic)
 
         def semantic():
-            assert '대상 이름' in named('instruction').get()
+            assert named('instruction').get() == ''
+            assert button('행 버튼으로 지정').winfo_viewable()
             write('MES Setup 조건을 N으로 설정해줘')
             button('적용하고 다음 단계').invoke()
             later(prose)
@@ -123,6 +129,20 @@ def main():
         def known():
             assert named('steps').selection() == ('generationField',)
             write(known_prose)
+            button('적용하고 다음 단계').invoke()
+            later(repair_row)
+
+        def repair_row():
+            listing = named('steps')
+            before = listing.get_children()
+            assert listing.selection() == ('repair',)
+            repair = button('행 버튼으로 지정')
+            assert repair.winfo_viewable()
+            repair.invoke()  # Cancel the first teaching dialog.
+            assert listing.get_children() == before and listing.set('repair', 'status') == '확인 필요'
+            repair.invoke()
+            assert listing.get_children() == before and listing.selection() == ('repair',)
+            assert listing.set('repair', 'instruction') == '두 번째 행 실행' and listing.set('repair', 'status') == '준비됨'
             button('적용하고 다음 단계').invoke()
             later(command)
 
@@ -146,13 +166,19 @@ def main():
             later(save)
 
         def save():
-            button('저장').invoke()
+            add = next(w for w in widgets(root) if isinstance(w, ttk.Menubutton))
+            assert add.winfo_viewable()
+            root.nametowidget(add['menu']).invoke('직접 설명 입력')
+            write('두번째 요소 실행버튼 누르기')
+            button('적용하고 다음 단계').invoke()
+            button('초안 저장').invoke()
 
         later(begin)
         root.after(15000, root.destroy)
         return root
 
-    with patch.object(tk, 'Tk', side_effect=create), patch.object(capture, 'CaptureSession', Session):
+    with patch.object(tk, 'Tk', side_effect=create), patch.object(capture, 'CaptureSession', Session), \
+            patch.object(row_teach, 'teach_row_dialog', side_effect=[None, (row_teach.raw_row_step('두 번째 행 실행', row_spec), row_spec)]):
         result = capture.capture(Mock(), title='Local description recovery test')
     assert not errors, errors
     assert result['status'] == 'recorded', result
@@ -164,7 +190,12 @@ def main():
     assert (steps[2]['match'], steps[2]['target'], steps[2]['instruction']['value']) == ('query', 'MES Setup', 'N')
     assert steps[3]['instruction_draft'] == freeform
     assert (steps[4]['target'], steps[4]['instruction_draft']) == ('generationField', known_prose)
-    assert steps[5]['instruction']['text'] == '조회 버튼을 눌러줘'
+    assert result['steps'][5]['id'] == 'repair'
+    assert (steps[5]['action'], steps[5]['row']) == ('row-action', row_spec)
+    assert steps[6]['instruction']['text'] == '조회 버튼을 눌러줘'
+    assert (steps[7]['action'], steps[7]['ordinal']) == ('row-launch', 2)
+    checks.append('add_instruction_without_capture')
+    checks += ['repair_cancel_preserves_step', 'repair_replaces_selected_step_in_place']
     checks += ['untouched_default_saved', 'unreadable_combo_variable_saved', 'unknown_target_live_query_saved',
                'freeform_prose_saved_for_host_interpretation', 'known_target_prose_preserves_identity',
                'button_named_instruction_saved']

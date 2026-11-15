@@ -412,11 +412,28 @@ def save_instruction(args):
     step = plan['steps'][number - 1]
     if args.alias is not None:
         step['alias'] = args.alias
-    spec = tasks.compile_instruction(step, args.text, mode=args.mode, argument=args.argument,
-                                     target=args.target, role=args.role, within=args.within)
-    if spec is None:
-        raise tasks.TaskError('instruction_required')
-    step = tasks.instructed_step(step, spec)
+    ordinal = getattr(args, 'row', None)
+    if ordinal is not None:
+        from row_intent import conflicts_with_launch, parse
+        interpreted = parse(args.text)
+        if conflicts_with_launch(args.text) or (interpreted is not None and interpreted != ordinal):
+            raise tasks.TaskError('instruction_binding_conflict')
+        if (not 1 <= ordinal <= 64 or not tasks._text(args.text, 1000)
+                or any(v is not None for v in (args.mode, args.argument, args.target, args.role, args.within, args.wait_after))
+                or not (tasks.is_recoverable(step) or step.get('action') in ('row-action','row-launch'))):
+            raise tasks.TaskError('invalid_row_instruction')
+        hint = step.get('row', step.get('row_hint'))
+        step = dict(action='row-launch', ordinal=ordinal, label=f'{ordinal}번째 행 실행',
+                    **tasks._annotations(step))
+        step['description'] = args.text.strip()
+        if hint is not None:
+            step['row_hint'] = hint
+    else:
+        spec = tasks.compile_instruction(step, args.text, mode=args.mode, argument=args.argument,
+                                         target=args.target, role=args.role, within=args.within)
+        if spec is None:
+            raise tasks.TaskError('instruction_required')
+        step = tasks.instructed_step(step, spec)
     plan['steps'][number - 1] = step
     if args.wait_after is not None:
         step['wait_after'] = args.wait_after
@@ -478,7 +495,7 @@ def run(args):
     if args.command == 'instruct':
         return save_instruction(args)
     if args.command == 'plan':
-        plan = tasks.load_task(args.task, task_directory())
+        plan = tasks.resolve_saved_intents(tasks.load_task(args.task, task_directory()))
         result = saved_execution_plan(plan)
         return dict(status='planned' if result.get('envelope') else 'needs_review',
                     task=tasks.summary(plan), execution_plan=execution_plan_info(result), input_dispatched=False)
@@ -488,7 +505,7 @@ def run(args):
         return {'status': 'observed', 'task': tasks.summary(tasks.load_task(args.task, task_directory())),
                 'input_dispatched': False}
     if args.command == 'replay':
-        plan = tasks.load_task(args.task, task_directory())
+        plan = tasks.resolve_saved_intents(tasks.load_task(args.task, task_directory()))
         requirements = replay_input_requirements(plan, args.only)
         if getattr(args, 'input_plan', False):
             return dict(status='observed', input_dispatched=False, input_requirements=requirements)
@@ -518,6 +535,13 @@ def run(args):
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
     binding = pick_window(rows, args.window, args.hwnd)
     owner = bridge.Binding(binding)
+    if args.command == 'row-launch':
+        from row_intent import execute
+        if args.background_only and not args.preview:
+            return input_policy.blocked(input_policy.profile([{'action':'row-launch'}]))
+        return execute(owner, args.window, args.ordinal,
+                       lambda: guard(owner, owner, args.window, mutate=not args.preview),
+                       task_directory(), preview=args.preview)
     if args.command == 'record-rows':
         from row_action import teach_rows
         guard(owner, owner, args.window)
@@ -569,6 +593,11 @@ def replay_step():
             return refusal
     bridge.set_dpi_awareness()
     owner = bridge.Binding(binding)
+    if step['action'] == 'row-launch':
+        from row_intent import execute
+        return execute(owner, binding['title'], step['ordinal'],
+                       lambda: guard(owner, owner, binding['title'], mutate=True), task_directory(),
+                       hint=step.get('row_hint'))
     if step['action'] == 'result-menu':
         from result_menu import execute as execute_result
         tasks._validate_context(step)
@@ -604,10 +633,11 @@ def parser():
     edit.add_argument('--alias', help='explicitly associate this name with the recorded target')
     edit.add_argument('--target', help='interpreted current-screen field or command name when recording missed it')
     edit.add_argument('--role', help='interpreted target role, such as combobox or button')
+    edit.add_argument('--row', type=int, help='visible list ordinal for a launch instruction interpreted by the host')
     edit.add_argument('--within', help='observed region to distinguish identical names')
     edit.add_argument('--wait-after', type=float, help='explicit seconds to wait after this button call')
     edit.add_argument('--save-as', required=True, help='new task name; never overwrite the original')
-    for verb in ('windows', 'inspect', 'select', 'fill', 'open', 'record', 'replay', 'record-rows', 'row-status'):
+    for verb in ('windows', 'inspect', 'select', 'fill', 'open', 'record', 'replay', 'record-rows', 'row-status', 'row-launch'):
         s = commands.add_parser(verb)
         s.add_argument('--exe', required=True, help='exact executable basename')
         if verb != 'windows':
@@ -624,7 +654,10 @@ def parser():
         if verb == 'replay':
             s.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
             s.add_argument('--input-plan', action='store_true', help='preview input modes without inspecting an app')
-        if verb in ('replay', 'select', 'fill', 'open'):
+        if verb == 'row-launch':
+            s.add_argument('--ordinal', required=True, type=int)
+            s.add_argument('--preview', action='store_true', help='find the current row and play control without input')
+        if verb in ('replay', 'select', 'fill', 'open', 'row-launch'):
             s.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and restoration')
         if verb in ('replay', 'row-status'):
             s.add_argument('--only', help='run just one named step or step number')
@@ -665,9 +698,10 @@ def worker_receipt(argv, mutating, payload=None):
     # our helper only; never assume a timed-out mutation failed or repeat it.
     try:
         kind = (payload or {}).get('step', {}).get('action')
-        timeout = {'row-action': 120, 'result-menu': 160}.get(kind, 90)
+        timeout = {'row-action': 120, 'row-launch': 120, 'result-menu': 160}.get(kind, 90)
         if argv == ['_plan']:
-            timeout += sum(s.get('seconds', 0) for s in payload['recipe']['steps'])
+            from python_workflow import worker_timeout
+            timeout = worker_timeout(payload['recipe'])
         child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
                                input=json.dumps(payload) if payload is not None else None,
                                capture_output=True, encoding='utf-8', timeout=timeout)
@@ -684,7 +718,8 @@ def worker_receipt(argv, mutating, payload=None):
 
 
 def supervise(args, argv):
-    receipt = worker_receipt(['_worker', *argv], mutating=args.command in ('open', 'select', 'fill'))
+    mutating = args.command in ('open','select','fill') or (args.command == 'row-launch' and not args.preview)
+    receipt = worker_receipt(['_worker', *argv], mutating=mutating)
     print(json.dumps(receipt, ensure_ascii=False))
     return result_code(receipt)
 

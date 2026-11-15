@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 4
+COMPILER = 5
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -41,14 +41,18 @@ def compile_plan(task):
     Callers retaining legacy replay defaults should leave those tasks on that
     player; the notes make this distinction visible before export.
     """
-    tasks._validate(task)
-    if len(task['steps']) > 100:
+    # Keep the original instruction and fingerprint in the envelope, including
+    # legacy drafts whose supported action can now be resolved locally.
+    steps = tasks.resolve_saved_intents(task)['steps']
+    if len(steps) > 100:
         return _result('not_compatible', diagnostic='execution_plan_step_limit')
     # Establish whole-task compatibility before deriving any executable steps.
-    for number, step in enumerate(task['steps'], 1):
+    for number, step in enumerate(steps, 1):
         reason = None
         if step.get('instruction_draft'):
             reason = 'instruction_requires_structure'
+        elif step['action'] in ('row-action', 'row-launch'):
+            continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
         elif step.get('match') not in ('automation_id', 'name', 'query'):
@@ -58,10 +62,17 @@ def compile_plan(task):
         if reason:
             return _result('not_compatible', diagnostic=reason, step=number)
     converted, source_steps, notes = [], [], []
-    for number, step in enumerate(task['steps'], 1):
+    for number, step in enumerate(steps, 1):
+        if step['action'] in ('row-action', 'row-launch'):
+            # Preserve demonstrated identity versus a live ordinal request.
+            # A relative row instruction must still select the current Nth row.
+            fields = ('action', 'label', 'row', 'row_hint', 'ordinal', 'alias')
+            converted.append({k: deepcopy(step[k]) for k in fields if k in step})
+            source_steps.append(number)
+            continue
         # Original recorded playback stopped at a command whose business result
         # was unverified. Do not silently turn that into immediate continuation.
-        if step['action'] == 'open' and number < len(task['steps']) and not step.get('wait_after'):
+        if step['action'] == 'open' and number < len(steps) and not step.get('wait_after'):
             return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])
         if step['match'] == 'query':
