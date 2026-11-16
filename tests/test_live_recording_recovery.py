@@ -263,6 +263,39 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.assertTrue(result['steps'][3]['capture_requires_consent'])
         self.menu.assert_not_called()
 
+    def test_prepare_reports_a_missing_recorded_field_before_publishing_the_copy(self):
+        self.observe.return_value['targets'].pop(1)
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        result = self.recover_cli('--prepare', '--save-as', '준비본')
+        self.assertEqual((result['status'], result['step_number'], result['diagnostic']),
+                         ('needs_grounding', 2, 'target_missing'))
+        self.assertEqual(result['steps'][1]['target'], 'c_family')
+        self.assertEqual(result['steps'][1]['scope_index'], 0)
+        self.assertFalse((self.directory/'준비본.json').exists())
+
+    def test_prose_after_last_menu_item_remains_a_separate_unresolved_step(self):
+        self.rows[3]['step']['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
+        self.observe.return_value['targets'].append(dict(role='group', automation_id='results', enabled=True, offscreen=False))
+        self.rows.append(dict(step=teach_capture.manual('unsupported_recorded_action', '7'),
+                              form=dict(alias='', text='상태에 맞춰 후속 처리', mode=None, argument='')))
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        result = self.recover_cli('--prepare', '--save-as', '준비본')
+        self.assertEqual((result['status'], result['step_number']), ('needs_grounding', 7), result)
+        hint = result['steps'][3]['menu_binding_hint']
+        self.assertEqual((hint['through'], hint['path']), (6, ['Export to Excel', 'Active sheet']))
+        self.assertFalse((self.directory/'준비본.json').exists())
+
+    def test_dependent_step_identifies_missing_opener_without_reusing_a_step_number(self):
+        self.observe.return_value['targets'].pop(2)
+        step = teach_capture.manual('capture_target_unavailable', '4')
+        step['_capture_window'] = dict(after_id='3', exe='Child.exe', title='Details')
+        self.rows[3:] = [dict(step=step, form=dict(alias='', text='Open 버튼을 눌러줘', mode=None, argument=''))]
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        result = self.recover_cli('--prepare')
+        self.assertEqual((result['step_number'], result['diagnostic']), (3, 'target_missing'), result)
+        self.assertEqual((result['steps'][3]['diagnostic'], result['steps'][3]['opener_step']),
+                         ('recorded_window_opener_unresolved', 3))
+
     def test_specific_rows_and_cells_are_never_generic_point_repairs(self):
         self.assertTrue(recovery._any_body_cell('조회된 테이블에서 우클릭을 눌러줘'))
         self.assertTrue(recovery._any_body_cell('결과 표를 우클릭해줘'))

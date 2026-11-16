@@ -121,6 +121,40 @@ class RegisteredRepairTests(unittest.TestCase):
         self.assertEqual(observed['diagnostic'], 'workflow_changed_during_repair')
         adjust.assert_not_called()
 
+    def test_preinput_unreadable_root_preserves_original_claim_until_same_menu_resumes(self):
+        flow.context_menu.execute.side_effect = self.menu
+        ticket = self.cli('--allow-physical')['menu_repair']['ticket']
+        session = repair.RepairSession(self.path)
+        original = session.read(ticket, self.recipe)
+        resume = ['--resume-menu', ticket, '--frame', 'frame', '--point', '30', '40', '--allow-physical']
+        with patch.object(repair, 'inspect_or_adjust', return_value=dict(self.recipe['steps'][1]['spec'], point=self.after)):
+            with patch.object(flow, 'check_window_readability', return_value=dict(
+                    status='unavailable', diagnostic='window_root_unreadable', input_dispatched=False)):
+                failure = self.cli(*resume)
+            self.assertEqual(failure['menu_repair']['ticket'], ticket)
+            self.assertFalse(failure['input_dispatched'])
+            self.assertEqual(failure['steps'], [])
+            self.assertEqual(original, session.read(ticket, self.recipe))
+            self.assertEqual(self.cli(*resume)['menu_corrections'], [2])
+            self.assertEqual(self.cli(*resume)['diagnostic'], 'menu_repair_expired')
+        flow.live.execute.assert_called_once()
+
+    def test_preinput_mismatched_root_consumes_claim_and_frame_inspection_requires_no_repeat_variables(self):
+        self.recipe['steps'][0] = dict(action='set-value', selector=dict(role='textfield', name='Field'),
+                                      parameter='Field')
+        self.write(self.recipe)
+        flow.context_menu.execute.side_effect = self.menu
+        ticket = self.cli('--allow-physical', '--set', 'Field=Value')['menu_repair']['ticket']
+        with patch.object(repair, 'inspect_or_adjust', return_value=dict(status='observed', input_dispatched=False)):
+            self.assertEqual(self.cli('--allow-physical', '--repair-frame', ticket)['status'], 'observed')
+        with (patch.object(repair, 'inspect_or_adjust', return_value=dict(self.recipe['steps'][1]['spec'], point=self.after)),
+              patch.object(flow, 'check_window_readability', return_value=dict(
+                  status='unavailable', diagnostic='window_root_process_mismatch', input_dispatched=False))):
+            resume = ['--allow-physical', '--set', 'Field=Value', '--resume-menu', ticket,
+                      '--frame', 'frame', '--point', '30', '40']
+            self.assertNotIn('menu_repair', self.cli(*resume))
+            self.assertEqual(self.cli(*resume)['diagnostic'], 'menu_repair_expired')
+
     def test_atomic_save_conflict_preserves_newer_content_and_successful_delivery(self):
         changed = deepcopy(self.recipe)
         changed['name'] = 'Edited during run'

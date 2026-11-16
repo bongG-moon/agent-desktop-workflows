@@ -254,7 +254,7 @@ def _menu_caption(label):
     return ' '.join(label.split()).casefold()
 
 
-def _menu_tail(row):
+def _menu_tail(row, known_captions=()):
     """Return witnessed captions or the user's complete, explicit menu path."""
     step = row['step']
     if (row.get('field_problem') or row['mode'] not in (None, 'recorded') or 'wait_after' in step
@@ -291,13 +291,20 @@ def _menu_tail(row):
     click = tasks.click_request(text)
     if click:
         return [click[0]]
-    # The recording editor also accepts a bare caption or "Active sheet 선택".
-    caption = re.sub(r'\s*(?:을|를)?\s*선택(?:해\s*(?:줘|주세요))?[.!。]?$', '', text).strip()
-    return [caption] if tasks._text(caption, 200) else []
+    # An unwitnessed sentence following the menu may describe a separate task.
+    # Treat a bare caption as such only when the supplied path/live popup names it.
+    if _menu_caption(text) in known_captions:
+        return [text]
+    selection = re.fullmatch(r'(.+?)\s*(?:을|를)?\s*선택(?:해\s*(?:줘|주세요))?[.!。]?', text)
+    if selection is None:
+        selection = re.fullmatch(r'select\s+(.+?)[.!]?', text, re.IGNORECASE)
+    if selection and tasks._text(selection[1], 200):
+        return [selection[1].strip()]
+    return []
 
 
 def _next_menu_index(path, index, row):
-    labels = [_menu_caption(label) for label in _menu_tail(row)]
+    labels = [_menu_caption(label) for label in _menu_tail(row, path[index:index+1])]
     if len(labels) > 1:
         return len(path) if index < len(path) and labels == path else None
     if labels and index < len(path) and labels[0] == path[index]:
@@ -312,7 +319,8 @@ def _menu_hint(rows, number, inventory):
     for n, following in enumerate(rows[number:number+8], number+1):
         if following.get('scope_problem') or following['context'] != start['context']:
             break
-        labels = _menu_tail(following)
+        known = {_menu_caption(label) for label in (path or inventory.get('open_menu_items', []))}
+        labels = _menu_tail(following, known)
         if not labels:
             break
         if len(labels) > 1:
@@ -535,6 +543,9 @@ def run(app, args):
             remap[number] = len(revised)
             continue
         try:
+            origin = (row['context'] or {}).get('after_step')
+            if prepare and origin in pending:
+                raise tasks.TaskError('recorded_window_opener_unresolved')
             if not args.bindings or operation:
                 surface = _bind_surface(app, doc, owner, rows, sequence, number)
                 key = surface.hwnd, surface.pid, surface.created
@@ -566,8 +577,16 @@ def run(app, args):
                 step = deepcopy(row['step'])
                 if prepare and (step['action'] == 'manual' or step.get('match') == 'query'):
                     raise tasks.TaskError(step.get('reason', 'instruction_requires_structure'))
+                if prepare and step.get('match') in ('automation_id', 'name'):
+                    key = step['match']
+                    matches = [node for node in observation['targets'] if node.get('role') == step['role']
+                               and node.get(key) == step['target']]
+                    _require(len(matches) == 1, 'target_ambiguous' if matches else 'target_missing')
+                    _require(matches[0].get('enabled') is True, 'target_disabled')
+                    _require(matches[0].get('offscreen') is False, 'target_offscreen')
             context = step.get('window_context')
             if context and 'after_step' in context:
+                _require(context['after_step'] in remap, 'recorded_window_opener_unresolved')
                 context['after_step'] = remap[context['after_step']]
             revised.append(step)
             remap[number] = len(revised)
@@ -579,7 +598,8 @@ def run(app, args):
                 detail['recovery_hint'] = f"{error.step_number}번의 창, 컨트롤 및 메뉴 이름을 원문과 대조하세요."
                 if error.step_number != number:
                     detail['recovery_hint'] += " 별도 동작이면 through를 그 단계 앞에서 끝내세요."
-            if reason in ('recorded_window_not_open', 'invalid_window_origin_step') and row.get('context'):
+            if reason in ('recorded_window_not_open', 'invalid_window_origin_step',
+                          'recorded_window_opener_unresolved') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
             if args.bindings:
                 return dict(result, status='needs_grounding', diagnostic=reason, step_number=number)
@@ -588,8 +608,6 @@ def run(app, args):
                 if 'menu_binding_hint' in detail:
                     detail['image_args'] = ['recover', '--task', doc['name'], '--only', str(number), '--image']
                     detail['capture_requires_consent'] = True
-                # Keep original numbering available to dependent diagnostic rows.
-                remap[number] = number
     if not args.bindings and (not prepare or pending):
         result['host_action'] = 'bind_recorded_instructions_from_live_scopes'
         suggested = []

@@ -110,10 +110,16 @@ class RepairSession:
                        number=number, scope=scope, only=only, checked_fields=checked_fields,
                        query_sent=query_sent, routes=routes or [], expires=time.time() + 600)
         self.discard()
+        return self.write(pending)
+
+    def write(self, record):
+        remaining = record['expires'] - time.time()
+        need(remaining > 0, 'menu_repair_expired')
         with self.pending.open('x', encoding='utf8') as stream:
-            json.dump(pending, stream)
-        return dict(ticket=ticket, step=number, expires_seconds=600, host_action='inspect_menu_repair_frame',
-                    frame_args=['--repair-frame', ticket, '--allow-physical'])
+            json.dump(record, stream)
+        ticket = record['ticket']
+        return dict(ticket=ticket, step=record['number'], expires_seconds=int(remaining),
+                    host_action='inspect_menu_repair_frame', frame_args=['--repair-frame', ticket, '--allow-physical'])
 
     def read(self, ticket, recipe):
         need(self.pending.is_file() and self.pending.stat().st_size < tasks.MAX_FILE_BYTES, 'menu_repair_expired')
@@ -144,9 +150,7 @@ def capture_region(app, binding, uia, spec, guard):
     return (x, y, width, height), grounding._png(width, height, crop), window, png
 
 
-def inspect_or_adjust(flow, recipe, record, frame=None, point=None):
-    import grounding
-    import live_recovery
+def recorded_surface(flow, recipe, record):
     index = record['number'] - 1
     step = recipe['steps'][index]
     owner_id, surface_id = record['scope']
@@ -165,6 +169,15 @@ def inspect_or_adjust(flow, recipe, record, frame=None, point=None):
         flow.app.guard(binding, binding, ctx['title'] if ctx else recipe['window'])
         if ctx:
             resolved.check(ctx, binding)
+    guard()
+    return binding, guard
+
+
+def inspect_or_adjust(flow, recipe, record, frame=None, point=None):
+    import grounding
+    import live_recovery
+    step = recipe['steps'][record['number'] - 1]
+    binding, guard = recorded_surface(flow, recipe, record)
     with flow.app.bridge.UIA() as uia:
         spec = menu(step)
         rect, crop, window, png = capture_region(flow.app, binding, uia, spec, guard)
@@ -251,6 +264,15 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
         routes = report.pop('menu_repair_routes', None)
         try:
             persist(args.recipe, recipe, report, flow.load, replacements)
+            if (resume and report.get('status') == 'blocked' and report.get('input_dispatched') is False
+                    and report.get('steps') == [] and report.get('diagnostic') == 'window_root_unreadable'
+                    and report.get('readability_check', {}).get('status') == 'unavailable'
+                    and report['readability_check'].get('diagnostic') == 'window_root_unreadable'):
+                # The claim was consumed before entering the runner. Restore it only
+                # for a positive, pre-input transient receipt on the identical live scope.
+                need(flow.load(args.recipe) == recipe, 'workflow_changed_during_repair')
+                recorded_surface(flow, recipe, resume)
+                report['menu_repair'] = session.write(resume)
             if scope:
                 number = report['stopped_at']
                 row = next(r for r in report['steps'] if r['number'] == number)

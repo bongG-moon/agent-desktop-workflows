@@ -67,7 +67,8 @@ def exercise(archive, work):
         original = (task_dir / (name + '.json')).read_bytes()
         prepared = call('prepare', scripts / 'desktop_select.py', 'recover', '--task', name,
                         '--prepare', '--save-as', 'resolved-demo')
-        assert prepared['status'] == 'recorded' and prepared['input_dispatched'] is False, prepared
+        assert (prepared['status'] == 'recorded' and prepared['input_dispatched'] is False
+                and prepared['observed_scopes'] == 1), prepared
         registration = call('register', scripts / 'python_workflow.py', 'register', '--task', 'resolved-demo',
                             '--out', registered)
         assert registration['status'] == 'registered' and not registration['input_dispatched'], registration
@@ -111,7 +112,8 @@ def exercise(archive, work):
             assert [cells[k] for k in ('A2', 'B2', 'C2')] == ['N', 'Hybrid', str(run_number)], cells
             book.rename(work / f'verified-{run_number}.xlsx')
         assert (task_dir / (name + '.json')).read_bytes() == original
-        return dict(original_steps=len(rows), original_preserved=True, queries=2, right_clicks=2,
+        return dict(original_steps=len(rows), original_preserved=True, prepare_scope_count=prepared['observed_scopes'],
+                    preparation_lookup=prepared['lookup_modes'], queries=2, right_clicks=2,
                     workbooks_verified=2, separate_process_repeat=True, scope_reads_per_run=1, seconds=times)
     finally:
         fixture.close()
