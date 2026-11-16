@@ -47,6 +47,8 @@ def compile_plan(task, *, replacements=None):
     if replacements:
         for number, replacement in replacements.items():
             original = steps[number - 1]
+            if original['action'] == 'manual' and not tasks.is_recoverable(original):
+                return _result('not_compatible', diagnostic=original['reason'], step=number)
             step = deepcopy(replacement)
             if 'window_context' in original:
                 step['window_context'] = deepcopy(original['window_context'])
@@ -56,10 +58,12 @@ def compile_plan(task, *, replacements=None):
     # Establish whole-task compatibility before deriving any executable steps.
     for number, step in enumerate(steps, 1):
         reason = None
-        if step.get('instruction_draft'):
+        if tasks.has_groundable_draft(step):
             return _result('not_compatible', diagnostic='instruction_requires_structure', step=number,
                            grounding_steps=[tasks.grounding_request(i, s) for i, s in enumerate(steps, 1)
-                                            if s.get('instruction_draft')])
+                                            if tasks.has_groundable_draft(s)])
+        elif step['action'] == 'manual' and step.get('instruction_draft'):
+            reason = step['reason']
         elif step['action'] in ('row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open'):
             continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):

@@ -1,4 +1,6 @@
-# Desktop Select 0.4.15
+# Desktop Select 0.4.16
+
+녹화 검토 화면에서 한 단계라도 남아 있으면 **초안 저장**을 사용할 수 있습니다. 연결할 창이나 입력 변수가 미정이면 작성한 문장과 편집 중인 값을 함께 저장합니다. 나중에 같은 프로젝트에서 `review --task "작업 이름"`으로 이어서 편집할 수 있습니다. 파일 쓰기에 실패하면 검토 창에서 다시 저장할 수 있습니다. [초안 저장과 다시 열기](skills/desktop-select/사용가이드.md#초안-저장과-다시-열기)
 
 같은 모양의 실행 버튼이 목록에 반복되면 AX Workspace나 Claude Code가 현재 창에서 행 이름과 같은 줄의 버튼을 함께 지정할 수 있습니다. 선택한 행을 다시 찾을 수 있는 정보는 프로젝트 실행안에 저장합니다. 같은 녹화를 다시 실행할 때는 행 순서가 바뀌어도 해당 이름과 버튼을 확인합니다.
 
@@ -10,7 +12,7 @@
 
 0.4.0 태그(`02fa20e`)에서 다시 구성한 실행기에 자연어 녹화와 실행안 저장을 연결했습니다. 처음에는 위치를 녹화하고 설명 초안을 수정한 뒤 Python 업무 스킬로 등록합니다. 이후에는 Family 같은 선택값과 SearchText 같은 입력값을 받아 같은 순서로 실행합니다. 0.4.10은 목록 안 버튼을 일반 녹화 중에 인식하고, 단계마다 실제로 실행할 문장을 입력할 수 있게 합니다. 녹화한 위치에 버튼 이름이 없어도 `두번째 요소 실행버튼 누르기`라고 쓰면 실행 당시 보이는 목록의 두 번째 행에서 실행 버튼을 찾습니다. 기본 조회와 Excel 내보내기 흐름은 유지합니다. 기존 CUA MCP와 별도이며 CUA 드라이버가 필요하지 않습니다. ZIP에는 Python 소스를 포함한 텍스트 파일만 있습니다.
 
-Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받아 줘. 조회 뒤 결과 표를 우클릭해서 Excel로 내보내고, 저장 창과 파일 확인까지 Python 업무 스킬로 연결해 줘”라고 요청하세요. 호스트 모델이 현재 화면을 확인해 실행안을 한 번 정리하고, 반복 실행은 저장한 동작을 Python으로 수행합니다. 외부 모델 호출은 없으며 업무 앱의 서버 처리 시간은 줄이지 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows ZIP 다운로드](https://github.com/bongG-moon/agent-desktop-workflows/releases/download/desktop-select-v0.4.15/desktop-select-0.4.15-windows-x64.zip) | [한국어 사용 가이드](https://github.com/bongG-moon/agent-desktop-workflows/blob/desktop-select-v0.4.15/skills/desktop-select/사용가이드.md)
+Claude Code에 “MES Setup은 N으로 고정하고 Family는 실행할 때 받아 줘. 조회 뒤 결과 표를 우클릭해서 Excel로 내보내고, 저장 창과 파일 확인까지 Python 업무 스킬로 연결해 줘”라고 요청하세요. 호스트 모델이 현재 화면을 확인해 실행안을 한 번 정리하고, 반복 실행은 저장한 동작을 Python으로 수행합니다. 외부 모델 호출은 없으며 업무 앱의 서버 처리 시간은 줄이지 않습니다. 회사 PC에는 64비트 Python 3.10 이상이 필요하며 녹화 창은 Tkinter를 사용합니다. ZIP의 `desktop-select` 폴더 전체를 프로젝트의 `.claude/skills/` 아래에 넣으세요. [Windows 배포 파일](https://github.com/bongG-moon/agent-desktop-workflows/releases) | [한국어 사용 가이드](skills/desktop-select/사용가이드.md)
 
 정확한 ID나 이름이 없는 입력란은 확인된 상위 영역과 그 안의 상대 위치를 기록할 수 있습니다. 실행 때 영역과 실제 UIA 대상의 역할, 클래스, 소속을 다시 확인합니다. 임시 HWND를 저장하거나 옛 절대좌표를 누르지 않습니다. 표준 Win32 우클릭 메뉴는 대상 창의 실제 메뉴 소유자를 확인한 뒤 읽습니다. 이름 있는 표 영역과 완료 표식, 메뉴 항목은 필요한 후보만 조회해 전체 화면 반복 탐색을 줄입니다.
 

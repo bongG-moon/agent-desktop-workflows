@@ -33,6 +33,7 @@ from targeting import SelectionError, field_labels, resolve, scope_map
 from live_action import execute
 import provider_visibility as visibility
 import learned_tasks as tasks
+import review_drafts
 import input_policy
 
 
@@ -628,9 +629,33 @@ def _replay_recorded(plan, args, overrides, background):
     return tasks.replay(plan,args.exe,args.window,overrides,invoke,only=args.only)
 
 
+def edit_recording(owner, storage):
+    from teach_capture import capture
+    focus = storage.previous.get('step_number') if storage.previous else None
+    result = capture(owner, title=storage.title, initial_draft=storage.initial_rows(), initial_step=focus,
+                     save_recording=storage.save_recording, save_draft=storage.save_draft)
+    if storage.saved_plan is not None:
+        try:
+            result['execution_plan'] = execution_plan_info(saved_execution_plan(storage.saved_plan))
+        except Exception as error:
+            # The task is already on disk. Keep its receipt if deriving the plan fails.
+            result['execution_plan'] = dict(status='unavailable',
+                                            diagnostic=getattr(error, 'code', 'execution_plan_unavailable'))
+    return result
+
+
 def run(args):
     if args.command == 'storage':
         return storage_info()
+    if args.command == 'review':
+        directory = task_directory()
+        doc = tasks.read_document(args.task, directory)
+        if doc.get('kind') != review_drafts.KIND:
+            raise tasks.TaskError('task_already_saved')
+        review_drafts.validate(doc)
+        storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
+        bridge.set_dpi_awareness()
+        return edit_recording(None, storage)
     bridge.set_dpi_awareness()
     if args.command in ('ground','bind-visual','bind-row'):
         import grounding
@@ -644,18 +669,20 @@ def run(args):
         result = compound_plan.save(task, instructions, task_directory())
         return dict(status='planned' if result.get('envelope') else 'needs_review', task=task['name'],
                     execution_plan=execution_plan_info(result), input_dispatched=False)
+    if args.command in ('plan', 'show', 'replay'):
+        plan = tasks.load_task(args.task, task_directory(), allow_review=True)
+        if plan.get('kind') == review_drafts.KIND:
+            return review_drafts.receipt(plan, 'observed' if args.command == 'show' else 'needs_review')
     if args.command == 'plan':
-        plan = tasks.load_task(args.task, task_directory())
         result = saved_execution_plan(plan)
         return dict(status='planned' if result.get('envelope') else 'needs_review',
                     task=tasks.summary(plan), execution_plan=execution_plan_info(result), input_dispatched=False)
-    if args.command in ('tasks', 'show'):
-        if args.command == 'tasks':
-            return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
-        return {'status': 'observed', 'task': tasks.summary(tasks.load_task(args.task, task_directory())),
-                'input_dispatched': False}
+    if args.command == 'tasks':
+        return {'status': 'observed', 'tasks': tasks.list_tasks(task_directory()), 'input_dispatched': False}
+    if args.command == 'show':
+        return {'status': 'observed', 'task': tasks.summary(plan), 'input_dispatched': False}
     if args.command == 'replay':
-        original = tasks.load_task(args.task, task_directory())
+        original = plan
         plan = tasks.resolve_saved_intents(original)
         requirements = replay_input_requirements(original, args.only)
         if getattr(args, 'input_plan', False):
@@ -718,16 +745,9 @@ def run(args):
             result.append({'number': number, 'label': step['label'], 'observed_state': state})
         return {'status': 'observed', 'steps': result, 'input_dispatched': False}
     if args.command == 'record':
-        from teach_capture import capture
-        tasks.check_new_task(args.task, task_directory())
+        storage = review_drafts.ReviewStorage(args.task, args.exe, args.window, task_directory())
         guard(owner, owner, args.window)
-        capture_result = capture(owner, title=args.window)
-        if capture_result['status'] != 'recorded':
-            return capture_result
-        plan = tasks.from_recording(args.task, args.exe, args.window, capture_result['steps'])
-        tasks.save_task(plan, task_directory())
-        return {'status': 'recorded', 'task': tasks.summary(plan), 'input_dispatched': False,
-                'execution_plan': execution_plan_info(saved_execution_plan(plan))}
+        return edit_recording(owner, storage)
     anchor = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
@@ -800,6 +820,7 @@ def parser():
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
+    commands.add_parser('review', help='reopen an editable recording draft without its application').add_argument('--task', required=True)
     commands.add_parser('plan', help='save a literal execution plan from recorded instructions').add_argument('--task', required=True)
     interpret = commands.add_parser('interpret', help='compile host-interpreted conditional steps for an existing recording')
     interpret.add_argument('--task', required=True)
@@ -947,7 +968,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('record', 'review', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
 
 
 if __name__ == '__main__':

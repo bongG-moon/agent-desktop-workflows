@@ -8,9 +8,10 @@ OPEN_TIMEOUT = 30
 
 
 class ContextError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, *, step_number=None):
         super().__init__(code)
         self.code = code
+        self.step_number = step_number
         self.input_dispatched = False
 
 
@@ -38,7 +39,7 @@ def validate_sequence(steps):
             source = spec.get('after_step')
             if source is not None and (source >= number or not isinstance(steps[source-1], dict) or
                     steps[source-1].get('action') in ('wait', 'verify-file', 'manual')):
-                raise ContextError('invalid_window_origin_step')
+                raise ContextError('invalid_window_origin_step', step_number=number)
 
 
 def _key(spec):

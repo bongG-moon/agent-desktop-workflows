@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 import json
 import ntpath
 import os
@@ -30,9 +31,20 @@ LEGACY_INSTRUCTION_HINT = '화면의 대상 이름과 실행할 동작을 입력
 
 
 class TaskError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, *, step_number=None):
         super().__init__(code)
         self.code = code
+        self.step_number = step_number
+
+
+@contextmanager
+def _at_step(number):
+    try:
+        yield
+    except (ValueError, RuntimeError) as error:
+        if not hasattr(error, 'code'):
+            raise
+        raise TaskError(error.code, step_number=number) from error
 
 
 def _text(value, limit=1024):
@@ -208,20 +220,22 @@ def _convert(raw, *, allow_point=False):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
     source = raw.get('target')
+    locator = source.get('locator') if isinstance(source, dict) else None
+    if any(isinstance(candidate, dict) and (candidate.get('role') == 'password' or any(
+            candidate.get(key) is True for key in ('secure', 'protected', 'is_protected', 'is_password', 'password')))
+            for candidate in [raw, source, locator, *((locator or {}).get('ancestors', []) if isinstance(locator, dict)
+                               and isinstance(locator.get('ancestors', []), list) else [])]):
+        return _manual('target_protected')
+    if isinstance(source, dict) and 'window' in source:
+        return _manual('popup_needs_live_binding')
+    if raw.get('action') == 'right-click':
+        return _manual('right_click_requires_menu_teaching')
     recognition = raw.get('recognition')
     recognition = recognition if isinstance(recognition, dict) else {}
     point = allow_point and _point_target(raw)
     if (not isinstance(source, dict) or source.get('kind') != 'element' or raw.get('action') == 'manual'
             or (not point and (recognition.get('action') != 'supported' or recognition.get('target') != 'identified'))):
         return _manual(recognition.get('reason', 'unsupported_demonstration'))
-    if 'window' in source:
-        return _manual('popup_needs_live_binding')
-    locator = source.get('locator')
-    if any(isinstance(candidate, dict) and (candidate.get('role') == 'password' or any(
-            candidate.get(key) is True for key in ('secure', 'protected', 'is_protected', 'is_password', 'password')))
-            for candidate in [raw, source, locator, *((locator or {}).get('ancestors', []) if isinstance(locator, dict)
-                               and isinstance(locator.get('ancestors', []), list) else [])]):
-        return _manual('target_protected')
     selector = _selector(locator)
     if not selector:
         return _manual('stable_locator_unavailable')
@@ -542,14 +556,19 @@ def instructed_step(raw_step, spec):
             else dict(raw_step))
     step.update(_annotations(raw_step))
     if spec.get('mode') == 'draft':
-        if ((not is_recoverable(raw_step) and step.get('action') not in (*VALUE_ACTIONS, 'open'))
+        if (step.get('action') not in ('manual', *VALUE_ACTIONS, 'open')
                 or set(spec) != {'mode', 'text'}
                 or not _text(spec.get('text'), 1000) or len(spec['text'].encode('utf-8')) > 1000
                 or spec['text'] != spec['text'].strip()):
             raise TaskError('invalid_step_instruction')
         if step.get('action') == 'manual':
-            result = {**_manual(step['reason']), **_annotations(raw_step), 'instruction_draft': spec['text']}
+            reason = step.get('reason')
+            if reason in RECOVERABLE_CAPTURE_REASONS and not is_recoverable(raw_step):
+                reason = 'action_needs_review'
+            result = {**_manual(reason), **_annotations(raw_step), 'instruction_draft': spec['text']}
             if 'visual_hint' in raw_step:
+                if not is_recoverable(result):
+                    raise TaskError('invalid_visual_step')
                 result['visual_hint'] = raw_step['visual_hint']
             return result
         step.pop('instruction', None)
@@ -585,27 +604,31 @@ def instructed_step(raw_step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    spec = raw.get('instruction')
+    if 'instruction_draft' in raw:
+        if spec is not None:
+            raise TaskError('invalid_step_instruction')
+        spec = {'mode': 'draft', 'text': raw['instruction_draft']}
     if raw.get('action') == 'visual-click':
-        if 'instruction' in raw:
-            return instructed_step(raw, raw['instruction'])
+        if spec is not None:
+            return instructed_step(raw, spec)
         return _visual_step(raw, raw.get('label'))
     if raw.get('action') == 'result-menu':
+        if spec is not None:
+            raise TaskError('invalid_step_instruction')
         step = {'action': 'result-menu', 'label': raw.get('label'), 'context': raw.get('context'), **_annotations(raw)}
         _validate_context(step)
         return step
     if raw.get('action') == 'row-action':
         step = {'action': 'row-action', 'label': raw.get('label'), 'row': raw.get('row'), **_annotations(raw)}
         _validate_row(step)
-        if 'instruction' in raw:
-            return instructed_step(raw, raw['instruction'])
+        if spec is not None:
+            return instructed_step(raw, spec)
         return step
-    spec = raw.get('instruction')
     if spec is not None:
         return instructed_step(raw, spec)
-    step = _convert(raw, allow_point=spec is not None)
+    step = _convert(raw)
     step.update(_annotations(raw))
-    if 'instruction_draft' in raw:
-        step = instructed_step(raw, {'mode': 'draft', 'text': raw['instruction_draft']})
     if 'wait_after' in raw:
         step['wait_after'] = raw['wait_after']
     return step
@@ -616,7 +639,10 @@ def from_recording(name, exe, window, steps):
     _window(exe, window)
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
         raise TaskError('invalid_recorded_step_count')
-    converted = [recorded_step(raw) for raw in steps]
+    converted = []
+    for number, raw in enumerate(steps, 1):
+        with _at_step(number):
+            converted.append(recorded_step(raw))
     counts = Counter(s['parameter'].casefold() for s in converted if 'parameter' in s)
     used = set()
     for number, s in enumerate(converted, 1):
@@ -705,6 +731,119 @@ def grounding_request(number, step):
     return result
 
 
+def has_groundable_draft(step):
+    return bool(step.get('instruction_draft')) and (step['action'] != 'manual' or is_recoverable(step))
+
+
+def _validate_step(s, parameters):
+    if not isinstance(s, dict) or not isinstance(s.get('action'), str):
+        raise TaskError('invalid_task_step')
+    annotation = _annotations(s)
+    if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
+        raise TaskError('invalid_step_annotation')
+    if s['action'] == 'visual-click':
+        if _visual_step(s, s.get('label')) != s:
+            raise TaskError('invalid_visual_step')
+        return
+    if s.get('action') == 'row-action':
+        _validate_row(s)
+        return
+    if s.get('action') == 'row-launch':
+        from row_intent import parse
+        if (set(s) - set(annotation) - {'row_hint'} != {'action', 'ordinal', 'label'}
+                or not _text(s.get('label'), 1000) or len(s['label'].encode('utf-8')) > 1000
+                or type(s.get('ordinal')) is not int or parse(s['label']) != s['ordinal']):
+            raise TaskError('invalid_row_step')
+        if 'row_hint' in s:
+            _validate_row({'action': 'row-action', 'label': 'row', 'row': s['row_hint']})
+        return
+    if s.get('action') == 'result-menu':
+        _validate_context(s)
+        return
+    if s.get('action') == 'manual':
+        expected = {'action', 'reason'}
+        if 'visual_hint' in s:
+            from visual_target import validate_spec
+            if not is_recoverable(s) or 'instruction_draft' not in s:
+                raise TaskError('invalid_visual_step')
+            validate_spec(s['visual_hint'])
+            expected.add('visual_hint')
+        if 'instruction_draft' in s:
+            expected.add('instruction_draft')
+            draft = s['instruction_draft']
+            if (not _text(draft, 1000)
+                    or len(draft.encode('utf-8')) > 1000 or draft != draft.strip()):
+                raise TaskError('invalid_step_instruction')
+        if set(s) - set(annotation) != expected or s['reason'] != _reason(s['reason']):
+            raise TaskError('invalid_task_step')
+        return
+    allowed = {'action', 'role', 'target', 'match', 'ancestors', 'within', 'label', 'command_name', *annotation}
+    if 'wait_after' in s:
+        allowed.add('wait_after')
+        if (s.get('action') != 'open' or s.get('expand') or s.get('role') not in INVOKE
+                or type(s['wait_after']) not in (int, float) or not 0 < s['wait_after'] <= 120):
+            raise TaskError('invalid_step_wait')
+    if 'label' in s and not _text(s['label'], 200):
+        raise TaskError('invalid_task_target')
+    if 'command_name' in s and (s.get('role') not in INVOKE or s.get('match') != 'automation_id'
+                                or not _text(s['command_name'])):
+        raise TaskError('invalid_task_target')
+    if s.get('match') not in ('name', 'automation_id', 'query') or not _text(s.get('target')):
+        raise TaskError('invalid_task_target')
+    ancestors = s.get('ancestors', [])
+    if (not isinstance(ancestors, list) or len(ancestors) > 4
+            or any(not isinstance(a, dict) or a != _selector(a) for a in ancestors)):
+        raise TaskError('invalid_task_scope')
+    scope = (ancestors[0].get('automation_id') or ancestors[0].get('name')) if ancestors else None
+    if s['match'] == 'query':
+        if ('ancestors' in s or s['target'] != s['target'].strip() or ('within' in s
+                and (not _text(s['within']) or s['within'] != s['within'].strip()))):
+            raise TaskError('invalid_task_scope')
+    elif s.get('within') != scope:
+        raise TaskError('invalid_task_scope')
+    instruction = None
+    draft = s.get('instruction_draft')
+    if 'instruction_draft' in s:
+        allowed.add('instruction_draft')
+        if ('instruction' in s or not _text(draft, 1000)
+                or len(draft.encode('utf-8')) > 1000 or draft != draft.strip()):
+            raise TaskError('invalid_step_instruction')
+    if 'instruction' in s:
+        allowed.add('instruction')
+        instruction = _check_instruction(s, s['instruction'])
+    if s['match'] == 'query' and ((instruction is None and draft is None) or not isinstance(s.get('role'), str) or (s.get('action') == 'open'
+            and (s.get('role') not in INVOKE or s.get('expand'))) or (s.get('action') in VALUE_ACTIONS
+            and s.get('recorded_effect') != 'unobserved')):
+        raise TaskError('invalid_task_instruction_query')
+    if s.get('action') in VALUE_ACTIONS:
+        allowed.add('recorded_effect')
+        if s.get('role') != VALUE_ACTIONS[s['action']] or s.get('recorded_effect') not in ('matched', 'unverified', 'unobserved'):
+            raise TaskError('invalid_task_selection')
+        if s['action'] == 'fill' and any(a['role'] == 'combobox' for a in ancestors):
+            raise TaskError('text_input_owned_by_combo')
+        if instruction is None:
+            allowed.update(('value', 'parameter'))
+            key = s.get('parameter')
+            if draft is not None:
+                if (('value' in s and not valid_value(s['value'], s['role'])) or ('parameter' in s
+                        and (not _text(key, 1000) or '=' in key))):
+                    raise TaskError('invalid_task_selection')
+            elif (not valid_value(s.get('value'), s['role']) or not _text(key, 1000) or '=' in key
+                  or key.casefold() in parameters or s.get('recorded_effect') == 'unobserved'):
+                raise TaskError('invalid_task_selection')
+            if draft is None:
+                parameters.add(key.casefold())
+    elif s.get('action') == 'open':
+        allowed.add('expand')
+        if (type(s.get('expand')) is not bool or not isinstance(s.get('role'), str)
+                or s['role'] not in (EXPAND if s['expand'] else INVOKE | CHOOSE)):
+            raise TaskError('invalid_task_action')
+    else:
+        raise TaskError('invalid_task_action')
+    if set(s) - allowed:
+        raise TaskError('unexpected_task_step_data')
+
+
 def _validate(plan):
     if (not isinstance(plan, dict) or set(plan) != {'schema', 'name', 'exe', 'window', 'steps'}
             or type(plan['schema']) is not int or plan['schema'] != 1):
@@ -714,119 +853,15 @@ def _validate(plan):
     if not isinstance(plan['steps'], list) or not 1 <= len(plan['steps']) <= MAX_STEPS:
         raise TaskError('invalid_task_steps')
     parameters = set()
-    for s in plan['steps']:
-        if not isinstance(s, dict) or not isinstance(s.get('action'), str):
-            raise TaskError('invalid_task_step')
-        annotation = _annotations(s)
-        if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
-            raise TaskError('invalid_step_annotation')
-        if s['action'] == 'visual-click':
-            if _visual_step(s, s.get('label')) != s:
-                raise TaskError('invalid_visual_step')
-            continue
-        if s.get('action') == 'row-action':
-            _validate_row(s)
-            continue
-        if s.get('action') == 'row-launch':
-            from row_intent import parse
-            if (set(s) - set(annotation) - {'row_hint'} != {'action', 'ordinal', 'label'}
-                    or not _text(s.get('label'), 1000) or len(s['label'].encode('utf-8')) > 1000
-                    or type(s.get('ordinal')) is not int or parse(s['label']) != s['ordinal']):
-                raise TaskError('invalid_row_step')
-            if 'row_hint' in s:
-                _validate_row({'action': 'row-action', 'label': 'row', 'row': s['row_hint']})
-            continue
-        if s.get('action') == 'result-menu':
-            _validate_context(s)
-            continue
-        if s.get('action') == 'manual':
-            expected = {'action', 'reason'}
-            if 'visual_hint' in s:
-                from visual_target import validate_spec
-                if not is_recoverable(s) or 'instruction_draft' not in s:
-                    raise TaskError('invalid_visual_step')
-                validate_spec(s['visual_hint'])
-                expected.add('visual_hint')
-            if 'instruction_draft' in s:
-                expected.add('instruction_draft')
-                draft = s['instruction_draft']
-                if (not is_recoverable(s) or not _text(draft, 1000)
-                        or len(draft.encode('utf-8')) > 1000 or draft != draft.strip()):
-                    raise TaskError('invalid_step_instruction')
-            if set(s) - set(annotation) != expected or s['reason'] != _reason(s['reason']):
-                raise TaskError('invalid_task_step')
-            continue
-        allowed = {'action', 'role', 'target', 'match', 'ancestors', 'within', 'label', 'command_name', *annotation}
-        if 'wait_after' in s:
-            allowed.add('wait_after')
-            if (s.get('action') != 'open' or s.get('expand') or s.get('role') not in INVOKE
-                    or type(s['wait_after']) not in (int, float) or not 0 < s['wait_after'] <= 120):
-                raise TaskError('invalid_step_wait')
-        if 'label' in s and not _text(s['label'], 200):
-            raise TaskError('invalid_task_target')
-        if 'command_name' in s and (s.get('role') not in INVOKE or s.get('match') != 'automation_id'
-                                    or not _text(s['command_name'])):
-            raise TaskError('invalid_task_target')
-        if s.get('match') not in ('name', 'automation_id', 'query') or not _text(s.get('target')):
-            raise TaskError('invalid_task_target')
-        ancestors = s.get('ancestors', [])
-        if (not isinstance(ancestors, list) or len(ancestors) > 4
-                or any(not isinstance(a, dict) or a != _selector(a) for a in ancestors)):
-            raise TaskError('invalid_task_scope')
-        scope = (ancestors[0].get('automation_id') or ancestors[0].get('name')) if ancestors else None
-        if s['match'] == 'query':
-            if ('ancestors' in s or s['target'] != s['target'].strip() or ('within' in s
-                    and (not _text(s['within']) or s['within'] != s['within'].strip()))):
-                raise TaskError('invalid_task_scope')
-        elif s.get('within') != scope:
-            raise TaskError('invalid_task_scope')
-        instruction = None
-        draft = s.get('instruction_draft')
-        if 'instruction_draft' in s:
-            allowed.add('instruction_draft')
-            if ('instruction' in s or not _text(draft, 1000)
-                    or len(draft.encode('utf-8')) > 1000 or draft != draft.strip()):
-                raise TaskError('invalid_step_instruction')
-        if 'instruction' in s:
-            allowed.add('instruction')
-            instruction = _check_instruction(s, s['instruction'])
-        if s['match'] == 'query' and ((instruction is None and draft is None) or not isinstance(s.get('role'), str) or (s.get('action') == 'open'
-                and (s.get('role') not in INVOKE or s.get('expand'))) or (s.get('action') in VALUE_ACTIONS
-                and s.get('recorded_effect') != 'unobserved')):
-            raise TaskError('invalid_task_instruction_query')
-        if s.get('action') in VALUE_ACTIONS:
-            allowed.add('recorded_effect')
-            if s.get('role') != VALUE_ACTIONS[s['action']] or s.get('recorded_effect') not in ('matched', 'unverified', 'unobserved'):
-                raise TaskError('invalid_task_selection')
-            if s['action'] == 'fill' and any(a['role'] == 'combobox' for a in ancestors):
-                raise TaskError('text_input_owned_by_combo')
-            if instruction is None:
-                allowed.update(('value', 'parameter'))
-                key = s.get('parameter')
-                if draft is not None:
-                    if (('value' in s and not valid_value(s['value'], s['role'])) or ('parameter' in s
-                            and (not _text(key, 1000) or '=' in key))):
-                        raise TaskError('invalid_task_selection')
-                elif (not valid_value(s.get('value'), s['role']) or not _text(key, 1000) or '=' in key
-                      or key.casefold() in parameters or s.get('recorded_effect') == 'unobserved'):
-                    raise TaskError('invalid_task_selection')
-                if draft is None:
-                    parameters.add(key.casefold())
-        elif s.get('action') == 'open':
-            allowed.add('expand')
-            if (type(s.get('expand')) is not bool or not isinstance(s.get('role'), str)
-                    or s['role'] not in (EXPAND if s['expand'] else INVOKE | CHOOSE)):
-                raise TaskError('invalid_task_action')
-        else:
-            raise TaskError('invalid_task_action')
-        if set(s) - allowed:
-            raise TaskError('unexpected_task_step_data')
+    for number, step in enumerate(plan['steps'], 1):
+        with _at_step(number):
+            _validate_step(step, parameters)
     if any('window_context' in s for s in plan['steps']):
         from window_context import validate_sequence, ContextError
         try:
             validate_sequence(plan['steps'])
         except ContextError as error:
-            raise TaskError(error.code) from error
+            raise TaskError(error.code, step_number=error.step_number) from error
 
 
 def check_display(step, observed):
@@ -901,11 +936,19 @@ def check_new_task(name, directory=None):
 
 def save_task(plan, directory=None):
     _validate(plan)
-    data = (json.dumps(plan, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    return _write_document(plan, directory)
+
+
+def _write_document(document, directory, *, replace_review=False):
+    """Publish complete JSON. Only a revision-checked review editor may replace a file."""
+    data = (json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + '\n').encode('utf-8')
     if len(data) > MAX_FILE_BYTES:
         raise TaskError('task_too_large')
     try:
-        path = check_new_task(plan['name'], directory)
+        path = _directory(directory) / (_name(document['name']) + '.json')
+        _deny_redirect(path)
+        if not replace_review:
+            check_new_task(document['name'], directory)
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, prefix='.new-', delete=False) as f:
             temp = Path(f.name)
@@ -918,7 +961,9 @@ def save_task(plan, directory=None):
                 temp.unlink(missing_ok=True)
                 raise
         try:
-            if os.name == 'nt':
+            if replace_review:
+                os.replace(temp, path)
+            elif os.name == 'nt':
                 os.rename(temp, path)   # Windows RenameFile refuses to replace an existing file.
             else:
                 os.link(temp, path)     # Atomic exclusive publication on POSIX.
@@ -938,7 +983,7 @@ def _unique_keys(pairs):
     return d
 
 
-def load_task(name, directory=None):
+def read_document(name, directory=None):
     try:
         path = _directory(directory) / (_name(name) + '.json')
         _deny_redirect(path)
@@ -949,7 +994,8 @@ def load_task(name, directory=None):
         if len(data) > MAX_FILE_BYTES:
             raise TaskError('task_too_large')
         plan = json.loads(data.decode('utf-8'), object_pairs_hook=_unique_keys)
-        _validate(plan)
+        if not isinstance(plan, dict) or not isinstance(plan.get('name'), str):
+            raise TaskError('invalid_task')
         if plan['name'].casefold() != name.casefold():
             raise TaskError('task_name_mismatch')
         return plan
@@ -957,6 +1003,17 @@ def load_task(name, directory=None):
         raise TaskError('invalid_task') from error
     except OSError as error:
         raise TaskError('task_store_unavailable') from error
+
+
+def load_task(name, directory=None, *, allow_review=False):
+    plan = read_document(name, directory)
+    if plan.get('kind') == 'recording-review':
+        if allow_review:
+            from review_drafts import validate
+            return validate(plan)
+        raise TaskError('recording_draft_requires_review')
+    _validate(plan)
+    return plan
 
 
 def list_tasks(directory=None):
@@ -1055,8 +1112,8 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
     results = []
     report = {'status': 'verified', 'steps': results, 'input_dispatched': False}
     for number, s in sequence:
-        if s.get('instruction_draft'):
-            unresolved = [grounding_request(i, step) for i, step in sequence if step.get('instruction_draft')]
+        if has_groundable_draft(s):
+            unresolved = [grounding_request(i, step) for i, step in sequence if has_groundable_draft(step)]
             return dict(report, status='needs_review', stopped_at=number, diagnostic='instruction_requires_structure',
                         grounding_steps=unresolved)
         if s['action'] == 'manual':
