@@ -145,10 +145,12 @@ class GroundedRowTests(TestCase):
               patch.object(flow,'bind',return_value=owner),
               patch.object(flow,'resolve_step',side_effect=app.SelectionError('target_missing')),
               patch.object(app,'windows',return_value=[]),patch.object(app,'guard'),
-              patch.object(app.bridge,'UIA'),patch.object(app.bridge,'set_dpi_awareness'),
+              patch.object(app.visibility,'restore_for_action',return_value=False),
+              patch.object(app.bridge,'UIA') as uia,patch.object(app.bridge,'set_dpi_awareness'),
               patch.object(grounding,'_directory',return_value=store),
               patch.object(app,'pick_window'),patch.object(app.bridge,'Binding',return_value=owner),
               patch.object(grounding,'_capture',return_value=(self.sample[0],self.png))):
+            uia.return_value.__enter__.return_value.pid.return_value = owner.pid
             cli = app.parser()
             replay = cli.parse_args(['replay','--task','watch','--exe','Manager.exe','--window','Managers'])
             result = app.run(replay)
@@ -209,8 +211,9 @@ class GroundedRowTests(TestCase):
         app = desktop_select
         with (patch.object(flow,'bind',return_value=owner),patch.object(app,'guard'),
               patch.object(flow,'check_surface'),patch.object(app,'windows',return_value=[]),
-              patch.object(flow.window_context,'OPEN_TIMEOUT',0),patch.object(app.bridge,'UIA'),
+              patch.object(flow.window_context,'OPEN_TIMEOUT',0),patch.object(app.bridge,'UIA') as uia,
               patch.object(app.bridge,'set_dpi_awareness'),patch.object(app.visibility,'restore_for_action')):
+            uia.return_value.__enter__.return_value.pid.return_value = owner.pid
             result = flow.run(recipe)
         self.assertEqual(result['diagnostic'],'recorded_window_not_open')
         self.assertEqual(result['stopped_at'],1)

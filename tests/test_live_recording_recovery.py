@@ -156,6 +156,109 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
                 self.assertFalse((self.directory/'실행용.json').exists())
         self.menu.assert_not_called()
 
+    def five_step_draft(self):
+        self.rows[4:] = [dict(step=teach_capture.manual('capture_target_unavailable', '5'), form=dict(
+            alias='', text='Export to excel > Active sheet버튼 눌러줘', mode=None, argument=''))]
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+
+    def recover_cli(self, *options):
+        args = app.parser().parse_args(['recover', '--task', '내 녹화', *options])
+        return app.run(args)
+
+    def test_public_recover_folds_exact_menu_route_from_0417_raw_editor(self):
+        self.five_step_draft()
+        source = (self.directory / '내 녹화.json').read_bytes()
+        info = self.recover_cli()
+        row = info['steps'][4]
+        self.assertEqual((row['action'], row['match'], row['role'], row['target']),
+                         ('open', 'query', 'button', 'Export to excel > Active sheet'))
+        path = ['Export to excel', 'Active sheet']
+        hint = dict(number=4, through=5, mode='context-menu', path=path)
+        self.assertEqual(info['steps'][3]['menu_binding_hint'], hint)
+        self.assertEqual(info['steps'][3]['image_args'], ['recover', '--task', '내 녹화', '--only', '4', '--image'])
+        image = self.recover_cli('--only', '4', '--image')
+        self.assertEqual(image['steps'][0]['menu_binding_hint'], hint)
+        self.observe.assert_called_with(app, self.owner, self.owner, '업무', frame_key=[info['source_fingerprint'], 4])
+        binding = dict(hint, target='results', role='group', frame='001', point=[10,30])
+        self.menu.return_value['menu']['path'] = path
+        operations = [*info['bindings_template']['steps'], binding]
+        self.inputs.write_text(json.dumps(dict(source_fingerprint=info['source_fingerprint'], steps=operations)), encoding='utf8')
+        result = self.recover_cli('--bindings', str(self.inputs), '--save-as', '실행용')
+        self.assertEqual(result['status'], 'recorded', result)
+        self.assertEqual(result['source_steps'], {1:1, 2:2, 3:3, 4:4, 5:4})
+        self.assertFalse(result['input_dispatched'])
+        self.assertEqual(tasks.load_task('실행용', self.directory)['steps'][3]['context']['menu']['path'], path)
+        self.assertEqual(self.menu.call_args.args[-1], binding)
+        self.assertEqual((self.directory / '내 녹화.json').read_bytes(), source)
+
+    def test_complete_route_on_missing_capture_is_recoverable_after_normal_save(self):
+        self.five_step_draft()
+        rows = self.rows[3:]
+        edits = teach_capture.StepEdits()
+        for row in rows:
+            if row['step']['id'] != '4':
+                edits.store(row['step'], '', row['form']['text'])
+        source = tasks.from_recording('저장된 녹화', 'Demo.exe', '업무', edits.apply([row['step'] for row in rows]))
+        tasks.save_task(source, self.directory)
+        result = app.run(app.parser().parse_args(['recover', '--task', source['name']]))
+        hint = result['steps'][0]['menu_binding_hint']
+        self.assertEqual(hint['through'], 2)
+        self.assertEqual(result['steps'][1]['match'], 'query')
+        saved = self.bind(result['source_fingerprint'], [dict(self.patches()[-1], **hint)], task=source['name'])
+        self.assertEqual(saved['source_steps'], {1:1, 2:1})
+
+    def test_grounded_recorded_anchor_includes_menu_binding_in_template(self):
+        self.rows[3]['step']['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
+        self.observe.return_value['targets'].append(dict(role='group', automation_id='results', enabled=True, offscreen=False))
+        self.five_step_draft()
+        info = self.recover_cli()
+        template = info['bindings_template']
+        hint = info['steps'][3]['menu_binding_hint']
+        self.assertEqual(template['steps'][-1], hint)
+        self.assertNotIn('image_args', info['steps'][3])
+        self.assertEqual(self.bind(template['source_fingerprint'], template['steps'])['status'], 'recorded')
+        self.assertEqual(self.menu.call_args.args[-1]['menu_anchor'], self.rows[3]['step']['menu_anchor'])
+
+    def test_ordinary_right_click_accepts_complete_path_even_if_popup_row_was_missed(self):
+        raw = self.rows[3]['step']
+        raw['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
+        text = 'Export to excel > Active sheet버튼 눌러줘'
+        edits = teach_capture.StepEdits()
+        edits.store(raw, '', text)
+        source = tasks.from_recording('내 녹화', 'Demo.exe', '업무', edits.apply([raw]))
+        tasks.save_task(source, self.directory)
+        self.assertEqual(source['steps'][0]['instruction_draft'], text)
+        self.assertEqual(source['steps'][0]['action'], 'manual')
+        self.observe.return_value['targets'].append(dict(role='group', automation_id='results', enabled=True, offscreen=False))
+        template = self.recover_cli()['bindings_template']
+        self.assertEqual(template['steps'], [dict(number=1, through=1, path=['Export to excel', 'Active sheet'],
+                                                  mode='context-menu')])
+        self.assertEqual(self.bind(template['source_fingerprint'], template['steps'])['source_steps'], {1:1})
+
+    def test_rejected_route_identifies_conflicting_tail_and_preserves_real_buttons(self):
+        text = 'Export to excel > Active sheet버튼 눌러줘'
+        real_button = button()
+        real_button.pop('instruction', None)
+        real_button.update(id='5', label='조회')
+        for raw, sentence, path in [
+            (teach_capture.manual('capture_target_unavailable', '5'), text, ['Active sheet', 'Export to excel']),
+            (teach_capture.manual('capture_target_unavailable', '5'), text, ['Other export', 'Active sheet']),
+            (teach_capture.manual('capture_target_unavailable', '5'), 'Active sheet버튼 눌러줘', ['Export to excel', 'Active sheet']),
+            (real_button, text, ['Export to excel', 'Active sheet']),
+        ]:
+            with self.subTest(sentence=sentence, path=path, capture=raw['action']):
+                self.rows[4:] = [dict(step=raw, form=dict(alias='', text=sentence, mode=None, argument=''))]
+                store = review_drafts.ReviewStorage('내 녹화', 'Demo.exe', '업무', self.directory)
+                store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+                info = self.recover_cli()
+                result = self.bind(info['source_fingerprint'], [*self.patches()[:3],
+                                   dict(self.patches()[-1], through=5, path=path)])
+                self.assertEqual(result['diagnostic'], 'menu_step_range_mismatch', result)
+                self.assertEqual(result['steps'][3]['conflicting_step'], 5)
+                self.assertIn('through', result['steps'][3]['recovery_hint'])
+                self.assertFalse((self.directory / '실행용.json').exists())
+        self.menu.assert_not_called()
+
     def test_different_observed_control_requires_supporting_user_wording(self):
         info = self.probe()
         ops = self.patches()

@@ -31,6 +31,15 @@ class POINT(C.Structure):
     _fields_ = [('x', C.c_int32), ('y', C.c_int32)]
 
 
+class _LastInput(C.Structure):
+    _fields_ = [('size', W.UINT), ('tick', W.DWORD)]
+
+
+_IME_MODE_KEYS = (0x15, 0x19)  # VK_HANGUL/KANA and VK_HANJA/KANJI
+_POINTER_GUARD_KEYS = tuple(key for key in range(1, 255) if key not in _IME_MODE_KEYS)
+_FOREGROUND_QUIET_MS = 500
+
+
 class RECT(C.Structure):
     _fields_ = [('left', C.c_int32), ('top', C.c_int32), ('right', C.c_int32), ('bottom', C.c_int32)]
 
@@ -102,7 +111,9 @@ if os.name == 'nt':
     _sig(user32, 'ShowWindow', W.BOOL, W.HWND, C.c_int)
     _sig(user32, 'GetSystemMetrics', C.c_int, C.c_int)
     _sig(user32, 'GetAsyncKeyState', C.c_short, C.c_int)
+    _sig(user32, 'GetLastInputInfo', W.BOOL, C.POINTER(_LastInput))
     _sig(user32, 'SendInput', W.UINT, W.UINT, C.POINTER(INPUT), C.c_int)
+    _sig(kernel32, 'GetTickCount', W.DWORD)
     _sig(kernel32, 'OpenProcess', W.HANDLE, W.DWORD, W.BOOL, W.DWORD)
     _sig(kernel32, 'CloseHandle', W.BOOL, W.HANDLE)
     _sig(kernel32, 'ProcessIdToSessionId', W.BOOL, W.DWORD, C.POINTER(W.DWORD))
@@ -159,6 +170,35 @@ def window_class(hwnd):
 
 def foreground():
     return int(user32.GetForegroundWindow() or 0)
+
+
+def input_tick():
+    info = _LastInput(C.sizeof(_LastInput), 0)
+    if not user32.GetLastInputInfo(C.byref(info)):
+        raise BridgeError('physical_input_state_unavailable')
+    return info.tick
+
+
+def pointer_keys_down():
+    # IME mode VKs can remain asserted with no events on a Korean keyboard.
+    # Mouse buttons, modifiers, typing keys, etc. must still be up. Changes
+    # in IME input are independently detected by the session's input tick.
+    return any(user32.GetAsyncKeyState(key) & 0x8000 for key in _POINTER_GUARD_KEYS)
+
+
+def check_foreground_input(original, tick, restored=None):
+    if (foreground() not in (original, restored) or pointer_keys_down() or input_tick() != tick):
+        raise BridgeError('foreground_or_input_changed')
+
+
+def wait_for_quiet_foreground(original, tick):
+    check_foreground_input(original, tick)
+    age_ms = (kernel32.GetTickCount() - tick) & 0xffffffff
+    if age_ms < _FOREGROUND_QUIET_MS:
+        # One bounded wait before activation. A new event or a change of
+        # foreground ends this attempt; never restart the clock on user input.
+        time.sleep((_FOREGROUND_QUIET_MS - age_ms) / 1000)
+        check_foreground_input(original, tick)
 
 
 def window_from_point(x, y):
@@ -1122,20 +1162,29 @@ def probe(request):
                 'window': {'hwnd': window, 'title': window_text(window), 'class_name': window_class(window)}}
 
 
-def activate(request):
+def activate(request, *, input_checkpoint=None):
     binding = Binding(request)
     if not request.get('process_started_utc_ticks'):
         raise BridgeError('lifetime_required')
     binding.check()
+    original, tick = input_checkpoint or (foreground(), input_tick())
+    wait_for_quiet_foreground(original, tick)
+    binding.check()
+    check_foreground_input(original, tick)
     try:
         if user32.IsIconic(binding.hwnd):
             user32.ShowWindow(binding.hwnd, 9)
+            binding.check()
+            check_foreground_input(original, tick, binding.hwnd)
         returned = bool(user32.SetForegroundWindow(binding.hwnd))
         time.sleep(.1)
         binding.check()
+        check_foreground_input(original, tick, binding.hwnd)
         matched = root_window(foreground()) == binding.hwnd
         return {'ok': matched, 'status': 'completed' if matched else 'unavailable', 'input_dispatched': True,
                 'delivery': 'delivered_unverified', 'foreground_verified': matched, 'activation_returned': returned}
+    except BridgeError as error:
+        raise BridgeError(error.code, dispatched=None) from error
     except BaseException as error:
         raise BridgeError('activation_outcome_unknown', dispatched=None) from error
 
@@ -1160,6 +1209,7 @@ def point(request):
         raise BridgeError('invalid_number')
     if not .02 <= xr <= .98 or not .02 <= yr <= .98:
         raise BridgeError('point_near_boundary')
+    tick = input_tick()
     with UIA() as uia:
         nodes, elements, complete = read_tree(binding, uia)
         if not complete:
@@ -1189,11 +1239,13 @@ def point(request):
             raise BridgeError('point_element_mismatch')
         if uia.secure(live):
             raise BridgeError('protected_point_target')
-        if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12, 0x5b, 0x5c, 1, 2, 4, 5, 6)):
+        if pointer_keys_down():
             raise BridgeError('physical_input_busy')
         binding.check()
         if uia.bounds(element) != rect or window_from_point(x, y) != hit:
             raise BridgeError('target_moved')
+        if root_window(foreground()) != fg or input_tick() != tick:
+            raise BridgeError('foreground_or_input_changed')
         return _send_point(x, y, action)
 
 
@@ -1250,7 +1302,7 @@ def _combo_surface(binding):
         raise BridgeError('window_not_visible')
     if not binding.contains_window(foreground()):
         raise BridgeError('target_not_foreground')
-    if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12, 0x5b, 0x5c, 1, 2, 4, 5, 6)):
+    if pointer_keys_down():
         raise BridgeError('physical_input_busy')
 
 

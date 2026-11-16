@@ -30,6 +30,10 @@ class RegisteredRowTests(TestCase):
         self.addCleanup(patches.close)
         for target in ('bind', 'app.guard', 'app.visibility.restore_for_action', 'app.bridge.UIA', 'app.task_directory'):
             patches.enter_context(mock.patch('python_workflow.' + target))
+        binding = workflow.bind.return_value
+        binding.hwnd, binding.pid = 101, 11
+        workflow.app.bridge.UIA.return_value.__enter__.return_value.pid.return_value = binding.pid
+        patches.enter_context(mock.patch.object(workflow.app.bridge.user32, 'IsIconic', return_value=False))
 
     def compile(self):
         return recorded_plan.compile_plan(self.task)['envelope']['recipe']

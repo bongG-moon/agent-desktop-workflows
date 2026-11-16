@@ -75,6 +75,17 @@ class VisibilityTests(unittest.TestCase):
             desktop_select.action(args,self.binding)
             restore.assert_not_called()
 
+    def test_minimized_inspect_reports_window_before_reading_targets_without_restoring(self):
+        args = Mock(command='inspect', popup=None, window='Title', target='Filter')
+        with (patch.object(visibility.win.user32, 'IsIconic', return_value=True),
+              patch.object(desktop_select, 'bind_surface', return_value=self.binding),
+              patch.object(desktop_select, 'guard'), patch.object(desktop_select, 'observe') as observe,
+              patch.object(visibility, 'restore_for_action') as restore):
+            with self.assertRaisesRegex(visibility.win.BridgeError, 'target_window_minimized'):
+                desktop_select.action(args, self.binding)
+            observe.assert_not_called()
+            restore.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

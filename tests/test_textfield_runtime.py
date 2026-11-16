@@ -146,11 +146,13 @@ class TextFieldWorkflowTests(unittest.TestCase):
         self.uia.__enter__.return_value = self.uia
         self.uia.same.return_value = True
         self.uia.actions.return_value = ['SetValue', 'Click']
-        self.binding, self.element = MagicMock(), MagicMock()
+        self.binding, self.element = MagicMock(hwnd=101, pid=11), MagicMock()
+        self.uia.pid.return_value = self.binding.pid
         self.element.property.return_value = ''
         for target, kwargs in (
             ('bind', dict(return_value=self.binding)),
             ('app.bridge.UIA', dict(return_value=self.uia)),
+            ('app.bridge.user32.IsIconic', dict(return_value=False)),
             ('app.guard', dict(return_value=None)),
             ('app.visibility.restore_for_action', dict(return_value=False)),
             ('lookup.resolve', dict(return_value=self.element)),

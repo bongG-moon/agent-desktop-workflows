@@ -206,7 +206,8 @@ def instruction_view(step, instruction):
     if step.get('ordinary_menu') and instruction and instruction.get('mode') == 'draft':
         return '작성한 설명과 우클릭 위치를 저장합니다. 현재 메뉴에서 지시한 경로를 확인합니다.'
     if step.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching':
-        return '작성한 설명을 바탕으로 현재 창의 우클릭 위치와 하위 메뉴 경로를 확인합니다.'
+        return ('실행 전에 현재 창의 우클릭 위치를 대조합니다. 하위 메뉴가 녹화되지 않았으면 '
+                '이 단계에 “상위 메뉴 > 하위 메뉴를 눌러줘”처럼 표시 이름을 순서대로 입력하세요.')
     if step['action'] == 'result-menu':
         spec = step['context']
         route = (['조회 완료 확인'] if spec['trigger'] else []) + ['표 우클릭', *spec['menu']['path']]
@@ -281,6 +282,12 @@ class StepEdits:
         if '=' in alias or alias.isdecimal():
             raise ValueError('별칭에는 등호 또는 숫자만으로 된 이름을 사용할 수 없습니다.')
         data = {'alias': alias} if alias else {}
+        if (mode is None and step.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching'
+                and learned_tasks.click_menu_path(sentence)):
+            # Preserve the route as a note until recovery checks the region.
+            note = dict(mode='draft', text=sentence.strip())
+            learned_tasks.instructed_step(step, note)
+            return dict(data, instruction=note)
         if step.get('ordinary_menu') and mode is None:
             text = sentence.strip()
             if text and text != step['label']:

@@ -612,6 +612,54 @@ class BridgeTests(unittest.TestCase):
             self._run_point(patches)
         user.SendInput.assert_not_called()
 
+    def test_idle_ime_modes_allow_point_but_real_held_keys_block(self):
+        for held in (set(), {0x41}, {0x11}, {0x01}):
+            with self.subTest(held=held):
+                patches, user = self._point_context()
+                user.GetAsyncKeyState.side_effect = lambda k: 0x8000 if k in {0x15, 0x19} | held else 0
+                patches.append(patch.object(w, 'input_tick', return_value=250))
+                if held:
+                    with self.assertRaisesRegex(w.BridgeError, 'physical_input_busy'):
+                        self._run_point(patches)
+                    user.SendInput.assert_not_called()
+                else:
+                    self.assertTrue(self._run_point(patches)['input_dispatched'])
+                    user.SendInput.assert_called_once()
+
+    def test_tap_during_point_validation_blocks_even_with_only_ime_modes_asserted(self):
+        patches, user = self._point_context()
+        user.GetAsyncKeyState.side_effect = lambda k: 0x8000 if k in (0x15, 0x19) else 0
+        patches.append(patch.object(w, 'input_tick', side_effect=[250, 251]))
+        with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed'):
+            self._run_point(patches)
+        user.SendInput.assert_not_called()
+
+    def test_foreground_waits_once_for_recent_quiet_input_and_rejects_new_activity(self):
+        for changed in (True, False):
+            with (self.subTest(changed=changed), patch.object(w, 'foreground', return_value=701),
+                    patch.object(w, 'pointer_keys_down', return_value=False),
+                    patch.object(w, 'input_tick', side_effect=[90, 91 if changed else 90]),
+                    patch.object(w.kernel32, 'GetTickCount', return_value=190),
+                    patch.object(w.time, 'sleep') as sleep):
+                if changed:
+                    with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed'):
+                        w.wait_for_quiet_foreground(701, 90)
+                else:
+                    w.wait_for_quiet_foreground(701, 90)
+                sleep.assert_called_once_with(.4)
+
+    def test_foreground_input_during_restore_does_not_call_setforegroundwindow(self):
+        binding = MagicMock(hwnd=900)
+        with (patch.object(w, 'Binding', return_value=binding), patch.object(w, 'user32') as user,
+              patch.object(w, 'foreground', return_value=701), patch.object(w, 'pointer_keys_down', return_value=False),
+              patch.object(w, 'input_tick', side_effect=[100, 100, 101]),
+              patch.object(w.kernel32, 'GetTickCount', return_value=600)):
+            user.IsIconic.return_value = True
+            with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed'):
+                w.activate(self._request(), input_checkpoint=(701, 100))
+            user.ShowWindow.assert_called_once_with(900, 9)
+            user.SetForegroundWindow.assert_not_called()
+
     def test_dispatch_exception_has_unknown_outcome_and_no_retry(self):
         patches, user = self._point_context()
         user.SendInput.side_effect = OSError('provider failure')

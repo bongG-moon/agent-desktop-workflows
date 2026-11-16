@@ -145,3 +145,36 @@ class OrdinaryContext(unittest.TestCase):
             self.assertIsNone(menu_capture.capture_surface(binding, None, dict(self.event, scope_proven=False), ()))
             self.assertIsNone(menu_capture.capture_surface(binding, None, dict(self.event, window=8), ()))
             teach.assert_called_once_with(binding, (100, 200))
+
+    def test_fast_popup_reuses_exact_preclick_hit_with_named_parent_group(self):
+        binding, uia = Mock(hwnd=1, pid=7), Mock()
+        child, parent, root = Mock(), Mock(), Mock()
+        child.property.return_value = parent.property.return_value = True
+        uia.from_handle.return_value = root
+        uia.same.side_effect = lambda a, b: a is b
+        uia.within.return_value = True
+        uia.secure.return_value = False
+        uia.pid.return_value = 7
+        uia.basic.side_effect = {
+            child: dict(role='group', automation_id='1385', name='Repeated'),
+            parent: dict(role='group', name='Results') }.__getitem__
+        uia.parent.return_value = parent
+        obs = dict(window=1, hit_window=2, pointer=(100, 200), element=child, root=root,
+                   node=dict(secure=False, enabled=True))
+        history = [(9.9, obs)]
+        def resolve(owner, tree, selector):
+            if selector.get('name') == 'Repeated':
+                raise context_menu.win.BridgeError('context_region_ambiguous')
+            self.assertEqual(selector, dict(role='group', name='Results'))
+            return parent
+        with (patch.object(context_menu, 'teach_surface', side_effect=context_menu.win.BridgeError('context_point_occluded')),
+              patch.object(context_menu, '_region', side_effect=resolve),
+              patch.object(context_menu, '_rect', return_value=(80, 160, 100, 100)),
+              patch.object(context_menu, '_check_region_children') as check):
+            self.assertEqual(menu_capture.capture_surface(binding, uia, self.event, history),
+                             dict(target=dict(role='group', name='Results'), point=[.2, .4]))
+            check.assert_called_once_with(binding, uia, parent, (100, 200))
+            self.assertIsNone(menu_capture.capture_surface(binding, uia, dict(self.event, hit_window=99), history))
+            self.assertIsNone(menu_capture.capture_surface(binding, uia, dict(self.event, at=11), history))
+            check.side_effect = context_menu.win.BridgeError('context_point_protected')
+            self.assertIsNone(menu_capture.capture_surface(binding, uia, self.event, history))

@@ -17,7 +17,7 @@ from smoke_desktop_context import compile_fixture, decoded_cells
 from smoke_native import Fixture
 
 
-def exercise(package, work):
+def exercise(package, work, *, combined_menu=False, expect_rejection=False):
     with ZipFile(package) as archive:
         archive.extractall(work)
     skill = work / 'desktop-select' / 'scripts'
@@ -48,14 +48,18 @@ def exercise(package, work):
         name = 'legacy'
         baseline = fixture.command('state')
         rows = []
-        for reason, text in [
+        instructions = [
             ('capture_target_unavailable', "MES Setup에 'N'을 선택해줘"),
             ('capture_target_unavailable', 'Family에 입력받은 변수를 넣어줘'),
             ('capture_target_unavailable', 'Search 버튼을 누르고 5초 기다려줘'),
-            ('right_click_requires_menu_teaching', '결과 데이터에서 우클릭'),
-            ('popup_needs_live_binding', 'Export to excel 선택'),
-            ('unsupported_recorded_action', 'Active sheet 선택'),
-        ]:
+            ('right_click_requires_menu_teaching', '조회된 테이블에서 우클릭을 눌러줘'),
+        ]
+        if combined_menu:
+            instructions.append(('capture_target_unavailable', 'Export to excel > Active sheet버튼 눌러줘'))
+        else:
+            instructions.extend([('popup_needs_live_binding', 'Export to excel 선택'),
+                                 ('unsupported_recorded_action', 'Active sheet 선택')])
+        for reason, text in instructions:
             raw = manual(reason)
             rows.append(dict(step=raw, form=dict(text=text, mode=None, alias='', argument='')))
         review_drafts.ReviewStorage(name, exe.name, title, store).save_draft(rows, 'instruction_target_mismatch', 1)
@@ -63,7 +67,7 @@ def exercise(package, work):
         tool = skill / 'desktop_select.py'
         initial = cli(tool, 'replay', '--task', name, '--exe', exe.name, '--window', title)
         overview = initial['live_recovery']
-        assert initial['input_dispatched'] is False and len(overview['steps']) == 6, initial
+        assert initial['input_dispatched'] is False and len(overview['steps']) == len(rows), initial
         scope = overview['live_scopes'][overview['steps'][0]['scope_index']]
         by_id = {t['automation_id']: t for t in scope['targets'] if t.get('automation_id')}
         assert by_id['conditionState']['semantic_label'] == 'MES Setup' and by_id['conditionFamily']['semantic_label'] == 'Family', scope
@@ -77,7 +81,7 @@ def exercise(package, work):
             dict(number=1, mode='fixed', target='conditionState', role='combobox', argument='N'),
             dict(number=2, mode='required', target='conditionFamily', role='combobox', argument='Family'),
             dict(number=3, mode='recorded', target='QueryCommand', role='button', wait_after=5),
-            dict(number=4, through=6, mode='context-menu', target='ResultSurface', role='group',
+            dict(number=4, through=len(rows), mode='context-menu', target='ResultSurface', role='group',
                  frame=current['frame'], point=point, path=['Export to excel', 'Active sheet'],
                  output=dict(kind='file', path=str(book))),
         ]
@@ -85,6 +89,10 @@ def exercise(package, work):
         document.write_text(json.dumps(dict(source_fingerprint=overview['source_fingerprint'], steps=decisions)),
                             encoding='utf8')
         repaired = cli(tool, 'recover', '--task', name, '--bindings', document, '--save-as', 'report')
+        if expect_rejection:
+            assert combined_menu and repaired['diagnostic'] == 'menu_step_range_mismatch', repaired
+            assert repaired['input_dispatched'] is False and fixture.command('state') == baseline
+            return dict(original_steps=len(rows), diagnostic=repaired['diagnostic'], input_dispatched=False)
         assert repaired['status'] == 'recorded' and len(repaired['task']['steps']) == 4, repaired
         reg = cli(skill / 'python_workflow.py', 'register', '--task', 'report', '--out', work / 'report-skill')
         assert reg['status'] == 'registered' and (store / 'legacy.json').read_bytes() == original, reg
@@ -100,7 +108,7 @@ def exercise(package, work):
         assert receipt['steps'][-1]['receipt'].get('workbook_verified') is True, receipt['steps'][-1]
         cells = decoded_cells(book)
         assert cells['A2'] == 'N' and cells['B2'] == 'Hybrid' and cells['C2'] == '1', cells
-        return dict(live_scopes=len(overview['live_scopes']), original_steps=6, derived_steps=4,
+        return dict(live_scopes=len(overview['live_scopes']), original_steps=len(rows), derived_steps=4,
                     source_preserved=True, preflight_input=False, queries=1, right_clicks=1, leaf_calls=1,
                     cells=[cells[k] for k in ('A2','B2','C2')], status=receipt['status'])
     finally:
@@ -110,5 +118,9 @@ def exercise(package, work):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('zip', type=Path)
+    parser.add_argument('--combined-menu', action='store_true', help='record an entire submenu path as one sentence')
+    parser.add_argument('--expect-range-rejection', action='store_true', help='verify the 0.4.17 diagnostic')
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='ds-recover-') as folder:
-        print(json.dumps(exercise(parser.parse_args().zip.resolve(), Path(folder))))
+        print(json.dumps(exercise(args.zip.resolve(), Path(folder), combined_menu=args.combined_menu,
+                                  expect_rejection=args.expect_range_rejection)))

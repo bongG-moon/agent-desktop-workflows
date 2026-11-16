@@ -303,6 +303,7 @@ def execute(binding, title, ordinal, guard, directory=None, *, preview=False, ti
                         ordinal=ordinal,evidence=evidence)
     if not preview:
         row_action.foreground(binding)
+        tick = row_action._input_tick()
     guard()
     frame, rect, point, source = locate(binding, ordinal)
     press = row_capture.prepare(frame, point, frame.end)
@@ -337,6 +338,8 @@ def execute(binding, title, ordinal, guard, directory=None, *, preview=False, ti
     bridge._combo_surface(binding)
     if bridge.root_window(bridge.window_from_point(*point)) != binding.hwnd:
         raise bridge.BridgeError('row_point_not_exposed')
+    if row_action._input_tick() != tick:
+        raise bridge.BridgeError('foreground_or_input_changed')
     delivery = bridge._send_point(*point,'click')
     if delivery.get('input_dispatched') is not True or not delivery.get('ok'):
         return row_action._result('uncertain',delivery.get('input_dispatched'),'unknown',

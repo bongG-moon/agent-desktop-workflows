@@ -20,7 +20,7 @@ def window(hwnd, title='Instance A', created='1234'):
 
 def binding(row):
     return SimpleNamespace(hwnd=row['hwnd'], pid=row['pid'], exe=row['exe_name'],
-                           created=row['process_started_utc_ticks'])
+                           created=row['process_started_utc_ticks'], check=mock.Mock())
 
 
 def scope(**changes):
@@ -31,13 +31,15 @@ class LinkedWindowTests(TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.owner = SimpleNamespace(hwnd=1, exe='Manager.exe', pid=1, created='1111')
+        self.owner = SimpleNamespace(hwnd=1, exe='Manager.exe', pid=1, created='1111', check=mock.Mock())
         self.records = []
         self.stack.enter_context(mock.patch.object(flow.app, 'windows', side_effect=lambda _:list(self.records)))
         self.stack.enter_context(mock.patch.object(flow.app.bridge, 'Binding', side_effect=binding))
         self.stack.enter_context(mock.patch.object(flow.app, 'guard'))
         self.stack.enter_context(mock.patch.object(flow, 'bind', return_value=self.owner))
-        self.stack.enter_context(mock.patch.object(flow.app.bridge, 'UIA'))
+        uia = self.stack.enter_context(mock.patch.object(flow.app.bridge, 'UIA')).return_value.__enter__.return_value
+        uia.pid.return_value = self.owner.pid
+        self.stack.enter_context(mock.patch.object(flow.app.bridge.user32, 'IsIconic', return_value=False))
         self.stack.enter_context(mock.patch.object(flow.app.visibility, 'restore_for_action', return_value=False))
         self.stack.enter_context(mock.patch.object(flow, 'resolve_step', return_value=(mock.Mock(), {}, None)))
         self.stack.enter_context(mock.patch.object(window_context, 'OPEN_TIMEOUT', 0))

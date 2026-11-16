@@ -8,10 +8,12 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 import desktop_select as app
@@ -256,6 +258,25 @@ def bind(exe, title, hwnd=None):
     return binding
 
 
+def check_window_readability(binding, uia):
+    """Read one live UIA property on the bound HWND, without enumerating its controls."""
+    started = time.monotonic()
+    result = dict(scope='window_root', count=1, input_dispatched=False, status='unavailable')
+    try:
+        root = uia.from_handle(binding.hwnd)
+        pid = uia.pid(root) if root is not None else None
+        if type(pid) is not int or pid <= 0:
+            result['diagnostic'] = 'window_root_unreadable'
+        elif pid != binding.pid:
+            result['diagnostic'] = 'window_root_process_mismatch'
+        else:
+            result['status'] = 'observed'
+    except app.bridge.BridgeError as error:
+        result.update(diagnostic='window_root_unreadable', provider_diagnostic=error.code)
+    result['elapsed_seconds'] = round(time.monotonic() - started, 4)
+    return result
+
+
 def wait(binding, title, seconds):
     deadline = time.monotonic() + seconds
     while True:
@@ -358,7 +379,7 @@ def _grounding_report(report, requests):
                 prior_input_requires_observation=report.get('input_dispatched') is not False)
 
 
-def _missing_groundings(recipe, entries, owner, uia):
+def _missing_groundings(recipe, entries, owner, uia, prepare=None):
     """Check already-open scopes of recovered click instructions before dispatch."""
     openers = {s.get('window_context',{}).get('after_step') for s in recipe['steps']}
     candidates = [(n, step) for n, step in entries if step.get('grounding_text') and (
@@ -378,10 +399,13 @@ def _missing_groundings(recipe, entries, owner, uia):
         if binding is None:
             continue
         try:
+            if prepare:
+                prepare(binding, scope['title'] if scope else recipe['window'])
             element, _, _ = resolve_step(binding, uia, uia.from_handle(binding.hwnd), step['selector'])
             need('Click' in uia.actions(element), 'workflow_pattern_unavailable')
         except (app.SelectionError, app.bridge.BridgeError, WorkflowError) as error:
             if error.code not in _GROUNDING_DIAGNOSTICS:
+                error.step_number = number
                 raise
             missing.append(_grounding_step(recipe, number, step, error.code))
     return missing
@@ -444,13 +468,37 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                      if step['action'] == 'verify-file'} if not read_only else {}
         report['window_restored'] = False
         prepared = set()
+
+        def prepare(binding, title):
+            if read_only:
+                app.visibility.require_observable(binding)
+                return
+            if binding.hwnd in prepared:
+                return
+            if background_only:
+                input_policy.window_ready(binding)
+            else:
+                restored = app.visibility.restore_for_action(binding, title)
+                report['window_restored'] = bool(restored) or report['window_restored']
+            prepared.add(binding.hwnd)
+
         pending_opener = None
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
-            missing = _missing_groundings(recipe, entries, owner, uia)
+            if not read_only and any(s['action'] not in ('wait', 'verify-file') for s in active):
+                first = active[0]
+                if ('window_context' not in first and 'popup' not in first
+                        and first['action'] not in ('wait', 'verify-file')):
+                    prepare(owner, recipe['window'])
+                check = check_window_readability(owner, uia)
+                report['readability_check'] = check
+                if check['status'] != 'observed':
+                    raise WorkflowError(check['diagnostic'])
+            missing = _missing_groundings(recipe, entries, owner, uia, prepare)
             if missing:
                 return _grounding_report(report, missing)
+            report['preparation_seconds'] = round(time.monotonic() - started, 4)
             for number, step in entries:
                 stage_started = time.monotonic()
                 app.guard(owner, owner, recipe['window'])
@@ -488,15 +536,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     check_surface(binding, surface, title, popup, mutate=mutate)
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
-                if (not read_only and binding.hwnd not in prepared and 'popup' not in step
-                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'result-menu', 'row-action',
-                                               'row-launch', 'row-open', 'visual-click', 'conditional-open')):
-                    if background_only:
-                        input_policy.window_ready(binding)
-                    else:
-                        restored = app.visibility.restore_for_action(binding, title)
-                        report['window_restored'] = bool(restored) or report['window_restored']
-                    prepared.add(binding.hwnd)
+                if 'popup' not in step and step['action'] not in ('wait', 'verify-file'):
+                    prepare(binding, title)
                 if step['action'] == 'wait':
                     if read_only:
                         continue
@@ -515,6 +556,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         receipt = dict(status='verified' if ok else 'blocked', input_dispatched=False,
                                        diagnostic=diagnostic, file_verified=ok,
                                        baseline_scope='before_workflow', business_commit='not_verified')
+                        if ok and getattr(baselines[number], 'verified_path', None):
+                            receipt['verified_path'] = baselines[number].verified_path
                 elif step['action'] == 'conditional-open':
                     if read_only:
                         receipt = dict(status='observed',input_dispatched=False,condition='pending_execution')
@@ -586,6 +629,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                     elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                         continue
                     check_target(surface, popup, mutate=not read_only)
+                    if read_only and popup:
+                        app.visibility.require_observable(surface)
                     if background_only and not read_only:
                         input_policy.window_ready(surface)
                     root = uia.from_handle(surface.hwnd)
@@ -727,6 +772,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     break
     except Exception as error:
         diagnostic = getattr(error, 'code', 'provider_error')
+        if not number and getattr(error, 'step_number', None) in dict(entries):
+            number = error.step_number
+            step = recipe['steps'][number - 1]
         failure = dict(status='uncertain' if dispatching else 'blocked',
                        input_dispatched=None if dispatching else False, diagnostic=diagnostic)
         if number:
@@ -804,6 +852,68 @@ def _registered_runner(destination):
     return RUNNER.replace('RUNTIME_PARENT', str(relative_parent))
 
 
+REGISTERED_HEADING = '# 등록된 업무 실행\n\n'
+RUN_COMMAND = 'python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/run.py"'
+GUIDE_BEGIN = '<!-- desktop-select:run -->\n'
+GUIDE_END = '<!-- /desktop-select:run -->\n\n'
+
+
+def run_instructions(recipe):
+    parameters = list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s))
+    arguments = ' --set "이름=값"' if parameters else ''
+    note = ('물리 입력 단계가 있으므로 실행 직전에 마우스와 키보드를 잠시 비워 달라고 한 번 알린다. '
+            if input_policy.profile(recipe['steps'])['physical_input_required'] else '')
+    return (GUIDE_BEGIN + '## 실행 요청\n\n'
+            '사용자가 이 업무 스킬을 실행해 달라고 하면 아래 명령 한 번으로 시작한다. '
+            + ('필수 변수 ' + json.dumps(parameters, ensure_ascii=False) +
+               ' 중 빠진 값만 묻는다. 각 이름=값을 별도 --set 인자로 전달한다. ' if parameters else '')
+            + note + '이 SKILL.md가 있는 폴더를 명령의 작업 폴더로 사용한다. '
+            '실행기는 업무 입력 전에 대상 창이 읽히는지 같은 명령 안에서 한 번 확인한다. '
+            '창 목록 조회, --input-plan, 전체 --read-only 검사나 별도 창 전면화 명령을 준비 단계로 반복하지 않는다. '
+            '실행 중에는 각 동작 직전에 해당 대상과 창을 확인한다.\n\n'
+            + '`python -X utf8 -B scripts/run.py --summary' + arguments + '`\n\n'
+            '결과 JSON을 바로 보고한다. outcome=workbook_verified이면 verified_outputs에 적힌 파일 경로를 사용한다. '
+            '출력 폴더를 다시 검색하거나 파일을 다시 열 필요는 없다. '
+            '중단됐으면 stopped_at, diagnostic, input_dispatched를 먼저 확인한다. '
+            '이미 보낸 입력을 자동으로 다시 실행하지 않는다.\n' + GUIDE_END)
+
+
+def refresh_guide(destination):
+    """Add the quick-run instructions to an existing generated skill without re-registering it."""
+    destination = Path(destination).resolve()
+    path = destination / 'SKILL.md'
+    runner = destination / 'scripts/run.py'
+    need(not path.is_symlink() and path.is_file() and path.stat().st_size <= app.tasks.MAX_FILE_BYTES
+         and runner.is_file() and runner.stat().st_size <= 16384, 'registered_skill_required')
+    need(runner.read_text(encoding='utf8') in (RUNNER.replace('RUNTIME_PARENT', '2'),
+                                                RUNNER.replace('RUNTIME_PARENT', '4')), 'registered_skill_required')
+    recipe = load(destination / 'workflow.json')
+    original = path.read_bytes()
+    eol = b'\r\n' if b'\r\n' in original else b'\n'
+    heading = REGISTERED_HEADING.encode().replace(b'\n', eol)
+    prefix = ('---\nname: ' + destination.name + '\n').encode().replace(b'\n', eol)
+    need(original.startswith(prefix) and original.count(heading) == 1, 'generated_guide_required')
+    split = original.index(heading) + len(heading)
+    following = original[split:]
+    begin, end = (tag.encode().replace(b'\n', eol) for tag in (GUIDE_BEGIN, GUIDE_END))
+    if begin in following or end in following:
+        need(following.startswith(begin) and following.count(begin) == following.count(end) == 1,
+             'generated_guide_section_changed')
+        following = following.split(end, 1)[1]
+    updated = original[:split] + run_instructions(recipe).encode().replace(b'\n', eol) + following
+    if updated == original:
+        return dict(status='guide_current', input_dispatched=False)
+    with tempfile.NamedTemporaryFile(dir=destination, delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        temporary.write_bytes(updated)
+        need(path.read_bytes() == original, 'guide_changed_during_refresh')
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return dict(status='guide_updated', path=str(path), input_dispatched=False)
+
+
 def _recorded_targets(recipe, source_task):
     has_conditional = any(s['action']=='conditional-open' for s in recipe['steps'])
     if source_task is None or not all(
@@ -866,14 +976,13 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
         (destination / 'source-task.json').write_text(json.dumps(source_task, ensure_ascii=False, indent=2) + '\n',
                                                      encoding='utf8')
     description = json.dumps(recipe['name'] + ' 녹화 순서를 Windows에서 실행한다.', ensure_ascii=False)
-    command = 'python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/run.py"'
+    command = RUN_COMMAND
     guide = ('---\nname: ' + destination.name + '\ndescription: ' + description + '\n---\n\n'
-             '# 등록된 업무 실행\n\n'
-             '업무명, 대상 창과 순서는 `workflow.json`에 있다. 사용자의 실행 요청 범위와 대조한다. '
+             + REGISTERED_HEADING + run_instructions(recipe)
+             + '업무명, 대상 창과 순서는 `workflow.json`에 있다. '
              + ('필수 입력은 ' + json.dumps(required, ensure_ascii=False) + '이다. 각 값을 받아 `--set "이름=값"`으로 전달한다.'
                 if required else '이 작업은 실행 시 입력할 변수가 없다.') + '\n\n'
-             '`' + command + '`으로 실행한다. '
-             '현재 상태만 확인할 때는 `--read-only`를 붙인다. 이 명령은 대상 창을 복원하지 않는다.\n\n'
+             '사용자가 현재 상태만 확인해 달라고 하면 `--read-only`를 붙인다. 이 명령은 대상 창을 복원하지 않는다.\n\n'
              '`--input-plan`은 앱을 조회하지 않고 전체 단계의 입력 방식을 표시한다. '
              '`--background-only`는 도구의 실제 마우스/키보드 입력과 전면화 요청을 금지한다. '
              '그런 단계가 있으면 첫 입력 전에 전체 실행을 거절한다. 최소화된 창도 복원하지 않는다. '
@@ -956,6 +1065,35 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     return result
 
 
+def summarize_execution(report, entries):
+    """Summarize a finished run; preserve the full recovery protocol on interruption."""
+    rows = report.get('steps', [])
+    if (report['status'] not in ('completed_unverified', 'verified') or 'stopped_at' in report
+            or not entries or [row['number'] for row in rows] != [n for n, _ in entries]):
+        return report
+    summary = {k: v for k, v in report.items() if k not in ('steps', 'input_requirements')}
+    summary['steps'] = []
+    outputs = []
+    for row, (_, step) in zip(rows, entries):
+        receipt = row['receipt']
+        if receipt.get('status') not in ('verified', 'waited', 'delivered_unverified'):
+            return report
+        item = {k: row[k] for k in ('number', 'label', 'elapsed_seconds') if k in row}
+        item.update(action=step['action'])
+        item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items',
+                                             'verified_path') if k in receipt})
+        summary['steps'].append(item)
+        if (receipt['status'] == 'verified' and receipt.get('diagnostic') == 'export_workbook_verified'
+                and (receipt.get('file_verified') is True or receipt.get('workbook_verified') is True)
+                and isinstance(receipt.get('verified_path'), str) and receipt['verified_path']):
+            outputs.append(dict(number=row['number'], path=receipt['verified_path']))
+    if outputs:
+        summary['verified_outputs'] = outputs
+        if outputs[-1]['number'] == entries[-1][0] and entries[-1][1]['action'] in ('verify-file', 'result-menu'):
+            summary['outcome'] = 'workbook_verified'
+    return summary
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == '_scene_worker':
@@ -972,6 +1110,12 @@ def main(argv=None):
     discovery.add_argument('--exe', required=True)
     discovery.add_argument('--window', required=True)
     discovery.add_argument('--hwnd', type=int)
+    outputs = sub.add_parser('discover-output', help='check local output directory candidates for one running app')
+    outputs.add_argument('--exe', required=True)
+    outputs.add_argument('--window', required=True)
+    outputs.add_argument('--hwnd', type=int)
+    refresh = sub.add_parser('refresh-guide', help='update repeat-run instructions in an existing generated skill')
+    refresh.add_argument('--skill', type=Path, required=True)
     for command in ('register', 'run'):
         p = sub.add_parser(command)
         if command == 'register':
@@ -988,6 +1132,7 @@ def main(argv=None):
             p.add_argument('--only', help='run or inspect one workflow step by number or label')
             p.add_argument('--read-only', action='store_true')
             p.add_argument('--input-plan', action='store_true', help='preview input modes without opening or inspecting an app')
+            p.add_argument('--summary', action='store_true', help='return a compact receipt; exit 0 for a verified final workbook')
             p.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and window restoration')
     parser.add_argument('--_worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -1004,7 +1149,11 @@ def main(argv=None):
     try:
         source_task = None
         recipe = None
-        if args.command != 'discover':
+        if args.command == 'refresh-guide':
+            result = refresh_guide(args.skill)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        if args.command in ('run', 'register'):
             if getattr(args, 'task', None):
                 import recorded_plan
                 source_task = app.tasks.load_task(args.task, app.task_directory())
@@ -1041,6 +1190,9 @@ def main(argv=None):
         if args._worker:
             if args.command == 'discover':
                 result = discover(args.exe, args.window, args.hwnd)
+            elif args.command == 'discover-output':
+                owner = bind(args.exe, args.window, args.hwnd)
+                result = export_evidence.discover_directories(owner)
             elif args.command == 'register':
                 result = register(recipe, args.out, args.hwnd, source_task=source_task)
             else:
@@ -1055,12 +1207,15 @@ def main(argv=None):
             result = json.loads(child.stdout)
             need(child.returncode in (0, 2, 3) and isinstance(result, dict) and 'status' in result,
                  'invalid_worker_receipt')
+            if args.command == 'run' and args.summary and mutating:
+                result = summarize_execution(result, entries)
     except (Exception, KeyboardInterrupt) as error:
         uncertain = (launched or executing) and mutating
         result = dict(status='uncertain' if uncertain else 'blocked', input_dispatched=None if uncertain else False,
                       diagnostic=getattr(error, 'code', 'workflow_unavailable'))
     print(json.dumps(result, ensure_ascii=False))
-    return (0 if result['status'] in ('registered', 'observed', 'verified') else
+    return (0 if result['status'] in ('registered', 'observed', 'verified')
+              or (getattr(args, 'summary', False) and result.get('outcome') == 'workbook_verified') else
             3 if result['status'] in ('completed_unverified', 'uncertain', 'delivered_unverified') else 2)
 
 

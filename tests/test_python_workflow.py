@@ -59,12 +59,14 @@ class RuntimeTests(unittest.TestCase):
         self.uia.__enter__.return_value = self.uia
         self.uia.same.return_value = True
         self.uia.actions.return_value = ['SetValue', 'Click']
-        self.binding = MagicMock()
+        self.binding = MagicMock(hwnd=101, pid=11)
+        self.uia.pid.return_value = self.binding.pid
         self.element = MagicMock()
         self.element.property.return_value = ''
         for name, kwargs in (
             ('bind', dict(return_value=self.binding)),
             ('app.bridge.UIA', dict(return_value=self.uia)),
+            ('app.bridge.user32.IsIconic', dict(return_value=False)),
             ('app.guard', dict(return_value=None)),
             ('app.visibility.restore_for_action', dict(return_value=True)),
             ('lookup.resolve', dict(return_value=self.element)),
@@ -124,6 +126,23 @@ class RuntimeTests(unittest.TestCase):
         flow.app.visibility.restore_for_action.assert_not_called()
         execute.assert_not_called()
         flow.wait.assert_not_called()
+
+    def test_readonly_minimized_window_diagnosed_before_recorded_or_grounding_lookup(self):
+        data = recipe()
+        recorded = dict(action='invoke', selector=dict(automation_id='run', role='button'))
+        instructed = dict(action='invoke', selector=dict(query='Run', role='button'),
+                          grounding_text='Run button')
+        flow.app.bridge.user32.IsIconic.return_value = True
+        for step in (recorded, instructed):
+            with self.subTest(step=step), patch.object(flow.live, 'execute') as execute:
+                data['steps'] = [step]
+                result = flow.run(data, read_only=True)
+                self.assertEqual((result['status'], result['diagnostic'], result['input_dispatched']),
+                                 ('blocked', 'target_window_minimized', False))
+                self.uia.from_handle.assert_not_called()
+                flow.lookup.resolve.assert_not_called()
+                flow.app.visibility.restore_for_action.assert_not_called()
+                execute.assert_not_called()
 
     def test_register_creates_only_three_text_files_and_does_not_overwrite(self):
         with tempfile.TemporaryDirectory() as folder:

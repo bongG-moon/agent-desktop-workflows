@@ -51,7 +51,8 @@ class DraftClickTests(TestCase):
         self.patch(flow.app.bridge, 'Binding', side_effect=binding)
         self.patch(flow.app, 'guard')
         self.patch(flow.app.visibility, 'restore_for_action')
-        self.patch(flow.app.bridge, 'UIA')
+        uia = self.patch(flow.app.bridge, 'UIA').return_value.__enter__.return_value
+        uia.pid.return_value = self.primary.pid
 
     def patch(self,module,name,**args):
         return self.stack.enter_context(mock.patch.object(module,name,**args))

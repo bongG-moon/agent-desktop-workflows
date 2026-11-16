@@ -91,7 +91,7 @@ class MenuTests(unittest.TestCase):
         self.uia.within.side_effect = lambda a,b: (a,b)==('random','open-item')
         self.assertEqual(old_frame,choose(old_frame))
 
-    def run_path(self, *, before_leaf=None, receipts=None, guard=None):
+    def run_path(self, *, before_leaf=None, receipts=None, guard=None, ticks=None):
         def apply(p):
             value = p.start()
             self.addCleanup(p.stop)
@@ -105,6 +105,7 @@ class MenuTests(unittest.TestCase):
         apply(patch.object(cm,'_hit_region'))
         apply(patch.object(cm,'_hit_item',return_value=37))
         apply(patch.object(cm.win,'_combo_surface'))
+        apply(patch.object(cm.win,'input_tick',return_value=900,side_effect=ticks))
         apply(patch.object(cm.win,'root_window',return_value=37))
         apply(patch.object(cm.win,'window_from_point',return_value=37))
         apply(patch.object(cm,'_menus',side_effect=[[],[self.parent],[self.parent],
@@ -131,6 +132,12 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(2,send.call_count)
         self.assertEqual(('blocked',True,False,['Send']),
                          (result['status'],result['input_dispatched'],result['leaf_dispatched'],result['menu_items']))
+
+    def test_user_input_while_leaf_is_resolved_stops_without_clicking_it(self):
+        result, send = self.run_path(ticks=[40, 40, 41, 41, 42, 43])
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual((result['diagnostic'], result['input_dispatched'], result['leaf_dispatched']),
+                         ('foreground_or_input_changed', True, False))
 
     def test_partial_right_click_and_leaf_delivery_not_retried(self):
         yes = {'ok':True,'input_dispatched':True}

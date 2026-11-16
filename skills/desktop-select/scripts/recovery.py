@@ -49,6 +49,12 @@ def _rows(doc):
     for number, row in enumerate(doc['rows'], 1):
         raw, form = row['step'], row['form']
         entry = dict(text=form['text'], mode=form['mode'], argument=form['argument'], context=None)
+        # A transient popup can be compiled as manual even when the recorder
+        # identified a control. Keep its role/name when deciding what to fold.
+        locator = raw.get('target', {}).get('locator', {})
+        if locator.get('role'):
+            entry['capture_role'] = locator['role']
+            entry['capture_name'] = locator.get('name')
         try:
             entry['context'] = _row_context(raw, ids, number)
         except (tasks.TaskError, ContextError) as error:
@@ -243,18 +249,72 @@ def _mentions(text, label):
     return re.search(r'(?<![a-z0-9_])' + phrase + r'(?![a-z0-9_])', text, re.IGNORECASE) is not None
 
 
-def _menu_tail(row, label):
+def _menu_caption(label):
+    return ' '.join(label.split()).casefold()
+
+
+def _menu_tail(row):
+    """Return witnessed captions or the user's complete, explicit menu path."""
     step = row['step']
+    if (row.get('field_problem') or row['mode'] not in (None, 'recorded') or 'wait_after' in step
+            or row.get('capture_role') not in (None, 'menuitem')):
+        return []
+    route = tasks.click_menu_path(row['text'])
+    name = row.get('capture_name')
     if step['action'] == 'open':
-        if step.get('role') != 'menuitem':
-            return False
-        name = step.get('command_name') or (step.get('target') if step.get('match') == 'name' else None)
-        if name:
-            return name.strip().casefold() == label.strip().casefold()
+        if step.get('match') == 'query':
+            # Older drafts turn an unrecognized click into an unscoped button
+            # query for the WHOLE route. An ordinary single button, an alias
+            # rebound to another target or an explicitly scoped query stays put.
+            click = tasks.click_request(row['text'])
+            role = step.get('role')
+            if (not click or role not in ('button', 'menuitem') or (role == 'button' and not route)
+                    or step.get('within') or step.get('expand') or step.get('target') != click[0]):
+                return []
+        elif step.get('role') == 'menuitem':
+            name = step.get('command_name') or (step.get('target') if step.get('match') == 'name' else name)
+        else:
+            return []
     elif (step['action'] != 'manual' or step.get('reason') not in (
             'popup_needs_live_binding', 'capture_target_unavailable', 'unsupported_recorded_action', 'unsupported_demonstration')):
-        return False
-    return _mentions(row['text'], label)
+        return []
+    if name and not tasks._text(name):
+        return []
+    if route:
+        return route if not name or _menu_caption(name) == _menu_caption(route[-1]) else []
+    if name:
+        return [name]
+    text = row['text'].strip()
+    click = tasks.click_request(text)
+    if click:
+        return [click[0]]
+    # The recording editor also accepts a bare caption or "Active sheet 선택".
+    caption = re.sub(r'\s*(?:을|를)?\s*선택(?:해\s*(?:줘|주세요))?[.!。]?$', '', text).strip()
+    return [caption] if tasks._text(caption, 200) else []
+
+
+def _next_menu_index(path, index, row):
+    labels = [_menu_caption(label) for label in _menu_tail(row)]
+    if len(labels) > 1:
+        return len(path) if index < len(path) and labels == path else None
+    if labels and labels[0] in path[index:]:
+        return path.index(labels[0], index) + 1
+
+
+def _menu_hint(rows, number):
+    start = rows[number - 1]
+    path = tasks.click_menu_path(start['text'])
+    end = number
+    if number < len(rows):
+        following = rows[number]
+        if not following.get('scope_problem') and following['context'] == start['context']:
+            tail = _menu_tail(following)
+            if len(tail) > 1:
+                if path and list(map(_menu_caption, path)) != list(map(_menu_caption, tail)):
+                    return None
+                path, end = tail, number + 1
+    if path:
+        return dict(number=number, through=end, mode='context-menu', path=path)
 
 
 def _menu(app, rows, item, owner, surface, title, fingerprint):
@@ -268,14 +328,15 @@ def _menu(app, rows, item, owner, surface, title, fingerprint):
     _require(isinstance(path, list) and 0 < len(path) <= 8 and all(tasks._text(label, 200) for label in path),
              'invalid_menu_path')
     _require(type(end) is int and number <= end <= len(rows) and end - number <= len(path), 'invalid_menu_step_range')
+    normalized = [_menu_caption(label) for label in path]
+    written = tasks.click_menu_path(start['text'])
+    if written and [_menu_caption(label) for label in written] != normalized:
+        raise tasks.TaskError('menu_step_range_mismatch', step_number=number)
     path_index = 0
-    for row in rows[number:end]:
-        _require(not row.get('scope_problem') and row['context'] == start['context'], 'menu_step_range_mismatch')
-        # Every absorbed click must name a later item on the same menu route.
-        while path_index < len(path) and not _menu_tail(row, path[path_index]):
-            path_index += 1
-        _require(path_index < len(path), 'menu_step_range_mismatch')
-        path_index += 1
+    for tail_number, row in enumerate(rows[number:end], number + 1):
+        path_index = _next_menu_index(normalized, path_index, row)
+        if path_index is None or row.get('scope_problem') or row['context'] != start['context']:
+            raise tasks.TaskError('menu_step_range_mismatch', step_number=tail_number)
     grounded = dict(item)
     if (anchor := start['step'].get('menu_anchor')) and 'frame' not in grounded and 'point' not in grounded:
         grounded['menu_anchor'] = anchor
@@ -404,6 +465,11 @@ def run(app, args):
         except (ValueError, app.bridge.BridgeError) as error:
             reason = getattr(error, 'code', 'target_unavailable')
             detail['diagnostic'] = reason
+            if reason == 'menu_step_range_mismatch':
+                detail['conflicting_step'] = error.step_number
+                detail['recovery_hint'] = f"{error.step_number}번의 창, 컨트롤 및 메뉴 이름을 원문과 대조하세요."
+                if error.step_number != number:
+                    detail['recovery_hint'] += " 별도 동작이면 through를 그 단계 앞에서 끝내세요."
             if reason in ('recorded_window_not_open', 'invalid_window_origin_step') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
             if args.bindings:
@@ -411,13 +477,30 @@ def run(app, args):
     if not args.bindings:
         result['host_action'] = 'bind_recorded_instructions_from_live_scopes'
         suggested = []
+        menu_end = 0
         for detail in details:
             if 'scope_index' not in detail:
                 continue
             n = detail['number']
-            if detail.get('reason') == 'right_click_requires_menu_teaching' and not detail.get('menu_anchor'):
-                detail['image_args'] = ['recover', '--task', doc['name'], '--only', str(n), '--image']
-            item = _suggest_binding(n, rows[n-1], result['live_scopes'][detail['scope_index']])
+            inventory = result['live_scopes'][detail['scope_index']]
+            if detail.get('reason') == 'right_click_requires_menu_teaching':
+                hint = _menu_hint(rows, n)
+                anchor = detail.get('menu_anchor')
+                if hint:
+                    detail['menu_binding_hint'] = hint
+                    menu_end = hint['through']
+                if anchor and hint:
+                    target = anchor['target']
+                    matches = [node for node in inventory['targets'] if all(node.get(k) == v for k, v in target.items())]
+                    if len(matches) == 1 and matches[0].get('enabled') is True and matches[0].get('offscreen') is False:
+                        suggested.append(hint)
+                        continue
+                if not anchor or hint:
+                    detail['image_args'] = ['recover', '--task', doc['name'], '--only', str(n), '--image']
+                continue
+            if n <= menu_end:
+                continue
+            item = _suggest_binding(n, rows[n-1], inventory)
             if item:
                 suggested.append(item)
         result['bindings_template'] = dict(source_fingerprint=fingerprint, steps=suggested)

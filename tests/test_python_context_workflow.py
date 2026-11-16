@@ -71,6 +71,7 @@ class CompositionTests(unittest.TestCase):
         self.popup = MagicMock(pid=11, hwnd=200)
         self.uia = MagicMock()
         self.uia.__enter__.return_value = self.uia
+        self.uia.pid.return_value = self.owner.pid
         self.uia.same.return_value = True
         self.uia.actions.return_value = ['SetValue', 'Click']
         self.element = MagicMock()

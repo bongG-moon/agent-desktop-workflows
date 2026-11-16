@@ -295,6 +295,8 @@ def action(args, owner, *, learned=None, anchor=None):
         if background and mutate:
             input_policy.window_ready(surface)
     check()
+    if not mutate:
+        visibility.require_observable(surface)
     with bridge.UIA() as uia:
         if background and mutate:
             input_policy.configure_uia(uia)

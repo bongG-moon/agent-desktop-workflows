@@ -238,6 +238,8 @@ def execute(binding, spec, guard, title, *, observe_guard=None):
             return dict(info, diagnostic='menu_delivered_no_output_condition')
         _need(before is not None, 'export_baseline_missing')
         ok, diagnostic = export_evidence.wait(output, before)
+        if ok and getattr(before, 'verified_path', None):
+            info['verified_path'] = before.verified_path
         return dict(info, status='verified' if ok else 'delivered_unverified', diagnostic=diagnostic,
                     effect_verification='matched' if ok else 'unavailable', workbook_verified=ok)
     except Exception as error:

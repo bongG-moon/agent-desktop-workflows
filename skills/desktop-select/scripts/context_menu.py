@@ -203,6 +203,28 @@ def _hit_region(binding, uia, region, point):
     raise win.BridgeError('context_point_outside_region')
 
 
+def _surface_target(binding, uia, element, *, target=None, role=None):
+    info = uia.basic(element)
+    if info['role'] not in REGIONS or role not in (None, info['role']):
+        return None
+    for key in ('automation_id', 'name'):
+        value = info.get(key)
+        if not _text(value) or target not in (None, value) or (key == 'automation_id' and value.isdecimal()):
+            continue
+        locator = {'role': info['role'], key: value}
+        try:
+            region = _region(binding, uia, locator)
+        except win.BridgeError as error:
+            # The recorded point may be in a repeated child group of a named
+            # table. An explicitly requested region must still be unique.
+            if target is None and error.code == 'context_region_ambiguous':
+                continue
+            raise
+        _need(uia.same(element, region), 'context_region_changed')
+        return locator
+    return None
+
+
 def teach_surface(binding, screen_point, *, target=None, role=None):
     """Observe the named region and local point before a context menu opens."""
     binding.check()
@@ -217,28 +239,13 @@ def teach_surface(binding, screen_point, *, target=None, role=None):
             if element is None or uia.same(element, root):
                 break
             _need(uia.pid(element) == binding.pid and not uia.secure(element), 'context_point_protected')
-            info = uia.basic(element)
-            if info['role'] in REGIONS and role in (None, info['role']):
-                for key in ('automation_id', 'name'):
-                    value = info.get(key)
-                    if not _text(value) or target not in (None, value) or (key == 'automation_id' and value.isdecimal()):
-                        continue
-                    locator = {'role': info['role'], key: value}
-                    try:
-                        region = _region(binding, uia, locator)
-                    except win.BridgeError as error:
-                        # A repeated child group may still have a unique name or a
-                        # named containing table. Only ordinary point teaching may
-                        # switch identity. An explicit target must stay unambiguous.
-                        if target is None and error.code == 'context_region_ambiguous':
-                            continue
-                        raise
-                    _need(uia.same(element, region), 'context_region_changed')
-                    _hit_region(binding, uia, region, screen_point)
-                    x, y, w, h = _rect(uia, region)
-                    ratios = [(screen_point[0]-x)/w, (screen_point[1]-y)/h]
-                    _validate_surface(locator, ratios)
-                    return {'target':locator, 'point':ratios}
+            locator = _surface_target(binding, uia, element, target=target, role=role)
+            if locator:
+                _hit_region(binding, uia, element, screen_point)
+                x, y, w, h = _rect(uia, element)
+                ratios = [(screen_point[0]-x)/w, (screen_point[1]-y)/h]
+                _validate_surface(locator, ratios)
+                return {'target':locator, 'point':ratios}
             element = uia.parent(element)
     raise win.BridgeError('named_context_region_required')
 
@@ -414,6 +421,7 @@ def execute(binding, spec, guard, *, before_leaf=None):
         guard()
         foreground(binding)
         with win.UIA() as uia:
+            tick = win.input_tick()
             region = _region(binding, uia, spec['target'])
             rect = _rect(uia, region)
             x, y, w, h = rect
@@ -428,6 +436,7 @@ def execute(binding, spec, guard, *, before_leaf=None):
             win._combo_surface(binding)
             _need(_rect(uia, current) == rect and
                   win.root_window(win.window_from_point(px, py)) == binding.hwnd, 'context_region_changed')
+            _need(win.input_tick() == tick, 'foreground_or_input_changed')
             pending = True
             output = win._send_point(px, py, 'right-click')
             _need(output.get('ok') and output.get('input_dispatched') is True, 'context_click_uncertain')
@@ -435,6 +444,7 @@ def execute(binding, spec, guard, *, before_leaf=None):
             parent, anchor = None, (px, py, 1, 1)
             gap = max(6, round(12*binding.info()['dpi']/96))
             for number, name in enumerate(spec['path']):
+                tick = win.input_tick()
                 deadline = time.monotonic() + 3
                 while True:
                     guard()
@@ -458,6 +468,7 @@ def execute(binding, spec, guard, *, before_leaf=None):
                 prior_surfaces = set(_scoped_windows(binding))
                 _need(exposed in prior_surfaces and win.root_window(win.window_from_point(*fresh.center)) == exposed,
                       'context_menu_occluded')
+                _need(win.input_tick() == tick, 'foreground_or_input_changed')
                 pending = True
                 if leaf:
                     leaf_sent = None

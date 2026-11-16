@@ -22,6 +22,13 @@ def _shown(hwnd):
     return bool(win.user32.IsWindowVisible(hwnd)) and not win.user32.IsIconic(hwnd)
 
 
+def require_observable(binding):
+    """Check before resolving a control or capturing pixels in a read-only run."""
+    binding.check()
+    if win.user32.IsIconic(binding.hwnd):
+        raise win.BridgeError('target_window_minimized')
+
+
 def _window_box(hwnd, uia, root):
     box = uia.bounds(root)
     if valid(box):

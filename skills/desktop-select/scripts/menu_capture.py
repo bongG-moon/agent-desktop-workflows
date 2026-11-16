@@ -41,13 +41,8 @@ def capture_surface(binding, uia, event, history):
                 if (item is None or uia.same(root, item) or uia.secure(item)
                         or uia.pid(item) != binding.pid or item.property(30010) is not True):
                     return None
-                identity = uia.basic(item)
-                key = next((k for k in ('automation_id', 'name') if menus._text(identity.get(k))), None)
-                if key and identity['role'] in menus.REGIONS:
-                    target = {'role': identity['role'], key: identity[key]}
-                    region = menus._region(binding, uia, target)
-                    if not uia.same(region, item):
-                        return None
+                target = menus._surface_target(binding, uia, item)
+                if target:
                     rect = menus._rect(uia, item)
                     if not menus._inside(point, rect):
                         return None

@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import time
-import ctypes as C
 from ctypes import wintypes as W
 
 import win_bridge as bridge
+from win_bridge import check_foreground_input as _idle_foreground, input_tick as _input_tick
 
 
 def _result(status, sent, state, *, diagnostic=None, before=None):
@@ -20,32 +20,15 @@ def _result(status, sent, state, *, diagnostic=None, before=None):
     return result
 
 
-class _LastInput(C.Structure):
-    _fields_ = [('size', W.UINT), ('tick', W.DWORD)]
-
-
-def _input_tick():
-    info = _LastInput(C.sizeof(_LastInput), 0)
-    read = bridge._sig(bridge.user32, 'GetLastInputInfo', W.BOOL, C.POINTER(_LastInput))
-    if not read(C.byref(info)):
-        raise bridge.BridgeError('physical_input_state_unavailable')
-    return info.tick
-
-
-def _idle_foreground(original, tick):
-    if (bridge.foreground() != original or _input_tick() != tick
-            or any(bridge.user32.GetAsyncKeyState(key) & 0x8000 for key in range(1, 255))):
-        raise bridge.BridgeError('foreground_or_input_changed')
-
-
 def foreground(binding):
     original = bridge.foreground()
-    if bridge.root_window(original) == binding.hwnd and not bridge.user32.IsIconic(binding.hwnd):
-        return
     tick = _input_tick()
+    if bridge.root_window(original) == binding.hwnd and not bridge.user32.IsIconic(binding.hwnd):
+        bridge.wait_for_quiet_foreground(original, tick)
+        return
     _idle_foreground(original, tick)
     activated = bridge.activate({'hwnd': binding.hwnd, 'pid': binding.pid, 'exe_name': binding.exe,
-                                 'process_started_utc_ticks': binding.created})
+                                 'process_started_utc_ticks': binding.created}, input_checkpoint=(original, tick))
     if activated.get('foreground_verified'):
         return
     binding.check()
@@ -62,13 +45,14 @@ def foreground(binding):
         binding.check()
         _idle_foreground(original, tick)
         bridge._sig(user, 'BringWindowToTop', W.BOOL, W.HWND)(binding.hwnd)
+        _idle_foreground(original, tick, binding.hwnd)
         user.SetForegroundWindow(binding.hwnd)
     finally:
         if not attached(thread, previous, False):
             raise bridge.BridgeError('focus_queue_detach_failed')
     for _ in range(6):
         binding.check()
-        if _input_tick() != tick:
+        if bridge.pointer_keys_down() or _input_tick() != tick:
             raise bridge.BridgeError('foreground_or_input_changed')
         active = bridge.foreground()
         if bridge.root_window(active) == binding.hwnd:
@@ -94,6 +78,7 @@ def execute(binding, spec, guard, *, timeout=90, required_bounds=None):
         time.sleep(.15)
     else:
         foreground(binding)
+        tick = _input_tick()
     guard()
     current = observe_row(binding, spec)
     if current['kind'] != state or current['row_bounds'] != observed['row_bounds']:
@@ -110,6 +95,8 @@ def execute(binding, spec, guard, *, timeout=90, required_bounds=None):
     bridge._combo_surface(binding)
     if bridge.root_window(bridge.window_from_point(*current['point'])) != binding.hwnd:
         return _result('blocked', False, state, diagnostic='row_point_not_exposed')
+    if _input_tick() != tick:
+        return _result('blocked', False, state, diagnostic='foreground_or_input_changed')
     sent = bridge._send_point(*current['point'], 'click')
     if sent.get('input_dispatched') is not True or not sent.get('ok'):
         return _result('uncertain', sent.get('input_dispatched'), 'unknown',

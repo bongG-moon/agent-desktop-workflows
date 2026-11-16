@@ -199,6 +199,14 @@ def click_request(sentence):
     return name, role
 
 
+def click_menu_path(sentence):
+    click = click_request(sentence)
+    if click:
+        parts = [part.strip() for part in re.split('[>→]', click[0])]
+        if 2 <= len(parts) <= 8 and all(_text(part, 200) for part in parts):
+            return parts
+
+
 def _field_request(sentence):
     """Recognize a single target-first assignment, preserving the literal's spelling."""
     if not isinstance(sentence, str) or _conditional_sentence(sentence):

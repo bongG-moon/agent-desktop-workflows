@@ -12,10 +12,20 @@ from xml.etree import ElementTree as ET
 from learned_tasks import TaskError
 
 
+_OUTPUT_FOLDER_NAMES = ('ExcelData', 'Export', 'Exports', 'Output', 'Outputs', 'ExcelExport', 'ExcelOutput')
+_INSTALL_PARENT_LIMIT = 4
+_FILE_CLOCK_RESOLUTION_NS = 2_000_000_000  # FAT last-write timestamps have a two-second resolution.
+
+
 def validate(spec):
     if not isinstance(spec, dict) or set(spec) != {'kind', 'path'} or spec['kind'] not in ('file', 'directory'):
         raise TaskError('invalid_export_output')
-    s = spec['path']
+    _validate_local_path(spec['path'])
+    if spec['kind'] == 'file' and Path(spec['path']).suffix.lower() not in ('.xlsx', '.xlsm'):
+        raise TaskError('export_workbook_type_unsupported')
+
+
+def _validate_local_path(s):
     if not isinstance(s, str) or len(s) > 1000 or not s or any(ord(c) < 32 for c in s):
         raise TaskError('export_local_path_required')
     drive, tail = ntpath.splitdrive(s)
@@ -26,8 +36,6 @@ def validate(spec):
                 or (p and ntpath.isreserved(p) if hasattr(ntpath, 'isreserved') else p and Path(p).is_reserved())
                 for p in parts)):
         raise TaskError('export_local_path_required')
-    if spec['kind'] == 'file' and Path(s).suffix.lower() not in ('.xlsx', '.xlsm'):
-        raise TaskError('export_workbook_type_unsupported')
 
 
 def _plain(path, directory):
@@ -38,19 +46,83 @@ def _plain(path, directory):
     return s
 
 
-def inventory(spec):
-    validate(spec)
-    path = Path(spec['path'])
-    folder = path if spec['kind'] == 'directory' else path.parent
+def _local_folder(folder):
     # Exclude mapped network drives as well as UNC paths, even if mapped with a drive letter.
     import ctypes
     if ctypes.windll.kernel32.GetDriveTypeW(str(folder.anchor)) not in (2, 3, 6):
         raise TaskError('export_local_path_required')
     for parent in [*reversed(folder.parents), folder]:
         _plain(parent, True)
+
+
+def _process_image(binding):
+    import ctypes
+    from ctypes import wintypes
+    from desktop_select import bridge
+
+    binding.check()
+    handle = bridge.kernel32.OpenProcess(0x1000, False, binding.pid)
+    if not handle:
+        raise TaskError('export_executable_unavailable')
+    try:
+        size = wintypes.DWORD(32768)
+        name = ctypes.create_unicode_buffer(size.value)
+        if not bridge.kernel32.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size)):
+            raise TaskError('export_executable_unavailable')
+        image = Path(name.value)
+        binding.check()
+        if image.name.casefold() != binding.exe.casefold():
+            raise TaskError('export_executable_changed')
+        return image
+    finally:
+        bridge.kernel32.CloseHandle(handle)
+
+
+def discover_directories(binding):
+    """Probe named local folders around the bound executable. Never list their files."""
+    started = time.monotonic()
+    image = _process_image(binding)
+    # Validate the full path before following any part of it, including the executable itself.
+    _validate_local_path(str(image))
+    _local_folder(image.parent)
+    _plain(image, False)
+    bases = list(image.parents[:_INSTALL_PARENT_LIMIT + 1])
+    profile = Path.home()
+    bases.extend((profile / 'Documents', profile / 'Downloads'))
+    directories = []
+    probes = 0
+    for base in dict.fromkeys(bases):
+        try:
+            _validate_local_path(str(base))
+            _local_folder(base)
+        except (OSError, TaskError):
+            continue
+        for name in _OUTPUT_FOLDER_NAMES:
+            candidate = base / name
+            probes += 1
+            try:
+                _plain(candidate, True)
+            except (OSError, TaskError):
+                continue
+            directories.append(str(candidate))
+    binding.check()
+    report = dict(status='observed', input_dispatched=False, directories=directories,
+                  file_verification='pending_execution', candidate_paths_checked=probes,
+                  elapsed_seconds=round(time.monotonic() - started, 4))
+    if len(directories) == 1:
+        report['suggested_output'] = dict(kind='directory', path=directories[0])
+    return report
+
+
+def inventory(spec):
+    validate(spec)
+    path = Path(spec['path'])
+    folder = path if spec['kind'] == 'directory' else path.parent
+    _local_folder(folder)
     def signature(file):
         s = _plain(file, False)
-        return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
+        created = s.st_birthtime_ns if hasattr(s, 'st_birthtime_ns') else s.st_ctime_ns
+        return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, created
     if spec['kind'] == 'file':
         try:
             return {path: signature(path)}
@@ -137,10 +209,14 @@ def _digest(path):
 
 class Baseline(dict):
     prior_digest = None
+    verified_path = None
 
 
 def baseline(spec):
+    started_ns = time.time_ns()
     result = Baseline(inventory(spec))
+    result.started_ns = started_ns
+    result.prior_file_ids = {sig[:2] for sig in result.values() if sig[1]}
     if spec['kind'] == 'file' and result:
         result.prior_digest = _digest(next(iter(result)))
         if inventory(spec) != result:
@@ -149,15 +225,24 @@ def baseline(spec):
 
 
 def wait(spec, before, *, timeout=26, pause=.3):
+    if isinstance(before, Baseline):
+        before.verified_path = None
     deadline, previous = time.monotonic() + timeout, None
-    ignored = None
+    ignored = seen_path = None
     while True:
         try:
             after = inventory(spec)
             candidates = [(p, sig) for p, sig in after.items() if
                           (p not in before if spec['kind'] == 'directory' else before.get(p) != sig)]
-            if len(candidates) > 1:
+            if len(candidates) > 1 or (candidates and seen_path is not None and seen_path != candidates[0][0]):
                 return False, 'multiple_new_workbooks'
+            if candidates and spec['kind'] == 'directory' and isinstance(before, Baseline):
+                sig = candidates[0][1]
+                # A renamed old workbook is a new directory entry, but cannot establish an export.
+                if sig[:2] in before.prior_file_ids or max(sig[3:]) < before.started_ns - _FILE_CLOCK_RESOLUTION_NS:
+                    candidates = []
+            if candidates:
+                seen_path = candidates[0][0]
             if candidates and previous == candidates[0] and ignored != previous and workbook(candidates[0][0]):
                 path, signature = previous
                 old = before.get(path)
@@ -167,6 +252,8 @@ def wait(spec, before, *, timeout=26, pause=.3):
                     ignored = previous
                 # Final stat revalidates the exact file we opened after its ZIP metadata was parsed.
                 elif inventory(spec) == after:
+                    if isinstance(before, Baseline):
+                        before.verified_path = str(path)
                     return True, 'export_workbook_verified'
             previous = candidates[0] if candidates else None
         except (OSError, zipfile.BadZipFile):

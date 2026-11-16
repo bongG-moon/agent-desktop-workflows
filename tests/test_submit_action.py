@@ -132,6 +132,12 @@ class SubmitActionTests(unittest.TestCase):
             self.assertEqual(self.run_submit()['diagnostic'], 'physical_input_changed')
         live.win.user32.SendInput.assert_not_called()
 
+    def test_pointer_exemption_for_ime_mode_keys_does_not_authorize_enter(self):
+        live.win.user32.GetAsyncKeyState.side_effect = lambda key: 0x8000 if key in (0x15, 0x19) else 0
+        self.assertEqual(self.run_submit()['diagnostic'], 'physical_input_busy')
+        self.element.call.assert_not_called()
+        live.win.user32.SendInput.assert_not_called()
+
     def test_combo_can_submit_only_its_own_safe_editor(self):
         self.props[30003] = 50003
         editor = MagicMock()

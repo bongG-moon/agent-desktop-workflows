@@ -20,6 +20,7 @@ class RowActionTests(unittest.TestCase):
         self.vision = SimpleNamespace(observe_row=Mock(), confirm_point=Mock(), confirm_pixels=Mock(), validate_spec=Mock())
         self.enter(patch.dict(sys.modules, row_vision=self.vision))
         self.enter(patch.object(row_action, 'foreground'))
+        self.tick = self.enter(patch.object(row_action, '_input_tick', return_value=400))
         self.enter(patch.object(app.bridge, '_combo_surface'))
         self.enter(patch.object(app.bridge, 'root_window', return_value=440))
         self.enter(patch.object(app.bridge, 'window_from_point', return_value=441))
@@ -77,6 +78,12 @@ class RowActionTests(unittest.TestCase):
         self.vision.confirm_pixels.side_effect = app.bridge.BridgeError('row_changed_before_action')
         with self.assertRaisesRegex(app.bridge.BridgeError, 'row_changed_before_action'):
             self.execute(sample('before'), sample('before'))
+        self.send.assert_not_called()
+
+    def test_input_event_during_row_validation_blocks_first_click(self):
+        self.tick.side_effect = [400, 401]
+        result = self.execute(sample('before'), sample('before'))
+        self.assertEqual((result['diagnostic'], result['input_dispatched']), ('foreground_or_input_changed', False))
         self.send.assert_not_called()
 
     def test_verification_accepts_a_transient_relayout_without_redispatch(self):
