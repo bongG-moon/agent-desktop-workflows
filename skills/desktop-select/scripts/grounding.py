@@ -115,6 +115,39 @@ def _directory():
     return folder
 
 
+def store_frame(folder, scope, data):
+    token = sha256(scope+data).hexdigest()
+    path = folder/(token+'.png')
+    tasks._deny_redirect(path)
+    try:
+        with path.open('xb') as output:
+            output.write(data)
+    except FileExistsError:
+        # Each filename authenticates the scope and the complete PNG, never
+        # overwrite an existing file or follow a replacement link.
+        if path.stat().st_size!=len(data) or path.read_bytes()!=data:
+            raise tasks.TaskError('grounding_frame_changed')
+        path.touch()
+    return token, path
+
+
+def read_frame(folder, scope, token):
+    if not isinstance(token, str) or not re.fullmatch('[a-f0-9]{64}',token):
+        raise tasks.TaskError('grounding_frame_invalid')
+    path = folder/(token+'.png')
+    tasks._deny_redirect(path)
+    try:
+        with path.open('rb') as source:
+            if time.time() - os.fstat(source.fileno()).st_mtime > TTL:
+                raise tasks.TaskError('grounding_frame_expired')
+            data=source.read(MAX_PIXELS*4+1000)
+    except FileNotFoundError as exc:
+        raise tasks.TaskError('grounding_frame_expired') from exc
+    if sha256(scope+data).hexdigest()!=token:
+        raise tasks.TaskError('grounding_frame_changed')
+    return path, data
+
+
 def _usable(step):
     return (tasks.is_recoverable(step) or step.get('action')=='visual-click'
             or (step.get('action')=='open' and step.get('match')=='query'))
@@ -223,37 +256,14 @@ def run(app, args):
     folder = _directory()
     if args.command=='ground':
         window,data = _capture(app,binding,check)
-        token = sha256(scope+data).hexdigest()
-        path = folder/(token+'.png')
-        tasks._deny_redirect(path)
-        try:
-            with path.open('xb') as output:
-                output.write(data)
-        except FileExistsError:
-            # Each filename authenticates the scope and the complete PNG, never
-            # overwrite an existing file or follow a replacement link.
-            if path.stat().st_size!=len(data) or path.read_bytes()!=data:
-                raise tasks.TaskError('grounding_frame_changed')
-            path.touch()
+        token, path = store_frame(folder, scope, data)
         return dict(status='observed',frame=token,image=str(path),width=window[2],height=window[3],
                     step=number,instruction=sentence,expires_seconds=TTL,input_dispatched=False,
                     **({'expected_windows': children} if children else {}),
                     **({'row_binding_command':'bind-row'} if _row_candidate(plan,number) else {}))
     if args.command == 'bind-visual':
         tasks.check_new_task(args.save_as,store)
-    if not re.fullmatch('[a-f0-9]{64}',args.frame):
-        raise tasks.TaskError('grounding_frame_invalid')
-    path = folder/(args.frame+'.png')
-    tasks._deny_redirect(path)
-    try:
-        with path.open('rb') as source:
-            if time.time() - os.fstat(source.fileno()).st_mtime > TTL:
-                raise tasks.TaskError('grounding_frame_expired')
-            data=source.read(MAX_PIXELS*4+1000)
-    except FileNotFoundError as exc:
-        raise tasks.TaskError('grounding_frame_expired') from exc
-    if sha256(scope+data).hexdigest()!=args.frame:
-        raise tasks.TaskError('grounding_frame_changed')
+    path, data = read_frame(folder, scope, args.frame)
     if args.command == 'bind-row':
         import row_target
         check()

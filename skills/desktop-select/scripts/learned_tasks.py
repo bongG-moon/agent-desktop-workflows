@@ -199,10 +199,35 @@ def click_request(sentence):
     return name, role
 
 
+def _field_request(sentence):
+    """Recognize a single target-first assignment, preserving the literal's spelling."""
+    if not isinstance(sentence, str) or _conditional_sentence(sentence):
+        return None
+    match = re.fullmatch(r'(.{1,200}?)에\s*(.+?)\s*(?:을|를)?\s*'
+                         r'(?:선택|설정|입력|넣어)(?:해)?\s*(?:줘|주세요)?[.!。]?', sentence.strip())
+    if not match:
+        return None
+    subject, literal = match[1].strip(), match[2].strip()
+    if not subject or re.search(r'[,;!?\n]|하고|말고|대신|\s후\s|\s뒤\s', subject):
+        return None
+    variable = re.fullmatch(r'\{([^{}]+)\}', literal)
+    if variable or re.fullmatch(r'(?:실행\s*(?:할\s*)?때\s*)?입력\s*받(?:은|는)\s*(?:변수|값)', literal):
+        return subject, 'required', variable[1] if variable else None
+    quoted = re.fullmatch(r"""(?:'([^']*)'|"([^"]*)"|‘([^’]*)’|“([^”]*)”)""", literal)
+    if quoted:
+        return subject, 'fixed', next(v for v in quoted.groups() if v is not None)
+    if re.fullmatch(r'[\w./+()-]+', literal) and literal not in ('값', '변수'):
+        return subject, 'fixed', literal
+    return None
+
+
 def instruction_subject(sentence):
     """Return the field named in a supported sentence for an explicit alias link."""
     if not isinstance(sentence, str):
         return None
+    field = _field_request(sentence)
+    if field:
+        return re.sub(r'\s*(?:조건|콤보박스|콤보|항목|필드|입력란)$', '', field[0]).strip()
     patterns = (r'입력\s*받은\s*(?:\{[^{}]+\}\s*)?변수(?:를|을)\s*(.+?)에\s*',
                 r'\{[^{}]+\}(?:을|를)\s*(.+?)에\s*',
                 r'(.+?)(?:을|를)\s*')
@@ -313,6 +338,10 @@ def _parse_sentence(step, sentence):
     """Only parse one bounded, field-specific instruction. No shell or model evaluation."""
     verb = r'(?:선택|설정|입력|변경|해)(?:해)?\s*(?:줘|주세요)?'
     tail = r'(?:[.!。])?'
+    field = _field_request(sentence)
+    if field and step.get('action') in VALUE_ACTIONS:
+        subject = _instruction_subject(step, field[0])
+        return field[1], subject if field[2] is None else field[2]
     required = re.fullmatch(r'입력\s*받은\s*(?:\{([^{}]+)\}\s*)?변수(?:를|을)\s*(.+?)에\s*' + verb + tail, sentence)
     assign = re.fullmatch(r'(.+?)(?:을|를)\s*(.+?)(?:으로|로)\s*' + verb + tail, sentence)
     into = re.fullmatch(r'\{([^{}]+)\}(?:을|를)\s*(.+?)에\s*' + verb + tail, sentence)
@@ -382,7 +411,8 @@ def _instruction_agrees(parsed, sentence, mode, argument):
     # A plain "input variable" sentence names only the field. Its field label
     # supplies an initial parameter name, which the explicit editor can rename.
     # Braced names are explicit instructions and must still match.
-    return (argument.casefold() == actual_arg.casefold()
+    field = _field_request(sentence)
+    return (argument.casefold() == actual_arg.casefold() or (field is not None and field[1:] == ('required', None))
             or bool(re.match(r'^입력\s*받은\s*변수(?:를|을)\s*', sentence)))
 
 
@@ -408,7 +438,7 @@ def _semantic_instruction(raw_step, sentence, mode, argument, target, role, with
         raise TaskError('invalid_task_scope')
     # Classification only identifies the small action grammar; the existing
     # parser below still checks the subject, operation, and bound argument.
-    command = re.fullmatch(r'(.+?)(?:을|를)\s*(누르기|눌러|클릭|펼치기|펼쳐|선택|실행)'
+    command = not _field_request(sentence) and re.fullmatch(r'(.+?)(?:을|를)\s*(누르기|눌러|클릭|펼치기|펼쳐|선택|실행)'
                            r'(?:해)?\s*(?:줘|주세요)?(?:[.!。])?', sentence)
     action = 'open' if mode == 'recorded' or (mode is None and (command or click)) else 'select'
     inferred_role = click[1] if click else ('menuitem' if command and re.search(r'메뉴\s*$', command[1]) else 'button')
@@ -566,6 +596,8 @@ def instructed_step(raw_step, spec):
             if reason in RECOVERABLE_CAPTURE_REASONS and not is_recoverable(raw_step):
                 reason = 'action_needs_review'
             result = {**_manual(reason), **_annotations(raw_step), 'instruction_draft': spec['text']}
+            if 'menu_anchor' in raw_step:
+                result['menu_anchor'] = _menu_anchor(raw_step['menu_anchor'], reason)
             if 'visual_hint' in raw_step:
                 if not is_recoverable(result):
                     raise TaskError('invalid_visual_step')
@@ -629,6 +661,8 @@ def recorded_step(raw):
         return instructed_step(raw, spec)
     step = _convert(raw)
     step.update(_annotations(raw))
+    if 'menu_anchor' in raw:
+        step['menu_anchor'] = _menu_anchor(raw['menu_anchor'], step.get('reason'))
     if 'wait_after' in raw:
         step['wait_after'] = raw['wait_after']
     return step
@@ -674,6 +708,19 @@ def _validate_row(step):
         validate_spec(step.get('row'))
     except BridgeError as error:
         raise TaskError(error.code) from error
+
+
+def _menu_anchor(anchor, reason):
+    import context_menu
+    from win_bridge import BridgeError
+    if (reason != 'right_click_requires_menu_teaching' or not isinstance(anchor, dict)
+            or set(anchor) != {'target', 'point'}):
+        raise TaskError('invalid_context_anchor')
+    try:
+        context_menu._validate_surface(anchor['target'], anchor['point'])
+    except BridgeError as error:
+        raise TaskError(error.code) from error
+    return anchor
 
 
 def _validate_context(step):
@@ -762,6 +809,9 @@ def _validate_step(s, parameters):
         return
     if s.get('action') == 'manual':
         expected = {'action', 'reason'}
+        if 'menu_anchor' in s:
+            _menu_anchor(s['menu_anchor'], s.get('reason'))
+            expected.add('menu_anchor')
         if 'visual_hint' in s:
             from visual_target import validate_spec
             if not is_recoverable(s) or 'instruction_draft' not in s:

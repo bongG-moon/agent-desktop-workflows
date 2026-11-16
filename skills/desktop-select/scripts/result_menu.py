@@ -168,6 +168,26 @@ def _query(binding, locator, title):
         return execute(binding, uia, element, {'role': 'button'}, 'invoke', still_valid=still_valid)
 
 
+def observe(binding, uia, spec):
+    """Resolve the current surface without opening a menu or submitting a query."""
+    if spec['trigger']:
+        button = lookup.resolve(binding, uia, spec['trigger'])
+        _need('Click' in uia.actions(button), 'query_button_unavailable')
+    if spec['output']:
+        export_evidence.inventory(spec['output'])
+    region_observed = True
+    try:
+        context_menu._region(binding, uia, spec['menu']['target'])
+    except bridge.BridgeError as error:
+        # Some result controls are created only after the recorded query.
+        if not spec['trigger'] or error.code != 'context_region_missing':
+            raise
+        region_observed = False
+    return dict(status='observed', input_dispatched=False, region_observed=region_observed,
+                menu_target=spec['menu']['target'], menu_path=spec['menu']['path'],
+                menu_verification='pending_execution')
+
+
 def execute(binding, spec, guard, title, *, observe_guard=None):
     validate_spec(spec)
     ready, trigger, output = spec['ready'], spec['trigger'], spec['output']

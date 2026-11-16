@@ -86,6 +86,10 @@ def capture_step(step):
               'recognition': copy.deepcopy(step['recognition'])}
     if 'window' in target:
         result['target']['window'] = copy.deepcopy(target['window'])
+        if role == 'menuitem' and learned_tasks._text(locator.get('name'), 200):
+            # A transient branch may disappear before the route is complete.
+            # Keep the witnessed caption for the host's later live inspection.
+            result['description'] = locator['name'].strip()
     if step.get('field_label'):
         result['field_label'] = step['field_label']
     if action == 'set-value':
@@ -127,6 +131,20 @@ class CaptureNotes:
 
     def manual(self, label, reason):
         self.add(manual(reason))
+
+    def context_start(self, step_id, surface):
+        with self.lock:
+            step = manual('right_click_requires_menu_teaching', step_id)
+            self.add(step)
+            if step_id in self.steps:
+                self.steps[step_id]['menu_anchor'] = surface
+
+    def context_complete(self, step):
+        with self.lock:
+            previous = self.steps.get(step['id'], {})
+            if (not self.closed and previous.get('menu_anchor')
+                    and previous.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching'):
+                self.steps[step['id']] = step
 
     def row_step(self, step_id, number, spec, selection=None):
         """Keep the click's original order while the observed row state settles."""
@@ -185,8 +203,10 @@ def default_text(step):
 
 
 def instruction_view(step, instruction):
+    if step.get('ordinary_menu') and instruction and instruction.get('mode') == 'draft':
+        return '작성한 설명과 우클릭 위치를 저장합니다. 현재 메뉴에서 지시한 경로를 확인합니다.'
     if step.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching':
-        return '새 작업에서 일반 우클릭 전에 ‘조회 후 우클릭 메뉴 가르치기’를 선택하세요.'
+        return '작성한 설명을 바탕으로 현재 창의 우클릭 위치와 하위 메뉴 경로를 확인합니다.'
     if step['action'] == 'result-menu':
         spec = step['context']
         route = (['조회 완료 확인'] if spec['trigger'] else []) + ['표 우클릭', *spec['menu']['path']]
@@ -227,6 +247,9 @@ class StepEdits:
 
     @staticmethod
     def identity(step):
+        if step.get('ordinary_menu') or step.get('menu_anchor'):
+            anchor = step.get('menu_anchor') or step['context']['menu']
+            return 'observed_context_surface', anchor['target'], anchor['point']
         if step['action'] == 'visual-click':
             return step['action'], step['visual']
         if step['action'] == 'row-action':
@@ -258,6 +281,13 @@ class StepEdits:
         if '=' in alias or alias.isdecimal():
             raise ValueError('별칭에는 등호 또는 숫자만으로 된 이름을 사용할 수 없습니다.')
         data = {'alias': alias} if alias else {}
+        if step.get('ordinary_menu') and mode is None:
+            text = sentence.strip()
+            if text and text != step['label']:
+                if not learned_tasks._text(text, 1000) or len(text.encode('utf-8')) > 1000:
+                    raise learned_tasks.TaskError('invalid_step_instruction')
+                data['instruction'] = dict(mode='draft', text=text)
+            return data
         if step['action'] in ('row-action', 'result-menu', 'visual-click') and sentence.strip() == step['label'] and mode is None:
             return data
         # A recorded literal can contain punctuation outside the sentence
@@ -330,7 +360,7 @@ class StepEdits:
             draft = self.drafts.get(step['id'])
             # Persist the visible generated instructions too. Otherwise an
             # untouched row can silently keep old recording-only semantics.
-            if (step['action'] != 'result-menu'
+            if ((step['action'] != 'result-menu' or step.get('ordinary_menu'))
                     and (saved or (draft and draft[0] == self.identity(step)) or default_text(step))):
                 sentence, mode, argument = self.form(step)
                 try:
@@ -338,8 +368,19 @@ class StepEdits:
                 except (ValueError, bridge.BridgeError):
                     self.failed_step = step['id']
                     raise
-            result.append(dict(step, **saved))
+            result.append(self.edited_step(step, saved))
         return result
+
+    @staticmethod
+    def edited_step(step, fields):
+        if step.get('ordinary_menu') and fields.get('instruction', {}).get('mode') == 'draft':
+            # A user override supersedes the witnessed route. Keep its surface
+            # and captions as context; only the new sentence supplies intent.
+            menu = step['context']['menu']
+            scope = {k: step[k] for k in ('_capture_window', 'window_context') if k in step}
+            step = dict(manual('right_click_requires_menu_teaching', step['id']), **scope,
+                        description=step['label'], menu_anchor={k: menu[k] for k in ('target', 'point')})
+        return dict(step, **fields)
 
 
 class _BoundWindow:
@@ -387,7 +428,9 @@ class _HookWindows:
                 and bridge.hwnd_pid(hwnd) != self.bound.pid)
 
     def recording_candidate(self, hwnd):
-        return self.bound.recording_candidate(hwnd) or self.embedded(hwnd)
+        return (self.bound.recording_candidate(hwnd) or self.embedded(hwnd) or
+                bool(hwnd and bridge.hwnd_pid(hwnd) == self.bound.pid
+                     and bridge.window_class(bridge.root_window(hwnd)) == '#32768'))
 
 
 class _CaptureUIA(bridge.UIA):
@@ -395,6 +438,11 @@ class _CaptureUIA(bridge.UIA):
     def __init__(self, binding):
         super().__init__()
         self.binding = binding
+
+    def observe_point(self, binding, x, y, window=None):
+        result = super().observe_point(binding, x, y, window)
+        result['pointer'] = (x, y)
+        return result
 
     def value_observation(self, element):
         if element.property(30003) == 50004:
@@ -474,8 +522,25 @@ class _Worker(recorder.CaptureWorker):
     pointed = None
     row_tracker = None
     visual_tracker = None
+    menu_gesture = None
 
     def observe_down(self, event):
+        if event.get('kind') == 'down':
+            if event.get('action') == 'right-click':
+                from menu_capture import capture_surface
+                self.menu_gesture = None
+                event['menu_anchor'] = capture_surface(self.binding, self.uia, event, self.hover_history)
+            elif self.menu_gesture is not None:
+                pick = self.menu_gesture.at_down(self.binding, self.uia, event)
+                if pick:
+                    # The menu observer proved this HWND, point and item. The
+                    # legacy capture worker must not interpret it as a combo.
+                    event.update(menu_pick=pick, scope_proven=True)
+                    return None
+                self.menu_gesture = None
+            if (event.get('scope_proven') is False and event.get('window')
+                    and bridge.window_class(event['window']) == '#32768'):
+                return None
         # Pin pixels completed BEFORE the hook reported mouse-down. The live
         # UIA lookup may finish after the application's click handler.
         tracker = self.row_tracker
@@ -555,6 +620,9 @@ class _Worker(recorder.CaptureWorker):
         return observation
 
     def handle(self, event):
+        if event['kind'] in ('outside', 'scroll', 'candidate_scroll', 'typing', 'enter', 'tab',
+                             'escape', 'shortcut', 'pause'):
+            self.menu_gesture = None
         if self.row_tracker and event['kind'] in ('scroll','candidate_scroll'):
             self.row_tracker.invalidate(event['at'])
         self.model.event_at = event.get('at')
@@ -562,6 +630,8 @@ class _Worker(recorder.CaptureWorker):
             down, _ = self.captures.get(event.get('token'), (None, None))
             if down:
                 self.model.event_at = down.get('at', self.model.event_at)
+                if not event['inside'] or abs(event['x'] - down['x']) > 8 or abs(event['y'] - down['y']) > 8:
+                    self.menu_gesture = None
         try:
             return super().handle(event)
         finally:
@@ -569,15 +639,27 @@ class _Worker(recorder.CaptureWorker):
 
     def tick(self):
         super().tick()
+        self._poll_menu()
         if (self.row_tracker and self.hovered and self.hovered.get('window') == self.binding.hwnd
                 and self.hovered['node'].get('role') in ('list','listitem','row','table')):
             self.row_tracker.interest.set()
+
+    def _poll_menu(self):
+        gesture = self.menu_gesture
+        if gesture is not None:
+            state = gesture.tick(self.binding, self.uia, time.monotonic())
+            if state == 'complete':
+                self.model.context_complete(gesture.step())
+            if state != 'pending':
+                self.menu_gesture = None
 
     def capture_double(self, down, observation):
         previous_id = (self.recent_click or {}).get('step_id')
         result = super().capture_double(down,observation)
         if result and previous_id and self.row_tracker:
             self.row_tracker.cancel_step(previous_id)
+        if result:
+            self.menu_gesture = None
         return result
 
     def _drop_watch(self):
@@ -732,7 +814,19 @@ class _Worker(recorder.CaptureWorker):
         pointed = None
         if event['action'] == 'right-click':
             self.freeze_watch(event.get('at'))
+            surface = event.get('menu_anchor')
+            if surface:
+                from menu_capture import MenuGesture
+                step_id = uuid.uuid4().hex
+                self.model.context_start(step_id, surface)
+                self.menu_gesture = MenuGesture(step_id, surface, event, self.binding.info()['dpi'])
+                return step_id
             self.model.manual('', 'right_click_requires_menu_teaching')
+            return
+        if event.get('menu_pick') is not None and self.menu_gesture is not None:
+            self.menu_gesture.clicked = event['menu_pick']
+            self.menu_gesture.last_poll = 0
+            self._poll_menu()
             return
         if observation:
             if event['action'] == 'click' and 'painted_row' in observation:
@@ -1250,7 +1344,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         return '준비됨'
 
     def fields():
-        if editing is not None and editing['action'] == 'result-menu':
+        if editing is not None and editing['action'] == 'result-menu' and not editing.get('ordinary_menu'):
             return alias.get(), '', None, None
         chosen = modes[mode.get()]
         return alias.get(), instruction.get(), chosen, argument.get()
@@ -1300,10 +1394,11 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     def load(step):
         sentence, chosen, arg = edits.form(step)
         configured = step['action'] in ('row-action', 'result-menu', 'visual-click')
-        sentence_entry.configure(state='readonly' if step['action'] == 'result-menu' else 'normal')
+        fixed_menu = step['action'] == 'result-menu' and not step.get('ordinary_menu')
+        sentence_entry.configure(state='readonly' if fixed_menu else 'normal')
         mode_box.configure(state='disabled' if configured else 'readonly')
         alias.set(edits.alias(step))
-        instruction.set(step['label'] if step['action'] == 'result-menu' else sentence)
+        instruction.set(step['label'] if fixed_menu else sentence)
         mode.set(next(label for label, value in modes.items() if value == chosen))
         argument.set(arg or '')
         selected_number = next((i for i, s in enumerate(steps_now(), 1) if s['id'] == step['id']), '')
@@ -1335,7 +1430,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
                 render(review['steps'])
 
     def update_readiness(step, data):
-        compiled = learned_tasks.recorded_step(dict(step, **data))
+        compiled = learned_tasks.recorded_step(edits.edited_step(step, data))
         if compiled['action'] == 'manual' or 'instruction_draft' in compiled:
             unfinished.add(step['id'])
         else:

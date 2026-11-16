@@ -7,10 +7,12 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'skills' / 'desktop-select'
-VERSION = '0.4.16'
+VERSION = '0.4.17'
 FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'scripts/desktop_select.py',
                                          'scripts/live_action.py', 'scripts/targeting.py',
                                          'scripts/teach_capture.py', 'scripts/learned_tasks.py', 'scripts/review_drafts.py',
+                                         'scripts/recovery.py', 'scripts/live_recovery.py', 'scripts/menu_capture.py',
+                                         'scripts/continue_recording.py',
                                          'scripts/row_vision.py', 'scripts/row_teach.py', 'scripts/row_action.py',
                                          'scripts/row_capture.py', 'scripts/row_intent.py', 'scripts/row_target.py',
                                          'scripts/context_teach.py', 'scripts/context_menu.py',

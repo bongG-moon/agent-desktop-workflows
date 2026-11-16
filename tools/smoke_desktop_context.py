@@ -20,7 +20,7 @@ from smoke_native import Fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK = "Device result export"
-CASES = ("complete", "painted-result", "no-result", "stale-result", "no-file")
+CASES = ("complete", "painted-result", "no-result", "stale-result", "no-file", "group-menu")
 
 
 def compile_fixture(work):
@@ -73,7 +73,9 @@ def exercise(skill, work, exe, cases=CASES):
         folder = work / case
         folder.mkdir()
         book = folder / "report.xlsx"
-        fixture = Fixture(exe, str(book), ready_timeout=25)
+        group = case == "group-menu"
+        path = ["Export to excel", "Active sheet"] if group else ["EXPORT", "EXPORT TO EXCEL"]
+        fixture = Fixture(exe, str(book), *(["--group"] if group else []), ready_timeout=25)
         try:
             window = fixture.ready
             hwnd = window["hwnd"]
@@ -84,7 +86,7 @@ def exercise(skill, work, exe, cases=CASES):
             with app.bridge.UIA() as uia:
                 nodes, els = app.observe(binding, uia, identities_only=True)
                 grid_index, = [i for i, n in enumerate(nodes) if n.get("automation_id") == "ResultSurface"]
-                assert nodes[grid_index]["role"] == "table" and not list(uia.children(els[grid_index]))
+                assert nodes[grid_index]["role"] == ("group" if group else "table") and not list(uia.children(els[grid_index]))
                 def observed(identity):
                     node, = [n for n in nodes if n.get("automation_id") == identity]
                     return {"role": node["role"], "automation_id": node["automation_id"]}
@@ -101,7 +103,7 @@ def exercise(skill, work, exe, cases=CASES):
                 ready = {"kind": "text", "target": observed("ResultIndicator"), "expected": "RESULT READY"}
                 region = observed("ResultSurface")
             x, y, w, h = window["grid_bounds"]
-            menu = context_menu.teach_at(binding, (x+w//2, y+h//2), ["EXPORT", "EXPORT TO EXCEL"],
+            menu = context_menu.teach_at(binding, (x+w//2, y+h//2), path,
                                          target=region["automation_id"], role=region["role"])
             if case == "painted-result":
                 import result_menu
@@ -133,15 +135,38 @@ def exercise(skill, work, exe, cases=CASES):
             if case == "no-file":
                 fixture.command("skip-file")
             expected_family = "DRAM" if case == "painted-result" else "Hybrid"
-            run = replay("--set", "Family=" + expected_family)
+            if group:
+                # Use a separate project with the same installed runtime bytes.
+                from build_desktop_select import FILES
+                from runtime_integrity import checked_path
+                for name in FILES:
+                    source = skill / name
+                    if not source.is_file():
+                        source = checked_path(Path(name).name) if name.startswith("scripts/") else FILES[name]
+                    destination = folder / "desktop-select" / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(source.read_bytes())
+                def command(*args):
+                    proc = subprocess.run([sys.executable, "-X", "utf8", "-B", *map(str, args)],
+                                          cwd=folder, env=env, capture_output=True, encoding="utf8", timeout=165)
+                    answer = json.loads(proc.stdout)
+                    assert proc.returncode == 0, answer
+                    return answer
+                baseline = fixture.command("state")
+                reg = command(tool.with_name("python_workflow.py"), "register", "--task", TASK, "--out", folder/"device-report")
+                check("group_registration_checks_live_without_input", reg["status"] == "registered"
+                      and not reg["input_dispatched"] and fixture.command("state") == baseline, reg)
+                run = command(folder / "device-report/scripts/run.py", "--set", "Family=" + expected_family)
+            else:
+                run = replay("--set", "Family=" + expected_family)
             actual = fixture.command("state")
             (folder / "receipt.json").write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf8")
             effect = run["steps"][-1]["receipt"]
-            if case in ("complete", "painted-result"):
+            if case in ("complete", "painted-result", "group-menu"):
                 prefix = "painted_" if case == "painted-result" else ""
                 check(prefix + "single_full_replay_verified", run["status"] == "verified" and len(run["steps"]) == 3
                       and all(effect.get(key) is True for key in ("query_verified", "leaf_dispatched", "workbook_verified"))
-                      and effect.get("menu_items") == ["EXPORT", "EXPORT TO EXCEL"], run)
+                      and effect.get("menu_items") == path, run)
                 check(prefix + "submitted_fixed_and_runtime_conditions", (actual["status"], actual["family"],
                       actual["result_status"], actual["result_family"]) == ("N", expected_family, "N", expected_family), actual)
                 check(prefix + "query_real_right_click_and_owned_menu_exactly_once", tuple(actual[k] for k in (

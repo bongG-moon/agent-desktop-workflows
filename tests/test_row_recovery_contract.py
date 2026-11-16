@@ -135,7 +135,10 @@ class GroundedRowTests(TestCase):
         original = path.read_bytes()
         owner = SimpleNamespace(hwnd=5,pid=42,created='100',exe='Manager.exe')
         app = desktop_select
-        def worker(args, mutating, payload):
+        def worker(args, mutating, payload=None):
+            if args == ['_worker', 'recover', '--task', 'watch']:
+                self.assertFalse(mutating)
+                return dict(status='observed', input_dispatched=False, live_scopes=[])
             return flow.run(payload['recipe'])
         with (patch.object(app,'task_directory',return_value=store),
               patch.object(app,'worker_receipt',side_effect=worker),

@@ -45,6 +45,11 @@ def validate(doc):
             ancestors = step['target'].get('locator', {}).get('ancestors', [])
             require(isinstance(ancestors, list) and all(isinstance(node, dict) for node in ancestors))
         require(isinstance(step.get('recognition', {}), dict))
+        if 'ordinary_menu' in step:
+            require(step['action'] == 'result-menu' and step['ordinary_menu'] is True)
+        if 'menu_anchor' in step:
+            require(step['action'] == 'manual')
+            tasks._menu_anchor(step['menu_anchor'], step.get('recognition', {}).get('reason'))
         if step['action'] == 'set-value':
             require(isinstance(step.get('value'), str))
         if '_capture_window' in step:
@@ -75,6 +80,7 @@ def summary(doc):
 def receipt(doc, status):
     return dict(status=status, draft=True, diagnostic='recording_draft_requires_review',
                 save_diagnostic=doc['diagnostic'], step_number=doc['step_number'], task=summary(doc),
+                host_action='observe_and_recover_recorded_steps', recover_args=['recover', '--task', doc['name']],
                 resume_args=['review', '--task', doc['name']],
                 input_dispatched=False)
 

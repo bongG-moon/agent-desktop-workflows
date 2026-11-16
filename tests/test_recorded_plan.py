@@ -38,6 +38,21 @@ def recording():
 
 
 class CompilationTests(unittest.TestCase):
+    def test_query_wait_and_exact_group_menu_survive_compilation(self):
+        task = recording()
+        task['steps'][-1]['wait_after'] = 5
+        menu = dict(action='result-menu', label='시트 내보내기', context=dict(
+            trigger=None, ready=None, output=None, menu=dict(
+                target=dict(role='group', automation_id='Results'), point=[.38, .54],
+                path=['Export to excel', 'Active sheet'])))
+        task['steps'].append(menu)
+        compiled = plans.compile_plan(task)['envelope']
+        actions = compiled['recipe']['steps']
+        self.assertEqual([s['action'] for s in actions], ['set-value','set-value','invoke','wait','result-menu'])
+        self.assertEqual((actions[0]['value'], actions[1]['parameter'], actions[-2]['seconds']), ('N', 'Family', 5))
+        self.assertEqual(actions[-1], menu)
+        self.assertEqual(compiled['source_steps'], [1, 2, 3, 3, 4])
+
     def test_fixed_and_required_text_and_stable_scope_are_preserved(self):
         source = recording()
         source['steps'][1].update(alias='제품군', description='업무에서 받은 제품군')

@@ -19,6 +19,7 @@ using System.Windows.Threading;
 
 sealed class ResultSurface : FrameworkElement {
     internal bool Ready;
+    internal bool GroupRole;
     internal string Result = "";
     static readonly Typeface Face = new Typeface("Segoe UI");
     internal ResultSurface() {
@@ -40,7 +41,9 @@ sealed class ResultSurface : FrameworkElement {
     sealed class SurfacePeer : FrameworkElementAutomationPeer {
         internal SurfacePeer(ResultSurface element) : base(element) {}
         protected override string GetClassNameCore() { return "PaintedResults"; }
-        protected override AutomationControlType GetAutomationControlTypeCore() { return AutomationControlType.DataGrid; }
+        protected override AutomationControlType GetAutomationControlTypeCore() {
+            return ((ResultSurface)Owner).GroupRole ? AutomationControlType.Group : AutomationControlType.DataGrid;
+        }
         protected override List<AutomationPeer> GetChildrenCore() { return null; }
     }
 }
@@ -59,7 +62,8 @@ sealed class DesktopContextFixture : Window {
     string resultStatus = "", resultFamily = "";
     bool hold, stale, skipFile;
 
-    DesktopContextFixture(string path) {
+    DesktopContextFixture(string path, bool groupRole) {
+        surface.GroupRole = groupRole;
         output = path; Width = 525; Height = 370; Title = "Synthetic device report";
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         ShowInTaskbar = false;
@@ -78,11 +82,13 @@ sealed class DesktopContextFixture : Window {
         timer.Tick += delegate { timer.Stop(); generation++; UpdateResult(true); };
         panel.Children.Add(query); panel.Children.Add(indicator); panel.Children.Add(surface);
         var decoy = new Menu();
-        var menu = new MenuItem { Header = "EXPORT" };
-        var item = new MenuItem { Header = "EXPORT TO EXCEL" };
+        string export = groupRole ? "Export to excel" : "EXPORT";
+        string selection = groupRole ? "Active sheet" : "EXPORT TO EXCEL";
+        var menu = new MenuItem { Header = export };
+        var item = new MenuItem { Header = selection };
         item.Click += delegate { unrelated++; }; menu.Items.Add(item); decoy.Items.Add(menu); panel.Children.Add(decoy);
-        var parent = new MenuItem { Header = "EXPORT" };
-        var leaf = new MenuItem { Header = "EXPORT TO EXCEL" };
+        var parent = new MenuItem { Header = export };
+        var leaf = new MenuItem { Header = selection };
         var other = new MenuItem { Header = "Copy cell" };
         other.Click += delegate { unrelated++; };
         parent.SubmenuOpened += delegate { parents++; };
@@ -170,5 +176,7 @@ sealed class DesktopContextFixture : Window {
             if (cmd == "quit") break;
         }
     }
-    [STAThread] static void Main(string[] args) { new Application().Run(new DesktopContextFixture(args[0])); }
+    [STAThread] static void Main(string[] args) {
+        new Application().Run(new DesktopContextFixture(args[0], args.Length == 2 && args[1] == "--group"));
+    }
 }

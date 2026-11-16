@@ -93,18 +93,20 @@ def _text(value):
 
 def validate_spec(spec):
     _need(isinstance(spec, dict) and set(spec) == {'target', 'point', 'path'}, 'invalid_context_spec')
-    target = spec['target']
+    _validate_surface(spec['target'], spec['point'])
+    path = spec['path']
+    _need(isinstance(path, list) and 1 <= len(path) <= 8 and all(_text(v) for v in path),
+          'invalid_context_menu_path')
+
+
+def _validate_surface(target, point):
     _need(isinstance(target, dict) and set(target) in ({'role','name'}, {'role','automation_id'})
           and isinstance(target['role'], str) and target['role'] in REGIONS
           and _text(target.get('name', target.get('automation_id')))
           and not str(target.get('automation_id', '')).isdecimal(), 'invalid_context_target')
-    point = spec['point']
     _need(isinstance(point, list) and len(point) == 2 and all(
         type(v) in (float, int) and .02 <= v <= .98 and math.isfinite(v) for v in point),
         'context_point_near_boundary')
-    path = spec['path']
-    _need(isinstance(path, list) and 1 <= len(path) <= 8 and all(_text(v) for v in path),
-          'invalid_context_menu_path')
 
 
 def _rect(uia, element):
@@ -201,12 +203,11 @@ def _hit_region(binding, uia, region, point):
     raise win.BridgeError('context_point_outside_region')
 
 
-def teach_at(binding, screen_point, menu_path, *, target=None, role=None):
-    """Return the reviewed region's identity and relative point. Sends no input."""
+def teach_surface(binding, screen_point, *, target=None, role=None):
+    """Observe the named region and local point before a context menu opens."""
     binding.check()
     _need(isinstance(screen_point, (tuple,list)) and len(screen_point) == 2 and
           all(type(v) is int for v in screen_point), 'invalid_context_point')
-    _need(isinstance(menu_path, (tuple, list)), 'invalid_context_menu_path')
     with win.UIA() as uia:
         element = uia.from_point(*screen_point)
         root = uia.from_handle(binding.hwnd)
@@ -218,20 +219,36 @@ def teach_at(binding, screen_point, menu_path, *, target=None, role=None):
             _need(uia.pid(element) == binding.pid and not uia.secure(element), 'context_point_protected')
             info = uia.basic(element)
             if info['role'] in REGIONS and role in (None, info['role']):
-                key = next((k for k in ('automation_id','name') if _text(info.get(k))
-                            and target in (None, info[k])), None)
-                if key:
-                    locator = {'role':info['role'], key:info[key]}
-                    region = _region(binding, uia, locator)
+                for key in ('automation_id', 'name'):
+                    value = info.get(key)
+                    if not _text(value) or target not in (None, value) or (key == 'automation_id' and value.isdecimal()):
+                        continue
+                    locator = {'role': info['role'], key: value}
+                    try:
+                        region = _region(binding, uia, locator)
+                    except win.BridgeError as error:
+                        # A repeated child group may still have a unique name or a
+                        # named containing table. Only ordinary point teaching may
+                        # switch identity. An explicit target must stay unambiguous.
+                        if target is None and error.code == 'context_region_ambiguous':
+                            continue
+                        raise
                     _need(uia.same(element, region), 'context_region_changed')
                     _hit_region(binding, uia, region, screen_point)
                     x, y, w, h = _rect(uia, region)
                     ratios = [(screen_point[0]-x)/w, (screen_point[1]-y)/h]
-                    spec = {'target':locator, 'point':ratios, 'path':list(menu_path)}
-                    validate_spec(spec)
-                    return spec
+                    _validate_surface(locator, ratios)
+                    return {'target':locator, 'point':ratios}
             element = uia.parent(element)
     raise win.BridgeError('named_context_region_required')
+
+
+def teach_at(binding, screen_point, menu_path, *, target=None, role=None):
+    """Bind a supplied menu path to a region observed in the live window."""
+    _need(isinstance(menu_path, (tuple, list)), 'invalid_context_menu_path')
+    spec = dict(teach_surface(binding, screen_point, target=target, role=role), path=list(menu_path))
+    validate_spec(spec)
+    return spec
 
 
 @dataclass

@@ -54,4 +54,4 @@ class MenuRecordingTests(unittest.TestCase):
                                           'target': {'kind': 'region', 'locator': {'role': 'group'}}})
         self.assertEqual('manual', step['action'])
         self.assertIn('우클릭', step['label'])
-        self.assertIn('조회 후 우클릭 메뉴 가르치기', teach_capture.instruction_view(step, None))
+        self.assertIn('현재 창의 우클릭 위치', teach_capture.instruction_view(step, None))

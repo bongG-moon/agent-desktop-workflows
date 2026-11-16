@@ -235,7 +235,7 @@ def observe(binding, uia, *, identities_only=False):
     return nodes, elements
 
 
-LIST_ROLES = {'button', 'combobox', 'menuitem', 'treeitem', 'tab', 'table', 'toolbar', 'textfield', 'checkbox'}
+LIST_ROLES = {'button', 'splitbutton', 'hyperlink', 'combobox', 'menuitem', 'treeitem', 'tab', 'table', 'toolbar', 'textfield', 'checkbox'}
 
 
 def describe(node, regions, label):
@@ -413,7 +413,11 @@ def execution_plan_info(result):
 
 def save_instruction(args):
     """Keep freeform source prose and its once-interpreted action in a new task."""
-    source = tasks.load_task(args.task, task_directory())
+    source = tasks.load_task(args.task, task_directory(), allow_review=True)
+    if source.get('kind') == review_drafts.KIND:
+        result = review_drafts.receipt(source, 'needs_review')
+        result['save_as'] = args.save_as
+        return attach_recovery(result, args.task)
     plan = deepcopy(source)
     tasks.check_new_task(args.save_as, task_directory())
     number = tasks._step_number(plan, args.only)
@@ -644,6 +648,15 @@ def edit_recording(owner, storage):
     return result
 
 
+def attach_recovery(result, name):
+    """After an incomplete recording, give the host current app evidence in the same response."""
+    result['recover_args'] = ['recover', '--task', name]
+    result['live_recovery'] = worker_receipt(['_worker', *result['recover_args']], mutating=False)
+    if result.get('input_dispatched') is not False:
+        result['host_action'] = 'check_current_effect_before_continuing'
+    return result
+
+
 def run(args):
     if args.command == 'storage':
         return storage_info()
@@ -651,12 +664,21 @@ def run(args):
         directory = task_directory()
         doc = tasks.read_document(args.task, directory)
         if doc.get('kind') != review_drafts.KIND:
-            raise tasks.TaskError('task_already_saved')
+            tasks._validate(doc)
+            return dict(status='observed', task=tasks.summary(doc), diagnostic='task_already_saved',
+                        continue_args=['continue-recording', '--task', args.task],
+                        recover_args=['recover', '--task', args.task], input_dispatched=False)
         review_drafts.validate(doc)
         storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
         bridge.set_dpi_awareness()
         return edit_recording(None, storage)
     bridge.set_dpi_awareness()
+    if args.command == 'continue-recording':
+        import continue_recording
+        return continue_recording.run(sys.modules[__name__], args)
+    if args.command == 'recover':
+        import recovery
+        return recovery.run(sys.modules[__name__], args)
     if args.command in ('ground','bind-visual','bind-row'):
         import grounding
         return grounding.run(sys.modules[__name__],args)
@@ -672,7 +694,12 @@ def run(args):
     if args.command in ('plan', 'show', 'replay'):
         plan = tasks.load_task(args.task, task_directory(), allow_review=True)
         if plan.get('kind') == review_drafts.KIND:
-            return review_drafts.receipt(plan, 'observed' if args.command == 'show' else 'needs_review')
+            result = review_drafts.receipt(plan, 'observed' if args.command == 'show' else 'needs_review')
+            if args.command == 'replay' and not getattr(args, 'input_plan', False):
+                if args.exe.casefold() != plan['exe'].casefold() or args.window != plan['window']:
+                    raise tasks.TaskError('recorded_window_mismatch')
+                return attach_recovery(result, args.task)
+            return result
     if args.command == 'plan':
         result = saved_execution_plan(plan)
         return dict(status='planned' if result.get('envelope') else 'needs_review',
@@ -694,12 +721,17 @@ def run(args):
                 return refusal
         overrides = tasks.parse_overrides(args.set)
         quick = fast_replay(original, args, overrides)
-        if quick is not None:
-            return quick
-        report = _replay_recorded(plan, args, overrides, background)
-        if report.get('diagnostic') == 'instruction_requires_structure':
-            report['host_action'] = 'interpret_recorded_instructions'
-        return dict(report, input_policy='background_only' if background else 'auto', input_requirements=requirements)
+        if quick is None:
+            report = _replay_recorded(plan, args, overrides, background)
+            if report.get('diagnostic') == 'instruction_requires_structure':
+                report['host_action'] = 'interpret_recorded_instructions'
+            quick = dict(report, input_policy='background_only' if background else 'auto', input_requirements=requirements)
+        missing_target = quick.get('diagnostic') in (
+            'target_missing', 'target_ambiguous', 'target_grounding_required', 'new_context_menu_item_missing',
+            'context_menu_item_changed', 'recorded_window_not_open')
+        if quick['status'] in ('needs_grounding', 'needs_review') or missing_target:
+            return attach_recovery(quick, args.task)
+        return quick
     rows = windows(args.exe)
     if args.command == 'windows':
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
@@ -745,9 +777,22 @@ def run(args):
             result.append({'number': number, 'label': step['label'], 'observed_state': state})
         return {'status': 'observed', 'steps': result, 'input_dispatched': False}
     if args.command == 'record':
-        storage = review_drafts.ReviewStorage(args.task, args.exe, args.window, task_directory())
+        try:
+            storage = review_drafts.ReviewStorage(args.task, args.exe, args.window, task_directory())
+        except tasks.TaskError as error:
+            if error.code != 'task_already_exists':
+                raise
+            source = tasks.load_task(args.task, task_directory())
+            tasks.check_binding(source, args.exe, args.window)
+            return dict(status='needs_review', diagnostic=error.code, task=tasks.summary(source),
+                        host_action='continue_recording_from_saved_task',
+                        continue_args=['continue-recording', '--task', args.task], input_dispatched=False)
         guard(owner, owner, args.window)
-        return edit_recording(owner, storage)
+        result = edit_recording(owner, storage)
+        if result.get('status') == 'recorded' and (result.get('draft') or
+                result.get('execution_plan', {}).get('status') == 'not_compatible'):
+            return attach_recovery(result, args.task)
+        return result
     anchor = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
@@ -821,6 +866,17 @@ def parser():
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
     commands.add_parser('review', help='reopen an editable recording draft without its application').add_argument('--task', required=True)
+    repair = commands.add_parser('recover', help='inspect the live task windows or bind interpreted steps into a new task')
+    repair.add_argument('--task', required=True)
+    repair.add_argument('--only', type=int, help='observe one original step')
+    repair.add_argument('--image', action='store_true', help='also capture the selected step window locally')
+    repair.add_argument('--bindings', type=Path, help='local JSON with source_fingerprint and interpreted steps')
+    repair.add_argument('--save-as', help='derived task name when applying bindings')
+    continuation = commands.add_parser('continue-recording', help='record or merge a supplement while preserving the source')
+    continuation.add_argument('--task', required=True)
+    continuation.add_argument('--from-step', type=int, help='replace the tail starting at this step; defaults to append')
+    continuation.add_argument('--supplement', help='merge a previously saved supplement instead of opening a recorder')
+    continuation.add_argument('--save-as', help='optional name for the combined task')
     commands.add_parser('plan', help='save a literal execution plan from recorded instructions').add_argument('--task', required=True)
     interpret = commands.add_parser('interpret', help='compile host-interpreted conditional steps for an existing recording')
     interpret.add_argument('--task', required=True)
@@ -968,7 +1024,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'review', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('record', 'review', 'continue-recording', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
 
 
 if __name__ == '__main__':

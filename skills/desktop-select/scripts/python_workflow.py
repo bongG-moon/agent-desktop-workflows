@@ -20,6 +20,7 @@ import context_menu
 import export_evidence
 import input_policy
 import live_action as live
+import result_menu
 import row_action
 import row_intent
 import row_vision
@@ -148,6 +149,10 @@ def validate(recipe):
             need(text(step.get('label', 'step'), 200), 'invalid_step_label')
             context_menu.validate_spec(step.get('spec'))
             continue
+        if step.get('action') == 'result-menu':
+            app.tasks._annotations(step)
+            app.tasks._validate_context(step)
+            continue
         if step.get('action') == 'verify-file':
             need(not set(step) - {'action', 'output', 'timeout', 'label'}, 'unknown_step_field')
             need(text(step.get('label', 'step'), 200), 'invalid_step_label')
@@ -156,7 +161,7 @@ def validate(recipe):
             need(type(timeout) in (int, float) and 0 <= timeout <= 120, 'invalid_file_timeout')
             continue
         need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label', 'popup',
-                              'grounding_text'}, 'unknown_step_field')
+                              'grounding_text', 'allow_option_select'}, 'unknown_step_field')
         need(step.get('action') in ('set-value', 'invoke', 'submit'), 'unsupported_workflow_action')
         if 'popup' in step:
             popup = step['popup']
@@ -167,6 +172,9 @@ def validate(recipe):
             need(type(timeout) in (int, float) and 0 <= timeout <= 10, 'invalid_popup_timeout')
         selector = step.get('selector')
         validate_selector(selector)
+        if 'allow_option_select' in step:
+            need(step['action'] == 'set-value' and selector['role'] == 'combobox' and
+                 step['allow_option_select'] is True, 'invalid_combo_selection')
         if 'grounding_text' in step:
             need(step['action'] == 'invoke' and 'query' in selector and text(step['grounding_text']),
                  'invalid_grounding_instruction')
@@ -218,6 +226,7 @@ def worker_timeout(recipe):
     return 90 + sum(step.get('seconds', 0) + step.get('popup', {}).get('timeout', 3 if 'popup' in step else 0)
                     + (step.get('timeout', 26) if step['action'] == 'verify-file' else 0)
                     + (3 * len(step['spec']['path']) + 3 if step['action'] == 'context-menu' else 0)
+                    + (60 + 3 * len(step['context']['menu']['path']) if step['action'] == 'result-menu' else 0)
                     + (120 if step['action'] in ('row-action', 'row-launch') else 0)
                     + (CHILD_VISUAL_TIMEOUT if step['action'] == 'visual-click'
                        and 'after_step' in step.get('window_context', {}) else 0)
@@ -313,7 +322,8 @@ def confirm_opened_window(report, routes, number):
         return
     receipt = routes.outcomes.get(number)
     if (receipt and (routes.steps[number-1]['action'],receipt.get('diagnostic')) in (
-            ('invoke','business_result_not_verified'),('row-open','row_open_dispatched'))
+            ('invoke','business_result_not_verified'),('row-open','row_open_dispatched'),
+            ('result-menu','menu_delivered_no_output_condition'))
             and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True):
         receipt.update(status='verified', effect_verification='matched',
                        verification_scope='recorded_window_opened', business_commit='not_verified')
@@ -479,7 +489,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
                 if (not read_only and binding.hwnd not in prepared and 'popup' not in step
-                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'row-action',
+                        and step['action'] in ('set-value', 'invoke', 'submit', 'context-menu', 'result-menu', 'row-action',
                                                'row-launch', 'row-open', 'visual-click', 'conditional-open')):
                     if background_only:
                         input_policy.window_ready(binding)
@@ -553,6 +563,16 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         dispatching = True
                         receipt = context_menu.execute(binding, step['spec'], context_guard)
                         dispatching = False
+                elif step['action'] == 'result-menu':
+                    spec = step['context']
+                    check_target(binding, mutate=not read_only)
+                    if read_only:
+                        receipt = result_menu.observe(binding, uia, spec)
+                    else:
+                        dispatching = True
+                        receipt = result_menu.execute(binding, spec, lambda: check_target(binding, mutate=True),
+                                                      title, observe_guard=lambda: check_target(binding))
+                        dispatching = False
                 else:
                     lookup_started = time.monotonic()
                     popup = step.get('popup')
@@ -616,7 +636,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             if step.get('field_label'):
                                 app.tasks.check_display({'label': step['field_label']},
                                                         app.field_label(surface, uia, current, root))
-                            if step['action'] != 'set-value' or selector['role'] == 'textfield' or not allow_recorded_selection:
+                            if (step['action'] != 'set-value' or selector['role'] == 'textfield' or
+                                    not (allow_recorded_selection or step.get('allow_option_select'))):
                                 capability = {'set-value': 'SetValue', 'invoke': 'Click', 'submit': 'SetFocus'}[step['action']]
                                 need(capability in uia.actions(current),
                                      'workflow_pattern_unavailable')
@@ -657,6 +678,24 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 if read_only and step['action'] in ('visual-click','row-open') and receipt['status'] != 'observed':
                     report.update(status=receipt['status'], stopped_at=number,
                                   diagnostic=receipt.get('diagnostic', 'visual_target_unavailable'))
+                    break
+                if not read_only and step['action'] == 'result-menu':
+                    # Match the recording player's stop on unverified delivery. A new
+                    # output may confirm completion; a delivered leaf alone cannot.
+                    if (receipt['status'] == 'verified' and receipt.get('workbook_verified') is True
+                            and receipt.get('menu_path_completed') is True and receipt.get('leaf_dispatched') is True
+                            and receipt.get('effect_verification') == 'matched'):
+                        continue
+                    if (routes.origins.get(number) and receipt.get('diagnostic') == 'menu_delivered_no_output_condition'
+                            and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True
+                            and receipt.get('menu_path_completed') is True and receipt.get('leaf_dispatched') is True):
+                        # A demonstrated dialog is a separate, observable outcome.
+                        # Wait for its exact window before any dependent action.
+                        pending_opener = number
+                        report['status'] = 'completed_unverified'
+                        continue
+                    report.update(status='blocked' if receipt['status'] == 'verified' else receipt['status'],
+                                  stopped_at=number, diagnostic=receipt.get('diagnostic', 'step_not_verified'))
                     break
                 if read_only or (step['action'] not in ('context-menu', 'submit') and receipt['status'] in ('verified', 'waited')):
                     continue
@@ -795,15 +834,21 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     rows = {row['number']: row for row in observed['steps']}
     for number, step in enumerate(recipe['steps'], 1):
-        if step['action'] in ('wait', 'context-menu', 'verify-file', 'row-action', 'row-launch','row-open', 'visual-click','conditional-open'):
+        if step['action'] in ('wait', 'context-menu', 'result-menu', 'verify-file', 'row-action', 'row-launch','row-open', 'visual-click','conditional-open'):
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
             need('popup' in step or 'window_context' in step, 'invalid_deferred_scope')
             continue
-        capability = {'set-value': 'SetValue', 'invoke': 'Click', 'submit': 'SetFocus'}[step['action']]
-        need(capability in row['receipt']['actions'],
-             'workflow_pattern_unavailable')
+        capabilities = {'set-value': {'SetValue'}, 'invoke': {'Click'}, 'submit': {'SetFocus'}}[step['action']]
+        if (step['action'] == 'set-value' and step['selector']['role'] == 'combobox'
+                and (source_task is not None or step.get('allow_option_select'))):
+            # A list-only combo exposes Expand on the field and Select on a
+            # live option once opened. The player validates the requested item.
+            capabilities.add('Expand')
+            if 'SetValue' not in row['receipt']['actions'] and 'Expand' in row['receipt']['actions']:
+                step['allow_option_select'] = True
+        need(not capabilities.isdisjoint(row['receipt']['actions']), 'workflow_pattern_unavailable')
         if row['receipt'].get('resolved_selector'):
             step['selector'] = row['receipt']['resolved_selector']
             step.pop('grounding_text', None)
@@ -890,8 +935,8 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
         guide += ('\nsubmit 단계는 지정한 입력란과 실제 키보드 포커스를 확인한 뒤 Enter를 한 번 보낸다. '
                   '실제 창을 앞으로 가져오며 실행 중 마우스와 키보드를 사용하지 않는다. '
                   '키 전달은 조회 완료의 증거가 아니며 불확실하면 반복하지 않는다.\n')
-    if any(step['action'] == 'context-menu' for step in active):
-        guide += ('\ncontext-menu 단계는 대상 창을 앞으로 가져오고 실제 마우스로 표를 우클릭한 뒤 메뉴를 선택한다. '
+    if any(step['action'] in ('context-menu', 'result-menu') for step in active):
+        guide += ('\n실제 마우스로 표를 우클릭하는 단계는 대상 창을 앞으로 가져온 뒤 녹화한 영역을 확인하고 지정된 메뉴 경로를 순서대로 선택한다. '
                   '해당 단계가 끝날 때까지 마우스와 키보드를 사용하지 않는다.\n')
     if any('anchor' in step.get('selector', {}) for step in active):
         guide += ('\n상위 영역과 상대 위치로 찾는 입력란은 실행할 때 대상 창을 앞으로 가져와 확인한다. '

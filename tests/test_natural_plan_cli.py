@@ -67,11 +67,13 @@ class NaturalPlanCLI(unittest.TestCase):
     def test_manual_step_falls_back_as_whole_task_before_any_input(self):
         task = deepcopy(self.task)
         task['steps'].append(dict(action='manual', reason='capture_target_unavailable'))
-        with patch.object(app.tasks, 'load_task', return_value=task), patch.object(app, 'worker_receipt') as worker:
+        probe = dict(status='observed', input_dispatched=False, live_scopes=[])
+        with patch.object(app.tasks, 'load_task', return_value=task), patch.object(app, 'worker_receipt', return_value=probe) as worker:
             result = app.run(self.args(extra=['--set', 'Family=Hybrid']))
         self.assertEqual(result['status'], 'needs_review')
         self.assertFalse(result['input_dispatched'])
-        worker.assert_not_called()
+        worker.assert_called_once_with(['_worker', 'recover', '--task', task['name']], mutating=False)
+        self.assertIs(result['live_recovery'], probe)
 
     def test_fixed_override_is_rejected_before_dispatch(self):
         with patch.object(app, 'worker_receipt') as worker, self.assertRaises(app.tasks.TaskError):

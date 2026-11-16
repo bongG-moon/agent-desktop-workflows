@@ -148,6 +148,45 @@ class CompositionTests(unittest.TestCase):
         self.assertTrue(all('elapsed_seconds' in row for row in result['steps']))
         self.assertIn('lookup_seconds', result['steps'][1]['receipt'])
 
+    def test_compiled_result_menu_cannot_continue_after_missing_output_or_partial_menu(self):
+        step = dict(action='result-menu', label='Export', context=dict(
+            trigger=None, ready=None, menu=context()['spec'], output=output()['output']))
+        for change in (dict(status='delivered_unverified', diagnostic='export_workbook_not_observed'),
+                       dict(status='verified', workbook_verified=False),
+                       dict(status='uncertain', leaf_dispatched=None)):
+            receipt = dict(delivered_menu(), **change)
+            with self.subTest(change=change), patch.object(flow.result_menu, 'execute', return_value=receipt):
+                result = flow.run(recipe(step, popup_step('invoke')))
+            self.assertEqual(result['stopped_at'], 1)
+            self.assertNotEqual(result['status'], 'verified')
+            self.assertTrue(result['input_dispatched'])
+        flow.live.execute.assert_not_called()
+
+    def test_menu_observe_accepts_group_and_defers_only_query_created_regions(self):
+        spec = dict(trigger=dict(name='Lookup',role='button'), ready=dict(kind='text',
+                    target=dict(role='statictext',name='Progress'), expected='Done'), output=None,
+                    menu=dict(context()['spec'],target=dict(role='group',automation_id='resultPanel')))
+        flow.context_menu._region.side_effect = flow.app.bridge.BridgeError('context_region_missing')
+        step = dict(action='result-menu', label='Export', context=spec)
+        report = flow.run(recipe(step), read_only=True)
+        self.assertEqual(report['status'], 'observed')
+        self.assertFalse(report['steps'][0]['receipt']['region_observed'])
+        step['context'] = dict(spec, trigger=None)
+        report = flow.run(recipe(step), read_only=True)
+        self.assertEqual(report['diagnostic'], 'context_region_missing')
+        flow.live.execute.assert_not_called()
+        flow.context_menu.execute.assert_not_called()
+
+    def test_option_selection_opt_in_applies_to_combo_values_only(self):
+        select = dict(action='set-value', selector=dict(name='Family',role='combobox'),
+                      parameter='Family', allow_option_select=True)
+        for invalid in (dict(select,action='invoke'), dict(select, allow_option_select=1),
+                        dict(select,selector=dict(name='Family', role='textfield'))):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(flow.WorkflowError, 'invalid_combo_selection'):
+                flow.validate(recipe(invalid))
+        self.uia.actions.return_value = ['Expand']
+        self.assertEqual(flow.run(recipe(select), {'Family':'Hybrid'})['status'], 'verified')
+
     def test_missing_or_ambiguous_popup_does_not_restore_or_input_owner(self):
         for popups, diagnostic in (([], 'popup_not_found'),
                 ([dict(hwnd=200, title='Export settings'), dict(hwnd=201, title='Export settings')], 'ambiguous_popup')):

@@ -26,6 +26,51 @@ class MenuTests(unittest.TestCase):
             with self.subTest(spec=spec), self.assertRaises(cm.win.BridgeError):
                 cm.validate_spec(spec)
 
+    def teach_in_groups(self, identities, resolve, **kwargs):
+        from contextlib import nullcontext
+        child, outer, root = 'inner', 'table', 'root'
+        scope = Mock(hwnd=10, pid=42)
+        self.uia.from_handle.return_value = root
+        self.uia.from_point.return_value = child
+        self.uia.within.return_value = True
+        self.uia.within.side_effect = None
+        self.uia.pid.return_value = scope.pid
+        self.uia.secure.return_value = False
+        self.uia.point_descendant.return_value = child
+        self.uia.basic.side_effect = identities.__getitem__
+        self.uia.parent.side_effect = {child: outer, outer: root}.__getitem__
+        with (patch.object(cm.win, 'UIA', return_value=nullcontext(self.uia)),
+              patch.object(cm, '_region', side_effect=resolve),
+              patch.object(cm, '_hit_region') as hit,
+              patch.object(cm, '_rect', return_value=(0, 0, 200, 100))):
+            anchor = cm.teach_surface(scope, (80, 40), **kwargs)
+            hit.assert_called_once()
+        return anchor
+
+    def test_record_surface_uses_unique_name_when_inner_id_is_transient(self):
+        identities = {'inner': dict(role='group', automation_id='1393', name='Results panel')}
+        def resolve(scope, uia, selector):
+            self.assertEqual(selector, dict(role='group', name='Results panel'))
+            return 'inner'
+        anchor = self.teach_in_groups(identities, resolve)
+        self.assertEqual(anchor, dict(target=dict(role='group', name='Results panel'), point=[.4, .4]))
+
+    def test_ordinary_point_can_resolve_parent_through_repeated_nested_groups(self):
+        identities = {'inner': dict(role='group', automation_id='repeated', name='Repeated'),
+                      'table': dict(role='table', automation_id='Grid')}
+        def resolve(scope, uia, selector):
+            if selector['role'] == 'group':
+                raise cm.win.BridgeError('context_region_ambiguous')
+            return 'table'
+        anchor = self.teach_in_groups(identities, resolve)
+        self.assertEqual(anchor['target'], dict(role='table', automation_id='Grid'))
+        with self.assertRaisesRegex(cm.win.BridgeError, 'context_region_ambiguous'):
+            self.teach_in_groups(identities, resolve, target='Repeated')
+        protected = Mock(side_effect=cm.win.BridgeError('target_protected'))
+        with self.assertRaisesRegex(cm.win.BridgeError, 'target_protected'):
+            self.teach_in_groups(identities, protected)
+        protected.assert_called_once()
+
     def test_preexisting_or_unrelated_menu_is_never_selected(self):
         choose = lambda items, old: cm._choose(self.uia, items, old,'Send',self.point,None,8)
         self.assertIsNone(choose([self.parent],[self.parent]))
