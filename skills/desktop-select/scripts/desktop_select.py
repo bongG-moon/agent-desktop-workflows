@@ -744,7 +744,7 @@ def run(args):
             'context_menu_item_changed', 'recorded_window_not_open')
         if quick['status'] in ('needs_grounding', 'needs_review') or missing_target:
             return attach_recovery(quick, args.task, prepare=quick.get('input_dispatched') is False
-                                   and not (args.only or background))
+                                   and not (quick.get('grounding_steps') or args.only or background))
         return quick
     rows = windows(args.exe)
     if args.command == 'windows':
