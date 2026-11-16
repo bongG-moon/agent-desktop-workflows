@@ -261,6 +261,9 @@ def _convert(raw, *, allow_point=False):
         return _manual('target_protected')
     if isinstance(source, dict) and 'window' in source:
         return _manual('popup_needs_live_binding')
+    special = _capture_command(raw)
+    if special is not None:
+        return special
     if raw.get('action') == 'right-click':
         return _manual('right_click_requires_menu_teaching')
     recognition = raw.get('recognition')
@@ -329,11 +332,145 @@ def _convert(raw, *, allow_point=False):
     return step
 
 
+CAPTURE_COMMANDS = frozenset({'field-input', 'submit', 'choose-item'})
+
+
+def _capture_command(raw):
+    """Retain a safely witnessed field, submit or non-combo item as a literal task step."""
+    if raw.get('action') in CAPTURE_COMMANDS and 'selector' in raw:
+        result = dict(raw)
+        _validate_capture_command(result)
+        return result
+    source = raw.get('target', {})
+    if not isinstance(source, dict):
+        return None
+    locator = source.get('locator', {}) if isinstance(source, dict) else {}
+    if source.get('kind') != 'element' or not isinstance(locator, dict):
+        return None
+    chain = locator.get('ancestors', [])
+    if not isinstance(chain, list) or any(not isinstance(node, dict) for node in chain):
+        return None
+    action, role = raw.get('action'), locator.get('role')
+    if any(isinstance(node, dict) and (node.get('role') == 'password' or any(
+            node.get(key) is True for key in ('secure', 'protected', 'is_protected', 'is_password', 'password')))
+           for node in [raw, source, locator, *chain]):
+        return None
+    if not ((action == 'set-value' and role == 'textfield' and 'anchor' in locator)
+            or (action == 'submit' and role in ('textfield', 'combobox'))
+            or (action == 'select' and role == 'listitem'
+                and not any(a.get('role') == 'combobox' for a in chain))):
+        return None
+    from copy import deepcopy
+    if 'anchor' in locator:
+        selector = deepcopy(locator)
+    else:
+        selector = _selector(locator)
+        if not selector:
+            return None
+        if locator.get('ancestors'):
+            selector['ancestors'] = deepcopy(locator['ancestors'])
+    recognition = raw.get('recognition', {})
+    if recognition.get('target') != 'identified' or recognition.get('action') != 'supported':
+        return None
+    result = dict(action='field-input' if action == 'set-value' else 'choose-item' if action == 'select' else 'submit',
+                  selector=selector, label=raw.get('field_label') or raw.get('label') or
+                  locator.get('name') or ('입력란' if role == 'textfield' else '항목'))
+    if action == 'set-value':
+        if recognition.get('result') != 'checkable' or not valid_value(raw.get('value'), role):
+            return None
+        result['value'] = raw['value']
+    _validate_capture_command(result)
+    return result
+
+
+def _validate_capture_command(step):
+    from python_workflow import validate_selector
+    selector = step.get('selector')
+    validate_selector(selector)
+    allowed = {'action', 'selector', 'label', 'instruction', 'instruction_draft', 'alias', 'description', 'window_context'}
+    if not _text(step.get('label'), 200):
+        raise TaskError('invalid_task_target')
+    if step['action'] == 'field-input':
+        if selector['role'] != 'textfield' or ('value' in step) == ('parameter' in step):
+            raise TaskError('invalid_task_selection')
+        allowed.update(('value', 'parameter'))
+        if 'value' in step and not valid_value(step['value'], 'textfield'):
+            raise TaskError('invalid_task_selection')
+        if 'parameter' in step and (not _text(step['parameter'], 100) or '=' in step['parameter']):
+            raise TaskError('invalid_parameter')
+    elif step['action'] == 'submit':
+        if selector['role'] not in ('textfield', 'combobox'):
+            raise TaskError('invalid_submit')
+    elif step['action'] == 'choose-item':
+        if selector['role'] not in CHOOSE:
+            raise TaskError('invalid_item_selection')
+    else:
+        raise TaskError('invalid_task_action')
+    if set(step) - allowed:
+        raise TaskError('unexpected_task_step_data')
+    if 'instruction_draft' in step:
+        draft = step['instruction_draft']
+        if ('instruction' in step or not _text(draft, 1000) or len(draft.encode('utf8')) > 1000
+                or draft != draft.strip()):
+            raise TaskError('invalid_step_instruction')
+    if 'instruction' in step:
+        if _command_instruction(step, step['instruction'].get('text'),
+                                mode=step['instruction'].get('mode'),
+                                argument=step['instruction'].get('parameter', step['instruction'].get('value'))) != step['instruction']:
+            raise TaskError('invalid_step_instruction')
+        if step['action'] == 'field-input':
+            key = 'parameter' if step['instruction']['mode'] == 'required' else 'value'
+            if step.get(key) != step['instruction'].get(key):
+                raise TaskError('instruction_binding_conflict')
+
+
+def _command_instruction(step, sentence, mode=None, argument=None):
+    if not _text(sentence, 1000):
+        raise TaskError('invalid_step_instruction')
+    if step['action'] == 'field-input':
+        fake = dict(action='fill', role='textfield', target=step['label'], label=step['label'],
+                    **_annotations(step))
+        parsed = _parse_sentence(fake, sentence)
+        if mode is None:
+            if not parsed:
+                return dict(mode='draft', text=sentence)
+            mode, argument = parsed
+        elif parsed and not _instruction_agrees(parsed, sentence, mode, argument):
+            raise TaskError('instruction_binding_conflict')
+        return _binding(fake, sentence, mode, argument)
+    if mode not in (None, 'recorded') or argument not in (None, ''):
+        raise TaskError('instruction_action_mismatch')
+    if step['action'] == 'submit':
+        affirmative = re.fullmatch(
+            r'(?:.+?(?:에서|에)\s*)?(?:Enter|Return|엔터)(?:\s*키)?(?:을|를)?\s*'
+            r'(?:눌러(?:서)?|누르기|입력|적용)(?:\s*(?:적용|조회))?(?:해)?\s*(?:줘|주세요)?[.!。]?'
+            r'|(?:press|send|submit)\s+(?:Enter|Return)[.!]?', sentence, re.I)
+        if not affirmative or _conditional_sentence(sentence):
+            return dict(mode='draft', text=sentence)
+        subject = re.match(r'(.+?)(?:에서|에)\s*(?:Enter|Return|엔터)', sentence, re.I)
+        if subject and ''.join(subject[1].split()) not in ('현재입력란', '해당입력란'):
+            try:
+                _instruction_subject(dict(label=step['label'], target=step['selector'].get('name', '')), subject[1])
+            except TaskError:
+                return dict(mode='draft', text=sentence)
+    else:
+        click = click_request(sentence)
+        selection = re.fullmatch(r'(.+?)\s*(?:을|를)?\s*선택(?:해)?\s*(?:줘|주세요)?[.!。]?', sentence)
+        subject = click[0] if click else selection[1] if selection else None
+        try:
+            if subject is None:
+                raise TaskError('instruction_target_unavailable')
+            _instruction_subject(dict(label=step['label'], target=step['selector'].get('name', '')), subject)
+        except TaskError:
+            return dict(mode='draft', text=sentence)
+    return dict(mode='recorded', text=sentence)
+
+
 def _instruction_subject(step, subject):
     candidates = [step.get(k, '') for k in ('label', 'target', 'alias', 'command_name')]
     norm = lambda s: ''.join(s.split()).casefold()
     text = norm(subject)
-    without_kind = re.sub(r'(?:조건|콤보박스|콤보|항목|필드|버튼|메뉴|입력란)$', '', text)
+    without_kind = re.sub(r'(?:조건|콤보박스|콤보|목록항목|항목|필드|버튼|메뉴|입력란|형식|옵션)$', '', text)
     if text in {'이항목', '이필드', '이콤보', '이메뉴', '이버튼', '이입력란'}:
         return next(c for c in candidates if c)
     for c in candidates:
@@ -499,6 +636,11 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         raise TaskError('invalid_step_instruction')
     if not sentence and all(value is None for value in (mode, argument, target, role, within)):
         return None
+    special = _capture_command(raw_step)
+    if special is not None:
+        if any(value is not None for value in (target, role, within)):
+            raise TaskError('instruction_target_mismatch')
+        return _command_instruction(special, sentence, mode, argument)
     if _conditional_sentence(sentence) and all(value is None for value in (mode, argument, target, role, within)):
         return {'mode': 'draft', 'text': sentence}
     if ('visual_hint' in raw_step and is_recoverable(raw_step) and click_request(sentence)
@@ -561,6 +703,29 @@ def instructed_step(raw_step, spec):
     """
     if not isinstance(raw_step, dict) or not isinstance(spec, dict):
         raise TaskError('invalid_step_instruction')
+    special = _capture_command(raw_step)
+    if special is not None:
+        sentence = spec.get('text')
+        if spec.get('mode') == 'draft':
+            if set(spec) != {'mode', 'text'} or not _text(sentence, 1000):
+                raise TaskError('invalid_step_instruction')
+            special.pop('instruction', None)
+            special['instruction_draft'] = sentence
+        else:
+            checked = _command_instruction(special, sentence, spec.get('mode'),
+                                          spec.get('parameter', spec.get('value')))
+            if checked != spec:
+                raise TaskError('invalid_step_instruction')
+            special['instruction'] = checked
+            special.pop('instruction_draft', None)
+            if special['action'] == 'field-input':
+                special.pop('value', None)
+                special.pop('parameter', None)
+                key = 'parameter' if spec['mode'] == 'required' else 'value'
+                special[key] = spec[key]
+        special.update(_annotations(raw_step))
+        _validate_capture_command(special)
+        return special
     if spec.get('mode') == 'visual-click' and 'visual_hint' in raw_step and is_recoverable(raw_step):
         if compile_instruction(raw_step, spec.get('text')) != spec:
             raise TaskError('invalid_step_instruction')
@@ -669,6 +834,10 @@ def recorded_step(raw):
         return step
     if spec is not None:
         return instructed_step(raw, spec)
+    special = _capture_command(raw)
+    if special is not None:
+        special.update(_annotations(raw))
+        return special
     step = _convert(raw)
     step.update(_annotations(raw))
     if 'menu_anchor' in raw:
@@ -689,10 +858,11 @@ def from_recording(name, exe, window, steps):
     for number, raw in enumerate(steps, 1):
         with _at_step(number):
             converted.append(recorded_step(raw))
-    counts = Counter(s['parameter'].casefold() for s in converted if 'parameter' in s)
+    counts = Counter(s['parameter'].casefold() for s in converted
+                     if 'parameter' in s and s['action'] not in CAPTURE_COMMANDS)
     used = set()
     for number, s in enumerate(converted, 1):
-        if 'parameter' in s:
+        if 'parameter' in s and s['action'] not in CAPTURE_COMMANDS:
             parameter = s['parameter']
             if counts[parameter.casefold()] > 1:
                 parameter += f' [{number}]'
@@ -807,6 +977,9 @@ def _validate_step(s, parameters):
     annotation = _annotations(s)
     if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
         raise TaskError('invalid_step_annotation')
+    if s['action'] in CAPTURE_COMMANDS:
+        _validate_capture_command(s)
+        return
     if s['action'] == 'visual-click':
         if _visual_step(s, s.get('label')) != s:
             raise TaskError('invalid_visual_step')

@@ -48,12 +48,45 @@ class MenuTests(unittest.TestCase):
         return anchor
 
     def test_record_surface_uses_unique_name_when_inner_id_is_transient(self):
-        identities = {'inner': dict(role='group', automation_id='1393', name='Results panel')}
+        identities = {'inner': dict(role='group', automation_id='1393', name='Results panel'),
+                      'table': dict(role='group', name='')}
         def resolve(scope, uia, selector):
             self.assertEqual(selector, dict(role='group', name='Results panel'))
             return 'inner'
         anchor = self.teach_in_groups(identities, resolve)
         self.assertEqual(anchor, dict(target=dict(role='group', name='Results panel'), point=[.4, .4]))
+
+    def test_named_outer_surface_survives_the_current_row_caption(self):
+        identities = {'inner': dict(role='group', automation_id='1393', name='Row value at row 2'),
+                      'table': dict(role='group', automation_id='9184', name='Results')}
+        def resolve(scope, uia, selector):
+            self.assertEqual(selector, dict(role='group', name='Results'))
+            return 'table'
+        anchor = self.teach_in_groups(identities, resolve)
+        self.assertEqual(anchor['target'], dict(role='group', name='Results'))
+
+    def test_shell_wide_wrapper_does_not_replace_the_results_region(self):
+        from contextlib import nullcontext
+        scope = Mock(hwnd=10, pid=42)
+        self.uia.from_handle.return_value = 'root'
+        self.uia.from_point.return_value = 'row'
+        self.uia.point_descendant.return_value = 'row'
+        self.uia.pid.return_value = 42
+        self.uia.secure.return_value = False
+        self.uia.within.side_effect = None
+        self.uia.within.return_value = True
+        self.uia.basic.side_effect = lambda item: dict(role='group', name={
+            'row': 'Device A at row 1', 'results': 'Results', 'shell': 'Application'}[item])
+        self.uia.parent.side_effect = {'row':'results', 'results':'shell', 'shell':'root'}.__getitem__
+        bounds = {'root': (0,0,1000,700), 'shell': (0,100,990,590),
+                  'results': (100,100,600,400), 'row': (120,150,560,30)}
+        self.uia.bounds.side_effect = lambda item: dict(zip(('x','y','width','height'), bounds[item]))
+        with (patch.object(cm.win, 'UIA', return_value=nullcontext(self.uia)),
+              patch.object(cm, '_region', return_value='results') as lookup,
+              patch.object(cm, '_hit_region'), patch.object(cm, '_rect', return_value=bounds['results'])):
+            anchor = cm.teach_surface(scope, (300,160))
+        self.assertEqual(anchor['target'], dict(role='group',name='Results'))
+        lookup.assert_called_once_with(scope, self.uia, dict(role='group',name='Results'))
 
     def test_ordinary_point_can_resolve_parent_through_repeated_nested_groups(self):
         identities = {'inner': dict(role='group', automation_id='repeated', name='Repeated'),
@@ -287,9 +320,48 @@ class MenuTests(unittest.TestCase):
               patch.object(cm.win,'hwnd_pid',return_value=2), patch.object(cm,'_rect',return_value=(0,0,200,100)),
               patch.object(cm,'_check_region_children') as children):
             cm._hit_region(scope, self.uia, region, (100,50),require_body=True,recorded_opaque=True)
-            children.assert_called_once_with(scope, self.uia, region, (100,50),data_only=True)
+            children.assert_called_once_with(scope, self.uia, region, (100,50),data_only=True,hit_element=region)
             with self.assertRaisesRegex(cm.win.BridgeError, 'context_data_cell_unconfirmed'):
                 cm._hit_region(scope, self.uia, region, (100,50),require_body=True)
+
+    def test_tab_container_is_transparent_only_above_the_observed_data_hit(self):
+        scope = Mock(hwnd=1,pid=7)
+        region,tabs,cell,header,other = [Mock() for _ in range(5)]
+        for node,role in ((region,50033),(tabs,50018),(cell,50033),(header,50019),(other,50018)):
+            node.property.side_effect = lambda key,role=role: {30003:role,30010:True}.get(key)
+        parents = {cell:tabs,tabs:region,header:tabs,other:region}
+        def within(node,ancestor):
+            for _ in range(10):
+                if node is ancestor:return True
+                node=parents.get(node)
+                if node is None:return False
+            return False
+        self.uia.same.side_effect = lambda a,b:a is b
+        self.uia.within.side_effect = within
+        self.uia.from_point.return_value = cell
+        self.uia.from_handle.return_value = region
+        self.uia.pid.return_value = 7
+        self.uia.secure.return_value = False
+        self.uia.parent.side_effect = parents.get
+        branches = {region:[tabs],tabs:[cell,header]}
+        self.uia.children.side_effect = lambda node: branches.get(node,[])
+        self.uia.bounds.side_effect = lambda node: dict(x=0,y=0,width=200,height=20 if node is header else 100)
+        with (patch.object(cm.win,'window_from_point',return_value=10),
+              patch.object(cm.win,'root_window',return_value=1),
+              patch.object(cm.win,'hwnd_pid',return_value=7),
+              patch.object(cm.lookup,'ancestry',return_value=[cell,tabs,region])):
+            cm._hit_region(scope,self.uia,region,(100,60),require_body=True,recorded_opaque=True)
+            cm._visual_point(scope,self.uia,region,(100,60))
+            for hit in (tabs,header):
+                self.uia.from_point.return_value=hit
+                with self.assertRaisesRegex(cm.win.BridgeError,'context_point_not_data'):
+                    cm._hit_region(scope,self.uia,region,(100,60),require_body=True,recorded_opaque=True)
+            self.uia.from_point.return_value=cell
+            branches[region].append(other)
+            with self.assertRaisesRegex(cm.win.BridgeError,'context_point_not_data'):
+                cm._hit_region(scope,self.uia,region,(100,60),require_body=True,recorded_opaque=True)
+            with self.assertRaisesRegex(cm.win.BridgeError,'context_point_not_data'):
+                cm._visual_point(scope,self.uia,region,(100,60))
 
     def test_blank_menu_caption_uses_owned_legacy_name_or_its_single_visible_label(self):
         scope = Mock(pid=8)

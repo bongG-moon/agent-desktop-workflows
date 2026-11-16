@@ -31,7 +31,7 @@ def validate(doc):
         require(isinstance(step, dict) and tasks._text(step.get('id'), 200)
                 and step['id'] not in ids and isinstance(step.get('label'), str))
         ids.add(step['id'])
-        require(step.get('action') in ('manual', 'click', 'set-value', 'select', 'expand', 'teach-target',
+        require(step.get('action') in ('manual', 'click', 'set-value', 'select', 'expand', 'teach-target', 'submit',
                                        'result-menu', 'row-action', 'visual-click'))
         if step['action'] == 'result-menu':
             context = step.get('context')

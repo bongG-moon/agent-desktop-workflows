@@ -39,6 +39,20 @@ def capture_surface(binding, uia, event, history):
         if error.code not in ('context_point_occluded', 'named_context_region_required',
                               'context_point_unproven', 'context_point_outside_region'):
             return None
+    # The hook proves the original native receiver at mouse-down. The app can
+    # open its menu before this worker reads UIA. Preserve a recording hint
+    # from that exact receiver; replay will hit-test it again before input.
+    hit = event.get('hit_window')
+    try:
+        if hit and win.root_window(hit) == binding.hwnd and win.hwnd_pid(hit) == binding.pid:
+            binding.check()
+            root = uia.from_handle(binding.hwnd)
+            receiver = uia.from_handle(hit)
+            hint = _surface_hint(binding, uia, receiver, root, point)
+            if hint:
+                return hint
+    except (win.BridgeError, OSError):
+        pass
     # A right-button release often opens the popup before the worker sees
     # the down event. Revalidate the previously hit region's identity and
     # protected children without hit-testing through the covering popup.
@@ -54,22 +68,31 @@ def capture_surface(binding, uia, event, history):
             binding.check()
             if not uia.same(root, uia.from_handle(binding.hwnd)) or not uia.within(item, root):
                 return None
-            for _ in range(32):
-                if (item is None or uia.same(root, item) or uia.secure(item)
-                        or uia.pid(item) != binding.pid or item.property(30010) is not True):
-                    return None
-                target = menus._surface_target(binding, uia, item)
-                if target:
-                    rect = menus._rect(uia, item)
-                    if not menus._inside(point, rect):
-                        return None
-                    menus._check_region_children(binding, uia, item, point)
-                    ratios = [(coord - start) / extent for coord, start, extent in zip(point, rect, rect[2:])]
-                    menus._validate_surface(target, ratios)
-                    return dict(target=target, point=ratios)
-                item = uia.parent(item)
+            return _surface_hint(binding, uia, item, root, point)
         except (win.BridgeError, OSError):
             return None
+    return None
+
+
+def _surface_hint(binding, uia, item, root, point):
+    for region in menus._surface_candidates(binding, uia, item, root):
+        if region.property(30010) is not True:
+            return None
+        target = menus._surface_target(binding, uia, region)
+        if not target:
+            continue
+        rect = menus._rect(uia, region)
+        if not menus._inside(point, rect):
+            continue
+        try:
+            menus._check_region_children(binding, uia, region, point)
+        except win.BridgeError as error:
+            if error.code == 'context_region_tree_incomplete':
+                continue
+            raise
+        ratios = [(coord-start)/extent for coord, start, extent in zip(point, rect, rect[2:])]
+        menus._validate_surface(target, ratios)
+        return dict(target=target, point=ratios)
     return None
 
 
@@ -92,15 +115,12 @@ class MenuGesture:
         self.last_seen = event['at']
         self.last_poll = 0
         self.history = deque(maxlen=16)
+        self.inventories = deque(maxlen=4)
         self.clicked = None
         self.parents = []
         self.active_frames = set()
 
-    def observe(self, binding, uia, items, point, hit):
-        matches = [item for item in items if menus._inside(point, item.box)]
-        if len(matches) != 1 or win.window_from_point(*point) != hit:
-            return None
-        chosen = matches[0]
+    def _path(self, uia, items, chosen):
         frame = chosen.surface, chosen.menu_box
         # Multiple rows or submenus with the same caption are distinguished
         # by the actual pointer hit and relationship to the preceding menu.
@@ -124,6 +144,17 @@ class MenuGesture:
             path = tuple(i.name for i in actual) + (chosen.name,)
         if len(path) > 8:
             return None
+        return path, parent, actual
+
+    def observe(self, binding, uia, items, point, hit):
+        matches = [item for item in items if menus._inside(point, item.box)]
+        if len(matches) != 1 or win.window_from_point(*point) != hit:
+            return None
+        chosen = matches[0]
+        found = self._path(uia, items, chosen)
+        if found is None:
+            return None
+        path, parent, actual = found
         opener = parent.item if parent else (actual[-1] if actual else None)
         menus._hit_item(binding, uia, chosen, opener,
                         {surface for surface, _ in parent.frames} if parent else set(), self.gap)
@@ -133,6 +164,28 @@ class MenuGesture:
         branch = chosen.element.property(30028) is True and state != 3
         self.active_frames.update((item.surface, item.menu_box) for item in [chosen, *actual])
         return Pick(chosen, path, {(i.surface, i.menu_box) for i in items}, hit, time.monotonic(), branch)
+
+    def remember_inventory(self, binding, uia, items):
+        """Record all visible native captions before down, including unhovered items."""
+        picks = []
+        owner = menus._native_menu_owner(binding)
+        if owner:
+            frames = {(item.surface, item.menu_box) for item in items}
+            for item in items:
+                if (win.window_class(item.surface) != '#32768' or win.hwnd_pid(item.surface) != binding.pid
+                        or win.window_from_point(*item.center) != item.surface):
+                    continue
+                found = self._path(uia, items, item)
+                if found is None:
+                    continue
+                path, _, _ = found
+                state = item.element.property(30070)
+                branch = item.element.property(30028) is True and state != 3
+                picks.append(Pick(item, path, frames, item.surface, 0, branch))
+            if menus._native_menu_owner(binding) != owner:
+                picks = []
+        completed = time.monotonic()
+        self.inventories.append((completed, picks))
 
     def sample(self, binding, uia, items, point, hit):
         picked = self.observe(binding, uia, items, point, hit)
@@ -155,6 +208,18 @@ class MenuGesture:
                         and menus._inside(point, sample.item.box)):
                     return sample
                 break
+        for when, inventory in reversed(self.inventories):
+            if when <= event['at']:
+                # Native commands may close the menu before the worker sees
+                # down. Match the hook's original receiver/point to the newest
+                # complete pre-down inventory, never a later picture or caption.
+                matches = [pick for pick in inventory if event['at'] - when <= .8
+                           and pick.hit == event['hit_window'] and menus._inside(point, pick.item.box)]
+                if len(matches) == 1:
+                    pick = matches[0]
+                    self.active_frames.update(pick.frames)
+                    return pick
+                break
         try:
             items = menus._menus(binding, uia)
             return self.sample(binding, uia, items, point, event['hit_window'])
@@ -169,6 +234,7 @@ class MenuGesture:
         try:
             binding.check()
             items = menus._menus(binding, uia)
+            self.remember_inventory(binding, uia, items)
             open_frames = {(i.surface, i.menu_box) for i in items}
             if self.clicked and not self.clicked.branch and not open_frames.intersection(self.active_frames):
                 return 'complete'

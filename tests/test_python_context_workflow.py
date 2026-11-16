@@ -38,6 +38,14 @@ def delivered_menu():
 
 
 class SchemaTests(unittest.TestCase):
+    def test_choose_item_requires_a_selectable_role_and_a_literal_selector(self):
+        step = dict(action='choose-item', selector=dict(name='Workbook', role='listitem'),
+                    popup=dict(title='Export settings'))
+        self.assertEqual(flow.validate(recipe(step)), recipe(step))
+        for patch in (dict(selector=dict(name='Finish', role='button')), dict(value='Workbook'),
+                      dict(parameter='Format'), dict(command_name='Workbook')):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                flow.validate(recipe(dict(step, **patch)))
     def test_composition_is_literal_and_strict(self):
         data = recipe(context(), popup_step(), popup_step('invoke'), output())
         self.assertEqual(flow.validate(data), data)
@@ -148,6 +156,19 @@ class CompositionTests(unittest.TestCase):
         self.assertEqual(flow.app.bridge.UIA.call_count, 1)
         self.assertTrue(all('elapsed_seconds' in row for row in result['steps']))
         self.assertIn('lookup_seconds', result['steps'][1]['receipt'])
+
+    def test_explicit_popup_item_uses_select_once_and_keeps_its_scope(self):
+        self.popups = [dict(hwnd=200, title='Export settings')]
+        self.uia.actions.return_value = ['Select']
+        step = dict(action='choose-item', selector=dict(name='Workbook', role='listitem'),
+                    popup=dict(title='Export settings', timeout=0))
+        with patch.object(flow.live, 'execute', return_value=dict(status='verified', input_dispatched=True)) as choose:
+            result = flow.run(recipe(step))
+        self.assertEqual(result['status'], 'verified')
+        self.assertEqual(choose.call_count, 1)
+        self.assertIs(choose.call_args.args[0], self.popup)
+        self.assertEqual(choose.call_args.args[4], 'choose')
+        self.assertEqual(result['steps'][0]['receipt']['popup'], dict(title='Export settings'))
 
     def test_compiled_result_menu_cannot_continue_after_missing_output_or_partial_menu(self):
         step = dict(action='result-menu', label='Export', context=dict(
@@ -276,7 +297,9 @@ class CompositionTests(unittest.TestCase):
         flow.context_menu.execute.assert_not_called()
 
     def test_register_preserves_future_popup_steps_and_reports_pending(self):
-        data = recipe(context(), dict(action='wait', seconds=0), popup_step(), popup_step('invoke'), output())
+        choose = dict(action='choose-item', selector=dict(name='Workbook',role='listitem'),
+                      popup=dict(title='Export settings', timeout=0))
+        data = recipe(context(), dict(action='wait', seconds=0), choose, popup_step(), popup_step('invoke'), output())
         before = deepcopy(data)
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / 'export-skill'
@@ -284,7 +307,7 @@ class CompositionTests(unittest.TestCase):
             self.assertEqual(flow.load(destination / 'workflow.json'), before)
             self.assertEqual(result['status'], 'registered')
             self.assertEqual(result['target_validation'], 'pending_scopes')
-            self.assertEqual([row['number'] for row in result['pending_scopes']], [3, 4])
+            self.assertEqual([row['number'] for row in result['pending_scopes']], [3, 4, 5])
         self.assertEqual(data, before)
         flow.context_menu.execute.assert_not_called()
         flow.live.execute.assert_not_called()

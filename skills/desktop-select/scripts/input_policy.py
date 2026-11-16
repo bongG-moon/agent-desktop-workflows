@@ -6,7 +6,7 @@ from ctypes import wintypes as W
 
 
 _POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open'})
-_ACCESSIBILITY_ACTIONS = frozenset({'set-value', 'invoke', 'select', 'fill', 'open'})
+_ACCESSIBILITY_ACTIONS = frozenset({'set-value', 'invoke', 'select', 'fill', 'open', 'choose-item'})
 _OBSERVATION_ACTIONS = frozenset({'wait', 'verify-file'})
 
 # Windows SDK 10.0.26100.0 UIAutomationClient.idl and UIAutomationClient.h:

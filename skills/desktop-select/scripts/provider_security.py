@@ -1,14 +1,58 @@
-"""Keep unknown input protection strict while admitting native dialog shells.
+"""Resolve native dialog shells and passive list peers with missing IsPassword.
 
-Windows' standard dialog provider can omit IsPassword on the dialog itself.
-That shell is not an editable control. Its children still require their own
-explicit, unprotected metadata and normal binding/ancestor validation.
+Editable inputs require explicit unprotected metadata. Native list captions
+and items can also be proved through their current noneditable metadata and
+positively unprotected SysListView32 owner.
 """
 
 
 _WINDOW = 50032
 _DIALOG_CLASS = '#32770'
 _INPUT_PATTERNS = (30033, 30040, 30043, 30149)  # RangeValue, Text, Value, TextEdit.
+
+
+def _passive_list_peer(win, uia, element):
+    """Native list providers omit IsPassword on their noneditable item peers."""
+    role = element.property(30003)
+    if role not in (50007, 50020):
+        return False
+    pid = uia.pid(element)
+    peers = [element]
+    item = element
+    if role == 50020:
+        item = uia.parent(element)
+        if item is None or item.property(30003) != 50007:
+            return False
+        peers.append(item)
+    owner = uia.parent(item)
+    if (owner is None or owner.property(30003) != 50008 or owner.property(30019) is not False
+            or uia.pid(owner) != pid):
+        return False
+    hwnd = owner.property(30020)
+    if (type(hwnd) is not int or hwnd <= 0 or type(pid) is not int or pid <= 0
+            or not win.user32.IsWindow(hwnd) or win.hwnd_pid(hwnd) != pid
+            or win.window_class(hwnd) != 'SysListView32'):
+        return False
+    current = uia.from_handle(hwnd)
+    if (current is None or not uia.same(current, owner) or uia.pid(current) != pid
+            or current.property(30019) is not False):
+        return False
+    box = uia.bounds(owner)
+    for peer in peers:
+        state = peer.property(30096)
+        rect = uia.bounds(peer)
+        if (peer.property(30019) not in (None, False) or uia.pid(peer) != pid
+                or peer.property(30090) is not True
+                or peer.property(30095) != (34 if peer.property(30003) == 50007 else 41)
+                or type(state) is not int or state & 0x20000000
+                or any(peer.property(key) not in (None, False) for key in _INPUT_PATTERNS)
+                or not all(type(rect[k]) in (int, float) for k in ('x', 'y', 'width', 'height'))
+                or rect['width'] <= 0 or rect['height'] <= 0
+                or not all(box[a] <= rect[a] and rect[a]+rect[s] <= box[a]+box[s]
+                           for a, s in (('x', 'width'), ('y', 'height')))):
+            return False
+    return (uia.same(uia.parent(item), owner) and owner.property(30019) is False
+            and win.user32.IsWindow(hwnd) and win.hwnd_pid(hwnd) == pid)
 
 
 def _shell_metadata(element):
@@ -24,6 +68,8 @@ def secure(win, uia, element):
     try:
         protected = element.property(30019)
         if protected is False:
+            return False
+        if protected is None and _passive_list_peer(win, uia, element):
             return False
         if protected is not None or not _shell_metadata(element):
             return True

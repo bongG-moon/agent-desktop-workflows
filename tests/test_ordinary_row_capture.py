@@ -120,7 +120,8 @@ class OrdinaryRowTests(TestCase):
             role='listitem', enabled=True, secure=False, locator={'role': 'listitem', 'name': 'Devices'},
             available_actions=['Click', 'Select', 'SetFocus']))
         event = dict(window=15, kind='down', action='click', at=10.1, x=157, y=205, scope_proven=True)
-        with mock.patch.object(teach_capture.recorder.CaptureWorker, 'observe_down', return_value=observation):
+        with (mock.patch.object(teach_capture.recorder.CaptureWorker, 'observe_down', return_value=observation),
+              mock.patch('control_lookup.resolve', side_effect=teach_capture.bridge.BridgeError('target_ambiguous'))):
             resolved = worker.observe_down(event)
             worker.capture_action(event, resolved)
         changed = [('a', 'running', 'stop'), self.base[1]]
@@ -132,6 +133,7 @@ class OrdinaryRowTests(TestCase):
         # The live row layout still supplies a helpful, editable ordinal draft.
         worker.row_tracker = rows.Tracker(binding, model)
         with (mock.patch.object(teach_capture.recorder.CaptureWorker, 'observe_down', return_value=observation),
+              mock.patch('control_lookup.resolve', side_effect=teach_capture.bridge.BridgeError('target_ambiguous')),
               mock.patch.object(vision, '_row_layout', return_value=(self.before.window, self.before.rows))):
             resolved = worker.observe_down(event)
             self.assertEqual(resolved['painted_row'], (1, None))
@@ -139,3 +141,27 @@ class OrdinaryRowTests(TestCase):
         step = model.snapshot()[1]
         self.assertEqual(step['action'], 'manual')
         self.assertEqual(teach_capture.default_text(step), '1번째 행 버튼을 눌러줘')
+
+    def test_unique_native_selection_is_preferred_over_an_available_row_image(self):
+        model = teach_capture.CaptureNotes()
+        binding = SimpleNamespace(hwnd=15, pid=7)
+        worker = teach_capture._Worker(binding, None, model, None, None)
+        worker.row_tracker = rows.Tracker(binding, model)
+        worker.row_tracker.observe(self.before)
+        worker.uia = mock.Mock()
+        worker.uia.same.side_effect = lambda first, second: first is second
+        worker.uia.combo_observation.return_value = None
+        element, root = mock.Mock(), mock.Mock()
+        observation = dict(window=15, element=element, root=root, combo=None, node=dict(
+            role='listitem', enabled=True, secure=False, locator=dict(role='listitem', name='Spreadsheet'),
+            available_actions=['Click', 'Select', 'SetFocus']))
+        event = dict(window=15, kind='down', action='click', at=10.1, x=157, y=205, scope_proven=True)
+        with (mock.patch.object(teach_capture.recorder.CaptureWorker, 'observe_down', return_value=observation),
+              mock.patch('control_lookup.resolve', return_value=element),
+              mock.patch.object(rows, 'prepare', side_effect=AssertionError('native item became a painted row'))):
+            resolved = worker.observe_down(event)
+            self.assertIs(resolved, observation)
+            worker.capture_action(event, resolved)
+        recorded, = model.snapshot()
+        self.assertEqual(recorded['action'], 'select')
+        self.assertEqual(recorded['target']['locator']['name'], 'Spreadsheet')

@@ -46,6 +46,7 @@ def _recorded_targets(app, surface, uia, lookups):
     for selector in lookups['selectors']:
         element = control_lookup.resolve(surface, uia, selector, root)
         node = dict(uia.basic(element), enabled=element.property(30010) is True)
+        node['recorded_selector'] = selector
         app.add_display_properties(node, element, surface, uia, root)
         if node['offscreen']:
             raise app.bridge.BridgeError('target_offscreen')

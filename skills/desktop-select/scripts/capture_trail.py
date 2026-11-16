@@ -9,6 +9,32 @@ import learned_tasks
 import win_bridge as bridge
 
 
+def resolve_menu_scope(scope, steps, number):
+    """Resolve a menu's original ID after its provisional capture completed."""
+    if not isinstance(scope, dict) or '_openers' not in scope or scope.get('related') is not True:
+        return scope
+    positions = {step['id']: (index, step) for index, step in enumerate(steps, 1)}
+    candidates = [positions[key] for key in scope['_openers'] if key in positions]
+    if not candidates or any(index >= number for index, _ in candidates):
+        return scope
+    _, latest = max(candidates, key=lambda row: row[0])
+    origin = latest.get('_capture_window') or latest.get('window_context')
+    if (latest.get('action') != 'result-menu'
+            or any((step.get('_capture_window') or step.get('window_context')) != origin
+                   for _, step in candidates)):
+        return scope
+    try:
+        command = learned_tasks.recorded_step(latest)
+        if command['action'] != 'result-menu':
+            return scope
+    except (ValueError, bridge.BridgeError):
+        return scope
+    resolved = dict(scope)
+    resolved.pop('_openers')
+    resolved['after_id'] = latest['id']
+    return resolved
+
+
 def finalize_contexts(steps):
     """Preserve trigger identity through review edits, then number the final steps."""
     numbers = {s['id']: i for i, s in enumerate(steps, 1)}
@@ -17,7 +43,7 @@ def finalize_contexts(steps):
         step = raw.copy()
         scope = step.pop('_capture_window', None)
         if scope:
-            context = scope.copy()
+            context = dict(resolve_menu_scope(scope, steps, number))
             if '_openers' in context:
                 raise ValueError(f'{number}단계를 선택하고 ‘창을 연 단계 지정’을 눌러 연결하세요.')
             trigger = context.pop('after_id', None)
@@ -118,6 +144,9 @@ class CaptureTrail:
 
     def snapshot(self):
         steps = [step for _,step in self._ordered()]
+        for number, step in enumerate(steps, 1):
+            if '_capture_window' in step:
+                step['_capture_window'] = resolve_menu_scope(step['_capture_window'], steps, number)
         if len(steps) > self.max_steps:
             from teach_capture import manual
             return steps[:self.max_steps-1] + [manual('recording_step_limit', 'multi-window-limit')]
@@ -134,9 +163,10 @@ class CaptureTrail:
                     if not 0 <= at-when <= 90:
                         continue
                     reason = step.get('recognition', {}).get('reason')
-                    if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click')
+                    if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click','submit')
                             or reason in ('row_capture_requires_review', 'stable_locator_unavailable',
-                                          'capture_target_unavailable', 'unsupported_recorded_action')):
+                                          'capture_target_unavailable', 'unsupported_recorded_action',
+                                          'right_click_requires_menu_teaching', 'popup_scope_unproven')):
                         result.append((when, part, key))
         # A completed transition followed by another demonstrated action in
         # the same origin starts a new sequence. Two actions both preceding
@@ -150,7 +180,22 @@ class CaptureTrail:
             opener = scope.get('after_id')
             if opener in sources and last_action[sources[opener]] > seen:
                 used.add(opener)
-        return sorted((row for row in result if row[2] not in used), key=lambda row: row[0])
+        result = sorted((row for row in result if row[2] not in used), key=lambda row: row[0])
+        if result:
+            last = result[-1]
+            part, key = last[1:]
+            step = part.notes.steps[key]
+            reason = step.get('recognition', {}).get('reason')
+            # Opening a context menu and choosing its leaf are one ordered
+            # interaction in one origin. A new owned dialog belongs to that
+            # menu command rather than earlier field edits. Independent
+            # launches retain the existing ambiguous-opener behavior.
+            menu_command = (step['action'] == 'result-menu' or
+                            step.get('target', {}).get('locator', {}).get('role') == 'menuitem' or
+                            reason == 'popup_scope_unproven')
+            if menu_command and all(row[1] is part for row in result):
+                return [last]
+        return result
 
     def _inventory(self):
         now = time.monotonic()
@@ -278,6 +323,7 @@ class CaptureTrail:
     def _attach(self, binding, title, key, scope):
         part = self.session_type(binding, title)
         part.linked = True
+        part.binding.is_linked_window = True
         part.notes.max_steps = max(1, self.max_steps - sum(len(p.notes.steps) for p,_ in self.parts))
         others = frozenset(handle for handle, _ in self.connected)
         part.binding.other_roots = others

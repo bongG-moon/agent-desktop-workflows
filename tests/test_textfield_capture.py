@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import queue
 import sys
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -140,6 +141,269 @@ class TextfieldWorkerTests(unittest.TestCase):
         self.assertEqual(final['recognition']['reason'], 'protected_input_not_recorded')
         self.assertNotIn('PRIVATE', json.dumps(final))
 
+    def test_unnamed_field_keeps_one_value_step_and_the_same_enter_target(self):
+        selector = dict(anchor=dict(role='group', name='Conditions'), role='textfield',
+                        point=[.4, .2], class_name='NativeEditor')
+        self.observed['node']['locator'] = selector
+        self.uia.focused.return_value = self.element
+        with patch('control_lookup.resolve', return_value=self.element):
+            self.worker.capture_action(dict(action='click'), self.observed)
+            first, = self.notes.snapshot()
+            self.worker._commit_value("Status = 'N'")
+            recorded, = self.notes.snapshot()
+            self.assertEqual(recorded['id'], first['id'])
+            self.assertEqual(recorded['target']['locator'], selector)
+            self.assertEqual(recorded['value'], "Status = 'N'")
+            self.worker.watched_samples.append((time.monotonic() - .01, "Status = 'N'"))
+            self.assertTrue(self.worker._capture_submit(dict(at=time.monotonic())))
+        value, submit = self.notes.snapshot()
+        self.assertEqual(value['value'], "Status = 'N'")
+        self.assertEqual(submit['action'], 'submit')
+        self.assertEqual(submit['target'], value['target'])
+
+    def test_activation_click_refines_the_same_field_before_recording_its_value(self):
+        selector = dict(anchor=dict(role='group', name='Conditions'), role='textfield',
+                        point=[.4, .2], class_name='NativeEditor')
+        focused = Mock()
+        focused.property.side_effect = lambda p: 50004 if p == 30003 else None
+        self.observed['node']['locator'] = dict(role='textfield')
+        self.uia.focused.return_value = focused
+        self.uia.pid.return_value = self.binding.pid
+        self.uia.within.return_value = True
+        self.uia.bounds.return_value = dict(x=0,y=0,width=100,height=100)
+        self.uia.node.return_value = dict(self.observed['node'], locator=selector)
+        with patch('control_lookup.resolve', return_value=focused):
+            self.worker.capture_action(dict(action='click',x=50,y=50), self.observed)
+            first, = self.notes.snapshot()
+            self.worker._commit_value('entered text')
+            last, = self.notes.snapshot()
+        self.assertEqual(first['action'], 'teach-target')
+        self.assertEqual(last['action'], 'set-value')
+        self.assertEqual(last['id'], first['id'])
+        self.assertEqual(last['value'], 'entered text')
+
+    def test_enter_does_not_use_a_previous_field_after_focus_moves(self):
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.uia.focused.return_value = object()
+        before = self.notes.snapshot()
+        self.assertFalse(self.worker._capture_submit(dict(at=time.monotonic())))
+        self.assertEqual(self.notes.snapshot(), before)
+
+    def test_passive_tabgroup_activation_refines_the_actual_focused_editor(self):
+        focused = Mock()
+        focused.property.side_effect = lambda p: 50004 if p == 30003 else None
+        self.uia.focused.return_value = focused
+        self.uia.pid.return_value = self.binding.pid
+        self.uia.within.return_value = True
+        self.uia.bounds.return_value = dict(x=20, y=20, width=100, height=30)
+        self.uia.node.return_value = self.observed['node']
+        passive = dict(self.observed, node=dict(secure=False, enabled=True, role='tabgroup',
+            available_actions=[], locator=dict(role='tabgroup', name='Data'),
+            bounds=dict(x=0,y=0,width=300,height=300)))
+        first_id = self.worker.capture_action(dict(action='click', x=50, y=35), passive)
+        first, = self.notes.snapshot()
+        self.assertEqual(first['id'], first_id)
+        self.assertEqual(first['action'], 'teach-target')
+        self.assertEqual(first['target']['locator']['role'], 'textfield')
+
+    def test_late_typed_editor_replaces_only_its_exact_passive_activation_id(self):
+        now = time.monotonic()
+        passive = dict(self.observed, node=dict(secure=False, enabled=True, role='tabgroup',
+            available_actions=[], locator=dict(role='tabgroup', name='Data'),
+            bounds=dict(x=0, y=0, width=300, height=300)))
+        self.uia.focused.return_value = None
+        self.worker.capture_action(dict(action='click', scope_proven=True, window=5,
+            x=50, y=35, at=now-.4), passive)
+        unknown, = self.notes.snapshot()
+        self.assertEqual(unknown['action'], 'manual')
+        self.worker.last_key = now-.2
+        self.observed['node']['bounds'] = dict(x=20,y=20,width=100,height=30)
+        self.worker.watch(self.observed)
+        final, = self.notes.snapshot()
+        self.assertEqual(final['id'], unknown['id'])
+        self.assertEqual(final['action'], 'set-value')
+        self.assertEqual(final['value'], 'old')
+
+    def test_late_typed_editor_does_not_consume_a_different_unknown_click(self):
+        now = time.monotonic()
+        passive = dict(self.observed, node=dict(secure=False, enabled=True, role='tabgroup',
+            available_actions=[], locator=dict(role='tabgroup', name='Data'),
+            bounds=dict(x=0,y=0,width=300,height=300)))
+        self.uia.focused.return_value = None
+        self.worker.capture_action(dict(action='click', scope_proven=True, window=5,
+            x=250, y=200, at=now-.4), passive)
+        unknown, = self.notes.snapshot()
+        self.worker.last_key = now-.2
+        self.observed['node']['bounds'] = dict(x=20,y=20,width=100,height=30)
+        self.worker.watch(self.observed)
+        self.assertEqual(self.notes.snapshot(), [unknown])
+
+    def test_late_typed_editor_cannot_refine_without_a_scoped_activation(self):
+        now = time.monotonic()
+        self.worker._pending_field_activation = None
+        passive = dict(self.observed, node=dict(secure=False, enabled=True, role='tabgroup',
+            available_actions=[], locator=dict(role='tabgroup', name='Data'),
+            bounds=dict(x=0,y=0,width=300,height=300)))
+        self.uia.focused.return_value = None
+        self.worker.capture_action(dict(action='click', scope_proven=False, window=5,
+            x=50, y=35, at=now-.4), passive)
+        unknown, = self.notes.snapshot()
+        self.worker.last_key = now-.2
+        self.observed['node']['bounds'] = dict(x=20,y=20,width=100,height=30)
+        self.worker.watch(self.observed)
+        self.assertEqual(self.notes.snapshot(), [unknown])
+
+    def test_queued_typing_keeps_the_real_value_when_first_read_finishes_after_paste(self):
+        now = time.monotonic()
+        value = 'the complete inserted string'
+        capture.live_action.text_readback.return_value = dict(value=value, value_evidence=dict(status='observed'))
+        self.worker.capture_action(dict(action='click',at=now-.5), self.observed)
+        first, = self.notes.snapshot()
+        self.assertEqual(first['action'], 'teach-target')
+        self.worker.handle(dict(kind='typing',at=now-.2))
+        recorded, = self.notes.snapshot()
+        self.assertEqual(recorded['id'], first['id'])
+        self.assertEqual(recorded['value'], value)
+        self.uia.focused.return_value = self.element
+        self.assertTrue(self.worker._capture_submit(dict(at=now-.1)))
+        recorded, submitted = self.notes.snapshot()
+        self.assertEqual(recorded['value'], value)
+        self.assertEqual(submitted['action'], 'submit')
+
+    def test_keyboard_event_before_field_activation_does_not_create_a_value_step(self):
+        now = time.monotonic()
+        self.worker.capture_action(dict(action='click',at=now), self.observed)
+        self.worker.handle(dict(kind='typing',at=now-.1))
+        recorded, = self.notes.snapshot()
+        self.assertEqual(recorded['action'], 'teach-target')
+
+    def test_enter_uses_proven_native_before_focus_when_submit_recreates_peer(self):
+        self.observed['node']['hwnd'] = 123
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.worker.watched_samples.append((time.monotonic() - .01, 'old'))
+        self.uia.focused.side_effect = capture.bridge.BridgeError('target_unavailable')
+        event = dict(at=time.monotonic(), submit_focus=123, submit_window=5)
+        self.assertTrue(self.worker._capture_submit(event))
+        self.assertEqual(self.notes.snapshot()[-1]['action'], 'submit')
+        self.uia.focused.assert_not_called()
+
+    def test_recent_command_click_is_recorded_after_its_dialog_closes(self):
+        now = time.monotonic()
+        raw = dict(id='finish', action='click', label='Finish',
+                   target=dict(kind='element', locator=dict(role='button', name='Finish')),
+                   recognition=dict(target='identified', action='supported', result='manual'))
+        self.worker.command_snapshot = (now-.1, [(dict(x=0,y=0,width=100,height=100), raw)])
+        self.binding.check.side_effect = capture.bridge.BridgeError('target_window_mismatch')
+        down = dict(kind='down', action='click', token=7, window=5, scope_proven=True, at=now, x=50, y=50)
+        self.worker.handle(down)
+        self.assertEqual(self.notes.snapshot(), [])
+        self.worker.tick()  # Await the paired release before closing the recorder part.
+        self.worker.handle(dict(kind='up', token=7, inside=True, at=now+.1, x=50, y=50))
+        recorded, = self.notes.snapshot()
+        self.assertEqual(recorded['target']['locator'], dict(role='button', name='Finish'))
+        self.assertEqual(recorded['action'], 'click')
+
+    def test_command_snapshot_never_substitutes_an_unscoped_or_stale_click(self):
+        now = time.monotonic()
+        self.worker.command_snapshot = (now-5, [(dict(x=0,y=0,width=100,height=100), dict(id='finish'))])
+        event = dict(action='click',window=5,scope_proven=True,at=now,x=50,y=50)
+        self.assertIsNone(self.worker._command_before(event))
+        self.worker.command_snapshot = (now-.1, self.worker.command_snapshot[1])
+        self.assertIsNone(self.worker._command_before(dict(event,scope_proven=False)))
+        self.assertIsNone(self.worker._command_before(dict(event,window=7)))
+
+    def test_distinct_clicks_on_one_cached_command_keep_distinct_step_ids(self):
+        now = time.monotonic()
+        raw = dict(id='command-identity', action='click', label='Next',
+                   target=dict(kind='element', locator=dict(role='button', name='Next')),
+                   recognition=dict(target='identified', action='supported', result='manual'))
+        self.worker.command_snapshot = (now-.1, [(dict(x=0,y=0,width=100,height=100), raw)])
+        event = dict(action='click',window=5,scope_proven=True,at=now,x=50,y=50)
+        first = self.worker._command_before(event)
+        second = self.worker._command_before(dict(event, at=now+.1))
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertNotEqual(first['id'], raw['id'])
+        self.assertEqual(first['target'], second['target'])
+        self.assertEqual(raw['id'], 'command-identity')
+
+    def test_command_inventory_refreshes_while_user_pauses_in_the_input_field(self):
+        self.worker.watched = self.observed
+        self.worker._last_command_refresh = time.monotonic() - 2
+        def refreshed():
+            self.worker._last_command_refresh = time.monotonic()
+        with (patch.object(capture.recorder.CaptureWorker,'tick'),
+              patch.object(self.worker,'_refresh_commands',side_effect=refreshed) as refresh):
+            self.worker.tick()
+            self.worker.tick()
+        refresh.assert_called_once()
+
+    def test_late_closed_dialog_read_keeps_the_last_bounded_command_evidence(self):
+        snapshot = (time.monotonic() - .2, [(dict(x=0,y=0,width=100,height=100), dict(id='finish'))])
+        self.worker.command_snapshot = snapshot
+        with patch('control_lookup.find_all',side_effect=capture.bridge.BridgeError('target_window_mismatch')):
+            self.worker._cache_commands()
+        self.assertIs(self.worker.command_snapshot, snapshot)
+
+    def test_unnamed_field_anchor_is_checked_against_the_actual_element(self):
+        field = Mock()
+        field.property.side_effect = lambda p: 'NativeEditor' if p == 30012 else None
+        ancestor = Mock()
+        uia = Mock()
+        uia.binding = Mock(pid=7)
+        uia.parent.return_value = ancestor
+        uia.pid.return_value = 7
+        uia.secure.return_value = False
+        uia.basic.return_value = dict(role='group', name='Conditions')
+        uia.same.side_effect = lambda a, b: a is b
+        uia.bounds.side_effect = lambda e: dict(x=120, y=60, width=80, height=20) if e is field else dict(x=100, y=20, width=200, height=100)
+        with patch('control_lookup.resolve', return_value=field):
+            selector = capture._CaptureUIA.anchored_field(uia, field, ancestor)
+        self.assertEqual(selector['point'], [.3, .5])
+        self.assertEqual(selector['anchor'], dict(role='group', name='Conditions'))
+        with patch('control_lookup.resolve', return_value=object()):
+            self.assertIsNone(capture._CaptureUIA.anchored_field(uia, field, ancestor))
+
+    def test_clicked_passive_caption_records_its_unique_selection_item(self):
+        item = Mock()
+        item.property.side_effect = lambda p: {30003: 50007, 30010: True, 30022: False}.get(p)
+        item_node = dict(role='listitem', name='Spreadsheet', secure=False, enabled=True,
+                         available_actions=['Click', 'Select'], locator=dict(role='listitem', name='Spreadsheet'))
+        self.observed['node'] = dict(role='statictext', name='Spreadsheet', secure=False,
+                                     enabled=True, available_actions=[])
+        self.uia.parent.return_value = item
+        self.uia.pid.return_value = self.binding.pid
+        self.uia.within.return_value = True
+        self.uia.bounds.return_value = dict(x=0, y=0, width=200, height=100)
+        self.uia.node.return_value = item_node
+        with (patch('control_lookup.resolve', return_value=item),
+              patch('provider_visibility.visible', return_value=True)):
+            self.worker.capture_action(dict(action='click', x=50, y=50), self.observed)
+        recorded, = self.notes.snapshot()
+        self.assertEqual(recorded['action'], 'select')
+        self.assertEqual(recorded['target']['locator']['name'], 'Spreadsheet')
+
+    def test_passive_caption_is_promoted_before_any_image_row_classification(self):
+        item = Mock()
+        item.property.side_effect = lambda p: {30003: 50007, 30010: True, 30022: False}.get(p)
+        self.observed['node'] = dict(role='statictext', name='Spreadsheet', secure=False,
+                                     enabled=True, available_actions=['SetFocus'])
+        self.uia.parent.return_value = item
+        self.uia.pid.return_value = self.binding.pid
+        self.uia.within.return_value = True
+        self.uia.bounds.return_value = dict(x=0,y=0,width=100,height=100)
+        self.uia.node.return_value = dict(role='listitem', name='Spreadsheet', secure=False,
+            enabled=True, available_actions=['Click','Select'], locator=dict(role='listitem',name='Spreadsheet'))
+        self.worker.row_tracker = Mock()
+        self.worker.row_tracker.before.return_value = None
+        event = dict(kind='down',action='click',window=5,scope_proven=True,at=time.monotonic(),x=50,y=50)
+        with (patch.object(capture.recorder.CaptureWorker,'observe_down',return_value=self.observed),
+              patch('control_lookup.resolve',return_value=item),
+              patch('provider_visibility.visible',return_value=True),
+              patch('row_vision._row_layout',side_effect=AssertionError('caption became painted row'))):
+            resolved = self.worker.observe_down(event)
+            self.assertEqual(resolved['node']['role'], 'listitem')
+            self.assertNotIn('painted_row', resolved)
+
     def test_unreadable_value_preserves_known_location_without_guessing(self):
         capture.live_action.text_readback.return_value = dict(value=None, value_evidence=dict(status='unavailable'))
         self.uia.value.return_value = None
@@ -170,6 +434,48 @@ class TextfieldWorkerTests(unittest.TestCase):
         self.assertEqual(capture.default_text(step), '입력받은 변수를 Family 조건에 입력해줘')
         capture.live_action.text_readback.assert_not_called()
         capture.live_action.textfield_scope.assert_not_called()
+
+
+class ClosedDialogFieldTests(unittest.TestCase):
+    setUp = TextfieldWorkerTests.setUp
+
+    def test_watch_keeps_validated_native_focus_even_if_display_node_has_no_handle(self):
+        native_element = Mock()
+        native_element.property.return_value = 99
+        self.observed['element'] = native_element
+        self.observed['node'].pop('hwnd', None)
+        with (patch.object(capture.bridge, 'hwnd_pid', return_value=self.binding.pid),
+              patch.object(capture.bridge, 'root_window', return_value=self.observed['window'])):
+            self.worker.capture_action(dict(action='click'), self.observed)
+        self.assertEqual(self.observed['_recorded_native_focus'], 99)
+
+    def test_closed_dialog_keeps_only_the_last_pre_transition_observed_value(self):
+        self.worker.capture_action(dict(action='click'), self.observed)
+        before = self.notes.snapshot()[0]
+        now = time.monotonic()
+        self.worker.last_key = now - .2
+        self.worker.watched_samples.clear()
+        self.worker.watched_samples.append((now-.1, 'chosen-folder'))
+        self.worker.watched_samples.append((now+.1, 'too-late'))
+        capture.live_action.textfield_scope.side_effect = capture.bridge.BridgeError('target_window_mismatch')
+        self.worker.freeze_watch(now)
+        final, = self.notes.snapshot()
+        self.assertEqual(final['id'], before['id'])
+        self.assertEqual(final['value'], 'chosen-folder')
+        self.assertEqual(final['target'], before['target'])
+        self.assertIsNone(self.worker.watched)
+
+    def test_popup_disappearing_between_samples_does_not_replace_verified_value_with_manual(self):
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.worker._commit_value('chosen-folder')
+        now = time.monotonic()
+        self.worker.last_key = now - .2
+        self.worker.watched_samples.append((now-.05, 'chosen-folder'))
+        capture.live_action.textfield_scope.side_effect = capture.bridge.BridgeError('target_window_mismatch')
+        self.worker.finalize_watch(True)
+        final, = self.notes.snapshot()
+        self.assertEqual(final['action'], 'set-value')
+        self.assertEqual(final['value'], 'chosen-folder')
 
 
 if __name__ == '__main__':

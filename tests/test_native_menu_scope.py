@@ -193,6 +193,18 @@ class HostMenuLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(win.BridgeError, 'accessibility_unavailable'):
             menu._menus(self.binding, self.uia)
 
+    def test_proven_native_popup_avoids_a_second_query_of_the_whole_host_tree(self):
+        popup = Node(self.uia, '', 50009, name='Popup')
+        popup.values[30022] = False
+        self.scopes.return_value = [123, 456]
+        self.uia.from_handle = lambda hwnd: self.root if hwnd == 123 else popup
+        self.uia.children.side_effect = lambda node: [self.item] if node is popup else []
+        with (patch.object(menu.win, 'window_class', return_value='#32768'),
+              patch.object(menu, '_native_menu_owner', return_value=(42,123))):
+            items = menu._menus(self.binding,self.uia)
+        self.assertEqual([x.surface for x in items], [456])
+        self.assertEqual(self.uia.queries, [])
+
 
 if __name__ == '__main__':
     unittest.main()

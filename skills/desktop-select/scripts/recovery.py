@@ -44,7 +44,9 @@ def _rows(doc):
         return rows
 
     from teach_capture import StepEdits
+    from capture_trail import resolve_menu_scope
     ids = {row['step']['id']: number for number, row in enumerate(doc['rows'], 1)}
+    captured = [row['step'] for row in doc['rows']]
     edits, rows = StepEdits(), []
     for number, row in enumerate(doc['rows'], 1):
         raw, form = row['step'], row['form']
@@ -56,7 +58,10 @@ def _rows(doc):
             entry['capture_role'] = locator['role']
             entry['capture_name'] = locator.get('name')
         try:
-            entry['context'] = _row_context(raw, ids, number)
+            scoped_raw = raw
+            if '_capture_window' in raw:
+                scoped_raw = dict(raw, _capture_window=resolve_menu_scope(raw['_capture_window'], captured, number))
+            entry['context'] = _row_context(scoped_raw, ids, number)
         except (tasks.TaskError, ContextError) as error:
             entry['scope_problem'] = error.code
         try:
@@ -403,6 +408,11 @@ def _routes(rows, operations):
     for number, row in enumerate(rows, 1):
         step = dict(action=row['step']['action'])
         item = operations.get(number, {})
+        if not item and row['step'].get('reason') == 'right_click_requires_menu_teaching':
+            # Reserve only a structurally supported demonstrated menu route as
+            # the source for a following related window. Actual binding happens
+            # later against this window's live region before the task is saved.
+            item = _menu_hint(rows, number, {'targets': []}) or {}
         if item.get('mode') == 'context-menu' and type(item.get('through')) is int:
             menu_end = item['through']
         if number <= menu_end:
@@ -482,7 +492,9 @@ def _recorded_lookups(rows):
     """Use native lookups for fully identified recordings, including their split popup captions."""
     selectors, captions, through = [], [], 0
     for number, row in enumerate(rows, 1):
-        if row['context'] or row.get('scope_problem'):
+        if row['context']:
+            continue
+        if row.get('scope_problem'):
             return None
         if number <= through:
             continue
@@ -495,6 +507,11 @@ def _recorded_lookups(rows):
             selector = anchor['target']
             through = hint['through']
             captions.extend(hint['path'])
+        elif step.get('action') == 'result-menu':
+            selector = step['context']['menu']['target']
+            captions.extend(step['context']['menu']['path'])
+        elif step.get('action') in tasks.CAPTURE_COMMANDS and not row.get('field_problem'):
+            selector = step['selector']
         elif step.get('match') in ('automation_id', 'name') and not row.get('field_problem'):
             selector = {step['match']: step['target'], 'role': step['role']}
         else:
@@ -502,6 +519,37 @@ def _recorded_lookups(rows):
         if selector not in selectors:
             selectors.append(selector)
     return dict(selectors=selectors, captions=captions)
+
+
+def _observe_command(step, inventory, app=None, surface=None):
+    selector = step['selector']
+    candidates = [node for node in inventory['targets'] if node.get('recorded_selector') == selector]
+    if not candidates and app is not None and surface is not None and 'anchor' in selector:
+        # A mixed draft can require a full inventory for another unknown step.
+        # That inventory deliberately omits unnamed inputs. Resolve this exact
+        # recorded input directly and reuse the result for its Enter stage.
+        checks = inventory.setdefault('recorded_selector_checks', [])
+        previous = next((row for row in checks if row['selector'] == selector), None)
+        if previous is not None and previous.get('diagnostic'):
+            raise tasks.TaskError(previous['diagnostic'])
+        import live_recovery
+        try:
+            with app.bridge.UIA() as uia:
+                surface.check()
+                candidates = live_recovery._recorded_targets(app, surface, uia,
+                                                             dict(selectors=[selector], captions=[]))
+                surface.check()
+        except app.bridge.BridgeError as error:
+            checks.append(dict(selector=selector, diagnostic=error.code))
+            raise
+        inventory['targets'].extend(candidates)
+        checks.append(dict(selector=selector, status='observed'))
+    if not candidates and 'anchor' not in selector:
+        identities = {k: selector[k] for k in ('role', 'name', 'automation_id') if k in selector}
+        candidates = [node for node in inventory['targets'] if all(node.get(k) == v for k, v in identities.items())]
+    _require(len(candidates) == 1, 'target_ambiguous' if candidates else 'target_missing')
+    _require(candidates[0].get('enabled') is True, 'target_disabled')
+    _require(candidates[0].get('offscreen') is False, 'target_offscreen')
 
 
 def run(app, args):
@@ -547,7 +595,25 @@ def run(app, args):
             if prepare and origin in pending:
                 raise tasks.TaskError('recorded_window_opener_unresolved')
             if not args.bindings or operation:
-                surface = _bind_surface(app, doc, owner, rows, sequence, number)
+                try:
+                    surface = _bind_surface(app, doc, owner, rows, sequence, number)
+                except tasks.TaskError as error:
+                    # Recorded related dialogs often no longer exist after the
+                    # demonstration. Keep identified literal steps and validate
+                    # their live targets immediately after their actual opener.
+                    context = row.get('context')
+                    if not (prepare and error.code == 'recorded_window_not_open' and context
+                            and context.get('related') is True and origin in remap
+                            and not row.get('field_problem') and row['step']['action'] != 'manual'
+                            and (row['step']['action'] in tasks.CAPTURE_COMMANDS
+                                 or row['step'].get('match') in ('automation_id', 'name'))):
+                        raise
+                    step = deepcopy(row['step'])
+                    step['window_context'] = dict(context, after_step=remap[origin])
+                    revised.append(step)
+                    remap[number] = len(revised)
+                    detail.update(scope_validation='deferred_until_opener', opener_step=origin)
+                    continue
                 key = surface.hwnd, surface.pid, surface.created
                 if key not in observations:
                     observation = live_recovery.observe_scope(app, owner, surface, doc['window'],
@@ -561,7 +627,8 @@ def run(app, args):
                     detail['recorded_image_point'] = [min(extent-1, round(fraction*extent)) for fraction, extent in
                         zip(detail['menu_window_point'], [observation['width'], observation['height']])]
             if prepare:
-                operation = _suggest(number, rows, detail, observation, doc['name'])
+                operation = (None if row['step']['action'] in tasks.CAPTURE_COMMANDS else
+                             _suggest(number, rows, detail, observation, doc['name']))
             if not args.bindings and not prepare:
                 continue
             if row.get('scope_problem'):
@@ -584,6 +651,8 @@ def run(app, args):
                     _require(len(matches) == 1, 'target_ambiguous' if matches else 'target_missing')
                     _require(matches[0].get('enabled') is True, 'target_disabled')
                     _require(matches[0].get('offscreen') is False, 'target_offscreen')
+                if prepare and step['action'] in tasks.CAPTURE_COMMANDS:
+                    _observe_command(step, observation, app, surface)
             context = step.get('window_context')
             if context and 'after_step' in context:
                 _require(context['after_step'] in remap, 'recorded_window_opener_unresolved')
@@ -665,4 +734,7 @@ def run(app, args):
         saved['observed_scopes'] = len(observations)
         saved['lookup_modes'] = [scope.get('lookup_mode', 'window_inventory') for scope in result['live_scopes']]
         saved['menu_previews'] = [dict(number=d['number'], **d['menu_preview']) for d in details if 'menu_preview' in d]
+        saved['pending_scopes'] = [dict(number=d['number'], opener_step=d['opener_step'],
+                                       scope_validation=d['scope_validation']) for d in details
+                                   if d.get('scope_validation') == 'deferred_until_opener']
     return saved

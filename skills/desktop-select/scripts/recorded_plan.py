@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 9
+COMPILER = 10
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 
 
@@ -64,7 +64,8 @@ def compile_plan(task, *, replacements=None):
                                             if tasks.has_groundable_draft(s)])
         elif step['action'] == 'manual' and step.get('instruction_draft'):
             reason = step['reason']
-        elif step['action'] in ('row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open', 'result-menu'):
+        elif step['action'] in ('row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open', 'result-menu',
+                                *tasks.CAPTURE_COMMANDS):
             continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
             reason = 'execution_plan_special_step'
@@ -83,6 +84,17 @@ def compile_plan(task, *, replacements=None):
         context = deepcopy(step.get('window_context'))
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
+        if step['action'] in tasks.CAPTURE_COMMANDS:
+            current = dict(action='set-value' if step['action'] == 'field-input' else step['action'],
+                           selector=deepcopy(step['selector']), label=step['label'])
+            if context is not None:
+                current['window_context'] = context
+            if step['action'] == 'field-input':
+                key = 'parameter' if 'parameter' in step else 'value'
+                current[key] = step[key]
+            converted.append(current)
+            source_steps.append(number)
+            continue
         if step['action'] in ('conditional-open', 'row-open', 'result-menu'):
             current = deepcopy(step)
             if context is not None:
@@ -109,7 +121,11 @@ def compile_plan(task, *, replacements=None):
             independent = (current_scope and next_scope and next_step['action'] in ('visual-click', 'open', 'conditional-open')
                            and (current_scope['exe'].casefold(), current_scope['title']) !=
                                (next_scope['exe'].casefold(), next_scope['title']))
-            if not independent:
+            # A demonstrated button inside its related dialog can lead to the
+            # next page of that same dialog. Each next target is read live.
+            dialog_sequence = (current_scope and current_scope.get('related') is True and
+                               current_scope == next_scope)
+            if not independent and not dialog_sequence:
                 return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])
         if step['match'] == 'query':

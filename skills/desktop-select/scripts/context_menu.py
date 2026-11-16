@@ -169,7 +169,15 @@ _NON_DATA_CONTROLS = frozenset({50000, 50002, 50003, 50004, 50005, 50009, 50010,
                                 50037, 50038})
 
 
-def _check_region_children(binding, uia, region, point, *, data_only=False):
+def _transparent_data_ancestor(uia, element, hit):
+    # A Tab control wraps its active content as well as its selectable tabs.
+    # Only the already-proven hit's ancestor is transparent. A tab header,
+    # direct Tab hit or overlapping sibling keeps the non-data classification.
+    return (hit is not None and element.property(30003) == 50018 and not uia.same(element, hit)
+            and uia.within(hit, element))
+
+
+def _check_region_children(binding, uia, region, point, *, data_only=False, hit_element=None):
     # Blank/custom peers can answer ElementFromPoint with the parent even
     # when a separate protected editor is drawn over part of the surface.
     pending = deque([(region, 0)])
@@ -189,7 +197,8 @@ def _check_region_children(binding, uia, region, point, *, data_only=False):
             if _inside(point, rect) and visible:
                 _need(child.property(30010) is True, 'context_point_disabled')
                 if data_only:
-                    _need(child.property(30003) not in _NON_DATA_CONTROLS, 'context_point_not_data')
+                    _need(child.property(30003) not in _NON_DATA_CONTROLS
+                          or _transparent_data_ancestor(uia, child, hit_element), 'context_point_not_data')
             # Providers sometimes give wrappers no bounds, so do not prune a
             # branch merely because the wrapper did not contain the point.
             pending.append((child, depth + 1))
@@ -204,6 +213,7 @@ def _hit_region(binding, uia, region, point, *, require_body=False, recorded_opa
     if not uia.within(element, region):
         _need(uia.within(region, element), 'context_point_outside_region')
         element = uia.point_descendant(element, *point, binding.pid)
+    hit_element = element
     body, opaque = False, True
     for _ in range(32):
         if element is None:
@@ -213,17 +223,18 @@ def _hit_region(binding, uia, region, point, *, require_body=False, recorded_opa
         if uia.same(element, region):
             _need(_inside(point, _rect(uia, region)), 'context_point_outside_region')
             _need(not require_body or body or (recorded_opaque and opaque), 'context_data_cell_unconfirmed')
-            _check_region_children(binding, uia, region, point, data_only=require_body)
+            _check_region_children(binding, uia, region, point, data_only=require_body, hit_element=hit_element)
             _need(win.window_from_point(*point) == hit, 'context_point_occluded')
             return
         if require_body:
             role = element.property(30003)
             # A row may contain a command button, editor or trailing scroll bar.
             # Its row ancestor alone does not turn an interactive control into data.
-            _need(role in (50006, 50007, 50020, 50025, 50026, 50028, 50029, 50033, 50036),
+            transparent = _transparent_data_ancestor(uia, element, hit_element)
+            _need(role in (50006, 50007, 50020, 50025, 50026, 50028, 50029, 50033, 50036) or transparent,
                   'context_point_not_data')
             body |= role in (50007, 50029) or element.property(30029) is True
-            opaque &= role in _PROXY_ROLES
+            opaque &= role in _PROXY_ROLES or transparent
         element = uia.parent(element)
     raise win.BridgeError('context_point_outside_region')
 
@@ -274,7 +285,8 @@ def _visual_point(binding, uia, region, point):
             _need(ancestor or uia.within(node, region) or (alias and uia.within(node, element)),
                   'context_point_occluded')
             if not ancestor:
-                _need(node.property(30003) in _PROXY_ROLES | {50006, 50007, 50020, 50029},
+                _need(node.property(30003) in _PROXY_ROLES | {50006, 50007, 50020, 50029}
+                      or _transparent_data_ancestor(uia, node, element),
                       'context_point_not_data')
         pending.extend(uia.children(node))
     _need(win.window_from_point(*point) == hit, 'context_point_occluded')
@@ -412,6 +424,33 @@ def _surface_target(binding, uia, element, *, target=None, role=None):
     return None
 
 
+def _surface_candidates(binding, uia, element, root, *, target=None, role=None):
+    """Rank the durable containing regions of an already scoped native/UIA hit."""
+    _need(element is not None and root is not None and uia.within(element, root), 'context_point_occluded')
+    candidates = []
+    window_box = uia.bounds(root)
+    for depth in range(32):
+        if element is None or uia.same(element, root):
+            break
+        _need(uia.pid(element) == binding.pid and not uia.secure(element), 'context_point_protected')
+        info = uia.basic(element)
+        if info['role'] in REGIONS:
+            # Some grids label the current row as a group. The containing
+            # table, stable control ID or outer surface survives value changes.
+            identifier = info.get('automation_id')
+            rank = (0 if info['role'] in ('table', 'list', 'tree') else
+                    1 if _text(identifier) and not identifier.isdecimal() else 2)
+            box = uia.bounds(element)
+            shell = (target is None and role is None and rank > 0 and visibility.valid(box)
+                     and visibility.valid(window_box) and
+                     box['width'] >= .9 * window_box['width'] and
+                     box['height'] >= .75 * window_box['height'])
+            if not shell:
+                candidates.append((rank, -depth if rank == 2 else depth, element))
+        element = uia.parent(element)
+    return [item for _, _, item in sorted(candidates, key=lambda row: row[:2])]
+
+
 def teach_surface(binding, screen_point, *, target=None, role=None):
     """Observe the named region and local point before a context menu opens."""
     binding.check()
@@ -422,18 +461,19 @@ def teach_surface(binding, screen_point, *, target=None, role=None):
         root = uia.from_handle(binding.hwnd)
         _need(element is not None and root is not None and uia.within(element, root), 'context_point_occluded')
         element = uia.point_descendant(element, *screen_point, binding.pid)
-        for _ in range(32):
-            if element is None or uia.same(element, root):
-                break
-            _need(uia.pid(element) == binding.pid and not uia.secure(element), 'context_point_protected')
+        for element in _surface_candidates(binding, uia, element, root, target=target, role=role):
             locator = _surface_target(binding, uia, element, target=target, role=role)
             if locator:
-                _hit_region(binding, uia, element, screen_point)
+                try:
+                    _hit_region(binding, uia, element, screen_point)
+                except win.BridgeError as error:
+                    if target is None and error.code == 'context_region_tree_incomplete':
+                        continue
+                    raise
                 x, y, w, h = _rect(uia, element)
                 ratios = [(screen_point[0]-x)/w, (screen_point[1]-y)/h]
                 _validate_surface(locator, ratios)
                 return {'target':locator, 'point':ratios}
-            element = uia.parent(element)
     raise win.BridgeError('named_context_region_required')
 
 
@@ -494,7 +534,16 @@ def _menus(binding, uia):
                 items.append(_Item(hwnd, item, frame, _rect(uia, frame), rect, name))
     # Some trees expose a popup both on its own HWND and below the host.
     # Prefer the popup root so the final hit test has its actual window.
-    for hwnd in sorted(_scoped_windows(binding), key=lambda h: h == binding.hwnd):
+    scopes = _scoped_windows(binding)
+    native_scopes = {hwnd for hwnd in scopes if hwnd != binding.hwnd and win.window_class(hwnd) == '#32768'}
+    if native_scopes and _native_menu_owner(binding) is None:
+        native_scopes = set()
+    for hwnd in sorted(scopes, key=lambda h: h == binding.hwnd):
+        if hwnd == binding.hwnd and any(item.surface in native_scopes for item in items):
+            # A proven native menu already contains the actual visible
+            # commands. A whole-window FindAll adds unrelated application
+            # menus and can outlive a short mouse gesture on large SWT trees.
+            continue
         root = uia.from_handle(hwnd)
         _need(root is not None and uia.pid(root) == binding.pid, 'context_menu_scope_unavailable')
         if hwnd == binding.hwnd:

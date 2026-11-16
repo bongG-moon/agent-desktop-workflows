@@ -166,7 +166,7 @@ def validate(recipe):
             continue
         need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label', 'popup',
                               'grounding_text', 'allow_option_select'}, 'unknown_step_field')
-        need(step.get('action') in ('set-value', 'invoke', 'submit'), 'unsupported_workflow_action')
+        need(step.get('action') in ('set-value', 'invoke', 'submit', 'choose-item'), 'unsupported_workflow_action')
         if 'popup' in step:
             popup = step['popup']
             need(isinstance(popup, dict) and not set(popup) - {'title', 'timeout'}
@@ -199,6 +199,9 @@ def validate(recipe):
         elif step['action'] == 'submit':
             need(selector['role'] in ('combobox', 'textfield')
                  and 'value' not in step and 'parameter' not in step, 'invalid_submit')
+        elif step['action'] == 'choose-item':
+            need(selector['role'] in ('listitem', 'treeitem', 'tab')
+                 and 'value' not in step and 'parameter' not in step, 'invalid_item_selection')
         else:
             need(selector['role'] in ('button', 'menuitem', 'splitbutton', 'hyperlink')
                  and 'value' not in step and 'parameter' not in step, 'invalid_invoke')
@@ -729,12 +732,15 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                         app.field_label(surface, uia, current, root))
                             if (step['action'] != 'set-value' or selector['role'] == 'textfield' or
                                     not (allow_recorded_selection or step.get('allow_option_select'))):
-                                capability = {'set-value': 'SetValue', 'invoke': 'Click', 'submit': 'SetFocus'}[step['action']]
+                                capability = {'set-value': 'SetValue', 'invoke': 'Click', 'submit': 'SetFocus',
+                                              'choose-item': 'Select'}[step['action']]
                                 need(capability in uia.actions(current),
                                      'workflow_pattern_unavailable')
                         value = values[step['parameter'].casefold()] if 'parameter' in step else step.get('value')
                         dispatching = True
-                        operation = ('fill' if selector['role'] == 'textfield' else 'select') if step['action'] == 'set-value' else step['action']
+                        operation = (('fill' if selector['role'] == 'textfield' else 'select')
+                                     if step['action'] == 'set-value' else
+                                     'choose' if step['action'] == 'choose-item' else step['action'])
                         try:
                             receipt = live.execute(surface, uia, element, {'role': selector['role']}, operation,
                                                    value, still_valid=check)
@@ -910,8 +916,9 @@ GUIDE_END = '<!-- /desktop-select:run -->\n\n'
 def run_instructions(recipe):
     parameters = list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s))
     arguments = ' --set "이름=값"' if parameters else ''
-    note = ('화면 확인과 실제 입력이 필요한 창 및 메뉴 경로를 말하고 마우스와 키보드를 비울 수 있는지 한 번 묻는다. '
-            '사용자가 승인하면 아래 명령을 실행한다. 거절하면 실행을 멈춘다. '
+    note = ('화면 확인과 실제 입력이 필요한 창 및 메뉴 경로를 알린다. '
+            '현재 요청이나 앞선 대화에서 해당 실행의 실제 입력과 화면 확인을 승인받았으면 다시 묻지 않고 이어 간다. '
+            '승인이 없으면 마우스와 키보드를 비울 수 있는지 한 번 묻는다. 거절하면 실행을 멈춘다. '
             if input_policy.profile(recipe['steps'])['physical_input_required'] else '')
     if note:
         arguments += ' --allow-physical'
@@ -1005,7 +1012,8 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
         if row['receipt']['status'] == 'deferred':
             need('popup' in step or 'window_context' in step, 'invalid_deferred_scope')
             continue
-        capabilities = {'set-value': {'SetValue'}, 'invoke': {'Click'}, 'submit': {'SetFocus'}}[step['action']]
+        capabilities = {'set-value': {'SetValue'}, 'invoke': {'Click'}, 'submit': {'SetFocus'},
+                        'choose-item': {'Select'}}[step['action']]
         if (step['action'] == 'set-value' and step['selector']['role'] == 'combobox'
                 and (source_task is not None or step.get('allow_option_select'))):
             # A list-only combo exposes Expand on the field and Select on a

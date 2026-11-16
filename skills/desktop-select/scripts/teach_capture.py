@@ -39,6 +39,19 @@ def manual(reason, step_id=None):
     return step
 
 
+def _capture_locator_valid(locator):
+    if recorder._locator_valid(locator):
+        return True
+    if not isinstance(locator, dict) or 'anchor' not in locator:
+        return False
+    try:
+        import control_lookup
+        control_lookup._selector(locator)
+        return locator.get('role') == 'textfield'
+    except bridge.BridgeError:
+        return False
+
+
 def capture_step(step):
     """Copy only data used by a Desktop Select command. All other inputs are review stops."""
     if step['action'] == 'visual-click':
@@ -72,6 +85,7 @@ def capture_step(step):
                     'result': 'manual', 'reason': 'combo_choice_unproven' if role == 'combobox' else 'text_value_unobserved'})
     supported = (pointed or (action == 'set-value' and role == 'combobox' and bool(step.get('value')))
                  or (action == 'set-value' and role == 'textfield' and isinstance(step.get('value'), str))
+                 or (action == 'submit' and role == 'textfield')
                  or (action == 'click' and role in {'menuitem', 'button', 'splitbutton', 'hyperlink'})
                  or (action == 'select' and role in {'tab', 'treeitem', 'listitem'})
                  or (action == 'expand' and role in {'treeitem', 'menuitem', 'splitbutton'}))
@@ -198,6 +212,12 @@ def default_text(step):
         return f"{field} 조건을 {command['value']}로 설정해줘"
     if command['action'] == 'fill':
         return f"{field} 입력란을 {json.dumps(command['value'], ensure_ascii=False)}로 설정해줘"
+    if command['action'] == 'field-input':
+        return f"이 입력란을 {json.dumps(command.get('value', ''), ensure_ascii=False)}로 설정해줘"
+    if command['action'] == 'submit':
+        return '이 입력란에서 Enter를 눌러 적용해줘'
+    if command['action'] == 'choose-item':
+        return f"{command['selector'].get('name', field)} 항목을 선택해줘"
     if command['action'] == 'open':
         kind = '버튼' if command.get('role') in {'button', 'splitbutton'} else '항목'
         verb = '펼쳐줘' if command.get('expand') else '눌러줘'
@@ -469,7 +489,47 @@ class _CaptureUIA(bridge.UIA):
         from provider_visibility import visible
         node = super().node(element, root, path, parent)
         node['offscreen'] = not visible(self.binding, self, element, root)
+        if (node['role'] == 'textfield' and node.get('secure') is False
+                and node.get('enabled') is True and not recorder._locator_valid(node.get('locator'))):
+            locator = self.anchored_field(element, root)
+            if locator is not None:
+                node['locator'] = locator
         return node
+
+    def anchored_field(self, element, root):
+        """Retain a demonstrated unnamed field using a unique owned ancestor."""
+        import control_lookup
+        from provider_visibility import inside, valid
+        try:
+            live_action.textfield_scope(self.binding, self, element)
+            bounds = self.bounds(element)
+            class_name = element.property(30012)
+            if not valid(bounds) or not isinstance(class_name, str) or not class_name:
+                return None
+            center = (bounds['x'] + bounds['width'] / 2, bounds['y'] + bounds['height'] / 2)
+            parent = self.parent(element)
+            for _ in range(32):
+                if parent is None:
+                    return None
+                if self.pid(parent) != self.binding.pid or self.secure(parent):
+                    return None
+                identity = learned_tasks._selector(self.basic(parent))
+                box = self.bounds(parent)
+                if (identity and identity['role'] in {'group', 'window', 'tab', 'toolbar'}
+                        and inside(bounds, box)):
+                    selector = dict(anchor=identity, role='textfield', class_name=class_name,
+                                    point=[(center[0]-box['x'])/box['width'], (center[1]-box['y'])/box['height']])
+                    try:
+                        current = control_lookup.resolve(self.binding, self, selector, root=root)
+                        if self.same(current, element):
+                            return selector
+                    except bridge.BridgeError:
+                        pass
+                if self.same(parent, root):
+                    return None
+                parent = self.parent(parent)
+        except bridge.BridgeError:
+            return None
 
     def semantic_label(self, element, root):
         from desktop_select import field_label
@@ -500,6 +560,19 @@ class _RowHookPump(recorder.HookPump):
     visual_tracker = None
 
     def _emit(self, event):
+        if event.get('kind') == 'enter':
+            # Native focus is cheap enough to sample before the target handles
+            # Enter. The UIA peer can be rebuilt immediately by that handler.
+            C, W = recorder.ctypes, recorder.wintypes
+            class GuiInfo(C.Structure):
+                _fields_ = [('size', W.DWORD), ('flags', W.DWORD),
+                            ('active', W.HWND), ('focus', W.HWND), ('capture', W.HWND),
+                            ('menu', W.HWND), ('move', W.HWND), ('caret', W.HWND), ('rect', W.RECT)]
+            info = GuiInfo(size=C.sizeof(GuiInfo))
+            read = bridge._sig(bridge.user32, 'GetGUIThreadInfo', W.BOOL, W.DWORD, C.POINTER(GuiInfo))
+            if read(0, C.byref(info)):
+                event['submit_focus'] = int(info.focus or 0)
+                event['submit_window'] = int(bridge.root_window(info.focus) or 0)
         if self.visual_tracker is not None and (event.get('kind') in
                 ('scroll', 'candidate_scroll', 'typing', 'enter', 'tab', 'escape', 'shortcut', 'pause', 'outside')
                 or (event.get('kind') == 'down' and event.get('action') != 'click')):
@@ -533,6 +606,134 @@ class _Worker(recorder.CaptureWorker):
     row_tracker = None
     visual_tracker = None
     menu_gesture = None
+    command_snapshot = ()
+
+    def _cache_commands(self):
+        """Keep recent button intent while an input may close its containing dialog."""
+        import control_lookup
+        self._last_command_refresh = time.monotonic()
+        if getattr(self.binding, 'is_linked_window', False) is not True:
+            return
+        commands = []
+        peers = {}
+        try:
+            root = self.uia.from_handle(self.binding.hwnd)
+            items = control_lookup.find_all(self.uia, root, roles=('button', 'splitbutton', 'hyperlink'), limit=128)
+            for item in items:
+                node = self.uia.node(item, root)
+                locator = node.get('locator')
+                if (node.get('secure') is not False or node.get('enabled') is not True or node.get('offscreen')
+                        or 'Click' not in node.get('available_actions', ()) or not recorder._locator_valid(locator)):
+                    continue
+                raw = dict(id=uuid.uuid4().hex, action='click', label=node.get('name') or node.get('role'),
+                           target=dict(kind='element', locator=copy.deepcopy(locator)),
+                           recognition=dict(target='identified', action='supported', result='manual'))
+                commands.append((node['bounds'], raw))
+                hwnd = node.get('hwnd')
+                if type(hwnd) is int and hwnd > 0:
+                    peers[raw['id']] = hwnd, bridge.window_class(hwnd), bridge.window_text(hwnd)
+            keys = [json.dumps(raw['target'], sort_keys=True) for _, raw in commands]
+            self.command_snapshot = (time.monotonic(), [(box, raw) for box, raw in commands
+                                      if keys.count(json.dumps(raw['target'], sort_keys=True)) == 1])
+            self._command_peers = peers
+        except (bridge.BridgeError, OSError, AttributeError, TypeError):
+            # A button may already have closed its dialog while this refresh
+            # runs. Retain the last bounded pre-click evidence for its queued
+            # down/up event instead of erasing it on that late read failure.
+            pass
+
+    def _refresh_commands(self):
+        """Refresh already checked native buttons without repeated UIA tree searches."""
+        self._last_command_refresh = time.monotonic()
+        if not self.command_snapshot:
+            return
+        C, W = recorder.ctypes, recorder.wintypes
+        read = bridge._sig(bridge.user32, 'GetWindowRect', W.BOOL, W.HWND, C.POINTER(W.RECT))
+        enabled = bridge._sig(bridge.user32, 'IsWindowEnabled', W.BOOL, W.HWND)
+        commands = []
+        try:
+            self.binding.check()
+            for _, raw in self.command_snapshot[1]:
+                peer = getattr(self, '_command_peers', {}).get(raw['id'])
+                if not peer:
+                    continue
+                hwnd, class_name, caption = peer
+                if (bridge.hwnd_pid(hwnd) != self.binding.pid or bridge.root_window(hwnd) != self.binding.hwnd
+                        or bridge.window_class(hwnd) != class_name or bridge.window_text(hwnd) != caption
+                        or not enabled(hwnd) or not bridge.user32.IsWindowVisible(hwnd)):
+                    continue
+                rect = W.RECT()
+                if read(hwnd, C.byref(rect)) and rect.right > rect.left and rect.bottom > rect.top:
+                    commands.append((dict(x=rect.left,y=rect.top,width=rect.right-rect.left,
+                                          height=rect.bottom-rect.top), raw))
+            if commands:
+                self.command_snapshot = time.monotonic(), commands
+        except (bridge.BridgeError, OSError):
+            pass
+
+    def _command_before(self, event):
+        if (event.get('action') != 'click' or not event.get('scope_proven')
+                or event.get('window') != self.binding.hwnd):
+            return None
+        for at, observation in reversed(self.hover_history):
+            if not 0 <= event['at'] - at <= 1.2 or not observation:
+                continue
+            node = observation['node']
+            if (observation.get('window') == self.binding.hwnd and node.get('secure') is False
+                    and node.get('enabled') is True and not node.get('offscreen')
+                    and node.get('role') in {'button', 'splitbutton', 'hyperlink', 'menuitem'}
+                    and 'Click' in node.get('available_actions', ())
+                    and recorder._locator_valid(node.get('locator'))
+                    and recorder._inside(node.get('bounds'), event['x'], event['y'])):
+                return dict(id=uuid.uuid4().hex, action='click', label=node.get('name') or node['role'],
+                            target=dict(kind='element', locator=copy.deepcopy(node['locator'])),
+                            recognition=dict(target='identified', action='supported', result='manual'))
+        if self.command_snapshot:
+            at, commands = self.command_snapshot
+            if 0 <= event['at'] - at <= 4:
+                matches = [raw for box, raw in commands if recorder._inside(box, event['x'], event['y'])]
+                if len(matches) == 1:
+                    # The inventory identifies a button, not a demonstrated
+                    # gesture. Separate real clicks must remain separate steps.
+                    return dict(copy.deepcopy(matches[0]), id=uuid.uuid4().hex)
+        return None
+
+    def _unique_list_selection(self, observation):
+        node = observation['node']
+        locator = node.get('locator')
+        if node.get('role') != 'listitem' or 'Select' not in node.get('available_actions', ()):
+            return False
+        selector = learned_tasks._selector(locator)
+        if not selector:
+            return False
+        import control_lookup
+        try:
+            selector['ancestors'] = [learned_tasks._selector(parent) for parent in locator.get('ancestors', [])]
+            current = control_lookup.resolve(self.binding, self.uia, selector, root=observation['root'])
+            return self.uia.same(current, observation['element'])
+        except (bridge.BridgeError, TypeError, ValueError):
+            return False
+
+    def target(self, observation, kind, point=None):
+        if (kind == 'element' and point is None and observation.get('_freezing_observed_field')
+                and observation.get('_recorded_field_target')):
+            # The value and locator were read before the user's transition.
+            # This stores the demonstration, it sends no input to the closed dialog.
+            return copy.deepcopy(observation['_recorded_field_target'])
+        locator = observation['node'].get('locator')
+        if isinstance(locator, dict) and 'anchor' in locator:
+            if kind != 'element' or point is not None or not _capture_locator_valid(locator):
+                raise recorder.RecorderError('stable_locator_unavailable')
+            import control_lookup
+            current = control_lookup.resolve(self.binding, self.uia, locator, root=observation['root'])
+            if not self.uia.same(current, observation['element']):
+                raise recorder.RecorderError('capture_target_changed')
+            target = dict(kind='element', locator=copy.deepcopy(locator))
+            if observation['window'] != self.binding.hwnd:
+                target['window'] = dict(title=self.bridge.window_text(observation['window']),
+                                        class_name=self.bridge.window_class(observation['window']))
+            return target
+        return super().target(observation, kind, point)
 
     def observe_down(self, event):
         if event.get('kind') == 'down':
@@ -547,7 +748,7 @@ class _Worker(recorder.CaptureWorker):
                 if pick:
                     # The menu observer proved this HWND, point and item. The
                     # legacy capture worker must not interpret it as a combo.
-                    event.update(menu_pick=pick, scope_proven=True)
+                    event.update(menu_pick=pick, menu_gesture_id=self.menu_gesture.step_id, scope_proven=True)
                     return None
                 self.menu_gesture = None
             if (event.get('scope_proven') is False and event.get('window')
@@ -599,11 +800,19 @@ class _Worker(recorder.CaptureWorker):
             return observation
         node = observation['node']
         role = node.get('role')
+        if role in {'statictext', 'image'}:
+            owner = self._command_owner(event, observation)
+            if owner['node'].get('role') == 'listitem' and self._unique_list_selection(owner):
+                return owner
         if (node.get('secure') is not False or node.get('enabled') is not True
                 or role not in ('list', 'listitem', 'row', 'table', 'image', 'statictext', 'custom', 'group')
                 or event.get('action') != 'click'):
             return observation
         if 'combo' not in observation and self.combo_for(observation) is not None:
+            return observation
+        # A named native selection is stronger evidence than the generic row
+        # image tracker, which also sees ordinary dialog option lists as rows.
+        if self._unique_list_selection(observation):
             return observation
         import row_capture
         import row_vision
@@ -625,13 +834,48 @@ class _Worker(recorder.CaptureWorker):
                     press = row_capture.prepare(frame, point, event['at'])
             except bridge.BridgeError:
                 pass
-        if not press and _semantic_list_selection(node):
+        if not press and (_semantic_list_selection(node) or self._unique_list_selection(observation)):
             return observation
         if press or number or role in ('row','listitem'):
             return dict(observation, painted_row=(number,press))
         return observation
 
     def handle(self, event):
+        if event['kind'] in ('down', 'outside', 'scroll', 'candidate_scroll', 'tab', 'escape', 'shortcut', 'pause'):
+            self._pending_field_activation = None
+        if event['kind'] == 'typing' and self.watched:
+            activation = self.watched.get('_recorded_activation_at')
+            if activation is not None and event['at'] >= activation:
+                self.watched['_recorded_typing_at'] = event['at']
+                self._capture_typed_value()
+        pending = getattr(self, '_pending_commands', None)
+        if pending is None:
+            pending = self._pending_commands = {}
+        if event['kind'] == 'down' and (raw := self._command_before(event)):
+            pending[event['token']] = event, raw
+            try:
+                self.binding.check()
+            except bridge.BridgeError:
+                # The paired hook event will decide whether a click completed.
+                # This path records a witnessed intent and never sends input.
+                return
+        elif event['kind'] == 'up' and event.get('token') in pending:
+            down, raw = pending.pop(event['token'])
+            complete = (event.get('inside') and abs(event['x'] - down['x']) <= 8
+                        and abs(event['y'] - down['y']) <= 8)
+            try:
+                self.binding.check()
+                missing = self.captures.get(event['token'], (None, None))[1] is None
+            except bridge.BridgeError:
+                missing = True
+            if complete and missing:
+                self.captures.pop(event['token'], None)
+                self.model.event_at = down['at']
+                try:
+                    self.model.add(raw)
+                finally:
+                    self.model.event_at = None
+                return
         if event['kind'] in ('outside', 'scroll', 'candidate_scroll', 'typing', 'enter', 'tab',
                              'escape', 'shortcut', 'pause'):
             self.menu_gesture = None
@@ -645,12 +889,139 @@ class _Worker(recorder.CaptureWorker):
                 if not event['inside'] or abs(event['x'] - down['x']) > 8 or abs(event['y'] - down['y']) > 8:
                     self.menu_gesture = None
         try:
+            if event['kind'] == 'enter' and self._capture_submit(event):
+                return
             return super().handle(event)
         finally:
             self.model.event_at = None
 
+    def _capture_submit(self, event):
+        """An observed Enter on a writable focused field becomes an explicit submit."""
+        observation = self.watched
+        if not observation or observation['node'].get('role') != 'textfield':
+            return False
+        try:
+            self.binding.check()
+            before_focus = (event.get('submit_focus') and
+                            event['submit_focus'] == observation.get('_recorded_native_focus', observation['node'].get('hwnd')) and
+                            event.get('submit_window') == observation['window'] and
+                            observation.get('_recorded_field_target') is not None)
+            if not before_focus:
+                focused = self.uia.focused()
+                if focused is None or not self.uia.same(focused, observation['element']):
+                    return False
+                live_action.textfield_scope(self.binding, self.uia, observation['element'])
+            if not _capture_locator_valid(observation['node'].get('locator')):
+                return False
+            self.freeze_watch(event.get('at'))
+            observation['_freezing_observed_field'] = bool(before_focus)
+            try:
+                step = self.step('submit', observation)
+            finally:
+                observation.pop('_freezing_observed_field', None)
+            step['label'] = '입력란에서 Enter 적용'
+            step['recognition'] = dict(target='identified', action='supported', result='manual')
+            self.model.add(step)
+            return True
+        except (bridge.BridgeError, recorder.RecorderError, OSError):
+            return False
+
+    def _capture_typed_value(self):
+        observation = self.watched
+        if (not observation or observation['node'].get('role') != 'textfield'
+                or not observation.get('_recorded_field_target')
+                or '_recorded_typing_at' not in observation or not self.watched_samples):
+            return
+        at, value = self.watched_samples[-1]
+        if at < observation['_recorded_typing_at'] + .05 or not isinstance(value, str):
+            return
+        observation['_freezing_observed_field'] = True
+        try:
+            recorder.CaptureWorker._commit_value(self, value)
+            if self.watched_step and self.watched_step['action'] == 'set-value' and self.watched_step.get('value') == value:
+                observation['_typed_value_observed'] = True
+        finally:
+            observation.pop('_freezing_observed_field', None)
+
+    def _remember_field_activation(self, event, observation, step_id, previous_ids):
+        """Retain a witnessed passive activation, never an arbitrary unknown click."""
+        if (not observation or event.get('action') != 'click' or event.get('scope_proven') is not True
+                or event.get('window') != self.binding.hwnd or observation.get('window') != self.binding.hwnd):
+            return
+        node = observation['node']
+        if (node.get('secure') is not False or node.get('enabled') is not True
+                or node.get('role') not in {'window', 'pane', 'tabgroup', 'group', 'statictext', 'image', 'custom', 'textfield'}
+                or set(node.get('available_actions', [])) - {'SetFocus'}
+                or not recorder._inside(node.get('bounds'), event.get('x'), event.get('y'))):
+            return
+        with self.model.lock:
+            if step_id is None:
+                added = set(self.model.steps) - previous_ids
+                if len(added) != 1:
+                    return
+                step_id = added.pop()
+            raw = self.model.steps.get(step_id, {})
+            if (raw.get('action') != 'manual' or raw.get('recognition', {}).get('reason')
+                    not in {'unsupported_recorded_action', 'stable_locator_unavailable'}):
+                return
+        self._pending_field_activation = dict(id=step_id, window=event['window'],
+            x=event['x'], y=event['y'], at=event['at'])
+
+    def _refine_field_activation(self, observation):
+        """A later typed field may refine only its own exact activation step."""
+        pending = getattr(self, '_pending_field_activation', None)
+        if not pending or not observation.get('_recorded_field_target'):
+            return
+        if (observation.get('window') != pending['window'] or self.last_key < pending['at']
+                or not recorder._inside(observation['node'].get('bounds'), pending['x'], pending['y'])):
+            self._pending_field_activation = None
+            return
+        with self.model.lock:
+            raw = self.model.steps.get(pending['id'], {})
+            if (raw.get('action') != 'manual' or raw.get('recognition', {}).get('reason')
+                    not in {'unsupported_recorded_action', 'stable_locator_unavailable'}):
+                self._pending_field_activation = None
+                return
+        step = self.step('teach-target', observation)
+        step['id'] = pending['id']
+        step['recognition'] = dict(target='identified', action='requires_instruction',
+                                   result='manual', reason='text_value_unobserved')
+        observation['_recorded_activation_at'] = pending['at']
+        observation['_recorded_typing_at'] = self.last_key
+        self.model.add(step)
+        self.watched_step = step
+        self.pointed = observation
+        self._pending_field_activation = None
+        self._capture_typed_value()
+
     def tick(self):
+        if self.menu_gesture is not None:
+            events = getattr(self, 'events', None)
+            if events is not None and not events.empty():
+                # A hook can already have queued down/up while a preceding
+                # UIA read was running. Handle those timestamps before taking
+                # another snapshot of a menu that may now be closed.
+                return
+            # A native menu can disappear immediately on mouse-down. Keep
+            # its complete pre-down inventory fresh instead of spending this
+            # interval rediscovering the underlying edit/combo/button tree.
+            self._poll_menu()
+            if self.menu_gesture is not None:
+                from context_menu import _native_menu_owner
+                if _native_menu_owner(self.binding) is not None:
+                    return
+        pending = getattr(self, '_pending_commands', {})
+        if pending:
+            try:
+                self.binding.check()
+            except bridge.BridgeError:
+                if time.monotonic() - min(down['at'] for down, _ in pending.values()) < 2:
+                    return
+                pending.clear()
         super().tick()
+        if (self.watched and self.watched['node'].get('role') == 'textfield'
+                and time.monotonic() - getattr(self, '_last_command_refresh', 0) >= 1):
+            self._refresh_commands()
         self._poll_menu()
         if (self.row_tracker and self.hovered and self.hovered.get('window') == self.binding.hwnd
                 and self.hovered['node'].get('role') in ('list','listitem','row','table')):
@@ -659,10 +1030,25 @@ class _Worker(recorder.CaptureWorker):
     def _poll_menu(self):
         gesture = self.menu_gesture
         if gesture is not None:
+            # A native command can close its popup on down. The matching up
+            # still decides whether the demonstrated click was completed.
+            # Keep this exact gesture until that queued pair is processed.
+            now = time.monotonic()
+            if any(down.get('menu_pick') is not None and down.get('menu_gesture_id') == gesture.step_id
+                   and 0 <= now - down.get('at', -10) <= 2
+                   for down, _ in tuple(getattr(self, 'captures', {}).values())):
+                return
             state = gesture.tick(self.binding, self.uia, time.monotonic())
             if state == 'complete':
                 self.model.context_complete(gesture.step())
             if state != 'pending':
+                events = getattr(self, 'events', None)
+                if state == 'expired' and events is not None and not events.empty():
+                    # The popup may have closed during this very poll, after
+                    # its click was queued by the hook but before handle(down).
+                    # Preserve the pre-down evidence only until the queue is
+                    # processed. Its original timestamp limits still apply.
+                    return
                 self.menu_gesture = None
 
     def capture_double(self, down, observation):
@@ -687,13 +1073,14 @@ class _Worker(recorder.CaptureWorker):
             return False
         self.binding.check()
         locator = obs['node'].get('locator')
-        if self.uia.secure(obs['element']) or not recorder._locator_valid(locator):
+        if self.uia.secure(obs['element']) or not _capture_locator_valid(locator):
             return False
         role = obs['node']['role']
         if role == 'textfield':
             try:
                 root = live_action.textfield_scope(self.binding, self.uia, obs['element'])
-                if learned_tasks._selector(self.uia.locator(obs['element'], root)) != learned_tasks._selector(locator):
+                if ('anchor' not in locator and
+                        learned_tasks._selector(self.uia.locator(obs['element'], root)) != learned_tasks._selector(locator)):
                     return False
             except bridge.BridgeError:
                 return False
@@ -754,6 +1141,17 @@ class _Worker(recorder.CaptureWorker):
             self.selection_deadline = 0
             self.watched_samples.clear()
             self.watched_samples.append((time.monotonic(), value))
+            try:
+                observation['_recorded_field_target'] = copy.deepcopy(self.target(observation, 'element'))
+                native = int(observation['element'].property(30020) or 0) & 0xffffffff
+                if (native and bridge.hwnd_pid(native) == self.binding.pid
+                        and bridge.root_window(native) == observation['window']):
+                    observation['_recorded_native_focus'] = native
+            except (bridge.BridgeError, recorder.RecorderError):
+                pass
+            except (AttributeError, TypeError, ValueError):
+                pass
+            self._refine_field_activation(observation)
             return
         if observation['node'].get('role') != 'combobox':
             self.freeze_watch()
@@ -766,9 +1164,14 @@ class _Worker(recorder.CaptureWorker):
 
     def _commit_value(self, current):
         if self.watched and self.watched['node'].get('role') == 'textfield':
+            if self.watched.get('_freezing_observed_field'):
+                return recorder.CaptureWorker._commit_value(self, current)
             try:
                 live_action.textfield_scope(self.binding, self.uia, self.watched['element'])
             except bridge.BridgeError as error:
+                if (error.code in ('target_window_mismatch', 'element_disappeared')
+                        and self._freeze_observed_field()):
+                    return
                 self._manual_watch('protected_input_not_recorded' if error.code == 'target_protected' else error.code)
                 return
             if not isinstance(current, str):
@@ -778,7 +1181,12 @@ class _Worker(recorder.CaptureWorker):
             # text. Preserve its variable draft until a changed value is read.
             if self.watched_step and self.watched_step['action'] == 'teach-target' and current == self.watched_value:
                 return
-            return super()._commit_value(current)
+            changed = current != self.watched_value
+            result = super()._commit_value(current)
+            if (changed and self.watched_step and self.watched_step['action'] == 'set-value'
+                    and self.watched_step.get('value') == current):
+                self._cache_commands()
+            return result
         # An unchanged or unreadable collapsed value after a mere field click
         # cannot teach a selection. A witnessed option click retains its intent.
         if self.watched_selection is None and (not self.watched_step or self.watched_step['action'] == 'teach-target'):
@@ -794,9 +1202,48 @@ class _Worker(recorder.CaptureWorker):
             try:
                 live_action.textfield_scope(self.binding, self.uia, self.watched['element'])
             except bridge.BridgeError as error:
+                if (error.code in ('target_window_mismatch', 'element_disappeared')
+                        and self._freeze_observed_field()):
+                    return
                 self._manual_watch('protected_input_not_recorded' if error.code == 'target_protected' else error.code)
                 return
-        return super().finalize_watch(force, sample_only)
+        result = super().finalize_watch(force, sample_only)
+        if not sample_only:
+            self._capture_typed_value()
+        return result
+
+    def _freeze_observed_field(self, cutoff=None):
+        observation = self.watched
+        if (not observation or observation['node'].get('role') != 'textfield'
+                or observation['node'].get('secure') is not False
+                or observation['node'].get('enabled') is not True
+                or not observation.get('_recorded_field_target')):
+            return False
+        cutoff = time.monotonic() if cutoff is None else cutoff
+        samples = [(at, value) for at, value in self.watched_samples
+                   if at <= cutoff and (not self.last_key or at >= self.last_key + .05)
+                   and isinstance(value, str)]
+        if not samples:
+            if (observation.get('_typed_value_observed') and self.watched_step
+                    and self.watched_step['action'] == 'set-value'):
+                self._drop_watch()
+                return True
+            return False
+        if (self.watched_step and self.watched_step['action'] == 'teach-target'
+                and samples[-1][1] == self.watched_value):
+            return False
+        observation['_freezing_observed_field'] = True
+        try:
+            recorder.CaptureWorker._commit_value(self, samples[-1][1])
+        finally:
+            observation.pop('_freezing_observed_field', None)
+            self._drop_watch()
+        return True
+
+    def freeze_watch(self, cutoff=None):
+        if self._freeze_observed_field(cutoff):
+            return
+        return super().freeze_watch(cutoff)
 
     def _command_owner(self, event, observation):
         # Providers may return a passive caption or icon inside the actual
@@ -811,7 +1258,7 @@ class _Worker(recorder.CaptureWorker):
             if item is None or self.uia.same(item, root) or self.uia.pid(item) != self.binding.pid or self.uia.secure(item):
                 break
             role = bridge.ROLES.get(item.property(30003))
-            if role in {'button', 'splitbutton', 'menuitem', 'treeitem', 'tab', 'hyperlink'}:
+            if role in {'button', 'splitbutton', 'menuitem', 'treeitem', 'tab', 'hyperlink', 'listitem'}:
                 from provider_visibility import visible
                 if (item.property(30010) is not True or not visible(self.binding, self.uia, item, root)
                         or not self.uia.within(item, root)
@@ -845,6 +1292,26 @@ class _Worker(recorder.CaptureWorker):
             self._poll_menu()
             return
         if observation:
+            observed_role = observation['node'].get('role')
+            if (event['action'] == 'click' and event.get('scope_proven', True) and
+                    ((observed_role == 'textfield' and not _capture_locator_valid(observation['node'].get('locator')))
+                     or observed_role in {'window','pane','tabgroup','group','statictext','image','custom'})):
+                # An edit provider may expose its real bounds only after the
+                # activation click. Refine that same witnessed click before
+                # deciding that the field has no stable target.
+                try:
+                    self.binding.check()
+                    focused = self.uia.focused()
+                    root = observation['root']
+                    if (focused is not None and self.uia.pid(focused) == self.binding.pid
+                            and self.uia.within(focused, root) and not self.uia.secure(focused)
+                            and focused.property(30003) == 50004
+                            and recorder._inside(self.uia.bounds(focused), event['x'], event['y'])):
+                        node = self.uia.node(focused, root)
+                        if _capture_locator_valid(node.get('locator')):
+                            observation = dict(observation, element=focused, node=node, combo=None)
+                except (bridge.BridgeError, OSError):
+                    pass
             if event['action'] == 'click' and 'painted_row' in observation:
                 self.freeze_watch(event.get('at'))
                 number, press = observation['painted_row']
@@ -866,6 +1333,13 @@ class _Worker(recorder.CaptureWorker):
                 self.freeze_watch(event.get('at'))
                 self.model.manual('', 'protected_input_not_recorded')
                 return
+            if (event['action'] == 'click' and node.get('role') == 'listitem'
+                    and self.combo_for(observation) is None
+                    and (_semantic_list_selection(node) or self._unique_list_selection(observation))):
+                self.freeze_watch(event.get('at'))
+                step = self.step('select', observation)
+                self.model.add(step)
+                return step['id']
             if (event['action'] == 'click' and node.get('role') in {'menuitem', 'treeitem', 'splitbutton'}
                     and 'Expand' in node.get('available_actions', []) and 'collapsed' in node.get('states', [])):
                 self.freeze_watch(event.get('at'))
@@ -879,6 +1353,21 @@ class _Worker(recorder.CaptureWorker):
                 pointed = self.combo_for(observation)
                 if pointed is None and node.get('role') == 'textfield':
                     pointed = observation
+            if pointed is observation and node.get('role') == 'textfield':
+                observation.setdefault('_recorded_activation_at', event.get('at', time.monotonic()))
+            if (pointed is observation and isinstance(node.get('locator'), dict)
+                    and 'anchor' in node['locator']):
+                self.watch(observation)
+                if self.watched and self.uia.same(self.watched['element'], observation['element']):
+                    self._cache_commands()
+                    self.pointed = self.watched
+                    if self.watched_step is None:
+                        step = self.step('teach-target', self.watched)
+                        step['recognition'] = dict(target='identified', action='requires_instruction',
+                                                   result='manual', reason='text_value_unobserved')
+                        self.model.add(step)
+                        self.watched_step = step
+                    return self.watched_step['id']
         if event.get('visual') is not None and pointed is None and self._use_visual(event, observation):
             self.freeze_watch(event.get('at'))
             self.binding.check()
@@ -886,8 +1375,13 @@ class _Worker(recorder.CaptureWorker):
                         visual=event['visual'])
             self.model.add(step)
             return step['id']
+        with self.model.lock:
+            previous_ids = set(self.model.steps)
         step = super().capture_action(event, observation)
+        self._remember_field_activation(event, observation, step, previous_ids)
         if pointed and self.watched and self.uia.same(pointed['element'], self.watched['element']):
+            if self.watched['node'].get('role') == 'textfield':
+                self._cache_commands()
             self.pointed = self.watched
             # Store the clicked field immediately. Reading the selected value
             # can later refine this same step, but is not a prerequisite to
@@ -1810,9 +2304,10 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         update_phase()
 
     def unresolved_window(steps):
+        from capture_trail import resolve_menu_scope
         preceding = set()
         for number, step in enumerate(steps, 1):
-            scope = step.get('_capture_window', {})
+            scope = resolve_menu_scope(step.get('_capture_window', {}), steps, number)
             if '_openers' in scope or ('after_id' in scope and scope['after_id'] not in preceding):
                 return number
             preceding.add(step['id'])

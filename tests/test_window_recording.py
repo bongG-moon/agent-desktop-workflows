@@ -84,6 +84,23 @@ class WindowRecordingTests(TestCase):
         self.session.poll()
         self.assertIs(self.session.active,self.session.primary)
 
+    def test_menu_dialog_uses_the_final_command_instead_of_earlier_fields(self):
+        notes = self.session.primary.notes
+        for key, action, at, reason in [('field', 'set-value', 1.1, None),
+                                       ('context', 'manual', 1.2, 'right_click_requires_menu_teaching'),
+                                       ('export', 'manual', 1.3, 'popup_scope_unproven')]:
+            notes.steps[key] = dict(id=key, action=action,
+                                   recognition=dict(reason=reason) if reason else {})
+            notes.times[key] = at
+        self.assertEqual([r[2] for r in self.session._openers(1.4)], ['export'])
+        notes.steps['export'] = dict(id='export', action='result-menu')
+        self.assertEqual([r[2] for r in self.session._openers(1.4)], ['export'])
+
+    def test_independent_launch_buttons_keep_their_existing_ambiguity(self):
+        clicked(self.session.primary, 'launch-a', 1.1)
+        clicked(self.session.primary, 'launch-b', 1.2)
+        self.assertEqual([r[2] for r in self.session._openers(1.4)], ['launch-a', 'launch-b'])
+
     def test_opener_and_return_order_survive_delayed_capture_and_review_edits(self):
         clicked(self.session.primary,'unrelated',-100.)
         clicked(self.session.primary,'launch',1.2)

@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import time
+import queue
 import unittest
 from unittest.mock import Mock, patch
 
@@ -86,6 +87,105 @@ class OrdinaryContext(unittest.TestCase):
                                    'menu': dict(self.anchor, path=['Export to excel', 'Active sheet'])})
         self.assertIsNone(worker.menu_gesture)
 
+    def test_native_unhovered_menu_click_survives_the_menu_closing_before_worker_dispatch(self):
+        worker = self.setup_worker()
+        gesture = worker.menu_gesture
+        item = context_menu._Item(20, Element(), Element(), (101,200,100,60),
+                                  (101,220,100,20), 'Export workbook')
+        with (patch.object(context_menu, '_native_menu_owner', return_value=(7,1)),
+              patch.object(menu_capture.win, 'window_class', return_value='#32768'),
+              patch.object(menu_capture.win, 'hwnd_pid', return_value=7)):
+            gesture.remember_inventory(worker.binding, worker.uia, [item])
+        self.assertEqual(len(gesture.history), 0)
+        at = time.monotonic()
+        point = item.center
+        event = dict(kind='down', action='click', x=point[0], y=point[1], at=at,
+                     window=20, hit_window=20, scope_proven=False)
+        with patch.object(context_menu, '_menus', return_value=[]) as current:
+            self.assertIsNone(worker.observe_down(event))
+            self.assertTrue(event['scope_proven'])
+            worker.capture_action(event, None)
+            current.assert_called_once()
+        task = cli.tasks.from_recording('Export', 'Sample.exe', 'Example', worker.model.snapshot())
+        self.assertEqual(task['steps'][0]['action'], 'result-menu')
+        self.assertEqual(task['steps'][0]['context']['menu']['path'], ['Export workbook'])
+        self.assertIsNone(worker.menu_gesture)
+
+    def test_native_menu_snapshot_rejects_a_stale_or_different_native_receiver(self):
+        worker = self.setup_worker()
+        gesture = worker.menu_gesture
+        pick = menu_capture.Pick(self.root, ('Export',), {(20,self.root.menu_box)}, 20, 1, False)
+        gesture.inventories.append((time.monotonic(), [pick]))
+        x,y = self.root.center
+        with patch.object(context_menu, '_menus', return_value=[]):
+            for age,hit in ((2,20),(0,99)):
+                event = dict(x=x,y=y,hit_window=hit,at=time.monotonic()+age)
+                self.assertIsNone(gesture.at_down(worker.binding,worker.uia,event))
+
+    def test_popup_closes_on_down_but_the_same_menu_survives_until_its_paired_up(self):
+        worker = self.setup_worker()
+        gesture = worker.menu_gesture
+        pick = menu_capture.Pick(self.root, ('Export workbook',), {(20,self.root.menu_box)}, 20, 0, False)
+        event = dict(kind='down',token=1,action='click',at=time.monotonic(),menu_pick=pick,
+                     menu_gesture_id=gesture.step_id,scope_proven=True)
+        worker.captures = {1:(event,None)}
+        with patch.object(context_menu, '_menus', return_value=[]) as current:
+            worker._poll_menu()
+            self.assertIs(worker.menu_gesture,gesture)
+            self.assertIsNone(gesture.clicked)
+            current.assert_not_called()
+            worker.captures.pop(1)
+            worker.capture_action(event,None)
+        self.assertIsNone(worker.menu_gesture)
+        self.assertEqual(worker.model.snapshot()[0]['context']['menu']['path'],['Export workbook'])
+
+    def test_missing_menu_up_cannot_keep_a_gesture_alive_or_transfer_to_a_new_gesture(self):
+        worker = self.setup_worker()
+        gesture = worker.menu_gesture
+        pick = menu_capture.Pick(self.root,('Export',),set(),20,0,False)
+        for age,identity in ((3,gesture.step_id),(0,'other-gesture')):
+            with self.subTest(age=age,identity=identity):
+                worker.menu_gesture = gesture
+                down = dict(at=time.monotonic()-age,menu_pick=pick,menu_gesture_id=identity)
+                worker.captures = {1:(down,None)}
+                with patch.object(gesture,'tick',return_value='expired') as poll:
+                    worker._poll_menu()
+                poll.assert_called_once()
+                self.assertIsNone(worker.menu_gesture)
+
+    def test_owned_native_menu_inventory_precedes_generic_field_and_command_polling(self):
+        worker = object.__new__(capture._Worker)
+        worker.binding = Mock(hwnd=1,pid=7)
+        worker.menu_gesture = object()
+        worker.watched = worker.row_tracker = worker.hovered = None
+        worker._poll_menu = Mock()
+        with (patch.object(context_menu, '_native_menu_owner', return_value=(42,1)) as owner,
+              patch.object(capture.recorder.CaptureWorker, 'tick') as underlying):
+            worker.tick()
+            worker._poll_menu.assert_called_once()
+            underlying.assert_not_called()
+            owner.return_value = None
+            worker.tick()
+            underlying.assert_called_once()
+
+    def test_menu_expiry_during_a_poll_waits_for_the_down_already_queued_by_the_hook(self):
+        worker = self.setup_worker()
+        gesture = worker.menu_gesture
+        worker.events = queue.Queue()
+        def closes_while_polling(*_):
+            worker.events.put(dict(kind='down',token=1,at=time.monotonic()))
+            return 'expired'
+        with patch.object(gesture,'tick',side_effect=closes_while_polling):
+            worker._poll_menu()
+        self.assertIs(worker.menu_gesture,gesture)
+        with patch.object(gesture,'tick') as poll:
+            worker.tick()
+            poll.assert_not_called()
+        worker.events.get_nowait()
+        with patch.object(gesture,'tick',return_value='expired'):
+            worker._poll_menu()
+        self.assertIsNone(worker.menu_gesture)
+
     def test_logical_parent_without_hover_is_used_not_a_standalone_leaf(self):
         worker = self.setup_worker()
         self.leaf.element.parent = self.root.element
@@ -145,6 +245,28 @@ class OrdinaryContext(unittest.TestCase):
             self.assertIsNone(menu_capture.capture_surface(binding, None, dict(self.event, scope_proven=False), ()))
             self.assertIsNone(menu_capture.capture_surface(binding, None, dict(self.event, window=8), ()))
             teach.assert_called_once_with(binding, (100, 200))
+
+    def test_native_down_receiver_preserves_surface_when_its_menu_already_covers_the_point(self):
+        binding = Mock(hwnd=1, pid=7)
+        uia = Mock()
+        root, receiver, surface = object(), object(), Mock()
+        surface.property.return_value = True
+        uia.from_handle.side_effect = {1: root, 2: receiver}.__getitem__
+        with (patch.object(context_menu, 'teach_surface', side_effect=cli.bridge.BridgeError('context_point_occluded')),
+              patch.object(menu_capture.win, 'root_window', return_value=1),
+              patch.object(menu_capture.win, 'hwnd_pid', return_value=7),
+              patch.object(context_menu, '_surface_candidates', return_value=[surface]) as candidates,
+              patch.object(context_menu, '_surface_target', return_value=self.anchor['target']),
+              patch.object(context_menu, '_rect', return_value=(50,100,200,250)),
+              patch.object(context_menu, '_check_region_children') as protected,
+              patch.object(context_menu, '_hit_region') as hit):
+            captured = menu_capture.capture_surface(binding, uia, self.event, ())
+            self.assertEqual(captured, self.anchor)
+            candidates.assert_called_once_with(binding, uia, receiver, root)
+            hit.assert_not_called()
+            protected.side_effect = cli.bridge.BridgeError('context_point_protected')
+            self.assertIsNone(menu_capture.capture_surface(binding, uia, self.event, ()))
+            self.assertIsNone(menu_capture.capture_surface(binding, uia, dict(self.event, scope_proven=False), ()))
 
     def test_missing_region_preserves_only_a_window_relative_hint_on_a_scoped_gesture(self):
         import row_vision

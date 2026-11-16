@@ -135,6 +135,32 @@ class SecurityTests(unittest.TestCase):
         self.assertIs(app.load_bridge(), app.bridge)
         self.assertIs(app.load_bridge().UIA, current)
 
+    def test_native_passive_list_caption_and_item_inherit_verified_owner_protection(self):
+        owner = Node(**{'30003': 50008, '30019': False})
+        item = Node(**{'30003': 50007, '30090': True, '30095': 34, '30096': 2})
+        caption = Node(**{'30003': 50020, '30090': True, '30095': 41, '30096': 0})
+        self.uia.parent = lambda node: {id(caption): item, id(item): owner}.get(id(node))
+        self.uia.same.side_effect = lambda a, b: a is b
+        self.uia.from_handle.return_value = owner
+        self.uia.bounds = lambda node: dict(x=10, y=20, width=200, height=60)
+        self.win.window_class.return_value = 'SysListView32'
+        self.assertFalse(self.protected(item))
+        self.assertFalse(self.protected(caption))
+        self.assertNotIn(30005, item.reads)
+        self.assertNotIn(30045, item.reads)
+        for props in ({30019: True}, {30096: 0x20000000}, {30043: True}, {30002: 99}):
+            with self.subTest(props=props):
+                previous = dict(item.props)
+                item.props.update(props)
+                self.assertTrue(self.protected(caption))
+                item.props = previous
+        for cls in ('Edit', 'OtherList'):
+            self.win.window_class.return_value = cls
+            self.assertTrue(self.protected(item))
+        self.win.window_class.return_value = 'SysListView32'
+        owner.props[30019] = None
+        self.assertTrue(self.protected(item))
+
 
 if __name__ == '__main__':
     unittest.main()
