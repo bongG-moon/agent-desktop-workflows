@@ -146,6 +146,24 @@ class OrdinaryContext(unittest.TestCase):
             self.assertIsNone(menu_capture.capture_surface(binding, None, dict(self.event, window=8), ()))
             teach.assert_called_once_with(binding, (100, 200))
 
+    def test_missing_region_preserves_only_a_window_relative_hint_on_a_scoped_gesture(self):
+        import row_vision
+        worker = self.setup_worker()
+        with (patch.object(menu_capture.win, 'root_window', return_value=1),
+              patch.object(menu_capture.win, 'hwnd_pid', return_value=7),
+              patch.object(row_vision, '_window_rect', return_value=[20, 80, 200, 300])):
+            hint = menu_capture.window_point_hint(worker.binding, self.event)
+            self.assertEqual(hint, [.4, .4])
+            self.assertIsNone(menu_capture.window_point_hint(worker.binding, dict(self.event, scope_proven=False)))
+        key = worker.capture_action(dict(self.event, menu_window_point=hint), None)
+        step = worker.model.steps[key]
+        self.assertEqual(step['menu_window_point'], hint)
+        self.assertNotIn('menu_anchor', step)
+        self.assertEqual(cli.tasks.recorded_step(step)['menu_window_point'], hint)
+        for invalid in [[float('nan'), .5], [True, .3], [1, 0]]:
+            with self.assertRaisesRegex(ValueError, 'invalid_context_window_hint'):
+                cli.tasks.recorded_step(dict(step, menu_window_point=invalid))
+
     def test_fast_popup_reuses_exact_preclick_hit_with_named_parent_group(self):
         binding, uia = Mock(hwnd=1, pid=7), Mock()
         child, parent, root = Mock(), Mock(), Mock()

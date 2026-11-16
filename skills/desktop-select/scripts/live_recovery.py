@@ -2,6 +2,7 @@
 import json
 
 import context_menu
+import control_lookup
 import grounding
 import learned_tasks as tasks
 import result_menu
@@ -38,14 +39,47 @@ def _guard(app, main, surface, title):
     return check
 
 
-def observe_scope(app, main, surface, title, *, frame_key=None):
+def _recorded_targets(app, surface, uia, lookups):
+    """Observe stable recorded controls and detect caption collisions without a Python tree walk."""
+    root = uia.from_handle(surface.hwnd)
+    targets = []
+    for selector in lookups['selectors']:
+        element = control_lookup.resolve(surface, uia, selector, root)
+        node = dict(uia.basic(element), enabled=element.property(30010) is True)
+        app.add_display_properties(node, element, surface, uia, root)
+        if node['offscreen']:
+            raise app.bridge.BridgeError('target_offscreen')
+        if node['role'] in tasks.VALUE_ACTIONS.values():
+            node.update(app.field_label(surface, uia, element, root))
+        targets.append(node)
+    if lookups['captions']:
+        captions = {' '.join(label.split()).casefold() for label in lookups['captions']}
+        for button in control_lookup.find_all(uia, root, roles=tasks.INVOKE - {'menuitem'}, limit=256):
+            name = button.property(30005)
+            if isinstance(name, str) and ' '.join(name.split()).casefold() in captions:
+                node = dict(uia.basic(button), enabled=button.property(30010) is True)
+                app.add_display_properties(node, button, surface, uia, root)
+                if node not in targets:
+                    targets.append(node)
+    return targets
+
+
+def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None):
     check = _guard(app, main, surface, title)
     check()
     result = dict(exe=surface.exe, window=app.bridge.window_text(surface.hwnd),
                   targets=[], owned_popups=[], input_dispatched=False)
     with app.bridge.UIA() as uia:
         try:
-            result['targets'] = _targets(app, surface, uia)
+            if lookups:
+                try:
+                    result['targets'] = _recorded_targets(app, surface, uia, lookups)
+                    result['lookup_mode'] = 'recorded_selectors'
+                except app.bridge.BridgeError:
+                    lookups = None
+            if not lookups:
+                result['targets'] = _targets(app, surface, uia)
+                result['lookup_mode'] = 'window_inventory'
         except (app.SelectionError, app.bridge.BridgeError) as error:
             # A nonstandard provider may still expose its rendered window.
             result['tree_diagnostic'] = error.code
@@ -91,21 +125,37 @@ def _same_patch(previous, current, point):
     return True
 
 
-def menu_from_frame(app, main, surface, title, frame_key, binding):
+def menu_from_frame(app, main, surface, title, frame_key, binding, *, observation=None, inventory=None):
     check = _guard(app, main, surface, title)
     check()
     anchor = binding.get('menu_anchor')
+    menu = None
     if anchor is not None and 'frame' not in binding:
         candidate = dict(target=anchor['target'], point=anchor['point'], path=binding['path'])
+        if binding.get('point_policy'):
+            candidate['point_policy'] = binding['point_policy']
         context_menu.validate_spec(candidate)
         target = candidate['target']
         name, role = target.get('automation_id', target.get('name')), target['role']
         if binding.get('target', name) != name or binding.get('role', role) != role:
             raise tasks.TaskError('context_region_changed')
         with app.bridge.UIA() as uia:
-            region = context_menu._region(surface, uia, target)
-            x, y, w, h = context_menu._rect(uia, region)
-        screen = (x + round(anchor['point'][0] * w), y + round(anchor['point'][1] * h))
+            if binding.get('preparing'):
+                proof = context_menu.observe(surface, uia, candidate)
+                if observation is not None:
+                    observation['menu_preview'] = proof
+                menu = candidate
+            else:
+                region = context_menu._region(surface, uia, target)
+                x, y, w, h = context_menu._rect(uia, region)
+                screen = (x + round(anchor['point'][0] * w), y + round(anchor['point'][1] * h))
+    elif binding.get('menu_window_point') is not None and 'frame' not in binding:
+        name, role = binding.get('target'), binding.get('role')
+        if not tasks._text(name) or role not in context_menu.REGIONS:
+            raise tasks.TaskError('named_context_region_required')
+        window = row_vision._window_rect(surface)
+        screen = tuple(start + min(extent-1, round(fraction*extent))
+                       for start, extent, fraction in zip(window, window[2:], binding['menu_window_point']))
     else:
         point = binding.get('point')
         name, role = binding.get('target'), binding.get('role')
@@ -118,7 +168,21 @@ def menu_from_frame(app, main, surface, title, frame_key, binding):
         if not _same_patch(previous, current, point) or window != row_vision._window_rect(surface):
             raise tasks.TaskError('grounding_frame_changed')
         screen = (window[0] + point[0], window[1] + point[1])
-    menu = context_menu.teach_at(surface, screen, binding['path'], target=name, role=role)
+        with app.bridge.UIA() as uia:
+            targets = [node for node in inventory['targets'] if node.get('role') == role
+                       and name in (node.get('automation_id'), node.get('name'))]
+            if len(targets) != 1:
+                raise tasks.TaskError('context_region_ambiguous' if targets else 'context_region_missing')
+            target = targets[0]
+            key = 'automation_id' if target.get('automation_id') == name and not name.isdecimal() else 'name'
+            candidate = dict(target={'role': role, key: name}, point=[.5, .5], path=binding['path'])
+            if binding.get('point_policy'):
+                candidate['point_policy'] = binding['point_policy']
+            menu = context_menu.adjust_from_frame(surface, uia, candidate, screen, window=window, png=current)
+    if menu is None:
+        menu = context_menu.teach_at(surface, screen, binding['path'], target=name, role=role)
+        if binding.get('point_policy'):
+            menu['point_policy'] = binding['point_policy']
     check()
     context = dict(trigger=None, ready=None, menu=menu, output=binding.get('output'))
     result_menu.validate_spec(context)

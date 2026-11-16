@@ -1,6 +1,7 @@
 """Teach an interior point of a named surface and follow its newly opened menu."""
 from collections import deque
 from dataclasses import dataclass
+from hashlib import sha256
 from types import SimpleNamespace
 import ctypes as C
 from ctypes import wintypes as W
@@ -92,7 +93,14 @@ def _text(value):
 
 
 def validate_spec(spec):
-    _need(isinstance(spec, dict) and set(spec) == {'target', 'point', 'path'}, 'invalid_context_spec')
+    _need(isinstance(spec, dict) and {'target', 'point', 'path'} <= set(spec)
+          and not set(spec) - {'target', 'point', 'path', 'point_policy', 'visual_patch'}, 'invalid_context_spec')
+    if 'point_policy' in spec:
+        _need(spec['point_policy'] == 'any_data_cell', 'invalid_context_point_policy')
+    if 'visual_patch' in spec:
+        digest = spec['visual_patch']
+        _need(isinstance(digest, str) and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest),
+              'invalid_context_visual_patch')
     _validate_surface(spec['target'], spec['point'])
     path = spec['path']
     _need(isinstance(path, list) and 1 <= len(path) <= 8 and all(_text(v) for v in path),
@@ -156,7 +164,12 @@ def _menu_visible(binding, uia, item):
     return False
 
 
-def _check_region_children(binding, uia, region, point):
+_NON_DATA_CONTROLS = frozenset({50000, 50002, 50003, 50004, 50005, 50009, 50010, 50011, 50014, 50015,
+                                50016, 50017, 50018, 50019, 50021, 50022, 50027, 50031, 50034, 50035,
+                                50037, 50038})
+
+
+def _check_region_children(binding, uia, region, point, *, data_only=False):
     # Blank/custom peers can answer ElementFromPoint with the parent even
     # when a separate protected editor is drawn over part of the surface.
     pending = deque([(region, 0)])
@@ -175,12 +188,14 @@ def _check_region_children(binding, uia, region, point):
                 continue
             if _inside(point, rect) and visible:
                 _need(child.property(30010) is True, 'context_point_disabled')
+                if data_only:
+                    _need(child.property(30003) not in _NON_DATA_CONTROLS, 'context_point_not_data')
             # Providers sometimes give wrappers no bounds, so do not prune a
             # branch merely because the wrapper did not contain the point.
             pending.append((child, depth + 1))
 
 
-def _hit_region(binding, uia, region, point):
+def _hit_region(binding, uia, region, point, *, require_body=False, recorded_opaque=False):
     hit = win.window_from_point(*point)
     _need(hit and win.root_window(hit) == binding.hwnd and win.hwnd_pid(hit) == binding.pid,
           'context_point_occluded')
@@ -189,6 +204,7 @@ def _hit_region(binding, uia, region, point):
     if not uia.within(element, region):
         _need(uia.within(region, element), 'context_point_outside_region')
         element = uia.point_descendant(element, *point, binding.pid)
+    body, opaque = False, True
     for _ in range(32):
         if element is None:
             break
@@ -196,11 +212,182 @@ def _hit_region(binding, uia, region, point):
               and element.property(30010) is True, 'context_point_protected')
         if uia.same(element, region):
             _need(_inside(point, _rect(uia, region)), 'context_point_outside_region')
-            _check_region_children(binding, uia, region, point)
+            _need(not require_body or body or (recorded_opaque and opaque), 'context_data_cell_unconfirmed')
+            _check_region_children(binding, uia, region, point, data_only=require_body)
             _need(win.window_from_point(*point) == hit, 'context_point_occluded')
             return
+        if require_body:
+            role = element.property(30003)
+            # A row may contain a command button, editor or trailing scroll bar.
+            # Its row ancestor alone does not turn an interactive control into data.
+            _need(role in (50006, 50007, 50020, 50025, 50026, 50028, 50029, 50033, 50036),
+                  'context_point_not_data')
+            body |= role in (50007, 50029) or element.property(30029) is True
+            opaque &= role in _PROXY_ROLES
         element = uia.parent(element)
     raise win.BridgeError('context_point_outside_region')
+
+
+_UNPROVEN_POINT = frozenset({'context_point_outside_region', 'context_point_unproven',
+                              'context_point_not_data', 'context_data_cell_unconfirmed'})
+_PROXY_ROLES = frozenset({50008, 50025, 50026, 50028, 50030, 50032, 50033, 50036})
+
+
+def _visual_point(binding, uia, region, point):
+    """Prove that an opaque peer at this pixel belongs to the visible target surface."""
+    hit = win.window_from_point(*point)
+    _need(hit and win.root_window(hit) == binding.hwnd and win.hwnd_pid(hit) == binding.pid,
+          'context_point_occluded')
+    element = uia.from_point(*point)
+    _need(element is not None and _inside(point, _rect(uia, region)), 'context_point_outside_region')
+    root = uia.from_handle(binding.hwnd)
+    chain = lookup.ancestry(uia, element, root, pid=binding.pid)
+    _need(all(node.property(30010) is True for node in chain), 'context_point_disabled')
+    _need(element.property(30003) in _PROXY_ROLES, 'context_point_outside_region')
+    # If UIA hit the region itself, its owned ancestry was just proven. Only
+    # that subtree can hide an embedded command/editor under this surface.
+    # A broader proxy hit is rarer and requires checking competing branches.
+    direct_hit = uia.within(element, region)
+    alias = False
+    if not direct_hit and not uia.within(region, element):
+        # Some providers expose two peers for a single native child control.
+        # Require the actual hit HWND, equal geometry and the same parent;
+        # two unrelated panels in a process do not establish an alias.
+        a, b = uia.parent(element), uia.parent(region)
+        alias = (hit != binding.hwnd and region.property(30020) == hit == element.property(30020)
+                 and _rect(uia, element) == _rect(uia, region) and a is not None and b is not None
+                 and uia.same(a, b))
+        _need(alias, 'context_point_outside_region')
+    pending, visited = deque([region if direct_hit else root]), 0
+    while pending:
+        node = pending.popleft()
+        visited += 1
+        _need(visited <= 2500, 'context_region_tree_incomplete')
+        box = _rect(uia, node)
+        if uia.pid(node) != binding.pid or uia.secure(node):
+            _need(node.property(30022) is True or (box[2] > 0 and box[3] > 0 and not _inside(point, box)),
+                  'context_point_protected')
+            continue
+        if node.property(30022) is not True and _inside(point, box):
+            _need(node.property(30010) is True, 'context_point_disabled')
+            ancestor = uia.within(region, node)
+            _need(ancestor or uia.within(node, region) or (alias and uia.within(node, element)),
+                  'context_point_occluded')
+            if not ancestor:
+                _need(node.property(30003) in _PROXY_ROLES | {50006, 50007, 50020, 50029},
+                      'context_point_not_data')
+        pending.extend(uia.children(node))
+    _need(win.window_from_point(*point) == hit, 'context_point_occluded')
+
+
+def _patch_digest(window, png, point, rect):
+    import grounding
+    box, pixels = grounding._pixels(png)
+    x, y = point
+    radius = 12
+    corners = [(x-radius, y-radius), (x+radius, y+radius)]
+    _need(list(window[2:]) == box[2:] and all(_inside(c, rect) and _inside(c, window) for c in corners),
+          'context_patch_outside_region')
+    x, y = x-window[0], y-window[1]
+    width = window[2]
+    patch = b''.join(pixels[4*((y+dy)*width + x-radius):4*((y+dy)*width + x+radius+1)]
+                     for dy in range(-radius, radius+1))
+    _need(any(max(patch[channel::4])-min(patch[channel::4]) >= 20 for channel in range(3)),
+          'context_visual_patch_blank')
+    return sha256(patch).hexdigest()
+
+
+def adjust_from_frame(binding, uia, spec, screen_point, *, window, png):
+    """Use a point chosen in an approved, freshly matched frame of this exact window."""
+    validate_spec(spec)
+    _need(len(screen_point) == 2 and all(type(v) is int for v in screen_point), 'invalid_context_point')
+    region = _region(binding, uia, spec['target'])
+    x, y, w, h = rect = _rect(uia, region)
+    _need(w > 0 and h > 0, 'context_region_unavailable')
+    adjusted = dict(spec, point=[(screen_point[0]-x)/w, (screen_point[1]-y)/h])
+    adjusted.pop('visual_patch', None)
+    _validate_surface(spec['target'], adjusted['point'])
+    try:
+        # The host just selected this point in a fresh image, so a directly
+        # hit, opaque grid can use this point just as the original recording did.
+        _hit_region(binding, uia, region, screen_point,
+                    require_body='point_policy' in spec, recorded_opaque=True)
+    except win.BridgeError as error:
+        if error.code not in _UNPROVEN_POINT:
+            raise
+        _visual_point(binding, uia, region, screen_point)
+        adjusted['visual_patch'] = _patch_digest(window, png, screen_point, rect)
+    return adjusted
+
+
+def _verify_menu_point(binding, uia, region, point, spec, *, allow_capture, recorded_opaque=True):
+    if 'visual_patch' not in spec:
+        return _hit_region(binding, uia, region, point, require_body='point_policy' in spec,
+                           recorded_opaque=recorded_opaque)
+    _need(allow_capture, 'context_visual_check_deferred')
+    import desktop_select as app
+    import grounding
+    hit = win.window_from_point(*point)
+    _need(hit and win.root_window(hit) == binding.hwnd and win.hwnd_pid(hit) == binding.pid,
+          'context_point_occluded')
+    window, png = grounding._capture(app, binding, binding.check)
+    _need(_patch_digest(window, png, point, _rect(uia, region)) == spec['visual_patch'],
+          'context_visual_patch_changed')
+    _visual_point(binding, uia, region, point)
+
+
+def _resolve_menu_point(binding, uia, region, spec, *, allow_capture, defer_visual=False):
+    """Try the stored point first. Only a table-wide intent permits another data cell."""
+    x, y, w, h = rect = _rect(uia, region)
+    _need(type(w) in (int, float) and type(h) in (int, float) and w > 0 and h > 0,
+          'context_region_unavailable')
+    px, py = spec['point']
+    screen = (x + round(px*w), y + round(py*h))
+    if defer_visual and 'visual_patch' in spec:
+        # The final guarded check immediately before sending already validates
+        # the current image. Do not capture the same window twice per click.
+        return rect, screen, None
+    try:
+        _verify_menu_point(binding, uia, region, screen, spec, allow_capture=allow_capture)
+        return rect, screen, None
+    except win.BridgeError as error:
+        if (error.code not in _UNPROVEN_POINT or 'visual_patch' in spec
+                or spec.get('point_policy') != 'any_data_cell'):
+            raise
+    # These are input-free hit tests, restricted to the same named surface.
+    # Never turn a coordinate or an empty group into evidence of a data row.
+    candidates = {(cx, cy) for cx in (px, .25, .5, .75) for cy in (py, .25, .5, .75)}
+    candidates.discard((px, py))
+    deadline = time.monotonic() + .45
+    for cx, cy in sorted(candidates, key=lambda c: (((c[0]-px)*w)**2 + ((c[1]-py)*h)**2, c)):
+        candidate = x+round(cx*w), y+round(cy*h)
+        try:
+            _hit_region(binding, uia, region, candidate, require_body=True)
+        except win.BridgeError as error:
+            if error.code not in _UNPROVEN_POINT:
+                raise
+            if time.monotonic() >= deadline:
+                break
+            continue
+        return rect, candidate, {'from': list(spec['point']), 'to': [cx, cy]}
+    raise win.BridgeError('context_data_cell_unconfirmed')
+
+
+def observe(binding, uia, spec):
+    """Preview the same point resolver used immediately before dispatch, without taking input or a picture."""
+    validate_spec(spec)
+    region = _region(binding, uia, spec['target'])
+    receipt = dict(status='observed', input_dispatched=False, region_observed=True,
+                   point_observed=False, menu_verification='pending_execution')
+    try:
+        _, _, correction = _resolve_menu_point(binding, uia, region, spec, allow_capture=False)
+    except win.BridgeError as error:
+        receipt['point_diagnostic'] = error.code
+    else:
+        receipt['point_observed'] = True
+        if correction:
+            receipt['proposed_point'] = correction['to']
+    return receipt
 
 
 def _surface_target(binding, uia, element, *, target=None, role=None):
@@ -273,6 +460,26 @@ class _Item:
         return x + w//2, y + h//2
 
 
+def _menu_caption(binding, uia, item, box):
+    name = item.property(30005)
+    if _text(name):
+        return name
+    legacy = item.property(30092)  # LegacyIAccessible.Name
+    captions = {legacy} if _text(legacy) else set()
+    for number, child in enumerate(uia.children(item), 1):
+        if number > 64:
+            return None
+        if (uia.pid(child) != binding.pid or uia.secure(child) or child.property(30003) != 50020
+                or not _menu_visible(binding, uia, child)):
+            continue
+        x, y, w, h = _rect(uia, child)
+        if w > 0 and h > 0 and _inside((x, y), box) and _inside((x+w-1, y+h-1), box):
+            label = child.property(30005)
+            if _text(label):
+                captions.add(label)
+    return next(iter(captions)) if len(captions) == 1 else None
+
+
 def _menus(binding, uia):
     """Only visible menu items in the selected window or its owned popups."""
     items = []
@@ -282,7 +489,7 @@ def _menus(binding, uia):
             return
         rect = _rect(uia, item)
         if rect[2] > 1 and rect[3] > 1:
-            name = item.property(30005)
+            name = _menu_caption(binding, uia, item, rect)
             if _text(name) and not any(uia.same(item, prior.element) for prior in items):
                 items.append(_Item(hwnd, item, frame, _rect(uia, frame), rect, name))
     # Some trees expose a popup both on its own HWND and below the host.
@@ -348,6 +555,30 @@ def _near(anchor, frame, gap):
     ax, ay, aw, ah = anchor
     left_or_right_edge = min(abs(x-ax), abs(x-(ax+aw)), abs(x+w-ax), abs(x+w-(ax+aw))) <= gap
     return left_or_right_edge and y <= ay+ah+gap and ay <= y+h+gap
+
+
+def _unresolved_menu(binding, uia, remaining, previous, anchor, gap):
+    """Provide a read-only handoff for an actual menu left open after this dispatch."""
+    detail = dict(host_action='inspect_current_menu_state', remaining_items=list(remaining),
+                  repeat_right_click=False)
+    try:
+        matches = []
+        for hwnd in _scoped_windows(binding):
+            if hwnd in previous or hwnd == binding.hwnd:
+                continue
+            root = uia.from_handle(hwnd)
+            if root is None or uia.pid(root) != binding.pid or uia.secure(root):
+                continue
+            if (root.property(30003) != MENU and win.window_class(hwnd) != '#32768'):
+                continue
+            box = _rect(uia, root)
+            if _near(anchor, box, gap) and win.user32.IsWindowVisible(hwnd):
+                matches.append(dict(hwnd=hwnd, bounds=list(box)))
+        if len(matches) == 1:
+            detail.update(host_action='inspect_open_menu', observed_popup=matches[0])
+    except (OSError, win.BridgeError):
+        pass  # A transient popup can disappear during this final read.
+    return detail
 
 
 def _choose(uia, items, old, name, anchor, parent, gap):
@@ -416,23 +647,37 @@ def _hit_item(binding, uia, item, parent, prior_surfaces, gap):
 def execute(binding, spec, guard, *, before_leaf=None):
     """Deliver each event once and distinguish leaf delivery from output verification."""
     sent, pending, leaf_sent, completed = False, False, False, []
+    unresolved = None
     try:
         validate_spec(spec)
         guard()
         foreground(binding)
         with win.UIA() as uia:
             tick = win.input_tick()
-            region = _region(binding, uia, spec['target'])
-            rect = _rect(uia, region)
-            x, y, w, h = rect
-            px, py = x+round(w*spec['point'][0]), y+round(h*spec['point'][1])
-            _hit_region(binding, uia, region, (px, py))
+            # A delayed query can populate the result surface shortly after the
+            # button returns. This short wait only re-observes; no query is sent.
+            ready_until = time.monotonic() + .9
+            while True:
+                try:
+                    region = _region(binding, uia, spec['target'])
+                    rect, (px, py), correction = _resolve_menu_point(binding, uia, region, spec, allow_capture=True,
+                                                                    defer_visual=True)
+                    break
+                except win.BridgeError as error:
+                    if (spec.get('point_policy') != 'any_data_cell' or time.monotonic() >= ready_until
+                            or error.code not in ('context_data_cell_unconfirmed', 'context_region_missing',
+                                                  'context_region_unavailable')):
+                        raise
+                    guard()
+                    _need(win.input_tick() == tick, 'foreground_or_input_changed')
+                    time.sleep(.12)
             before = _menus(binding, uia)
             prior_surfaces = set(_scoped_windows(binding))
             guard()
             current = _region(binding, uia, spec['target'])
             _need(uia.same(current, region) and _rect(uia, current) == rect, 'context_region_changed')
-            _hit_region(binding, uia, current, (px, py))
+            _verify_menu_point(binding, uia, current, (px, py), spec, allow_capture=True,
+                               recorded_opaque=correction is None)
             win._combo_surface(binding)
             _need(_rect(uia, current) == rect and
                   win.root_window(win.window_from_point(px, py)) == binding.hwnd, 'context_region_changed')
@@ -452,7 +697,9 @@ def execute(binding, spec, guard, *, before_leaf=None):
                     choice = _choose(uia, snapshot, before, name, anchor, parent, gap)
                     if choice is not None:
                         break
-                    _need(time.monotonic() < deadline, 'new_context_menu_item_missing')
+                    if time.monotonic() >= deadline:
+                        unresolved = _unresolved_menu(binding, uia, spec['path'][number:], prior_surfaces, anchor, gap)
+                        raise win.BridgeError('new_context_menu_item_missing')
                     time.sleep(.06)
                 leaf = number == len(spec['path'])-1
                 guard()
@@ -479,12 +726,18 @@ def execute(binding, spec, guard, *, before_leaf=None):
                     leaf_sent = True
                 completed.append(name)
                 parent, anchor, before = fresh, fresh.box, snapshot
-        return dict(status='delivered_unverified', diagnostic='menu_leaf_sent',
+        receipt = dict(status='delivered_unverified', diagnostic='menu_leaf_sent',
                     input_dispatched=True, leaf_dispatched=True, menu_path_completed=True,
                     menu_items=completed, effect_verification='unverified',
                     input_mode='physical_pointer', physical_input=True)
+        if correction:
+            receipt['point_correction'] = correction
+        return receipt
     except Exception as error:
-        return dict(status='uncertain' if pending else 'blocked', diagnostic=getattr(error,'code','context_provider_error'),
+        receipt = dict(status='uncertain' if pending else 'blocked', diagnostic=getattr(error,'code','context_provider_error'),
                     input_dispatched=None if pending and not sent else sent, leaf_dispatched=leaf_sent,
                     menu_path_completed=False, menu_items=completed, effect_verification='unverified',
                     input_mode='physical_pointer', physical_input=True)
+        if unresolved:
+            receipt['menu_recovery'] = unresolved
+        return receipt

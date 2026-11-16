@@ -132,12 +132,15 @@ class CaptureNotes:
     def manual(self, label, reason):
         self.add(manual(reason))
 
-    def context_start(self, step_id, surface):
+    def context_start(self, step_id, surface, window_point=None):
         with self.lock:
             step = manual('right_click_requires_menu_teaching', step_id)
             self.add(step)
             if step_id in self.steps:
-                self.steps[step_id]['menu_anchor'] = surface
+                if surface:
+                    self.steps[step_id]['menu_anchor'] = surface
+                elif window_point is not None:
+                    self.steps[step_id]['menu_window_point'] = window_point
 
     def context_complete(self, step):
         with self.lock:
@@ -534,9 +537,11 @@ class _Worker(recorder.CaptureWorker):
     def observe_down(self, event):
         if event.get('kind') == 'down':
             if event.get('action') == 'right-click':
-                from menu_capture import capture_surface
+                from menu_capture import capture_surface, window_point_hint
                 self.menu_gesture = None
                 event['menu_anchor'] = capture_surface(self.binding, self.uia, event, self.hover_history)
+                if not event['menu_anchor']:
+                    event['menu_window_point'] = window_point_hint(self.binding, event)
             elif self.menu_gesture is not None:
                 pick = self.menu_gesture.at_down(self.binding, self.uia, event)
                 if pick:
@@ -827,6 +832,10 @@ class _Worker(recorder.CaptureWorker):
                 step_id = uuid.uuid4().hex
                 self.model.context_start(step_id, surface)
                 self.menu_gesture = MenuGesture(step_id, surface, event, self.binding.info()['dpi'])
+                return step_id
+            if event.get('menu_window_point') is not None:
+                step_id = uuid.uuid4().hex
+                self.model.context_start(step_id, None, event['menu_window_point'])
                 return step_id
             self.model.manual('', 'right_click_requires_menu_teaching')
             return

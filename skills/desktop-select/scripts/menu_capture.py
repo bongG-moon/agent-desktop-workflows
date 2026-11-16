@@ -7,6 +7,23 @@ import context_menu as menus
 import win_bridge as win
 
 
+def window_point_hint(binding, event):
+    """A window-relative recording hint, unusable as a standalone click target."""
+    from row_vision import _window_rect
+    if event.get('scope_proven') is not True or event.get('window') != binding.hwnd:
+        return None
+    try:
+        hit = event.get('hit_window')
+        if not hit or win.root_window(hit) != binding.hwnd or win.hwnd_pid(hit) != binding.pid:
+            return None
+        rect = _window_rect(binding)
+        point = event['x'], event['y']
+        if menus._inside(point, rect):
+            return [(coordinate-origin)/extent for coordinate, origin, extent in zip(point, rect, rect[2:])]
+    except (OSError, win.BridgeError):
+        return None
+
+
 def capture_surface(binding, uia, event, history):
     """Use the live region, or the exact pre-click hit if a popup now covers it."""
     point = event['x'], event['y']

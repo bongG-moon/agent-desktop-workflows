@@ -53,6 +53,11 @@ sealed class DesktopContextFixture : Window {
     readonly ComboBox family = new ComboBox();
     readonly Button query = new Button {Content = "Search"};
     readonly ResultSurface surface = new ResultSurface();
+    readonly Label overlay = new Label {
+        Content = "Side panel", Width = 115, Height = 120, Background = Brushes.WhiteSmoke,
+        HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top,
+        Visibility = Visibility.Collapsed
+    };
     readonly TextBlock indicator = new TextBlock();
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     readonly DispatcherTimer timer = new DispatcherTimer();
@@ -80,7 +85,11 @@ sealed class DesktopContextFixture : Window {
         };
         timer.Interval = TimeSpan.FromMilliseconds(1050);
         timer.Tick += delegate { timer.Stop(); generation++; UpdateResult(true); };
-        panel.Children.Add(query); panel.Children.Add(indicator); panel.Children.Add(surface);
+        panel.Children.Add(query); panel.Children.Add(indicator);
+        var results = new Grid();
+        results.Children.Add(surface);
+        results.Children.Add(overlay);
+        panel.Children.Add(results);
         var decoy = new Menu();
         string export = groupRole ? "Export to excel" : "EXPORT";
         string selection = groupRole ? "Active sheet" : "EXPORT TO EXCEL";
@@ -170,6 +179,10 @@ sealed class DesktopContextFixture : Window {
                 if (cmd == "hold-query") hold = true;
                 if (cmd == "stale-result") { stale = true; UpdateResult(true); }
                 if (cmd == "skip-file") skipFile = true;
+                if (cmd == "cover-recorded-point") {
+                    overlay.Visibility = Visibility.Visible;
+                    UpdateLayout();
+                }
                 if (cmd == "activate") Activate();
                 Emit("state");
             }));

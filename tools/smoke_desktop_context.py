@@ -156,7 +156,8 @@ def exercise(skill, work, exe, cases=CASES):
                 reg = command(tool.with_name("python_workflow.py"), "register", "--task", TASK, "--out", folder/"device-report")
                 check("group_registration_checks_live_without_input", reg["status"] == "registered"
                       and not reg["input_dispatched"] and fixture.command("state") == baseline, reg)
-                run = command(folder / "device-report/scripts/run.py", "--set", "Family=" + expected_family)
+                consent = ["--allow-physical"] if (skill / "scripts/workflow_repair.py").is_file() else []
+                run = command(folder / "device-report/scripts/run.py", "--set", "Family=" + expected_family, *consent)
             else:
                 run = replay("--set", "Family=" + expected_family)
             actual = fixture.command("state")

@@ -94,7 +94,8 @@ def _summary(number, row, doc):
     step, scope = row['step'], row['context'] or doc
     item = dict(number=number, text=row['text'], action=step['action'],
                 window=scope.get('title', doc['window']), exe=scope['exe'])
-    for key in ('target', 'reason', 'label', 'role', 'match', 'alias', 'description', 'menu_anchor', 'wait_after'):
+    for key in ('target', 'reason', 'label', 'role', 'match', 'alias', 'description', 'menu_anchor',
+                'menu_window_point', 'wait_after'):
         if key in step:
             item[key] = step[key]
     if row['mode'] is not None:
@@ -263,12 +264,12 @@ def _menu_tail(row):
     name = row.get('capture_name')
     if step['action'] == 'open':
         if step.get('match') == 'query':
-            # Older drafts turn an unrecognized click into an unscoped button
-            # query for the WHOLE route. An ordinary single button, an alias
-            # rebound to another target or an explicitly scoped query stays put.
+            # The editor can turn an unrecognized popup click into a query for
+            # its caption. It has no witnessed button identity. A real captured
+            # button is excluded above (draft) or by its stable match (task).
             click = tasks.click_request(row['text'])
             role = step.get('role')
-            if (not click or role not in ('button', 'menuitem') or (role == 'button' and not route)
+            if (not click or role not in ('button', 'menuitem')
                     or step.get('within') or step.get('expand') or step.get('target') != click[0]):
                 return []
         elif step.get('role') == 'menuitem':
@@ -285,6 +286,8 @@ def _menu_tail(row):
     if name:
         return [name]
     text = row['text'].strip()
+    if tasks._conditional_sentence(text) or re.search(r'하지\s*(?:마|말)|말고|대신|\b(?:never|instead|do not)\b', text, re.I):
+        return []
     click = tasks.click_request(text)
     if click:
         return [click[0]]
@@ -297,27 +300,58 @@ def _next_menu_index(path, index, row):
     labels = [_menu_caption(label) for label in _menu_tail(row)]
     if len(labels) > 1:
         return len(path) if index < len(path) and labels == path else None
-    if labels and labels[0] in path[index:]:
-        return path.index(labels[0], index) + 1
+    if labels and index < len(path) and labels[0] == path[index]:
+        return index + 1
 
 
-def _menu_hint(rows, number):
+def _menu_hint(rows, number, inventory):
     start = rows[number - 1]
     path = tasks.click_menu_path(start['text'])
     end = number
-    if number < len(rows):
-        following = rows[number]
-        if not following.get('scope_problem') and following['context'] == start['context']:
-            tail = _menu_tail(following)
-            if len(tail) > 1:
-                if path and list(map(_menu_caption, path)) != list(map(_menu_caption, tail)):
-                    return None
-                path, end = tail, number + 1
+    tails = []
+    for n, following in enumerate(rows[number:number+8], number+1):
+        if following.get('scope_problem') or following['context'] != start['context']:
+            break
+        labels = _menu_tail(following)
+        if not labels:
+            break
+        if len(labels) > 1:
+            if tails or (path and list(map(_menu_caption, path)) != list(map(_menu_caption, labels))):
+                return None
+            path, end = labels, n
+            break
+        caption = labels[0]
+        # An unknown click with a caption shared by a live ordinary control
+        # needs host inspection. Do not turn a toolbar or dialog into a menu.
+        if any(node.get('role') in tasks.INVOKE - {'menuitem'} and node.get('offscreen') is False
+               and _menu_caption(node.get('name') or '') == _menu_caption(caption)
+               for scope in [inventory, *inventory.get('owned_popups', [])] for node in scope.get('targets', [])):
+            break
+        if path and (len(tails) >= len(path) or _menu_caption(caption) != _menu_caption(path[len(tails)])):
+            break
+        tails.append(caption)
+        end = n
+        if path and len(tails) == len(path):
+            break
+    if not path:
+        path = tails
     if path:
         return dict(number=number, through=end, mode='context-menu', path=path)
 
 
-def _menu(app, rows, item, owner, surface, title, fingerprint):
+def _any_body_cell(text):
+    # Only generic region nouns: do not broaden "selected row", named cells,
+    # ordinal rows, filters or other record-specific targets.
+    return bool(re.fullmatch(
+        r'(?:(?:조회(?:된)?|결과|조회\s*결과|데이터|검색\s*결과)\s*)*'
+        r'(?:표|테이블|그리드)(?:(?:의|\s)*(?:안|내부|영역|데이터\s*영역))?'
+        r'\s*(?:에서|에|를|을)?\s*(?:마우스\s*)?우클릭(?:을)?\s*'
+        r'(?:눌러|클릭|해|하|하기)?\s*(?:줘|주세요|기)?[.!。]?'
+        r'|right[- ]click\s+(?:in\s+|on\s+)?(?:the\s+)?(?:results?\s+|data\s+)?(?:table|grid)[.!]?',
+        text.strip(), re.IGNORECASE))
+
+
+def _menu(app, rows, item, owner, surface, title, fingerprint, *, prepare=False, detail=None, inventory=None):
     import live_recovery
     number, end = item['number'], item.get('through', item['number'])
     _require(set(item) <= {'number', 'mode', 'through', 'target', 'role', 'frame', 'point', 'path', 'output'},
@@ -340,7 +374,14 @@ def _menu(app, rows, item, owner, surface, title, fingerprint):
     grounded = dict(item)
     if (anchor := start['step'].get('menu_anchor')) and 'frame' not in grounded and 'point' not in grounded:
         grounded['menu_anchor'] = anchor
-    context = live_recovery.menu_from_frame(app, owner, surface, title, [fingerprint, number], grounded)
+    elif start['step'].get('menu_window_point') and 'frame' not in grounded and 'point' not in grounded:
+        grounded['menu_window_point'] = start['step']['menu_window_point']
+    if prepare:
+        grounded['preparing'] = True
+    if _any_body_cell(start['text']):
+        grounded['point_policy'] = 'any_data_cell'
+    context = live_recovery.menu_from_frame(app, owner, surface, title, [fingerprint, number], grounded,
+                                            observation=detail, inventory=inventory)
     step = dict(action='result-menu', label=' → '.join(path), context=context)
     if start['context']:
         step['window_context'] = deepcopy(start['context'])
@@ -402,6 +443,59 @@ def _binding_map(file, fingerprint, count):
     return indexed
 
 
+def _suggest(number, rows, detail, observation, name):
+    if detail.get('reason') != 'right_click_requires_menu_teaching':
+        return _suggest_binding(number, rows[number-1], observation)
+    hint = _menu_hint(rows, number, observation)
+    anchor = detail.get('menu_anchor')
+    if hint:
+        detail['menu_binding_hint'] = hint
+        if anchor:
+            matches = [node for node in observation['targets']
+                       if all(node.get(k) == v for k, v in anchor['target'].items())]
+            if len(matches) == 1 and matches[0].get('enabled') is True and matches[0].get('offscreen') is False:
+                return hint
+        elif detail.get('menu_window_point') and _any_body_cell(rows[number-1]['text']):
+            # A window-relative point is only a hint. Require a single actual
+            # table and later prove this point belongs to that table.
+            tables = [n for n in observation['targets'] if n.get('role') == 'table'
+                      and n.get('enabled') is True and n.get('offscreen') is False]
+            if len(tables) == 1:
+                table = tables[0]
+                key = table.get('automation_id')
+                name = key if tasks._text(key) and not key.isdecimal() else table.get('name')
+                if tasks._text(name):
+                    return dict(hint, target=name, role='table')
+    detail['image_args'] = ['recover', '--task', name, '--only', str(number), '--image']
+    detail['capture_requires_consent'] = True
+
+
+def _recorded_lookups(rows):
+    """Use native lookups for fully identified recordings, including their split popup captions."""
+    selectors, captions, through = [], [], 0
+    for number, row in enumerate(rows, 1):
+        if row['context'] or row.get('scope_problem'):
+            return None
+        if number <= through:
+            continue
+        step = row.get('hint', row['step'])
+        if step.get('reason') == 'right_click_requires_menu_teaching':
+            anchor = step.get('menu_anchor')
+            hint = _menu_hint(rows, number, {'targets': []})
+            if not anchor or not hint:
+                return None
+            selector = anchor['target']
+            through = hint['through']
+            captions.extend(hint['path'])
+        elif step.get('match') in ('automation_id', 'name') and not row.get('field_problem'):
+            selector = {step['match']: step['target'], 'role': step['role']}
+        else:
+            return None
+        if selector not in selectors:
+            selectors.append(selector)
+    return dict(selectors=selectors, captions=captions)
+
+
 def run(app, args):
     import live_recovery
     directory = app.task_directory()
@@ -410,8 +504,13 @@ def run(app, args):
     only = args.only
     _require(only is None or (type(only) is int and 1 <= only <= len(rows)), 'unknown_task_step')
     _require(not args.image or only is not None, 'recovery_image_step_required')
-    _require(bool(args.save_as) == bool(args.bindings) and not (args.bindings and (args.image or only)),
-             'invalid_recovery_options')
+    prepare = getattr(args, 'prepare', False)
+    lookups = _recorded_lookups(rows) if prepare else None
+    _require((not prepare and bool(args.save_as) == bool(args.bindings) and not (args.bindings and (args.image or only)))
+             or (prepare and not (args.bindings or args.image or only)), 'invalid_recovery_options')
+    destination = args.save_as or (f"{doc['name'][:75]} - {fingerprint[:12]}" if prepare else None)
+    if destination:
+        _require(tasks._name(destination).casefold() != doc['name'].casefold(), 'task_already_exists')
     selection = list(range(1, len(rows)+1)) if only is None else [only]
     operations = {}
     if args.bindings:
@@ -428,6 +527,7 @@ def run(app, args):
 
     observations, revised, remap = {}, [], {}
     skip_until = 0
+    pending = {}
     for number, detail in zip(selection, details):
         row, operation = rows[number-1], operations.get(number)
         if number <= skip_until:
@@ -440,23 +540,32 @@ def run(app, args):
                 key = surface.hwnd, surface.pid, surface.created
                 if key not in observations:
                     observation = live_recovery.observe_scope(app, owner, surface, doc['window'],
-                                            frame_key=[fingerprint, number] if args.image else None)
+                                            frame_key=[fingerprint, number] if args.image else None,
+                                            **({'lookups': lookups} if lookups else {}))
                     observations[key] = len(result['live_scopes'])
                     result['live_scopes'].append(observation)
                 detail['scope_index'] = observations[key]
                 observation = result['live_scopes'][observations[key]]
-            if not args.bindings:
+                if args.image and detail.get('menu_window_point') and observation.get('width') and observation.get('height'):
+                    detail['recorded_image_point'] = [min(extent-1, round(fraction*extent)) for fraction, extent in
+                        zip(detail['menu_window_point'], [observation['width'], observation['height']])]
+            if prepare:
+                operation = _suggest(number, rows, detail, observation, doc['name'])
+            if not args.bindings and not prepare:
                 continue
             if row.get('scope_problem'):
                 raise tasks.TaskError(row['scope_problem'])
             if operation and operation['mode'] == 'context-menu':
-                step, skip_until = _menu(app, rows, operation, owner, surface, doc['window'], fingerprint)
+                step, skip_until = _menu(app, rows, operation, owner, surface, doc['window'], fingerprint,
+                                         prepare=prepare, detail=detail, inventory=observation)
             elif operation:
                 step = _field(row, operation, observation)
             else:
                 if row.get('field_problem'):
                     raise tasks.TaskError(row['field_problem'])
                 step = deepcopy(row['step'])
+                if prepare and (step['action'] == 'manual' or step.get('match') == 'query'):
+                    raise tasks.TaskError(step.get('reason', 'instruction_requires_structure'))
             context = step.get('window_context')
             if context and 'after_step' in context:
                 context['after_step'] = remap[context['after_step']]
@@ -474,7 +583,14 @@ def run(app, args):
                 detail['opener_step'] = row['context'].get('after_step')
             if args.bindings:
                 return dict(result, status='needs_grounding', diagnostic=reason, step_number=number)
-    if not args.bindings:
+            if prepare:
+                pending[number] = reason
+                if 'menu_binding_hint' in detail:
+                    detail['image_args'] = ['recover', '--task', doc['name'], '--only', str(number), '--image']
+                    detail['capture_requires_consent'] = True
+                # Keep original numbering available to dependent diagnostic rows.
+                remap[number] = number
+    if not args.bindings and (not prepare or pending):
         result['host_action'] = 'bind_recorded_instructions_from_live_scopes'
         suggested = []
         menu_end = 0
@@ -483,38 +599,39 @@ def run(app, args):
                 continue
             n = detail['number']
             inventory = result['live_scopes'][detail['scope_index']]
-            if detail.get('reason') == 'right_click_requires_menu_teaching':
-                hint = _menu_hint(rows, n)
-                anchor = detail.get('menu_anchor')
-                if hint:
-                    detail['menu_binding_hint'] = hint
-                    menu_end = hint['through']
-                if anchor and hint:
-                    target = anchor['target']
-                    matches = [node for node in inventory['targets'] if all(node.get(k) == v for k, v in target.items())]
-                    if len(matches) == 1 and matches[0].get('enabled') is True and matches[0].get('offscreen') is False:
-                        suggested.append(hint)
-                        continue
-                if not anchor or hint:
-                    detail['image_args'] = ['recover', '--task', doc['name'], '--only', str(n), '--image']
-                continue
             if n <= menu_end:
                 continue
-            item = _suggest_binding(n, rows[n-1], inventory)
+            item = _suggest(n, rows, detail, inventory, doc['name'])
+            if detail.get('menu_binding_hint'):
+                menu_end = detail['menu_binding_hint']['through']
             if item:
                 suggested.append(item)
         result['bindings_template'] = dict(source_fingerprint=fingerprint, steps=suggested)
+        if pending:
+            n = next(iter(pending))
+            result.update(status='needs_grounding', diagnostic=pending[n], step_number=n)
         if not result['live_scopes']:
             result.update(status='needs_grounding', diagnostic=details[0].get('diagnostic', 'target_unavailable'))
         return result
     app.guard(owner, owner, doc['window'])
-    task = dict(schema=1, name=args.save_as, exe=doc['exe'], window=doc['window'], steps=revised)
+    task = dict(schema=1, name=destination, exe=doc['exe'], window=doc['window'], steps=revised)
+    if prepare:
+        import recorded_plan
+        plan = recorded_plan.compile_plan(task)
+        if not plan.get('envelope'):
+            return dict(result, status='needs_grounding', diagnostic=plan.get('diagnostic', 'instruction_requires_structure'),
+                        step_number=next((i for i, n in remap.items() if n == plan.get('step')), None),
+                        host_action='bind_recorded_instructions_from_live_scopes')
     try:
         # Compare and publish under the same short lock used to revise editor
         # drafts. The source may have been edited while live targets were read.
         with review_drafts._edit_lock(directory):
             _require(_fingerprint(tasks.read_document(args.task, directory)) == fingerprint, 'recording_draft_changed')
-            tasks.save_task(task, directory)
+            try:
+                tasks.save_task(task, directory)
+            except tasks.TaskError as error:
+                if not prepare or error.code != 'task_already_exists' or tasks.read_document(destination, directory) != task:
+                    raise
     except OSError as error:
         raise tasks.TaskError('task_store_unavailable') from error
     except tasks.TaskError as error:
@@ -522,6 +639,12 @@ def run(app, args):
             raise
         original_number = next(i for i, n in remap.items() if n == error.step_number)
         return dict(result, status='needs_grounding', diagnostic=error.code, step_number=original_number)
-    return dict(status='recorded', source_task=doc['name'], task=tasks.summary(task), input_dispatched=False,
-                source_fingerprint=fingerprint, source_steps=remap,
-                execution_plan=app.execution_plan_info(app.saved_execution_plan(task)))
+    saved = dict(status='recorded', source_task=doc['name'], task=tasks.summary(task), input_dispatched=False,
+                 source_fingerprint=fingerprint, source_steps=remap,
+                 execution_plan=app.execution_plan_info(app.saved_execution_plan(task)))
+    if prepare:
+        saved['host_action'] = 'use_prepared_task'
+        saved['observed_scopes'] = len(observations)
+        saved['lookup_modes'] = [scope.get('lookup_mode', 'window_inventory') for scope in result['live_scopes']]
+        saved['menu_previews'] = [dict(number=d['number'], **d['menu_preview']) for d in details if 'menu_preview' in d]
+    return saved

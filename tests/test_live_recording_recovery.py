@@ -188,7 +188,7 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.assertEqual(result['source_steps'], {1:1, 2:2, 3:3, 4:4, 5:4})
         self.assertFalse(result['input_dispatched'])
         self.assertEqual(tasks.load_task('실행용', self.directory)['steps'][3]['context']['menu']['path'], path)
-        self.assertEqual(self.menu.call_args.args[-1], binding)
+        self.assertEqual(self.menu.call_args.args[-1], dict(binding, point_policy='any_data_cell'))
         self.assertEqual((self.directory / '내 녹화.json').read_bytes(), source)
 
     def test_complete_route_on_missing_capture_is_recoverable_after_normal_save(self):
@@ -218,6 +218,56 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.assertNotIn('image_args', info['steps'][3])
         self.assertEqual(self.bind(template['source_fingerprint'], template['steps'])['status'], 'recorded')
         self.assertEqual(self.menu.call_args.args[-1]['menu_anchor'], self.rows[3]['step']['menu_anchor'])
+
+    def test_one_prepare_on_previous_six_step_draft_uses_one_inventory_and_preserves_source(self):
+        self.rows[3]['step']['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
+        self.observe.return_value['targets'].append(dict(role='group', automation_id='results', enabled=True, offscreen=False))
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        original = (self.directory/'내 녹화.json').read_bytes()
+        result = self.recover_cli('--prepare')
+        self.assertEqual(result['status'], 'recorded', result)
+        self.observe.assert_called_once()
+        self.assertEqual(result['source_steps'], {1:1, 2:2, 3:3, 4:4, 5:4, 6:4})
+        self.assertEqual(result['execution_plan']['required_parameters'], ['제품군'])
+        self.assertEqual(self.menu.call_args.args[-1]['point_policy'], 'any_data_cell')
+        self.assertEqual(self.recover_cli('--prepare')['task']['name'], result['task']['name'])
+        self.assertEqual((self.directory/'내 녹화.json').read_bytes(), original)
+
+    def test_one_prepare_on_legacy_task_with_separate_unidentified_popup_queries(self):
+        self.rows[3]['step']['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
+        self.observe.return_value['targets'].append(dict(role='group', automation_id='results', enabled=True, offscreen=False))
+        rows = self.rows[3:]
+        edits = teach_capture.StepEdits()
+        for row in rows:
+            if row['step']['id'] != '4':
+                label = 'Export to excel' if row['step']['id'] == '5' else 'Active sheet'
+                row['step'] = teach_capture.manual('capture_target_unavailable', row['step']['id'])
+                edits.store(row['step'], '', label + ' 버튼을 눌러줘')
+        source = tasks.from_recording('old-task', 'Demo.exe', '업무', edits.apply([row['step'] for row in rows]))
+        self.assertEqual([s.get('match') for s in source['steps']], [None, 'query', 'query'])
+        tasks.save_task(source, self.directory)
+        args = app.parser().parse_args(['recover', '--task', 'old-task', '--prepare'])
+        result = app.run(args)
+        self.assertEqual(result['status'], 'recorded', result)
+        self.assertEqual(result['source_steps'], {1:1, 2:1, 3:1})
+        self.assertEqual(self.menu.call_args.args[-1]['path'], ['Export to excel', 'Active sheet'])
+
+    def test_prepare_rejects_guessed_captions_that_belong_to_live_buttons(self):
+        self.rows[3]['step']['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
+        self.observe.return_value['targets'].extend([
+            dict(role='group', automation_id='results', enabled=True, offscreen=False),
+            dict(role='button', automation_id='toolbar', name='Export to Excel', enabled=True, offscreen=False)])
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        result = self.recover_cli('--prepare')
+        self.assertEqual(result['status'], 'needs_grounding', result)
+        self.assertTrue(result['steps'][3]['capture_requires_consent'])
+        self.menu.assert_not_called()
+
+    def test_specific_rows_and_cells_are_never_generic_point_repairs(self):
+        self.assertTrue(recovery._any_body_cell('조회된 테이블에서 우클릭을 눌러줘'))
+        self.assertTrue(recovery._any_body_cell('결과 표를 우클릭해줘'))
+        for text in ('4번째 행의 셀을 우클릭해줘', '결과 표에서 특정 행을 우클릭', 'right click selected row'):
+            self.assertFalse(recovery._any_body_cell(text))
 
     def test_ordinary_right_click_accepts_complete_path_even_if_popup_row_was_missed(self):
         raw = self.rows[3]['step']

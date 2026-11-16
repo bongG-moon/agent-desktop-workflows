@@ -164,7 +164,7 @@ def exercise(skill, work, exe, include_legacy, include_workflow):
             check('python_skill_declares_physical_pointer', preview.get('input_dispatched') is False
                   and preview['input_requirements']['physical_input_required'] is True, preview)
             started = time.perf_counter()
-            run = run_cli(runner)
+            run = run_cli(runner, '--allow-physical')
             write_json(work / 'timings.json', dict(python_registration_seconds=round(registration_seconds,3),
                        python_two_stopped_rows_seconds=round(time.perf_counter()-started,3)))
             write_json(work / 'python-skill-run.json', run)

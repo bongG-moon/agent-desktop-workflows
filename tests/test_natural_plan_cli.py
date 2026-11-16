@@ -72,7 +72,7 @@ class NaturalPlanCLI(unittest.TestCase):
             result = app.run(self.args(extra=['--set', 'Family=Hybrid']))
         self.assertEqual(result['status'], 'needs_review')
         self.assertFalse(result['input_dispatched'])
-        worker.assert_called_once_with(['_worker', 'recover', '--task', task['name']], mutating=False)
+        worker.assert_called_once_with(['_worker', 'recover', '--task', task['name'], '--prepare'], mutating=False)
         self.assertIs(result['live_recovery'], probe)
 
     def test_fixed_override_is_rejected_before_dispatch(self):

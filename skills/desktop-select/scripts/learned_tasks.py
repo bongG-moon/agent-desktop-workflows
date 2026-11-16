@@ -606,6 +606,8 @@ def instructed_step(raw_step, spec):
             result = {**_manual(reason), **_annotations(raw_step), 'instruction_draft': spec['text']}
             if 'menu_anchor' in raw_step:
                 result['menu_anchor'] = _menu_anchor(raw_step['menu_anchor'], reason)
+            if 'menu_window_point' in raw_step:
+                result['menu_window_point'] = _menu_window_point(raw_step['menu_window_point'], reason)
             if 'visual_hint' in raw_step:
                 if not is_recoverable(result):
                     raise TaskError('invalid_visual_step')
@@ -671,6 +673,8 @@ def recorded_step(raw):
     step.update(_annotations(raw))
     if 'menu_anchor' in raw:
         step['menu_anchor'] = _menu_anchor(raw['menu_anchor'], step.get('reason'))
+    if 'menu_window_point' in raw:
+        step['menu_window_point'] = _menu_window_point(raw['menu_window_point'], step.get('reason'))
     if 'wait_after' in raw:
         step['wait_after'] = raw['wait_after']
     return step
@@ -716,6 +720,13 @@ def _validate_row(step):
         validate_spec(step.get('row'))
     except BridgeError as error:
         raise TaskError(error.code) from error
+
+
+def _menu_window_point(point, reason):
+    if (reason != 'right_click_requires_menu_teaching' or not isinstance(point, list) or len(point) != 2
+            or not all(type(value) in (int, float) and 0 <= value < 1 for value in point)):
+        raise TaskError('invalid_context_window_hint')
+    return point
 
 
 def _menu_anchor(anchor, reason):
@@ -817,6 +828,9 @@ def _validate_step(s, parameters):
         return
     if s.get('action') == 'manual':
         expected = {'action', 'reason'}
+        if 'menu_window_point' in s:
+            _menu_window_point(s['menu_window_point'], s.get('reason'))
+            expected.add('menu_window_point')
         if 'menu_anchor' in s:
             _menu_anchor(s['menu_anchor'], s.get('reason'))
             expected.add('menu_anchor')

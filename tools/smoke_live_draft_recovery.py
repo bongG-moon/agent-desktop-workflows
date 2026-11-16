@@ -97,7 +97,8 @@ def exercise(package, work, *, combined_menu=False, expect_rejection=False):
         reg = cli(skill / 'python_workflow.py', 'register', '--task', 'report', '--out', work / 'report-skill')
         assert reg['status'] == 'registered' and (store / 'legacy.json').read_bytes() == original, reg
         assert fixture.command('state') == baseline
-        receipt = cli(work / 'report-skill/scripts/run.py', '--set', 'Family=Hybrid')
+        consent = ['--allow-physical'] if (skill / 'workflow_repair.py').is_file() else []
+        receipt = cli(work / 'report-skill/scripts/run.py', '--set', 'Family=Hybrid', *consent)
         deadline = time.monotonic() + 3
         state = fixture.command('state')
         while not book.exists() and time.monotonic() < deadline:

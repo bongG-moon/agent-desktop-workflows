@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "0.4.19",
+  "version": "0.4.20",
   "files": {
     "win_bridge.py": "ada690e9109c8b34250f692f011aec8643ecb985976e98f832795ae45ee88507",
     "recorder.py": "c26af522a42426988a7fcefdfb4c48366164d7dccca7a5e88796ed6246654086"

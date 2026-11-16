@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 import desktop_select as app
 import control_lookup as lookup
@@ -28,6 +29,7 @@ import row_intent
 import row_vision
 import window_context
 import conditional_action
+import workflow_repair
 
 
 CHILD_VISUAL_TIMEOUT = 30
@@ -291,6 +293,21 @@ def combine(previous, current):
     return None if previous is None or current is None else bool(previous or current)
 
 
+def inspect_menu(binding, uia, step, preceding):
+    try:
+        if step['action'] == 'context-menu':
+            return context_menu.observe(binding, uia, step['spec'])
+        return result_menu.observe(binding, uia, step['context'])
+    except app.bridge.BridgeError as error:
+        # A recorded query can create its results table. Registration does not issue it.
+        if error.code != 'context_region_missing' or not any(
+                s['action'] == 'invoke' and not s.get('popup') and
+                s.get('window_context') == step.get('window_context') for _, s in preceding):
+            raise
+        return dict(status='observed', input_dispatched=False, region_observed=False,
+                    point_observed=False, point_diagnostic=error.code, menu_verification='pending_execution')
+
+
 def popup_surface(owner, title, spec, *, read_only=False):
     """Wait by observing only; never restore, focus or act on the owner as a fallback."""
     deadline = time.monotonic() + (0 if read_only else spec.get('timeout', 3))
@@ -412,16 +429,28 @@ def _missing_groundings(recipe, entries, owner, uia, prepare=None):
 
 
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
-        background_only=False, only=None, scene_session=None):
+        background_only=False, only=None, scene_session=None, resume=None, track_menu=False,
+        registered_session=None):
     recipe = validate(recipe)
+    if registered_session is not None:
+        # A conditional screen prompt returns control to the host while its worker
+        # remains alive. Keep correction receipts and the single-use lock in that worker.
+        need(scene_session is not None, 'menu_repair_session_unavailable')
+        args = SimpleNamespace(**registered_session)
+        args.recipe = Path(args.recipe)
+        need(workflow_repair.registered(args.recipe), 'registered_skill_required')
+        return workflow_repair.run_registered(sys.modules[__name__], recipe, args, overrides or {}, scene_session)
     entries = selected_steps(recipe, only)
+    requested = [step for _, step in entries]
+    if resume is not None:
+        entries = [(n, s) for n, s in entries if n >= resume['number']]
     active = [step for _, step in entries]
     requirements = input_policy.profile(active, [n for n, _ in entries])
     if background_only and not read_only:
         refusal = input_policy.blocked(requirements)
         if refusal:
             return refusal
-    values, missing = values_for(dict(recipe, steps=active), overrides or {})
+    values, missing = values_for(dict(recipe, steps=requested), overrides or {})
     if missing and not read_only:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     # A relative row by itself means "start the current Nth row". When a
@@ -444,8 +473,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         input_dispatched=False)
     if not read_only and scene_session is None and any(s['action']=='conditional-open' for s in active):
         from scene_session import start
-        return start(__file__, recipe, dict(overrides=overrides, hwnd=hwnd, only=only,
-                                            allow_recorded_selection=allow_recorded_selection),
+        return start(__file__, recipe, dict(overrides=overrides, hwnd=hwnd, only=only, resume=resume,
+                                            track_menu=track_menu, allow_recorded_selection=allow_recorded_selection),
                      worker_timeout(recipe))
     report = dict(status='observed' if read_only else 'verified', steps=[], input_dispatched=False,
                   business_commit='not_verified', input_requirements=requirements,
@@ -456,6 +485,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     stage_started = started
     try:
         owner = bind(recipe['exe'], recipe['window'], hwnd)
+        if resume:
+            need(workflow_repair.identity(owner) == resume['scope'][0], 'menu_repair_window_changed')
         if background_only and not read_only:
             input_policy.window_ready(owner)
         active_scopes = {n for n,_ in entries}
@@ -463,6 +494,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         active_scopes.update(n for n,s in enumerate(recipe['steps'],1) if s.get('window_context',{}).get('after_step') in row_openers)
         routes = window_context.WindowRoutes(recipe['steps'], owner, recipe['window'], read_only=read_only,
                                               active=sorted(active_scopes))
+        if resume:
+            workflow_repair.restore_routes(sys.modules[__name__], recipe, resume, routes)
         # Capture every requested output before window restoration or any input.
         baselines = {i: export_evidence.baseline(step['output']) for i, step in entries
                      if step['action'] == 'verify-file'} if not read_only else {}
@@ -498,6 +531,15 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             missing = _missing_groundings(recipe, entries, owner, uia, prepare)
             if missing:
                 return _grounding_report(report, missing)
+            if resume:
+                for field in resume['checked_fields']:
+                    prior = recipe['steps'][field - 1]
+                    selector = prior['selector']
+                    root = uia.from_handle(owner.hwnd)
+                    element, _, _ = resolve_step(owner, uia, root, selector)
+                    reader = live.text_readback if selector['role'] == 'textfield' else live.combo_readback
+                    expected = prior.get('value') if 'value' in prior else values[prior['parameter'].casefold()]
+                    need(reader(owner, uia, element).get('value') == expected, 'menu_repair_conditions_changed')
             report['preparation_seconds'] = round(time.monotonic() - started, 4)
             for number, step in entries:
                 stage_started = time.monotonic()
@@ -513,6 +555,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     confirm_opened_window(report, routes, pending_opener)
                     pending_opener = None
                 binding = routes.resolve(context) if context else owner
+                if resume and number == resume['number']:
+                    need(binding is not None and workflow_repair.identity(binding) == resume['scope'][1],
+                         'menu_repair_window_changed')
                 title = context['title'] if context else recipe['window']
                 if context and binding is not None and not read_only:
                     confirm_opened_window(report, routes, context.get('after_step'))
@@ -555,7 +600,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         app.guard(binding, binding, title)
                         receipt = dict(status='verified' if ok else 'blocked', input_dispatched=False,
                                        diagnostic=diagnostic, file_verified=ok,
-                                       baseline_scope='before_workflow', business_commit='not_verified')
+                                       baseline_scope='before_resumed_menu' if resume else 'before_workflow',
+                                       business_commit='not_verified')
                         if ok and getattr(baselines[number], 'verified_path', None):
                             receipt['verified_path'] = baselines[number].verified_path
                 elif step['action'] == 'conditional-open':
@@ -597,9 +643,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 elif step['action'] == 'context-menu':
                     check_target(binding, mutate=not read_only)
                     if read_only:
-                        context_menu._region(binding, uia, step['spec']['target'])
-                        receipt = dict(status='observed', input_dispatched=False,
-                                       region_observed=True, menu_verification='pending_execution')
+                        receipt = inspect_menu(binding, uia, step, ((n,s) for n,s in entries if n < number))
                     else:
                         def context_guard():
                             check_target(binding, mutate=True)
@@ -608,9 +652,11 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         dispatching = False
                 elif step['action'] == 'result-menu':
                     spec = step['context']
+                    if resume and number == resume['number'] and resume['query_sent']:
+                        spec = dict(spec, trigger=None)
                     check_target(binding, mutate=not read_only)
                     if read_only:
-                        receipt = result_menu.observe(binding, uia, spec)
+                        receipt = inspect_menu(binding, uia, step, ((n,s) for n,s in entries if n < number))
                     else:
                         dispatching = True
                         receipt = result_menu.execute(binding, spec, lambda: check_target(binding, mutate=True),
@@ -703,6 +749,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     if popup:
                         receipt['popup'] = dict(title=popup['title'])
                 routes.after(number, receipt)
+                if track_menu and workflow_repair.menu(step) and workflow_repair.point_failed(receipt):
+                    report['menu_repair_scope'] = [workflow_repair.identity(owner), workflow_repair.identity(binding)]
+                    report['menu_repair_routes'] = workflow_repair.saved_routes(routes, number)
                 if context:
                     receipt['window_context'] = deepcopy(context)
                 report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
@@ -861,8 +910,11 @@ GUIDE_END = '<!-- /desktop-select:run -->\n\n'
 def run_instructions(recipe):
     parameters = list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s))
     arguments = ' --set "이름=값"' if parameters else ''
-    note = ('물리 입력 단계가 있으므로 실행 직전에 마우스와 키보드를 잠시 비워 달라고 한 번 알린다. '
+    note = ('화면 확인과 실제 입력이 필요한 창 및 메뉴 경로를 말하고 마우스와 키보드를 비울 수 있는지 한 번 묻는다. '
+            '사용자가 승인하면 아래 명령을 실행한다. 거절하면 실행을 멈춘다. '
             if input_policy.profile(recipe['steps'])['physical_input_required'] else '')
+    if note:
+        arguments += ' --allow-physical'
     return (GUIDE_BEGIN + '## 실행 요청\n\n'
             '사용자가 이 업무 스킬을 실행해 달라고 하면 아래 명령 한 번으로 시작한다. '
             + ('필수 변수 ' + json.dumps(parameters, ensure_ascii=False) +
@@ -875,6 +927,9 @@ def run_instructions(recipe):
             '결과 JSON을 바로 보고한다. outcome=workbook_verified이면 verified_outputs에 적힌 파일 경로를 사용한다. '
             '출력 폴더를 다시 검색하거나 파일을 다시 열 필요는 없다. '
             '중단됐으면 stopped_at, diagnostic, input_dispatched를 먼저 확인한다. '
+            'menu_repair가 있으면 같은 승인의 범위에서 frame_args로 해당 표를 확인한다. '
+            '녹화 지시와 현재 이미지에서 같은 셀을 찾아 resume_args의 X, Y에 이미지 픽셀을 넣고 같은 변수로 이어 간다. '
+            '성공하면 실제 workflow.json의 menu_corrections를 확인한다. 메뉴 경로가 불분명할 때만 해당 항목을 묻는다. '
             '이미 보낸 입력을 자동으로 다시 실행하지 않는다.\n' + GUIDE_END)
 
 
@@ -1055,6 +1110,12 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     (destination / 'SKILL.md').write_text(guide, encoding='utf8')
     result = dict(status='registered', path=str(destination), required_parameters=required, input_dispatched=False,
                   input_requirements=input_policy.profile(active))
+    menu_checks = [dict(number=r['number'], **{k: v for k, v in r['receipt'].items()
+                       if k in ('region_observed', 'point_observed', 'proposed_point', 'point_diagnostic',
+                                'menu_verification')}) for r in observed['steps']
+                   if workflow_repair.menu(recipe['steps'][r['number'] - 1])]
+    if menu_checks:
+        result['menu_checks'] = menu_checks
     if recorded:
         result['target_validation'] = 'recorded_evidence'
         result['pending_scopes'] = [dict(number=i, window_context=deepcopy(s['window_context']),
@@ -1080,7 +1141,7 @@ def summarize_execution(report, entries):
             return report
         item = {k: row[k] for k in ('number', 'label', 'elapsed_seconds') if k in row}
         item.update(action=step['action'])
-        item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items',
+        item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items', 'menu_recovery',
                                              'verified_path') if k in receipt})
         summary['steps'].append(item)
         if (receipt['status'] == 'verified' and receipt.get('diagnostic') == 'export_workbook_verified'
@@ -1133,6 +1194,12 @@ def main(argv=None):
             p.add_argument('--read-only', action='store_true')
             p.add_argument('--input-plan', action='store_true', help='preview input modes without opening or inspecting an app')
             p.add_argument('--summary', action='store_true', help='return a compact receipt; exit 0 for a verified final workbook')
+            p.add_argument('--allow-physical', action='store_true', help='the user approved the registered screen/input scope for this run')
+            repair = p.add_mutually_exclusive_group()
+            repair.add_argument('--repair-frame', metavar='TICKET', help='inspect the failed result area without input')
+            repair.add_argument('--resume-menu', metavar='TICKET', help='resume a before-click failure from the approved frame')
+            p.add_argument('--frame', metavar='TOKEN')
+            p.add_argument('--point', nargs=2, type=int, metavar=('X', 'Y'))
             p.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and window restoration')
     parser.add_argument('--_worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -1144,7 +1211,7 @@ def main(argv=None):
             result = dict(status='blocked',diagnostic=getattr(error,'code','scene_answer_unavailable'),input_dispatched=False)
         print(json.dumps(result,ensure_ascii=False))
         return 0 if result['status']=='verified' else (3 if result['status'] in ('completed_unverified','uncertain') else 2)
-    mutating = args.command == 'run' and not args.read_only and not args.input_plan
+    mutating = args.command == 'run' and not args.read_only and not args.input_plan and not args.repair_frame
     launched, executing = False, False
     try:
         source_task = None
@@ -1169,6 +1236,13 @@ def main(argv=None):
                 recipe = load(args.recipe)
         overrides = {}
         if args.command == 'run':
+            registered = workflow_repair.registered(args.recipe)
+            repairing = bool(args.repair_frame or args.resume_menu)
+            need(not repairing or (registered and not args.read_only and not args.input_plan and
+                                   not args.background_only and args.only is None and args.hwnd is None),
+                 'invalid_registered_repair_arguments')
+            need((args.frame is not None) == bool(args.resume_menu) and
+                 (args.point is not None) == bool(args.resume_menu), 'menu_repair_frame_and_point_required')
             entries = selected_steps(recipe, args.only)
             active = dict(recipe, steps=[step for _, step in entries])
             requirements = input_policy.profile(active['steps'], [n for n, _ in entries])
@@ -1181,9 +1255,15 @@ def main(argv=None):
                 if refusal:
                     print(json.dumps(refusal, ensure_ascii=False))
                     return 2
+            if (registered and not args.allow_physical and
+                    (repairing or (mutating and requirements['physical_input_required']))):
+                print(json.dumps(dict(status='needs_consent', diagnostic='registered_physical_consent_required',
+                                      window=recipe['window'], input_requirements=requirements, steps=[],
+                                      approval_flag='--allow-physical', input_dispatched=False), ensure_ascii=False))
+                return 2
             overrides = app.tasks.parse_overrides(args.set)
             _, missing = values_for(active, overrides)
-            if missing and not args.read_only:
+            if missing and not args.read_only and not repairing:
                 print(json.dumps(dict(status='needs_input', missing_parameters=missing,
                                       steps=[], input_dispatched=False), ensure_ascii=False))
                 return 2
@@ -1195,6 +1275,17 @@ def main(argv=None):
                 result = export_evidence.discover_directories(owner)
             elif args.command == 'register':
                 result = register(recipe, args.out, args.hwnd, source_task=source_task)
+            elif registered and not args.read_only and (repairing or any(workflow_repair.menu(s) for _, s in entries)):
+                executing = mutating
+                if not args.repair_frame and any(s['action'] == 'conditional-open' for _, s in entries):
+                    from scene_session import start
+                    session_args = {k: getattr(args, k) for k in ('repair_frame', 'resume_menu', 'frame',
+                                                                  'point', 'only', 'hwnd')}
+                    session_args['recipe'] = str(args.recipe.absolute())
+                    result = start(__file__, recipe, dict(overrides=overrides, registered_session=session_args),
+                                   worker_timeout(recipe))
+                else:
+                    result = workflow_repair.run_registered(sys.modules[__name__], recipe, args, overrides)
             else:
                 executing = mutating
                 result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd,
@@ -1208,6 +1299,9 @@ def main(argv=None):
             need(child.returncode in (0, 2, 3) and isinstance(result, dict) and 'status' in result,
                  'invalid_worker_receipt')
             if args.command == 'run' and args.summary and mutating:
+                if result.get('resumed_at'):
+                    executed = {r['number'] for r in result.get('steps', [])}
+                    entries = [(n, s) for n, s in entries if n in executed]
                 result = summarize_execution(result, entries)
     except (Exception, KeyboardInterrupt) as error:
         uncertain = (launched or executing) and mutating

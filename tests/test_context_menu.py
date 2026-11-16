@@ -172,6 +172,161 @@ class MenuTests(unittest.TestCase):
             with self.assertRaisesRegex(cm.win.BridgeError,'context_point_protected'):
                 cm._check_region_children(owner,self.uia,region,(25,35))
 
+    def test_preview_distinguishes_table_and_actual_point_without_input(self):
+        failure = cm.win.BridgeError('context_point_outside_region')
+        with (patch.object(cm, '_region', return_value='table'),
+              patch.object(cm, '_rect', return_value=(0, 0, 200, 200)),
+              patch.object(cm, '_hit_region', side_effect=failure) as hit,
+              patch.object(cm.win, '_send_point') as send):
+            preview = cm.observe(Mock(), self.uia, self.spec)
+        self.assertTrue(preview['region_observed'])
+        self.assertFalse(preview['point_observed'])
+        self.assertEqual(preview['point_diagnostic'], failure.code)
+        self.assertNotIn('proposed_point', preview)
+        self.assertEqual(hit.call_count, 1)
+        send.assert_not_called()
+
+    def test_proposed_replacement_requires_explicit_table_wide_intent_and_a_data_hit(self):
+        spec = dict(self.spec, point_policy='any_data_cell')
+        def hit(binding, uia, region, point, *, require_body, recorded_opaque=False):
+            self.assertTrue(require_body)
+            if point != (100, 150):
+                raise cm.win.BridgeError('context_point_not_data')
+        with (patch.object(cm, '_region', return_value='table'),
+              patch.object(cm, '_rect', return_value=(0, 0, 200, 200)),
+              patch.object(cm, '_hit_region', side_effect=hit),
+              patch.object(cm.win, '_send_point') as send):
+            preview = cm.observe(Mock(), self.uia, spec)
+        self.assertEqual(preview['proposed_point'], [.5, .75])
+        self.assertTrue(preview['point_observed'])
+        self.assertEqual(spec['point'], [.5,.5])
+        send.assert_not_called()
+
+    def test_occlusion_and_protected_points_abort_automatic_relocation(self):
+        spec = dict(self.spec, point_policy='any_data_cell')
+        for code in ('context_point_occluded', 'context_point_protected', 'context_point_disabled'):
+            with (self.subTest(code=code), patch.object(cm, '_region', return_value='table'),
+                  patch.object(cm, '_rect', return_value=(0, 0, 200, 200)),
+                  patch.object(cm, '_hit_region', side_effect=cm.win.BridgeError(code)) as hit):
+                preview = cm.observe(Mock(), self.uia, spec)
+                self.assertEqual(preview['point_diagnostic'], code)
+                self.assertFalse(preview['point_observed'])
+                self.assertEqual(hit.call_count, 1)
+
+    def test_correction_is_reported_only_after_complete_exact_menu_path(self):
+        correction = {'from': [.5,.5], 'to': [.45,.5]}
+        with patch.object(cm, '_resolve_menu_point', return_value=((0,0,200,200), (90,100), correction)):
+            result, _ = self.run_path()
+        self.assertEqual(result['point_correction'], correction)
+        with patch.object(cm, '_resolve_menu_point', return_value=((0,0,200,200), (90,100), correction)):
+            failure, _ = self.run_path(before_leaf=Mock(side_effect=cm.win.BridgeError('window_changed')))
+        self.assertNotIn('point_correction', failure)
+
+    def test_data_cell_does_not_authorize_an_embedded_button_or_header(self):
+        owner = Mock(hwnd=10, pid=42)
+        row, region = Mock(), Mock()
+        role = {row: 50029, region: 50028}
+        self.uia.within.side_effect = None
+        self.uia.within.return_value = True
+        self.uia.pid.return_value = 42
+        self.uia.secure.return_value = False
+        for leaf_role, ok in ((50020, True), (50000, False), (50035, False), (50014, False)):
+            leaf = Mock()
+            role[leaf] = leaf_role
+            for node in (leaf, row, region):
+                node.property.side_effect = lambda prop, n=node: {30003: role[n], 30010: True}.get(prop)
+            self.uia.from_point.return_value = leaf
+            self.uia.parent.side_effect = {leaf: row, row: region}.__getitem__
+            with (self.subTest(role=leaf_role), patch.object(cm.win, 'window_from_point', return_value=10),
+                  patch.object(cm.win, 'root_window', return_value=10), patch.object(cm.win, 'hwnd_pid',return_value=42),
+                  patch.object(cm, '_check_region_children'), patch.object(cm, '_rect', return_value=(0,0,100,100))):
+                if ok:
+                    cm._hit_region(owner, self.uia, region,(30,30),require_body=True)
+                else:
+                    with self.assertRaisesRegex(cm.win.BridgeError, 'context_point_not_data'):
+                        cm._hit_region(owner, self.uia, region,(30,30),require_body=True)
+
+    def test_visual_repair_changes_point_only_after_an_approved_frame(self):
+        import grounding
+        a = bytearray([255] * (100*100*4))
+        a[4*(45*100 + 60)] = 0
+        png = grounding._png(100, 100, a)
+        scope = Mock(hwnd=37, pid=42)
+        with (patch.object(cm, '_region', return_value='data'),
+              patch.object(cm, '_rect', return_value=(100,200,100,100)),
+              patch.object(cm, '_hit_region', side_effect=cm.win.BridgeError('context_data_cell_unconfirmed')),
+              patch.object(cm, '_visual_point') as visual,
+              patch.object(cm.win, 'window_from_point', return_value=37),
+              patch.object(cm.win, 'root_window', return_value=37),
+              patch.object(cm.win, 'hwnd_pid', return_value=42),
+              patch.object(grounding,'_capture') as capture):
+            revised = cm.adjust_from_frame(scope, self.uia, self.spec, (160,245),window=[100,200,100,100],png=png)
+            self.assertEqual(revised['point'], [.6,.45])
+            self.assertNotIn('visual_patch', self.spec)
+            self.assertEqual(len(revised['visual_patch']), 64)
+            self.assertEqual(cm.observe(scope, self.uia, revised)['point_diagnostic'], 'context_visual_check_deferred')
+            capture.assert_not_called()
+            capture.return_value = ([100,200,100,100],png)
+            cm._verify_menu_point(scope,self.uia,'data',(160,245),revised,allow_capture=True)
+            a[4*(45*100 + 61)] = 0
+            capture.return_value = ([100,200,100,100],grounding._png(100,100,a))
+            with self.assertRaisesRegex(cm.win.BridgeError, 'context_visual_patch_changed'):
+                cm._verify_menu_point(scope,self.uia,'data',(160,245),revised,allow_capture=True)
+            self.assertEqual(visual.call_count, 2)
+
+    def test_directly_hit_opaque_surface_preserves_recorded_point_but_is_not_a_repair_candidate(self):
+        scope = Mock(hwnd=1, pid=2)
+        region = Mock()
+        region.property.return_value = True
+        self.uia.pid.return_value = 2
+        self.uia.secure.return_value = False
+        self.uia.within.side_effect = lambda a,b: a is b
+        self.uia.from_point.return_value = region
+        with (patch.object(cm.win, 'window_from_point',return_value=1),
+              patch.object(cm.win,'root_window',return_value=1),
+              patch.object(cm.win,'hwnd_pid',return_value=2), patch.object(cm,'_rect',return_value=(0,0,200,100)),
+              patch.object(cm,'_check_region_children') as children):
+            cm._hit_region(scope, self.uia, region, (100,50),require_body=True,recorded_opaque=True)
+            children.assert_called_once_with(scope, self.uia, region, (100,50),data_only=True)
+            with self.assertRaisesRegex(cm.win.BridgeError, 'context_data_cell_unconfirmed'):
+                cm._hit_region(scope, self.uia, region, (100,50),require_body=True)
+
+    def test_blank_menu_caption_uses_owned_legacy_name_or_its_single_visible_label(self):
+        scope = Mock(pid=8)
+        item, child = Mock(), Mock()
+        self.uia.pid.return_value = 8
+        self.uia.secure.return_value = False
+        self.uia.children.return_value = [child]
+        box = (100, 50, 120, 20)
+        child.property.side_effect = {30003:50020, 30005:'Workbook'}.get
+        with patch.object(cm,'_menu_visible',return_value=True), patch.object(cm,'_rect',return_value=box):
+            item.property.side_effect = {30005:'',30092:'Workbook'}.get
+            self.assertEqual(cm._menu_caption(scope,self.uia,item,box),'Workbook')
+            item.property.side_effect = {30005:'',30092:'Another label'}.get
+            self.assertIsNone(cm._menu_caption(scope,self.uia,item,box))
+            item.property.side_effect = {30005:'',30092:''}.get
+            self.assertEqual(cm._menu_caption(scope,self.uia,item,box),'Workbook')
+            self.uia.secure.return_value = True
+            self.assertIsNone(cm._menu_caption(scope,self.uia,item,box))
+            self.uia.secure.return_value = False
+            self.uia.pid.return_value = 99
+            self.assertIsNone(cm._menu_caption(scope,self.uia,item,box))
+
+    def test_unreadable_menu_handoff_reports_only_new_nearby_owned_popup(self):
+        scope = Mock(hwnd=1,pid=7)
+        root = Mock()
+        root.property.return_value = cm.MENU
+        self.uia.from_handle.return_value = root
+        self.uia.pid.return_value = 7
+        self.uia.secure.return_value = False
+        with (patch.object(cm,'_scoped_windows',return_value=[1,3,4]), patch.object(cm,'_rect',return_value=(90,80,90,60)),
+              patch.object(cm.win.user32,'IsWindowVisible',return_value=True)):
+            trace = cm._unresolved_menu(scope,self.uia,['Workbook'],{1,3},(90,80,1,1),8)
+            self.assertEqual((trace['host_action'], trace['observed_popup']['hwnd']), ('inspect_open_menu', 4))
+            self.assertFalse(trace['repeat_right_click'])
+            multiple = cm._unresolved_menu(scope,self.uia,['Workbook'],{1},(90,80,1,1),8)
+            self.assertNotIn('observed_popup', multiple)
+
 
 if __name__ == '__main__':
     unittest.main()

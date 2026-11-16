@@ -24,6 +24,12 @@ jobs:
         run: python -X utf8 -B tools/build.py --source-only
       - name: Build the Desktop Select skill ZIP
         run: python -X utf8 -B tools/build_desktop_select.py
+      - name: Prepare an existing recording and repeat its corrected menu in Windows
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem .build/desktop-select -Filter 'desktop-select-*-windows-x64.zip'
+          python -X utf8 -B tools/smoke_first_menu_run.py $package.FullName
       - name: Restore the pinned engine for the manual fixture test
         if: github.event_name == 'workflow_dispatch' && inputs.combo_smoke
         shell: python

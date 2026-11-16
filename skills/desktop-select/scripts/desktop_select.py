@@ -650,12 +650,19 @@ def edit_recording(owner, storage):
     return result
 
 
-def attach_recovery(result, name):
+def attach_recovery(result, name, *, prepare=False):
     """After an incomplete recording, give the host current app evidence in the same response."""
     result['recover_args'] = ['recover', '--task', name]
+    if prepare:
+        result['recover_args'].append('--prepare')
     result['live_recovery'] = worker_receipt(['_worker', *result['recover_args']], mutating=False)
     if result.get('input_dispatched') is not False:
         result['host_action'] = 'check_current_effect_before_continuing'
+    elif prepare:
+        if result['live_recovery'].get('host_action') == 'use_prepared_task':
+            result['host_action'] = 'use_prepared_task'
+        else:
+            result.setdefault('host_action', 'bind_recorded_instructions_from_live_scopes')
     return result
 
 
@@ -673,7 +680,11 @@ def run(args):
         review_drafts.validate(doc)
         storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
         bridge.set_dpi_awareness()
-        return edit_recording(None, storage)
+        result = edit_recording(None, storage)
+        if result.get('status') == 'recorded' and (result.get('draft') or
+                result.get('execution_plan', {}).get('status') == 'not_compatible'):
+            return attach_recovery(result, args.task, prepare=True)
+        return result
     bridge.set_dpi_awareness()
     if args.command == 'continue-recording':
         import continue_recording
@@ -700,7 +711,7 @@ def run(args):
             if args.command == 'replay' and not getattr(args, 'input_plan', False):
                 if args.exe.casefold() != plan['exe'].casefold() or args.window != plan['window']:
                     raise tasks.TaskError('recorded_window_mismatch')
-                return attach_recovery(result, args.task)
+                return attach_recovery(result, args.task, prepare=not (args.only or args.background_only))
             return result
     if args.command == 'plan':
         result = saved_execution_plan(plan)
@@ -732,7 +743,8 @@ def run(args):
             'target_missing', 'target_ambiguous', 'target_grounding_required', 'new_context_menu_item_missing',
             'context_menu_item_changed', 'recorded_window_not_open')
         if quick['status'] in ('needs_grounding', 'needs_review') or missing_target:
-            return attach_recovery(quick, args.task)
+            return attach_recovery(quick, args.task, prepare=quick.get('input_dispatched') is False
+                                   and not (args.only or background))
         return quick
     rows = windows(args.exe)
     if args.command == 'windows':
@@ -793,7 +805,7 @@ def run(args):
         result = edit_recording(owner, storage)
         if result.get('status') == 'recorded' and (result.get('draft') or
                 result.get('execution_plan', {}).get('status') == 'not_compatible'):
-            return attach_recovery(result, args.task)
+            return attach_recovery(result, args.task, prepare=True)
         return result
     anchor = None
     if getattr(args, 'near', None) is not None:
@@ -873,6 +885,7 @@ def parser():
     repair.add_argument('--only', type=int, help='observe one original step')
     repair.add_argument('--image', action='store_true', help='also capture the selected step window locally')
     repair.add_argument('--bindings', type=Path, help='local JSON with source_fingerprint and interpreted steps')
+    repair.add_argument('--prepare', action='store_true', help='resolve the recording once and save a ready copy without input')
     repair.add_argument('--save-as', help='derived task name when applying bindings')
     continuation = commands.add_parser('continue-recording', help='record or merge a supplement while preserving the source')
     continuation.add_argument('--task', required=True)

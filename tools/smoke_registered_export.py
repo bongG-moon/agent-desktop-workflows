@@ -48,8 +48,12 @@ def public_call(script, *args, cwd, env):
 def exercise(archive_path, work, legacy, repeats, *, start_minimized=False):
     skill = work / 'desktop-select'
     with ZipFile(archive_path) as archive:
+        version = json.loads(archive.read('desktop-select/runtime-manifest.json'))['version']
+        repair_supported = tuple(map(int, version.split('.'))) >= (0, 4, 20)
         # Install only the published runtime paths, all below the disposable project.
         for name in FILES:
+            if name == 'scripts/workflow_repair.py' and not repair_supported:
+                continue
             target = skill / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(archive.read('desktop-select/' + name))
@@ -132,7 +136,10 @@ def exercise(archive_path, work, legacy, repeats, *, start_minimized=False):
             current = fixture.command('state')
             assert all(current[k] == value for k, value in before.items()
                        if not (start_minimized and k.endswith('_bounds'))), (before, current)
-            receipt, code, execution = public_call(runner, *([] if legacy else ['--summary']), cwd=registered, env=env)
+            flags = [] if legacy else ['--summary']
+            if repair_supported:
+                flags.append('--allow-physical')
+            receipt, code, execution = public_call(runner, *flags, cwd=registered, env=env)
             actual = fixture.command('state')
             counters = {k: actual[k] for k in ('writes', 'queries', 'generation', 'right_clicks', 'menus', 'parents',
                                                'leaves', 'wrong_point', 'unrelated')}

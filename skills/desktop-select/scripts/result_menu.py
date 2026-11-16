@@ -175,23 +175,21 @@ def observe(binding, uia, spec):
         _need('Click' in uia.actions(button), 'query_button_unavailable')
     if spec['output']:
         export_evidence.inventory(spec['output'])
-    region_observed = True
     try:
-        context_menu._region(binding, uia, spec['menu']['target'])
+        receipt = context_menu.observe(binding, uia, spec['menu'])
     except bridge.BridgeError as error:
         # Some result controls are created only after the recorded query.
         if not spec['trigger'] or error.code != 'context_region_missing':
             raise
-        region_observed = False
-    return dict(status='observed', input_dispatched=False, region_observed=region_observed,
-                menu_target=spec['menu']['target'], menu_path=spec['menu']['path'],
-                menu_verification='pending_execution')
+        receipt = dict(status='observed', input_dispatched=False, region_observed=False, point_observed=False,
+                       point_diagnostic='context_region_missing', menu_verification='pending_execution')
+    return dict(receipt, menu_target=spec['menu']['target'], menu_path=spec['menu']['path'])
 
 
 def execute(binding, spec, guard, title, *, observe_guard=None):
     validate_spec(spec)
     ready, trigger, output = spec['ready'], spec['trigger'], spec['output']
-    info = dict(input_dispatched=False, query_dispatched=False, query_verified=False,
+    info = dict(input_dispatched=False, query_dispatched=False, query_verified=False, menu_input_dispatched=False,
                 leaf_dispatched=False, menu_path_completed=False, effect_verification='unavailable')
     def read():
         (observe_guard or guard)()
@@ -230,6 +228,7 @@ def execute(binding, spec, guard, title, *, observe_guard=None):
         menu = context_menu.execute(binding, spec['menu'], guard, before_leaf=before_leaf)
         sent = info['input_dispatched']
         info.update(menu)
+        info['menu_input_dispatched'] = menu['input_dispatched']
         if sent is True:
             info['input_dispatched'] = True
         if menu['status'] != 'delivered_unverified' or menu.get('leaf_dispatched') is not True:

@@ -1,4 +1,6 @@
-# Desktop Select 0.4.19
+# Desktop Select 0.4.20
+
+녹화에서 결과 표를 우클릭한 뒤 메뉴를 여러 단계로 나눠 설명할 수 있습니다. 저장한 녹화의 위치와 문장을 현재 창에 연결하고, 첫 시험에서 확인한 보정 위치를 등록 스킬에 저장합니다. 다음 실행은 창을 한 번 읽고 시작합니다. [회사 PC 사용 가이드](skills/desktop-select/사용가이드.md)
 
 “/device-setup-export 실행해줘”라고 요청하면 등록된 업무의 `scripts/run.py --summary`를 한 번 호출합니다. 실행기는 첫 입력 전에 대상 창의 최상위 요소를 읽을 수 있는지 한 번 확인하고, 성공하면 같은 호출에서 업무를 이어갑니다. 결과의 `readability_check`에서 창 확인 상태를, `verified_outputs`에서 최종 검증을 통과한 Excel 파일 경로를 볼 수 있습니다. [등록한 업무를 한 번에 실행하기](skills/desktop-select/사용가이드.md#등록한-업무를-한-번에-실행하기)
 

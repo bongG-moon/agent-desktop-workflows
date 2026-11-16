@@ -50,6 +50,9 @@ def validate(doc):
         if 'menu_anchor' in step:
             require(step['action'] == 'manual')
             tasks._menu_anchor(step['menu_anchor'], step.get('recognition', {}).get('reason'))
+        if 'menu_window_point' in step:
+            require(step['action'] == 'manual')
+            tasks._menu_window_point(step['menu_window_point'], step.get('recognition', {}).get('reason'))
         if step['action'] == 'set-value':
             require(isinstance(step.get('value'), str))
         if '_capture_window' in step:
