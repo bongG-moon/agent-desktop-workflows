@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 from ctypes import wintypes as W
 
+import coordination
 import win_bridge as bridge
 from win_bridge import check_foreground_input as _idle_foreground, input_tick as _input_tick
 
@@ -21,6 +22,12 @@ def _result(status, sent, state, *, diagnostic=None, before=None):
 
 
 def foreground(binding):
+    with coordination.desktop_input():
+        binding.check()
+        _foreground(binding)
+
+
+def _foreground(binding):
     original = bridge.foreground()
     tick = _input_tick()
     if bridge.root_window(original) == binding.hwnd and not bridge.user32.IsIconic(binding.hwnd):
@@ -64,6 +71,35 @@ def foreground(binding):
 
 
 def execute(binding, spec, guard, *, timeout=90, required_bounds=None):
+    from row_vision import observe_row
+    with coordination.desktop_input():
+        immediate = _click_row(binding, spec, guard, required_bounds)
+    if immediate is not None:
+        return immediate
+
+    deadline = time.monotonic() + timeout
+    last_state, matches, diagnostic = 'before', 0, 'row_state_not_confirmed'
+    while time.monotonic() < deadline:
+        try:
+            guard()
+            last_state = observe_row(binding, spec)['kind']
+        except Exception as error:
+            # Keep evidence of the already sent input even when the window or
+            # provider becomes unavailable during verification.
+            code = getattr(error, 'code', 'row_readback_failed')
+            diagnostic = code
+            if code not in ('row_layout_changed', 'row_window_moved', 'row_pixels_unavailable', 'window_disabled'):
+                last_state = 'unknown'
+                break
+            last_state = 'unknown'
+        matches = matches + 1 if last_state == 'after' else 0
+        if matches == 2:
+            return _result('verified', True, 'after', before='before')
+        time.sleep(.35)
+    return _result('delivered_unverified', True, last_state, diagnostic=diagnostic, before='before')
+
+
+def _click_row(binding, spec, guard, required_bounds):
     from row_vision import confirm_pixels, confirm_point, observe_row
     guard()
     observed = observe_row(binding, spec)
@@ -101,27 +137,6 @@ def execute(binding, spec, guard, *, timeout=90, required_bounds=None):
     if sent.get('input_dispatched') is not True or not sent.get('ok'):
         return _result('uncertain', sent.get('input_dispatched'), 'unknown',
                        diagnostic=sent.get('diagnostic', 'row_delivery_uncertain'), before='before')
-
-    deadline = time.monotonic() + timeout
-    last_state, matches, diagnostic = 'before', 0, 'row_state_not_confirmed'
-    while time.monotonic() < deadline:
-        try:
-            guard()
-            last_state = observe_row(binding, spec)['kind']
-        except Exception as error:
-            # Keep evidence of the already sent input even when the window or
-            # provider becomes unavailable during verification.
-            code = getattr(error, 'code', 'row_readback_failed')
-            diagnostic = code
-            if code not in ('row_layout_changed', 'row_window_moved', 'row_pixels_unavailable', 'window_disabled'):
-                last_state = 'unknown'
-                break
-            last_state = 'unknown'
-        matches = matches + 1 if last_state == 'after' else 0
-        if matches == 2:
-            return _result('verified', True, 'after', before='before')
-        time.sleep(.35)
-    return _result('delivered_unverified', True, last_state, diagnostic=diagnostic, before='before')
 
 
 def teach_rows(binding, title, args, directory):

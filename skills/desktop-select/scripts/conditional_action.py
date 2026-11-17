@@ -81,6 +81,7 @@ def _fresh(binding, original, png, guard, app, *, dismiss_point=None):
 
 
 def execute(binding, step, guard, session, progress, number, title):
+    import coordination
     import desktop_select as app
     import row_action
     from python_workflow import combine
@@ -96,8 +97,9 @@ def execute(binding, step, guard, session, progress, number, title):
         _wait(step['seconds'],guard)
         # Activate before offering the screenshot so normal activation chrome
         # is already in the user's observed scene during revalidation.
-        guard()
-        row_action.foreground(binding)
+        with coordination.desktop_input():
+            guard()
+            row_action.foreground(binding)
         for _ in range(8):
             window,png = grounding._capture(app,binding,guard)
             frame = grounding._pixels(png)

@@ -1,5 +1,6 @@
 import json
 import io
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -52,6 +53,29 @@ class RowActionTests(unittest.TestCase):
         self.assertEqual(('verified', False, 'after'),
                          (result['status'], result['input_dispatched'], result['initial_state']))
         self.send.assert_not_called()
+
+    def test_row_readback_wait_releases_the_shared_input(self):
+        held = False
+        samples = []
+
+        @contextmanager
+        def lease():
+            nonlocal held
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+
+        def observe(*_):
+            samples.append(held)
+            return sample('before' if self.send.call_count == 0 else 'after')
+
+        self.vision.observe_row.side_effect = observe
+        with patch.object(row_action.coordination, 'desktop_input', lease):
+            receipt = row_action.execute(SimpleNamespace(hwnd=440), self.spec, self.guard)
+        self.assertEqual(receipt['status'], 'verified')
+        self.assertEqual(samples, [True, True, False, False])
 
     def test_ambiguous_and_moving_targets_have_no_click(self):
         for observations in [(sample('ambiguous'),), (sample('before'), sample('before', (43, 63)))]:

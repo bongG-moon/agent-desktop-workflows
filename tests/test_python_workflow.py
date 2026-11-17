@@ -162,8 +162,9 @@ class RuntimeTests(unittest.TestCase):
 class BoundaryTests(unittest.TestCase):
     def test_worker_timeout_never_means_safe_to_retry(self):
         for read_only in (True, False):
+            supervisor = (flow.subprocess, 'run') if read_only else (flow.coordination, 'run_worker')
             with (self.subTest(read_only=read_only), patch.object(flow, 'load', return_value=recipe()), patch.object(
-                flow.subprocess, 'run', side_effect=subprocess.TimeoutExpired('workflow', 90)) as launched,
+                *supervisor, side_effect=subprocess.TimeoutExpired('workflow', 90)) as launched,
                 redirect_stdout(StringIO()) as output):
                 flow.main(['run', '--recipe', 'example.json', '--set', 'Family=Hybrid', *(['--read-only'] if read_only else [])])
                 result = json.loads(output.getvalue())

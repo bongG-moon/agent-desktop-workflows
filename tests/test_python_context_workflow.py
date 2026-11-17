@@ -1,4 +1,5 @@
 """Literal menu, owned-popup and workbook stages compose without implicit input retries."""
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 import sys
@@ -169,6 +170,24 @@ class CompositionTests(unittest.TestCase):
         self.assertIs(choose.call_args.args[0], self.popup)
         self.assertEqual(choose.call_args.args[4], 'choose')
         self.assertEqual(result['steps'][0]['receipt']['popup'], dict(title='Export settings'))
+
+    def test_selected_menu_reserves_declared_later_workbook_without_running_its_check(self):
+        @contextmanager
+        def lease(name, diagnostic):
+            if diagnostic == 'export_queue_timeout':
+                self.events.append('claim output')
+                try:
+                    yield
+                finally:
+                    self.events.append('release output')
+            else:
+                yield
+        with patch.object(flow.coordination, '_lease', side_effect=lease):
+            result = flow.run(recipe(context(), output()), only='Open export')
+        self.assertEqual([row['number'] for row in result['steps']], [1])
+        self.assertEqual(self.events, ['claim output', 'restore', 'menu', 'release output'])
+        flow.export_evidence.baseline.assert_not_called()
+        flow.export_evidence.wait.assert_not_called()
 
     def test_compiled_result_menu_cannot_continue_after_missing_output_or_partial_menu(self):
         step = dict(action='result-menu', label='Export', context=dict(

@@ -63,6 +63,8 @@ sealed class DesktopContextFixture : Window {
     readonly DispatcherTimer timer = new DispatcherTimer();
     readonly ContextMenu popup = new ContextMenu();
     readonly string output;
+    readonly List<object> events = new List<object>();
+    bool trace, delayedMenu, numberedOutput;
     int queries, rightClicks, menus, parents, leaves, wrongPoint, unrelated, generation;
     string resultStatus = "", resultFamily = "";
     bool hold, stale, skipFile;
@@ -70,6 +72,7 @@ sealed class DesktopContextFixture : Window {
     DesktopContextFixture(string path, bool groupRole) {
         surface.GroupRole = groupRole;
         output = path; Width = 525; Height = 370; Title = "Synthetic device report";
+        status.Written = delegate(string value) { Trace("write", value); };
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         ShowInTaskbar = false;
         family.Items.Add("Standard"); family.Items.Add("Hybrid"); family.Items.Add("DRAM");
@@ -80,6 +83,7 @@ sealed class DesktopContextFixture : Window {
         AddField(panel, "MES Setup", status); AddField(panel, "Family", family);
         query.Click += delegate {
             queries++; resultStatus = status.Current; resultFamily = (string)family.SelectedItem;
+            Trace("query", resultStatus);
             if (!stale) UpdateResult(false);
             timer.Stop(); if (!hold && !stale) timer.Start();
         };
@@ -100,12 +104,23 @@ sealed class DesktopContextFixture : Window {
         var leaf = new MenuItem { Header = selection };
         var other = new MenuItem { Header = "Copy cell" };
         other.Click += delegate { unrelated++; };
-        parent.SubmenuOpened += delegate { parents++; };
-        leaf.Click += delegate { leaves++; if (surface.Ready && !skipFile) WriteWorkbook(); };
+        parent.SubmenuOpened += delegate { parents++; Trace("parent", ""); };
+        leaf.Click += delegate { leaves++; Trace("leaf", resultStatus); if (surface.Ready && !skipFile) WriteWorkbook(); };
         parent.Items.Add(leaf); popup.Items.Add(other); popup.Items.Add(parent);
-        popup.Opened += delegate { menus++; }; surface.ContextMenu = popup;
+        popup.Opened += delegate {
+            menus++;
+            if (delayedMenu) {
+                // Model an application populating its menu asynchronously. The UI thread stays responsive.
+                parent.Visibility = Visibility.Collapsed;
+                var render = new DispatcherTimer {Interval = TimeSpan.FromMilliseconds(1550)};
+                render.Tick += delegate { render.Stop(); parent.Visibility = Visibility.Visible; };
+                render.Start();
+            }
+        };
+        surface.ContextMenu = popup;
         surface.PreviewMouseRightButtonUp += delegate(object sender, System.Windows.Input.MouseButtonEventArgs e) {
             rightClicks++;
+            Trace("right", "");
             Point point = e.GetPosition(surface);
             if (!surface.Ready || point.Y < 40 || point.Y >= 112) { wrongPoint++; e.Handled = true; }
         };
@@ -116,6 +131,10 @@ sealed class DesktopContextFixture : Window {
         ContentRendered += delegate {
             Emit("ready"); new Thread(ReadCommands) { IsBackground = true }.Start();
         };
+    }
+    void Trace(string action, string value) {
+        if (trace) events.Add(new {action = action, value = value,
+            at = (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency});
     }
     static void AddField(Panel panel, string text, Control control) {
         var row = new StackPanel { Orientation = Orientation.Horizontal };
@@ -132,7 +151,8 @@ sealed class DesktopContextFixture : Window {
         const string ss = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
         const string rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         const string pkgrel = "http://schemas.openxmlformats.org/package/2006/relationships";
-        using (var stream = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        string path = numberedOutput ? Path.Combine(Path.GetDirectoryName(output), "report-" + leaves + ".xlsx") : output;
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         using (var zip = new ZipArchive(stream, ZipArchiveMode.Create)) {
             Entry(zip, "[Content_Types].xml", "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/><Override PartName='/xl/workbook.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/><Override PartName='/xl/worksheets/sheet1.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'/></Types>");
             Entry(zip, "_rels/.rels", "<Relationships xmlns='" + pkgrel + "'><Relationship Id='rId1' Type='" + rel + "/officeDocument' Target='xl/workbook.xml'/></Relationships>");
@@ -161,7 +181,8 @@ sealed class DesktopContextFixture : Window {
             status = status.Current, family = (string)family.SelectedItem, result_status = resultStatus,
             result_family = resultFamily, writes = status.WriteCount, queries = queries, right_clicks = rightClicks,
             wrong_point = wrongPoint, menus = menus, parents = parents, leaves = leaves, unrelated = unrelated,
-            ready = surface.Ready, generation = generation, grid_bounds = Bounds(surface), query_bounds = Bounds(query) }));
+            ready = surface.Ready, generation = generation, grid_bounds = Bounds(surface), query_bounds = Bounds(query),
+            events = events }));
         Console.Out.Flush();
     }
     void ReadCommands() {
@@ -171,6 +192,12 @@ sealed class DesktopContextFixture : Window {
             Dispatcher.Invoke(new Action(delegate {
                 if (cmd == "quit") { popup.IsOpen = false; Close(); return; }
                 if (cmd == "reference-ready") UpdateResult(true);
+                if (cmd == "trace") { trace = true; events.Clear(); }
+                if (cmd == "delayed-menu") delayedMenu = true;
+                if (cmd == "numbered-output") numberedOutput = true;
+                if (cmd.StartsWith("title|")) Title = cmd.Substring(6);
+                if (cmd == "position-left") Left = SystemParameters.WorkArea.Left + 8;
+                if (cmd == "position-right") Left = SystemParameters.WorkArea.Right - ActualWidth - 8;
                 if (cmd == "reset") {
                     popup.IsOpen = false; timer.Stop(); hold = stale = skipFile = false;
                     queries = rightClicks = menus = parents = leaves = wrongPoint = unrelated = generation = 0;

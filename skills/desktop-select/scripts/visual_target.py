@@ -10,6 +10,7 @@ import threading
 import time
 
 import row_vision as vision
+import coordination
 import win_bridge as bridge
 
 
@@ -289,35 +290,37 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
         if read_only:
             return dict(status='observed', input_dispatched=False, target_resolution='unique_visual_match')
         import row_action
-        row_action.foreground(binding)
-        guard()
-        bridge._combo_surface(binding)
-        tick = row_action._input_tick()
-        current = observe(binding, spec)
-        point, box = current['point'], current['box']
-        _require(found['window'] == current['window'] and found['point'] == point,
-                 'visual_target_changed_before_input')
-        with bridge.UIA() as uia:
-            shown = _safe_patch(binding, uia, box, point, exposed=True)
-        if before_input is not None:
-            before_input(point)
-        guard()
-        bridge._combo_surface(binding)
-        raw = vision._frame(binding, current['window'], crop=box)
-        candidate = vision._rgb((box, (), raw), box)
-        _require(_distance(_decoded(spec), candidate) is not None, 'visual_target_changed_before_input')
-        hit = bridge.window_from_point(*point)
-        _require(hit == shown and _hit_belongs(binding, hit)
-                 and bridge.root_window(bridge.foreground()) == binding.hwnd
-                 and vision._window_rect(binding) == current['window'], 'visual_point_not_exposed')
-        _require(row_action._input_tick() == tick, 'foreground_or_input_changed')
+        with coordination.desktop_input():
+            guard()
+            row_action.foreground(binding)
+            guard()
+            bridge._combo_surface(binding)
+            tick = row_action._input_tick()
+            current = observe(binding, spec)
+            point, box = current['point'], current['box']
+            _require(found['window'] == current['window'] and found['point'] == point,
+                     'visual_target_changed_before_input')
+            with bridge.UIA() as uia:
+                shown = _safe_patch(binding, uia, box, point, exposed=True)
+            if before_input is not None:
+                before_input(point)
+            guard()
+            bridge._combo_surface(binding)
+            raw = vision._frame(binding, current['window'], crop=box)
+            candidate = vision._rgb((box, (), raw), box)
+            _require(_distance(_decoded(spec), candidate) is not None, 'visual_target_changed_before_input')
+            hit = bridge.window_from_point(*point)
+            _require(hit == shown and _hit_belongs(binding, hit)
+                     and bridge.root_window(bridge.foreground()) == binding.hwnd
+                     and vision._window_rect(binding) == current['window'], 'visual_point_not_exposed')
+            _require(row_action._input_tick() == tick, 'foreground_or_input_changed')
+            try:
+                result = bridge._send_point(*point, 'click')
+            except Exception as error:
+                result = dict(ok=False, input_dispatched=getattr(error,'input_dispatched', None),
+                              diagnostic=getattr(error,'code','visual_click_delivery_uncertain'))
     except (bridge.BridgeError, OSError, ValueError) as error:
         return blocked(getattr(error,'code','visual_observation_failed'))
-    try:
-        result = bridge._send_point(*point, 'click')
-    except (bridge.BridgeError, OSError) as error:
-        result = dict(ok=False, input_dispatched=getattr(error,'input_dispatched', None),
-                      diagnostic=getattr(error,'code','visual_click_delivery_uncertain'))
     delivered = result.get('ok') and result.get('input_dispatched') is True
     return dict(status='delivered_unverified' if delivered else 'uncertain',
                 diagnostic='visual_click_dispatched' if delivered else result.get('diagnostic','visual_click_delivery_uncertain'),

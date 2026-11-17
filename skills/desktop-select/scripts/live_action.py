@@ -1,11 +1,13 @@
 """Dispatch one scoped UI Automation command, then read current provider state."""
 import ctypes as C
 from collections import deque
+from contextlib import nullcontext
 import re
 import time
 
 import win_bridge as win
 import control_lookup
+import coordination
 import provider_values
 import provider_visibility
 
@@ -266,50 +268,51 @@ def submit(binding, uia, element, node, *, still_valid):
                  'physical_input_busy')
 
     try:
-        current()
-        foreground(binding)
-        current()
-        idle()
-        tick = _input_tick()
-        focus_pending = True
-        element.call(3, ())  # IUIAutomationElement::SetFocus.
-        focus_pending, focused = False, True
-        root = current()
-        idle()
-        _require(_input_tick() == tick, 'physical_input_changed')
-        focus = uia.focused()
-        _require(focus is not None, 'submit_focus_unavailable')
-        chain = control_lookup.ancestry(uia, focus, root, pid=binding.pid)
-        _require(not uia.secure(focus) and focus.property(30010) is True, 'submit_focus_protected')
-        if not uia.same(focus, element):
-            _require(node['role'] == 'combobox' and focus.property(30003) == 50004,
-                     'submit_focus_mismatch')
-            owner = next((ancestor for ancestor in chain[1:] if ancestor.property(30003) == 50003), None)
-            _require(owner is not None and uia.same(owner, element) and uia.within(focus, element),
-                     'submit_focus_mismatch')
-            _require(focus.property(30043) is True and focus.property(30046) is False
-                     and _visible(uia, focus, binding, root), 'submit_focus_not_editable')
-        # Recheck the selector, foreground and OS focus immediately before input.
-        current()
-        idle()
-        _require(_input_tick() == tick, 'physical_input_changed')
-        latest = uia.focused()
-        _require(latest is not None and uia.same(focus, latest), 'submit_focus_changed')
-        control_lookup.ancestry(uia, latest, root, pid=binding.pid)
-        _require(not uia.secure(latest) and latest.property(30010) is True
-                 and latest.property(30043) is True and latest.property(30046) is False,
-                 'submit_focus_not_editable')
-        idle()
-        _require(_input_tick() == tick, 'physical_input_changed')
-        events = (win.INPUT * 2)()
-        events[0].type, events[0].ki = 1, win.KEYBDINPUT(0x0D, 0, 0, 0, 0)
-        events[1].type, events[1].ki = 1, win.KEYBDINPUT(0x0D, 0, 0x0002, 0, 0)
-        pending = True
-        sent_count = win.user32.SendInput(2, events, C.sizeof(win.INPUT))
-        if sent_count != 2:
-            return result('uncertain', 'submit_partial_input', None)
-        pending = False
-        return result('delivered_unverified', 'submit_enter_sent', True)
+        with coordination.desktop_input():
+            current()
+            foreground(binding)
+            current()
+            idle()
+            tick = _input_tick()
+            focus_pending = True
+            element.call(3, ())  # IUIAutomationElement::SetFocus.
+            focus_pending, focused = False, True
+            root = current()
+            idle()
+            _require(_input_tick() == tick, 'physical_input_changed')
+            focus = uia.focused()
+            _require(focus is not None, 'submit_focus_unavailable')
+            chain = control_lookup.ancestry(uia, focus, root, pid=binding.pid)
+            _require(not uia.secure(focus) and focus.property(30010) is True, 'submit_focus_protected')
+            if not uia.same(focus, element):
+                _require(node['role'] == 'combobox' and focus.property(30003) == 50004,
+                         'submit_focus_mismatch')
+                owner = next((ancestor for ancestor in chain[1:] if ancestor.property(30003) == 50003), None)
+                _require(owner is not None and uia.same(owner, element) and uia.within(focus, element),
+                         'submit_focus_mismatch')
+                _require(focus.property(30043) is True and focus.property(30046) is False
+                         and _visible(uia, focus, binding, root), 'submit_focus_not_editable')
+            # Recheck the selector, foreground and OS focus immediately before input.
+            current()
+            idle()
+            _require(_input_tick() == tick, 'physical_input_changed')
+            latest = uia.focused()
+            _require(latest is not None and uia.same(focus, latest), 'submit_focus_changed')
+            control_lookup.ancestry(uia, latest, root, pid=binding.pid)
+            _require(not uia.secure(latest) and latest.property(30010) is True
+                     and latest.property(30043) is True and latest.property(30046) is False,
+                     'submit_focus_not_editable')
+            idle()
+            _require(_input_tick() == tick, 'physical_input_changed')
+            events = (win.INPUT * 2)()
+            events[0].type, events[0].ki = 1, win.KEYBDINPUT(0x0D, 0, 0, 0, 0)
+            events[1].type, events[1].ki = 1, win.KEYBDINPUT(0x0D, 0, 0x0002, 0, 0)
+            pending = True
+            sent_count = win.user32.SendInput(2, events, C.sizeof(win.INPUT))
+            if sent_count != 2:
+                return result('uncertain', 'submit_partial_input', None)
+            pending = False
+            return result('delivered_unverified', 'submit_enter_sent', True)
     except (Exception, KeyboardInterrupt) as error:
         return result('uncertain' if pending else 'blocked',
                       'submit_delivery_unknown' if pending else getattr(error, 'code', 'submit_unavailable'),
@@ -342,7 +345,11 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid, jus
 
     def send(target, operation, guard, argument=None):
         nonlocal pending, sent, expanded
-        _call(target, operation, argument, guard, dispatching)
+        # The verified no-autofocus client can operate on its own window
+        # while a different task holds the foreground for a menu.
+        background = getattr(uia, '_desktop_select_no_autofocus', False) is True
+        with nullcontext() if background else coordination.desktop_input():
+            _call(target, operation, argument, guard, dispatching)
         sent, pending = True, False
         expanded |= operation == 'Expand'
 

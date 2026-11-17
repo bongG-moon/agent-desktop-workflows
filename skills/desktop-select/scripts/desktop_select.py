@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import ExitStack
 from copy import deepcopy
 import ctypes as C
 from ctypes import wintypes as W
@@ -35,6 +36,7 @@ import provider_visibility as visibility
 import learned_tasks as tasks
 import review_drafts
 import input_policy
+import coordination
 
 
 def windows(exe, *, only_hwnd=None):
@@ -288,13 +290,13 @@ def near_region(nodes, anchor):
 
 def action(args, owner, *, learned=None, anchor=None):
     background = getattr(args, 'background_only', False)
-    if args.command in {'select', 'fill', 'open'}:
+    mutate = args.command in {'select', 'fill', 'open'}
+    if mutate:
         if background:
             input_policy.window_ready(owner)
         else:
             visibility.restore_for_action(owner, args.window)
     surface = bind_surface(owner, args.popup)
-    mutate = args.command in {'select', 'fill', 'open'}
     def check():
         guard(owner, surface, args.window, mutate)
         if background and mutate:
@@ -303,8 +305,11 @@ def action(args, owner, *, learned=None, anchor=None):
     if not mutate:
         visibility.require_observable(surface)
     with bridge.UIA() as uia:
-        if background and mutate:
-            input_policy.configure_uia(uia)
+        if mutate:
+            if background:
+                input_policy.configure_uia(uia)
+            elif anchor is None:
+                input_policy.prefer_background(uia)
         def read_view():
             nodes, elements = observe(surface, uia, identities_only=learned is not None or anchor is not None)
             if anchor is None:
@@ -599,6 +604,7 @@ def _replay_recorded(plan, args, overrides, background):
     numbers = iter(active)
     linked = any('window_context' in steps[n-1] for n in active)
     main = routes = None
+    held_windows = set()
 
     def invoke(step):
         nonlocal main, routes
@@ -606,17 +612,28 @@ def _replay_recorded(plan, args, overrides, background):
         try:
             if main is None:
                 main = pick_window(windows(args.exe), args.window, args.hwnd)
+                contexts = [steps[n-1]['window_context'] for n in active if 'window_context' in steps[n-1]]
+                # Per-step workers run their result-menu under these parent-held
+                # reservations, including its leaf baseline and workbook check.
+                leases.enter_context(coordination.reserve_outputs(steps[n-1] for n in active))
+                leases.enter_context(coordination.window(main, args.window, contexts))
                 if linked:
                     routes = WindowRoutes(steps,bridge.Binding(main),args.window,active=active)
+                    coordination.reserve_handles(leases, held_windows,
+                                                 (bound.hwnd for bound in routes.bindings.values() if bound is not None))
             target = main
             context = step.get('window_context')
             if routes:
                 source_window = None
                 if context:
                     source_window = routes.resolve(context)
+                    if source_window.hwnd not in held_windows:
+                        leases.enter_context(coordination.handle(source_window))
+                        held_windows.add(source_window.hwnd)
+                        routes.check(context, source_window)
                     target = _linked_record(source_window,context['title'])
                 routes.before(number,source_window)
-        except (SelectionError, bridge.BridgeError, ContextError) as error:
+        except (SelectionError, bridge.BridgeError, ContextError, coordination.CoordinationError) as error:
             return dict(status='blocked',diagnostic=error.code,input_dispatched=False)
         payload = dict(binding=target, step=step, background_only=background)
         if context:
@@ -639,7 +656,10 @@ def _replay_recorded(plan, args, overrides, background):
                                verification_scope='recorded_window_opened',business_commit='not_verified')
                 receipt.pop('diagnostic',None)
         return receipt
-    return tasks.replay(plan,args.exe,args.window,overrides,invoke,only=args.only)
+    # Keep the workflow reservation in the parent across legacy per-step workers.
+    # Validation, including missing variables, finishes before invoke acquires it.
+    with ExitStack() as leases:
+        return tasks.replay(plan,args.exe,args.window,overrides,invoke,only=args.only)
 
 
 def edit_recording(owner, storage, *, report_ready=False):
@@ -831,9 +851,12 @@ def run(args):
         from row_intent import execute
         if args.background_only and not args.preview:
             return input_policy.blocked(input_policy.profile([{'action':'row-launch'}]))
-        return execute(owner, args.window, args.ordinal,
-                       lambda: guard(owner, owner, args.window, mutate=not args.preview),
-                       task_directory(), preview=args.preview)
+        with ExitStack() as leases:
+            if not args.preview:
+                leases.enter_context(coordination.window(owner, args.window))
+            return execute(owner, args.window, args.ordinal,
+                           lambda: guard(owner, owner, args.window, mutate=not args.preview),
+                           task_directory(), preview=args.preview)
     if args.command == 'record-rows':
         from row_action import teach_rows
         guard(owner, owner, args.window)
@@ -883,12 +906,26 @@ def run(args):
                 result.get('execution_plan', {}).get('status') == 'not_compatible'):
             return attach_recovery(result, args.task, prepare=True)
         return result
-    anchor = None
+    anchor = context = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
         tasks.check_binding(plan, args.exe, args.window)
         anchor = tasks.get_step(plan, args.near)
         context = anchor.get('window_context')
+    with ExitStack() as leases:
+        mutate = args.command in ('select', 'fill', 'open')
+        if mutate:
+            scopes = [context] if context else []
+            if args.popup is not None:
+                if not owner.contains_window(args.popup) or not bridge.owned(args.popup, owner.hwnd):
+                    raise SelectionError('popup_not_owned_or_closed')
+                scopes.append(dict(exe=owner.exe, title=bridge.window_text(args.popup)))
+            leases.enter_context(coordination.window(owner, args.window, scopes))
+            if args.popup is not None:
+                leases.enter_context(coordination.handle({'hwnd': args.popup}))
+                if (not owner.contains_window(args.popup) or not bridge.owned(args.popup, owner.hwnd)
+                        or bridge.window_text(args.popup) != scopes[-1]['title']):
+                    raise SelectionError('popup_not_owned_or_closed')
         if context:
             from window_context import WindowRoutes
             routes = WindowRoutes(plan['steps'],owner,args.window,read_only=args.command=='inspect',
@@ -896,9 +933,12 @@ def run(args):
             found = routes.resolve(context)
             if found is None:
                 raise SelectionError('recorded_window_not_open')
+            if mutate:
+                leases.enter_context(coordination.handle(found))
+                routes.check(context, found)
             owner = _LinkedBinding(_linked_record(found,context['title']),binding,_opener_record(routes,context))
             args = argparse.Namespace(**{**vars(args), 'window':context['title']})
-    return action(args, owner, anchor=anchor)
+        return action(args, owner, anchor=anchor)
 
 
 def replay_step():
@@ -1057,7 +1097,7 @@ def result_code(result):
                                      'needs_grounding', 'needs_scene') else 3
 
 
-def worker_receipt(argv, mutating, payload=None):
+def worker_receipt(argv, mutating, payload=None, *, may_queue=False):
     # A third-party accessibility provider can hang inside a COM call. Terminate
     # our helper only; never assume a timed-out mutation failed or repeat it.
     try:
@@ -1066,12 +1106,16 @@ def worker_receipt(argv, mutating, payload=None):
         if argv == ['_plan']:
             from python_workflow import worker_timeout
             timeout = worker_timeout(payload['recipe'])
-        child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
-                               input=json.dumps(payload) if payload is not None else None,
-                               capture_output=True, encoding='utf-8', timeout=timeout)
+        run_child = coordination.run_worker if mutating or may_queue else subprocess.run
+        child = run_child([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()), *argv],
+                          input=json.dumps(payload) if payload is not None else None,
+                          capture_output=True, encoding='utf-8', timeout=timeout)
         receipt = json.loads(child.stdout)
         if not isinstance(receipt, dict) or 'status' not in receipt or child.returncode not in (0, 2, 3):
             raise ValueError()
+        queue_seconds = getattr(child, 'queue_seconds', 0)
+        if isinstance(queue_seconds, (int, float)) and queue_seconds > 0:
+            receipt['queue_seconds'] = round(queue_seconds, 3)
         return receipt
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         diagnostic = 'provider_timeout_or_interrupted'
@@ -1083,7 +1127,8 @@ def worker_receipt(argv, mutating, payload=None):
 
 def supervise(args, argv):
     mutating = args.command in ('open','select','fill') or (args.command == 'row-launch' and not args.preview)
-    receipt = worker_receipt(['_worker', *argv], mutating=mutating)
+    receipt = worker_receipt(['_worker', *argv], mutating=mutating,
+                             may_queue=args.command == 'recover' and args.restore_window)
     print(json.dumps(receipt, ensure_ascii=False))
     return result_code(receipt)
 

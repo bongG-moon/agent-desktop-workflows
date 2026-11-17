@@ -6,6 +6,7 @@ implicit retry is involved. UIA discovery remains available for first setup.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from copy import deepcopy
 import json
 import os
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 
 import desktop_select as app
 import control_lookup as lookup
+import coordination
 import context_menu
 import export_evidence
 import input_policy
@@ -331,6 +333,26 @@ def popup_surface(owner, title, spec, *, read_only=False):
         time.sleep(min(.1, remaining))
 
 
+def open_secondary_handles(owner, routes, steps):
+    """Existing routes are already bound. Inspect only explicitly requested popup titles."""
+    yield from (bound.hwnd for bound in routes.bindings.values() if bound is not None)
+    popup_owners = {}
+    for step in steps:
+        if 'popup' not in step:
+            continue
+        context = step.get('window_context')
+        parent = routes.bindings.get(window_context._key(context)) if context else owner
+        if parent is not None:
+            _, titles = popup_owners.setdefault(parent.hwnd, (parent, set()))
+            titles.add(step['popup']['title'])
+    for parent, titles in popup_owners.values():
+        rows = app.owned_popups(parent)
+        for title in titles:
+            matches = [r['hwnd'] for r in rows if r['title'] == title and app.bridge.user32.IsWindowVisible(r['hwnd'])]
+            if len(matches) == 1:
+                yield matches[0]
+
+
 def check_surface(owner, surface, title, popup=None, *, mutate=False):
     app.guard(owner, surface, title, mutate=mutate)
     if popup is not None:
@@ -448,6 +470,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     if resume is not None:
         entries = [(n, s) for n, s in entries if n >= resume['number']]
     active = [step for _, step in entries]
+    mutates_window = not read_only and any(s['action'] not in ('wait', 'verify-file') for s in active)
     requirements = input_policy.profile(active, [n for n, _ in entries])
     if background_only and not read_only:
         refusal = input_policy.blocked(requirements)
@@ -485,9 +508,27 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     started = time.monotonic()
     number, dispatching = 0, False
     anchor_proof = None
+    reservations = ExitStack()
+    anchor_input = ExitStack()
     stage_started = started
     try:
         owner = bind(recipe['exe'], recipe['window'], hwnd)
+        reserved_handles = {owner.hwnd}
+        if not read_only:
+            # A selected action can still produce a file checked by a later,
+            # unselected verify-file step. Reserve it without running that check.
+            checks = recipe['steps'] if only is not None and mutates_window else ()
+            reservations.enter_context(coordination.reserve_outputs(active, verify_steps=checks))
+        if mutates_window:
+            scopes = coordination.scopes_for(active, recipe['exe'])
+            reservations.enter_context(coordination.window(dict(hwnd=owner.hwnd, exe_name=recipe['exe']),
+                                                            recipe['window'], scopes))
+
+        def reserve_surface(binding):
+            if mutates_window and binding.hwnd not in reserved_handles:
+                reservations.enter_context(coordination.handle(binding))
+                reserved_handles.add(binding.hwnd)
+
         if resume:
             need(workflow_repair.identity(owner) == resume['scope'][0], 'menu_repair_window_changed')
         if background_only and not read_only:
@@ -499,6 +540,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                               active=sorted(active_scopes))
         if resume:
             workflow_repair.restore_routes(sys.modules[__name__], recipe, resume, routes)
+        if mutates_window and scopes:
+            coordination.reserve_handles(reservations, reserved_handles, open_secondary_handles(owner, routes, active))
         # Capture every requested output before window restoration or any input.
         baselines = {i: export_evidence.baseline(step['output']) for i, step in entries
                      if step['action'] == 'verify-file'} if not read_only else {}
@@ -511,6 +554,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 return
             if binding.hwnd in prepared:
                 return
+            reserve_surface(binding)
             if background_only:
                 input_policy.window_ready(binding)
             else:
@@ -522,7 +566,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
-            if not read_only and any(s['action'] not in ('wait', 'verify-file') for s in active):
+            elif mutates_window and requirements['background_eligible']:
+                input_policy.prefer_background(uia)
+            if mutates_window:
                 first = active[0]
                 if ('window_context' not in first and 'popup' not in first
                         and first['action'] not in ('wait', 'verify-file')):
@@ -573,6 +619,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
                                                 elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                     continue
+                reserve_surface(binding)
                 routes.before(number, binding)
 
                 def check_context():
@@ -637,9 +684,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     dispatching = not read_only
                     try:
                         receipt = row_receipt(binding, title, step, read_only=read_only, context_guard=check_context)
-                    except app.bridge.BridgeError as error:
+                    except (app.bridge.BridgeError, coordination.CoordinationError) as error:
                         # Both shared row engines report any input they already
-                        # sent in their receipt. Guard/lookup failures precede it.
+                        # sent in their receipt. A failed input reservation precedes dispatch.
                         dispatching = getattr(error, 'input_dispatched', False) is not False
                         raise
                     dispatching = False
@@ -677,6 +724,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         report['steps'].append(dict(number=number, label=step.get('label', ''), receipt=receipt,
                                                     elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                         continue
+                    reserve_surface(surface)
                     check_target(surface, popup, mutate=not read_only)
                     if read_only and popup:
                         app.visibility.require_observable(surface)
@@ -689,6 +737,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         # Point-based identity needs the actual target surface
                         # exposed. Ordinary UIA actions remain background-capable.
                         from row_action import foreground
+                        anchor_input.enter_context(coordination.desktop_input())
                         foreground(surface)
                         report['foreground_requested'] = True
                         check_target(surface, popup, mutate=True)
@@ -748,6 +797,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             if anchor_proof is not None:
                                 anchor_proof.close()
                                 anchor_proof = None
+                            anchor_input.close()
                         dispatching = False
                         if resolution is not None:
                             receipt['target_resolution'] = resolution
@@ -842,8 +892,12 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         if not dispatching and number and step.get('grounding_text') and diagnostic in _GROUNDING_DIAGNOSTICS:
             report = _grounding_report(report, [_grounding_step(recipe, number, step, diagnostic)])
     finally:
-        if anchor_proof is not None:
-            anchor_proof.close()
+        try:
+            if anchor_proof is not None:
+                anchor_proof.close()
+        finally:
+            anchor_input.close()
+            reservations.close()
     report['elapsed_seconds'] = round(time.monotonic() - started, 4)
     return report
 
@@ -1315,11 +1369,14 @@ def main(argv=None):
         else:
             timeout = worker_timeout(active if args.command == 'run' else recipe) if recipe else 90
             launched = True
-            child = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),
-                                    '--_worker', *argv], capture_output=True, encoding='utf8', timeout=timeout)
+            supervise = coordination.run_worker if mutating or getattr(args, 'repair_frame', None) else subprocess.run
+            child = supervise([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),
+                               '--_worker', *argv], capture_output=True, encoding='utf8', timeout=timeout)
             result = json.loads(child.stdout)
             need(child.returncode in (0, 2, 3) and isinstance(result, dict) and 'status' in result,
                  'invalid_worker_receipt')
+            if getattr(child, 'queue_seconds', 0):
+                result['queue_seconds'] = child.queue_seconds
             if args.command == 'run' and args.summary and mutating:
                 if result.get('resumed_at'):
                     executed = {r['number'] for r in result.get('steps', [])}

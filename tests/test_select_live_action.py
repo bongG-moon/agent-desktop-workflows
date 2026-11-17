@@ -1,5 +1,6 @@
 """Exercise option ownership, delivery classification and single-dispatch behavior."""
 from pathlib import Path
+from contextlib import contextmanager
 import sys
 import unittest
 from unittest.mock import patch
@@ -187,6 +188,25 @@ class LiveActionTests(unittest.TestCase):
         item = Element(50024, self.root, ['Select'], **{'30022': True})
         self.assertEqual(self.run_action('choose', None, item=item)['diagnostic'], 'target_offscreen')
         self.assertEqual(len(self.calls), 1)
+
+    def test_default_uia_uses_input_lease_and_no_autofocus_client_can_run_concurrently(self):
+        trace = []
+
+        @contextmanager
+        def lease():
+            trace.append('enter')
+            try:
+                yield
+            finally:
+                trace.append('leave')
+
+        self.after = lambda item, op, arg: trace.append(op)
+        item = Element(50000, self.root, ['Click'])
+        with patch.object(live.coordination, 'desktop_input', lease):
+            self.assertTrue(self.run_action('invoke', None, item=item)['input_dispatched'])
+            self.uia._desktop_select_no_autofocus = True
+            self.assertTrue(self.run_action('invoke', None, item=item)['input_dispatched'])
+        self.assertEqual(trace, ['enter', 'Invoke', 'leave', 'Invoke'])
 
     def test_tree_expand_and_tab_choose_verify_current_state(self):
         tree = Element(50024, self.root, ['Expand'], **{'30070': 0})

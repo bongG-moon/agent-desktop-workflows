@@ -1,9 +1,11 @@
 """Resolve a spoken launch instruction against the visible list at execution time."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import re
 import time
 
+import coordination
 import row_action
 import row_capture
 import row_vision as visual
@@ -259,7 +261,9 @@ def execute(binding, title, ordinal, guard, directory=None, *, preview=False, ti
     store, key = _memory(binding,title,ordinal,directory)
     guard()
     if not preview and bridge.user32.IsIconic(binding.hwnd):
-        row_action.foreground(binding)
+        with coordination.desktop_input():
+            guard()
+            row_action.foreground(binding)
     examples = []
     if hint is not None:
         visual.validate_spec(hint)
@@ -301,49 +305,51 @@ def execute(binding, title, ordinal, guard, directory=None, *, preview=False, ti
                     raise bridge.BridgeError('row_order_changed')
             return dict(row_action.execute(binding,spec,same_position,required_bounds=rect),
                         ordinal=ordinal,evidence=evidence)
-    if not preview:
-        row_action.foreground(binding)
-        tick = row_action._input_tick()
-    guard()
-    frame, rect, point, source = locate(binding, ordinal)
-    press = row_capture.prepare(frame, point, frame.end)
-    if preview:
-        return dict(status='resolved', ordinal=ordinal, evidence=source, input_dispatched=False)
-    # Re-observe both order and intent at dispatch time; never use old coordinates.
-    second, check_rect, check_point, check_source = locate(binding,ordinal)
-    if (check_rect,check_point,check_source) != (rect,point,source):
-        raise bridge.BridgeError('row_changed_before_action')
-    index = _row_index(second,rect)
-    box = row_capture._button(point,rect)
-    if not box or row_capture._crop(frame.pixels[_row_index(frame,rect)],rect[2],box) != row_capture._crop(second.pixels[index],rect[2],box):
-        raise bridge.BridgeError('row_button_changed')
-    if press and not any(row_capture._crop(press.pixels,rect[2],key_box) ==
-                         row_capture._crop(second.pixels[index],rect[2],key_box) for key_box in press.keys):
-        raise bridge.BridgeError('row_identity_changed')
-    obs = dict(kind='before', point=point, row_bounds=rect)
-    visual.confirm_point(binding,obs)
-    guard()
-    bridge._combo_surface(binding)
-    window = visual._window_rect(binding)
-    if window != second.window:
-        raise bridge.BridgeError('row_window_moved')
-    latest = (window, (), visual._frame(binding, window))
-    def matches(box):
-        previous = visual._glyph(row_capture._crop(second.pixels[index],rect[2],box))
-        current = visual._glyph(visual._rgb(latest, visual._patch(rect,box)))
-        return visual._match_distance(previous,current,box[2]) <= .14
-    if not matches(box) or (press and not any(matches(key_box) for key_box in press.keys)):
-        raise bridge.BridgeError('row_changed_before_action')
-    guard()
-    bridge._combo_surface(binding)
-    if bridge.root_window(bridge.window_from_point(*point)) != binding.hwnd:
-        raise bridge.BridgeError('row_point_not_exposed')
-    if row_action._input_tick() != tick:
-        raise bridge.BridgeError('foreground_or_input_changed')
-    delivery = bridge._send_point(*point,'click')
-    if delivery.get('input_dispatched') is not True or not delivery.get('ok'):
-        return row_action._result('uncertain',delivery.get('input_dispatched'),'unknown',
-                                  diagnostic=delivery.get('diagnostic','row_delivery_uncertain'))
+    with nullcontext() if preview else coordination.desktop_input():
+        if not preview:
+            guard()
+            row_action.foreground(binding)
+            tick = row_action._input_tick()
+        guard()
+        frame, rect, point, source = locate(binding, ordinal)
+        press = row_capture.prepare(frame, point, frame.end)
+        if preview:
+            return dict(status='resolved', ordinal=ordinal, evidence=source, input_dispatched=False)
+        # Re-observe both order and intent at dispatch time; never use old coordinates.
+        second, check_rect, check_point, check_source = locate(binding,ordinal)
+        if (check_rect,check_point,check_source) != (rect,point,source):
+            raise bridge.BridgeError('row_changed_before_action')
+        index = _row_index(second,rect)
+        box = row_capture._button(point,rect)
+        if not box or row_capture._crop(frame.pixels[_row_index(frame,rect)],rect[2],box) != row_capture._crop(second.pixels[index],rect[2],box):
+            raise bridge.BridgeError('row_button_changed')
+        if press and not any(row_capture._crop(press.pixels,rect[2],key_box) ==
+                             row_capture._crop(second.pixels[index],rect[2],key_box) for key_box in press.keys):
+            raise bridge.BridgeError('row_identity_changed')
+        obs = dict(kind='before', point=point, row_bounds=rect)
+        visual.confirm_point(binding,obs)
+        guard()
+        bridge._combo_surface(binding)
+        window = visual._window_rect(binding)
+        if window != second.window:
+            raise bridge.BridgeError('row_window_moved')
+        latest = (window, (), visual._frame(binding, window))
+        def matches(box):
+            previous = visual._glyph(row_capture._crop(second.pixels[index],rect[2],box))
+            current = visual._glyph(visual._rgb(latest, visual._patch(rect,box)))
+            return visual._match_distance(previous,current,box[2]) <= .14
+        if not matches(box) or (press and not any(matches(key_box) for key_box in press.keys)):
+            raise bridge.BridgeError('row_changed_before_action')
+        guard()
+        bridge._combo_surface(binding)
+        if bridge.root_window(bridge.window_from_point(*point)) != binding.hwnd:
+            raise bridge.BridgeError('row_point_not_exposed')
+        if row_action._input_tick() != tick:
+            raise bridge.BridgeError('foreground_or_input_changed')
+        delivery = bridge._send_point(*point,'click')
+        if delivery.get('input_dispatched') is not True or not delivery.get('ok'):
+            return row_action._result('uncertain',delivery.get('input_dispatched'),'unknown',
+                                      diagnostic=delivery.get('diagnostic','row_delivery_uncertain'))
     # Confirm a distinct same-row state marker as well as disappearance of the
     # original launch affordance. A changed hover effect alone supplies neither.
     deadline = time.monotonic()+timeout

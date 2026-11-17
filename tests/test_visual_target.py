@@ -102,6 +102,12 @@ class VisualTargets(unittest.TestCase):
             self.assertEqual(uncertain['status'],'uncertain')
             send.assert_called_once_with(235,162,'click')
             send.reset_mock()
+            send.side_effect = ValueError('transport failed after dispatch began')
+            uncertain = visual.execute(binding,spec,lambda:None)
+            self.assertEqual(uncertain['status'],'uncertain')
+            self.assertIsNone(uncertain['input_dispatched'])
+            send.assert_called_once_with(235,162,'click')
+            send.reset_mock(side_effect=True)
             visual.vision._frame.side_effect = [image((35,42)), image((35,42)), bytes(41*41*4)]
             self.assertFalse(visual.execute(binding,spec,lambda:None)['input_dispatched'])
             send.assert_not_called()
@@ -120,7 +126,8 @@ class VisualTargets(unittest.TestCase):
             result = visual.execute(binding,{},guard,first_match_timeout=2)
             self.assertEqual(result['diagnostic'],'visual_target_ambiguous')
             self.assertEqual(observe.call_count, 3)
-            self.assertEqual(guard.call_count, 3)
+            # Two observation attempts, then guard the leased window before and after activation.
+            self.assertEqual(guard.call_count, 4)
             activate.assert_called_once()
             wait.assert_called_once()
             send.assert_not_called()

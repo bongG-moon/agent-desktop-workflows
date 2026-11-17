@@ -9,6 +9,7 @@ import tempfile
 import time
 
 import learned_tasks as tasks
+import coordination
 
 
 def need(ok, reason):
@@ -235,16 +236,46 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
     session = RepairSession(args.recipe)
     with ExitStack() as stack:
         try:
+            stack.enter_context(coordination.recipe(args.recipe))
+            # Retain exclusion with older installations using this ticket directory.
             stack.enter_context(review_drafts._edit_lock(session.directory))
+        except coordination.CoordinationError as error:
+            return dict(status='blocked', diagnostic=error.code, input_dispatched=False)
         except OSError:
             return dict(status='blocked', diagnostic='registered_workflow_busy', input_dispatched=False)
-        run_recipe = recipe
         resume = None
         replacements = {}
         try:
-            need(flow.load(args.recipe) == recipe, 'workflow_changed_during_repair')
+            current = flow.load(args.recipe)
+            if current != recipe:
+                # Another queued run may have persisted a proven correction.
+                # Keep the exact consented actions, windows, paths and variables.
+                original = deepcopy(current)
+                for previous, step in zip(recipe['steps'], original['steps']):
+                    before, now = menu(previous), menu(step)
+                    if before and now:
+                        for key in ('point', 'visual_patch'):
+                            if key in before:
+                                now[key] = before[key]
+                            else:
+                                now.pop(key, None)
+                need(original == recipe, 'workflow_changed_during_repair')
+            recipe = run_recipe = current
             if args.repair_frame or args.resume_menu:
                 resume = session.read(args.repair_frame or args.resume_menu, recipe)
+                if args.resume_menu:
+                    active = [step for number, step in flow.selected_steps(recipe, resume['only'])
+                              if number >= resume['number']]
+                    checks = recipe['steps'] if resume['only'] is not None else ()
+                    stack.enter_context(coordination.reserve_outputs(active, verify_steps=checks))
+                # Hold the same window scopes through inspection and the
+                # resumed operation. flow.run reenters them on this thread.
+                contexts = coordination.scopes_for(recipe['steps'], recipe['exe'])
+                owner = dict(hwnd=resume['scope'][0][0], exe_name=recipe['exe'])
+                stack.enter_context(coordination.window(owner, recipe['window'], contexts))
+                surface_hwnd = resume['scope'][1][0]
+                if surface_hwnd != owner['hwnd']:
+                    stack.enter_context(coordination.handle({'hwnd': surface_hwnd}))
                 if args.repair_frame:
                     return inspect_or_adjust(flow, recipe, resume)
                 need(digest(overrides) == resume['variables'], 'menu_repair_parameters_changed')

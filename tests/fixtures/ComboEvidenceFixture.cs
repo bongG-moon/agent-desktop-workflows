@@ -20,6 +20,7 @@ sealed class EvidenceCombo : UserControl {
     internal readonly TextBox Editor;
     internal string Current = "Y";
     internal int WriteCount;
+    internal Action<string> Written;
     readonly TextBlock caption;
     internal EvidenceCombo(string key, bool selection, bool editor, bool ignore, bool conflict) {
         Key=key; SelectedEvidence=selection; EditorEvidence=editor; IgnoreWrites=ignore; Conflict=conflict;
@@ -44,7 +45,10 @@ sealed class EvidenceCombo : UserControl {
         if(value!="Y"&&value!="N")throw new ArgumentException("fixture_value_not_allowed");
         Current=value; Refresh();
     }
-    internal void Write(string value) { WriteCount++; if(!IgnoreWrites)Change(value); }
+    internal void Write(string value) {
+        WriteCount++; if(!IgnoreWrites)Change(value);
+        if(Written != null) Written(value);
+    }
     internal bool IsSelected(string value) { return value==(Conflict?"N":Current); }
     void Refresh() {
         caption.Text=Key+" = "+Current;

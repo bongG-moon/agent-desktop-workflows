@@ -122,7 +122,7 @@ class BackgroundRuntimeTests(unittest.TestCase):
         app.visibility.restore_for_action.assert_not_called()
         flow.live.execute.assert_not_called()
 
-    def test_default_policy_preserves_restore_and_original_execution(self):
+    def test_default_policy_prefers_background_and_preserves_restore(self):
         fixture = self.fixture()
         result = flow.run(context_fixture.recipe(field()))
         self.assertEqual('auto', result['input_policy'])
@@ -130,7 +130,7 @@ class BackgroundRuntimeTests(unittest.TestCase):
         self.assertTrue(result['input_dispatched'])
         self.assertEqual(['restore', ('fill', 100, 'value')], fixture.events)
         app.visibility.restore_for_action.assert_called_once_with(fixture.owner, 'Example window')
-        flow.input_policy.configure_uia.assert_not_called()
+        flow.input_policy.configure_uia.assert_called_once_with(fixture.uia)
 
     def test_auto_context_menu_propagates_physical_mechanism_to_workflow(self):
         fixture = self.fixture()
@@ -142,6 +142,14 @@ class BackgroundRuntimeTests(unittest.TestCase):
         self.assertIs(result['physical_input'], True)
         self.assertIs(result['input_dispatched'], True)
         self.assertEqual('physical_pointer', result['steps'][0]['receipt']['input_mode'])
+
+    def test_default_policy_falls_back_if_provider_cannot_disable_auto_focus(self):
+        fixture = self.fixture()
+        flow.input_policy.configure_uia.side_effect = app.bridge.BridgeError('background_autofocus_unavailable')
+        result = flow.run(context_fixture.recipe(field()))
+        self.assertEqual('verified', result['status'])
+        self.assertEqual(['restore', ('fill', 100, 'value')], fixture.events)
+        self.assertTrue(result['input_dispatched'])
 
     def test_direct_command_background_policy_refuses_minimized_before_observing(self):
         owner = Mock(hwnd=100)
@@ -187,7 +195,7 @@ class BackgroundCLITests(unittest.TestCase):
         data = context_fixture.recipe(field())
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(dict(status='verified', input_dispatched=True)))
         with patch.object(flow, 'load', return_value=data), \
-                patch.object(flow.subprocess, 'run', return_value=completed) as child, redirect_stdout(StringIO()):
+                patch.object(flow.coordination, 'run_worker', return_value=completed) as child, redirect_stdout(StringIO()):
             self.assertEqual(0, flow.main(['run', '--recipe', 'example.json', '--background-only']))
         self.assertIn('--background-only', child.call_args.args[0])
         self.assertIn('--_worker', child.call_args.args[0])

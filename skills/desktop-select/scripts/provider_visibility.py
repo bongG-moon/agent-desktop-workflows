@@ -74,8 +74,15 @@ def restore_for_action(binding, title):
     if not win.user32.IsIconic(binding.hwnd):
         return False
     # Reuse scoped, input-idle activation; no synthetic click or keypress.
+    import coordination
     from row_action import foreground
-    foreground(binding)
+    with coordination.desktop_input():
+        binding.check()
+        if win.window_text(binding.hwnd) != title:
+            raise win.BridgeError('business_window_changed')
+        if not win.user32.IsIconic(binding.hwnd):
+            return False
+        foreground(binding)
     deadline = time.monotonic()+1.5
     while True:
         binding.check()

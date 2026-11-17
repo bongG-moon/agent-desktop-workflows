@@ -1,11 +1,12 @@
 """Exercise registered-run consent, single-use continuation and the literal saved recipe."""
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -99,6 +100,29 @@ class RegisteredRepairTests(unittest.TestCase):
         self.assertEqual(check.call_args.args[2]['target'], group)
         self.assertEqual(check.call_count, 1)
 
+    def test_resumed_menu_claims_output_before_owning_window_and_releases_after_verification(self):
+        self.recipe['steps'].append(output())
+        self.write(self.recipe)
+        flow.context_menu.execute.side_effect = self.menu
+        ticket = self.cli('--allow-physical')['menu_repair']['ticket']
+        events = self.ui.events
+        events.clear()
+        @contextmanager
+        def lease(name, diagnostic):
+            events.append(('acquired', diagnostic))
+            try:
+                yield
+            finally:
+                events.append(('released', diagnostic))
+        with (patch.object(flow.coordination, '_lease', side_effect=lease),
+              patch.object(repair, 'inspect_or_adjust', return_value=dict(self.recipe['steps'][1]['spec'], point=self.after))):
+            result = self.cli('--allow-physical', '--resume-menu', ticket, '--frame', 'f', '--point', '20', '25')
+        claimed = events.index(('acquired', 'export_queue_timeout'))
+        owned = events.index(('acquired', 'window_queue_timeout'))
+        released = max(i for i, event in enumerate(events) if event == ('released', 'export_queue_timeout'))
+        self.assertTrue(claimed < owned < events.index('baseline') < events.index('menu') < events.index('file') < released)
+        self.assertTrue(result['steps'][-1]['receipt']['file_verified'])
+
     def test_no_persistence_or_ticket_after_uncertain_leaf(self):
         recovery = dict(remaining_items=['Workbook'], observed_popup='Export')
         flow.context_menu.execute.side_effect = lambda *args: dict(
@@ -154,6 +178,22 @@ class RegisteredRepairTests(unittest.TestCase):
                       '--frame', 'frame', '--point', '30', '40']
             self.assertNotIn('menu_repair', self.cli(*resume))
             self.assertEqual(self.cli(*resume)['diagnostic'], 'menu_repair_expired')
+
+    def test_queued_run_loads_previous_workers_location_but_cannot_adopt_another_action(self):
+        args = SimpleNamespace(recipe=self.path, repair_frame=None, resume_menu=None, only=None, hwnd=None)
+        current = deepcopy(self.recipe)
+        current['steps'][1]['spec']['point'] = self.after
+        self.write(current)
+        flow.context_menu.execute.side_effect = self.menu
+        report = repair.run_registered(flow, self.recipe, args, {})
+        self.assertTrue(report['steps'][-1]['receipt']['leaf_dispatched'])
+        self.assertEqual(flow.context_menu.execute.call_args.args[1]['point'], self.after)
+        current['steps'][1]['spec']['path'] = ['Another menu']
+        self.write(current)
+        report = repair.run_registered(flow, self.recipe, args, {})
+        self.assertEqual(report['diagnostic'], 'workflow_changed_during_repair')
+        self.assertFalse(report['input_dispatched'])
+        flow.context_menu.execute.assert_called_once()
 
     def test_atomic_save_conflict_preserves_newer_content_and_successful_delivery(self):
         changed = deepcopy(self.recipe)

@@ -143,6 +143,10 @@ class _GUID(C.Structure):
 class _BridgeError(Exception):
     input_dispatched = False
 
+    @property
+    def code(self):
+        return self.args[0]
+
 
 class AutoFocusPolicyTests(unittest.TestCase):
     def fixture(self, *, query_result=-2147467262, query_pointer=None,
@@ -197,7 +201,8 @@ class AutoFocusPolicyTests(unittest.TestCase):
 
     def test_existing_modern_client_is_configured_and_query_reference_released(self):
         uia, bridge, original, events = self.fixture(query_result=0, query_pointer=303)
-        policy.configure_uia(uia)
+        self.assertTrue(policy.prefer_background(uia))
+        self.assertIs(uia._desktop_select_no_autofocus, True)
         self.assertEqual(original, (uia.client, uia.walker))
         self.assertEqual([('call', 303, 59), ('call', 303, 58), ('close', 303)], events)
         bridge.ole32.CoCreateInstance.assert_not_called()
@@ -245,8 +250,17 @@ class AutoFocusPolicyTests(unittest.TestCase):
                 uia, bridge, original, events = self.fixture(readback=readback)
                 with self.assertRaisesRegex(_BridgeError, 'background_autofocus_unavailable'):
                     policy.configure_uia(uia)
+                self.assertIs(uia._desktop_select_no_autofocus, False)
                 self.assertEqual([('call', 303, 59), ('call', 303, 58), ('close', 303)], events)
                 self.assertEqual(original, (uia.client, uia.walker))
+
+    def test_best_effort_focus_suppression_only_falls_back_for_known_error(self):
+        uia, _, _, _ = self.fixture(readback=1)
+        self.assertFalse(policy.prefer_background(uia))
+        self.assertIs(uia._desktop_select_no_autofocus, False)
+        with patch.object(policy, 'configure_uia', side_effect=_BridgeError('target_closed')):
+            with self.assertRaisesRegex(_BridgeError, 'target_closed'):
+                policy.prefer_background(uia)
 
     def test_missing_walker_releases_new_client_and_preserves_old_one(self):
         uia, bridge, original, events = self.fixture(walker_pointer=None)

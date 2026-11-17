@@ -3,6 +3,7 @@ import row_action
 import row_capture
 import row_intent
 import row_vision as vision
+import coordination
 import win_bridge as bridge
 
 
@@ -142,36 +143,38 @@ def execute(binding, spec, guard, *, read_only=False, child_open=None):
             return dict(status='verified', input_dispatched=False, observed_state='after',
                         evidence='recorded_row_and_window', verification_scope='recorded_window_open',
                         effect_verification='matched')
-        row_action.foreground(binding)
-        guard()
-        bridge._combo_surface(binding)
-        tick = row_action._input_tick()
-        sample = vision._snapshot(binding)
-        rect, delta = _identity(sample,spec)
-        current = _launch(binding,sample,spec,rect,delta)
-        _require(current == observed, 'row_changed_before_action')
-        # Include the *current launch glyph* and row identity in the final
-        # physical input check. Translation applies equally to both patches.
-        box = row_capture._button(current['point'], rect)
-        _require(box is not None, 'row_launch_button_not_found')
-        button_mask = vision._pattern(vision._rgb(sample, vision._patch(rect,box)))
-        box = [box[0]-delta[0],box[1]-delta[1],*box[2:]]
-        runtime_spec = dict(spec, boxes=dict(spec['boxes'],button=box), button=button_mask)
-        vision.confirm_point(binding, current)
-        guard()
-        _require(not (child_open and child_open()), 'expected_window_opened_before_click')
-        bridge._combo_surface(binding)
-        _confirm(binding, runtime_spec, current)
-        _require(row_action._input_tick() == tick, 'foreground_or_input_changed')
+        with coordination.desktop_input():
+            guard()
+            row_action.foreground(binding)
+            guard()
+            bridge._combo_surface(binding)
+            tick = row_action._input_tick()
+            sample = vision._snapshot(binding)
+            rect, delta = _identity(sample,spec)
+            current = _launch(binding,sample,spec,rect,delta)
+            _require(current == observed, 'row_changed_before_action')
+            # Include the *current launch glyph* and row identity in the final
+            # physical input check. Translation applies equally to both patches.
+            box = row_capture._button(current['point'], rect)
+            _require(box is not None, 'row_launch_button_not_found')
+            button_mask = vision._pattern(vision._rgb(sample, vision._patch(rect,box)))
+            box = [box[0]-delta[0],box[1]-delta[1],*box[2:]]
+            runtime_spec = dict(spec, boxes=dict(spec['boxes'],button=box), button=button_mask)
+            vision.confirm_point(binding, current)
+            guard()
+            _require(not (child_open and child_open()), 'expected_window_opened_before_click')
+            bridge._combo_surface(binding)
+            _confirm(binding, runtime_spec, current)
+            _require(row_action._input_tick() == tick, 'foreground_or_input_changed')
+            try:
+                result = bridge._send_point(*current['point'], 'click')
+            except Exception as error:
+                # Once the transport was entered even an unclassified error may mean
+                # Windows received the input. Never offer a second attempt here.
+                result = dict(ok=False, input_dispatched=getattr(error,'input_dispatched',None),
+                              diagnostic=getattr(error,'code','row_delivery_uncertain'))
     except (bridge.BridgeError, OSError, ValueError) as error:
         return dict(status='blocked', input_dispatched=False, diagnostic=getattr(error,'code','row_target_unavailable'))
-    try:
-        result = bridge._send_point(*current['point'], 'click')
-    except Exception as error:
-        # Once the transport was entered even an unclassified error may mean
-        # Windows received the input. Never offer a second attempt here.
-        result = dict(ok=False, input_dispatched=getattr(error,'input_dispatched',None),
-                      diagnostic=getattr(error,'code','row_delivery_uncertain'))
     sent = result.get('input_dispatched')
     delivered = sent is True and result.get('ok') is True
     return dict(status='delivered_unverified' if delivered else 'uncertain', input_dispatched=sent,

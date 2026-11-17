@@ -10,6 +10,7 @@ import time
 
 import win_bridge as win
 import control_lookup as lookup
+import coordination
 import provider_visibility as visibility
 from row_action import foreground
 
@@ -699,9 +700,10 @@ def execute(binding, spec, guard, *, before_leaf=None):
     unresolved = None
     try:
         validate_spec(spec)
-        guard()
-        foreground(binding)
-        with win.UIA() as uia:
+        # Keep the foreground, right-click and all submenu selections together.
+        with coordination.desktop_input(), win.UIA() as uia:
+            guard()
+            foreground(binding)
             tick = win.input_tick()
             # A delayed query can populate the result surface shortly after the
             # button returns. This short wait only re-observes; no query is sent.

@@ -95,6 +95,7 @@ def configure_uia(uia):
     An application can still change focus through its own action handling.
     """
     import win_bridge as win
+    uia._desktop_select_no_autofocus = False
     interface = walker = None
     try:
         try:
@@ -133,3 +134,16 @@ def configure_uia(uia):
                 interface.close()
     except Exception as error:
         raise win.BridgeError('background_autofocus_unavailable') from error
+    uia._desktop_select_no_autofocus = True
+
+
+def prefer_background(uia):
+    """Allow default execution to take the foreground lease when UIA cannot suppress focus."""
+    import win_bridge as win
+    try:
+        configure_uia(uia)
+    except win.BridgeError as error:
+        if error.code != 'background_autofocus_unavailable':
+            raise
+        return False
+    return True

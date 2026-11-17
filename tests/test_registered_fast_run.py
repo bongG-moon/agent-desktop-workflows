@@ -24,7 +24,7 @@ class RegisteredFastRunTests(unittest.TestCase):
 
     def cli(self, result, *args):
         with (patch.object(flow, 'load', return_value=self.recipe),
-              patch.object(flow.subprocess, 'run', return_value=flow.subprocess.CompletedProcess(
+              patch.object(flow.coordination, 'run_worker', return_value=flow.subprocess.CompletedProcess(
                   [], 3, json.dumps(result))) as worker, redirect_stdout(StringIO()) as stdout):
             code = flow.main(['run', '--recipe', 'workflow.json', *args])
         worker.assert_called_once()

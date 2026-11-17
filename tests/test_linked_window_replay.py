@@ -1,4 +1,5 @@
 """An opened window must be the one named and bound by this recording."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
@@ -100,6 +101,28 @@ class LinkedWindowTests(TestCase):
             result=flow.run(self.recipe)
         self.assertEqual(execute.call_count,1)
         self.assertEqual(result['diagnostic'],'recorded_window_lifetime_changed')
+
+    def test_single_window_competitor_waits_for_all_steps_of_existing_linked_job(self):
+        self.child['window_context'] = scope(mode='existing')
+        self.records[:] = [window(0x77ff1234)]
+        detail = binding(self.records[0])
+        probes = []
+
+        def probe():
+            try:
+                with flow.coordination.window(detail, 'Instance A'):
+                    return 'available'
+            except flow.coordination.CoordinationError as error:
+                return error.code
+
+        with ThreadPoolExecutor(max_workers=1) as other, mock.patch.object(flow.coordination, 'QUEUE_SECONDS', 0):
+            def send(bound, *args, **kwargs):
+                probes.append((bound.hwnd, other.submit(probe).result(timeout=2)))
+                return dict(status='verified', input_dispatched=True)
+            with mock.patch.object(flow.live, 'execute', side_effect=send):
+                self.assertEqual(flow.run(self.recipe)['status'], 'verified')
+            self.assertEqual(other.submit(probe).result(timeout=2), 'available')
+        self.assertEqual(probes, [(hwnd, 'window_queue_timeout') for hwnd in (1, detail.hwnd, 1)])
 
     def test_only_opened_child_requires_opener_but_explicit_existing_child_can_be_used(self):
         self.records[:]=[window(2)]

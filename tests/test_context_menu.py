@@ -1,5 +1,6 @@
 """Bounds, popup provenance and final-dispatch boundaries for context menu replay."""
 from pathlib import Path
+from contextlib import contextmanager
 import sys
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -151,6 +152,26 @@ class MenuTests(unittest.TestCase):
         binding.info.return_value = {'dpi':96}
         result = cm.execute(binding,self.spec,guard or Mock(),before_leaf=before_leaf)
         return result, send
+
+    def test_right_click_and_nested_menu_hold_one_input_lease(self):
+        trace = []
+
+        @contextmanager
+        def lease():
+            trace.append('enter')
+            try:
+                yield
+            finally:
+                trace.append('leave')
+
+        def dispatch(x, y, kind):
+            trace.append(kind)
+            return dict(ok=True, input_dispatched=True)
+
+        with patch.object(cm.coordination, 'desktop_input', lease):
+            result, _ = self.run_path(receipts=dispatch, before_leaf=lambda: trace.append('before_leaf'))
+        self.assertTrue(result['menu_path_completed'])
+        self.assertEqual(trace, ['enter','right-click','click','before_leaf','click','leave'])
 
     def test_leaf_delivery_never_claims_file_verification(self):
         baseline = Mock()

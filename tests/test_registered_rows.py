@@ -38,6 +38,25 @@ class RegisteredRowTests(TestCase):
     def compile(self):
         return recorded_plan.compile_plan(self.task)['envelope']['recipe']
 
+    def test_row_input_reservation_timeout_reports_delivery_for_each_stage(self):
+        self.runtime()
+        recipe = self.compile()
+        with (mock.patch.object(workflow.app.bridge.user32, 'IsIconic', return_value=True),
+              mock.patch.object(workflow.row_intent, '_memory', return_value=(None, 'unused')),
+              mock.patch.object(workflow.coordination, 'desktop_input',
+                                side_effect=workflow.coordination.CoordinationError('desktop_input_queue_timeout')),
+              mock.patch.object(workflow.app.bridge, '_send_point') as pointer):
+            for number in (1, 2):
+                with self.subTest(number=number):
+                    report = workflow.run(recipe, only=number)
+                    self.assertEqual((report['status'], report['diagnostic'], report['input_dispatched']),
+                                     ('blocked', 'desktop_input_queue_timeout', False))
+            with mock.patch.object(workflow.row_action, 'execute', return_value=dict(status='verified', input_dispatched=True)):
+                report = workflow.run(recipe)
+            self.assertEqual((report['status'], report['stopped_at'], report['input_dispatched']), ('blocked', 2, True))
+            self.assertIs(report['steps'][-1]['receipt']['input_dispatched'], False)
+            pointer.assert_not_called()
+
     def test_legacy_spoken_step_preserves_source_and_both_rows_register_without_clicks(self):
         self.task['steps'][1] = dict(action='manual', reason='stable_locator_unavailable', alias='두 번째 요소 실행')
         source = deepcopy(self.task)

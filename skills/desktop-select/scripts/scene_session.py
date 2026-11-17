@@ -12,6 +12,7 @@ import threading
 import time
 
 import learned_tasks as tasks
+import coordination
 
 
 ANSWER_TTL = 300
@@ -108,10 +109,10 @@ def _alive(pid):
         kernel.CloseHandle(handle)
 
 
-def _await(folder, cursor, timeout, child=None, pid=None):
+def _await(folder, cursor, timeout, child=None, pid=None, clock=None):
     output = folder / ('out-' + cursor + '.json')
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = coordination.ActiveDeadline(timeout, clock)
+    while deadline.remaining() > 0:
         if output.exists():
             result = _read(output)
             output.unlink()
@@ -134,13 +135,14 @@ def start(workflow, recipe, options, timeout):
     folder, cursor = _paths(ticket)
     folder.mkdir()
     args = [sys.executable, '-X', 'utf8', '-B', str(Path(workflow).resolve()), '_scene_worker', ticket]
-    child = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), close_fds=True)
-    try:
-        child.stdin.write(json.dumps(dict(recipe=recipe, options=options)).encode('utf8'))
-    finally:
-        child.stdin.close()
-    return _await(folder, cursor, timeout, child)
+    with coordination.child_clock() as (env, clock):
+        child = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), close_fds=True, env=env)
+        try:
+            child.stdin.write(json.dumps(dict(recipe=recipe, options=options)).encode('utf8'))
+        finally:
+            child.stdin.close()
+        return _await(folder, cursor, timeout, child, clock=clock)
 
 
 class Session:
@@ -152,7 +154,17 @@ class Session:
 
     def arm(self, seconds):
         self.disarm()
-        self.timer = threading.Timer(seconds,os._exit,args=(124,))
+        deadline = coordination.ActiveDeadline(seconds)
+        def expire():
+            if self.timer is not threading.current_thread():
+                return
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                os._exit(124)
+            self.timer = threading.Timer(remaining, expire)
+            self.timer.daemon = True
+            self.timer.start()
+        self.timer = threading.Timer(seconds, expire)
         self.timer.daemon = True
         self.timer.start()
 
@@ -172,7 +184,7 @@ class Session:
         expires = time.time() + ANSWER_TTL
         _publish(image, png)
         try:
-            _json(pending, dict(expires=expires, timeout=self.timeout, pid=os.getpid(),
+            _json(pending, dict(expires=expires, timeout=self.timeout, pid=os.getpid(), clock=coordination.clock_token(),
                                 sha256=hashlib.sha256(png).hexdigest()))
             self.arm(ANSWER_TTL + 5)
             self.send(dict(progress, **prompt, status='needs_scene', image=str(image), ticket=ticket,
@@ -208,7 +220,8 @@ def answer(ticket, decision, point):
     if hashlib.sha256(image.read_bytes()).hexdigest() != info['sha256']:
         fail('scene_preview_changed')
     _json(folder / ('answer-' + cursor + '.json'), dict(decision=decision, point=point))
-    return _await(folder, cursor, info['timeout'],pid=info['pid'])
+    with coordination.ticket_clock(info.get('clock')) as clock:
+        return _await(folder, cursor, info['timeout'], pid=info['pid'], clock=clock)
 
 
 def worker(app, ticket):

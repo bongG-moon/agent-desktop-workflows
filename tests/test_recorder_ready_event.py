@@ -25,7 +25,12 @@ class RecorderReadyTests(unittest.TestCase):
     def test_only_mapped_root_can_signal_ready_and_remapping_does_not_repeat_it(self):
         root = self.root
         observations = []
-        ready = Mock(side_effect=lambda: observations.append((root.title(), root.winfo_viewable())))
+        def observed():
+            observations.append((root.title(), root.winfo_viewable()))
+            root.after_cancel(deadline)
+            root.after_idle(remap)
+
+        ready = Mock(side_effect=observed)
 
         def show():
             panel = root.winfo_children()[0]
@@ -38,8 +43,10 @@ class RecorderReadyTests(unittest.TestCase):
             root.deiconify()
             root.after_idle(root.destroy)
 
+        # The recording editor constructs its controls before entering mainloop.
+        # Remapping on a timer started here races the first real Map event.
+        deadline = root.after(3000, root.destroy)
         root.after(0, show)
-        root.after(80, remap)
         receipt = self.open_review(ready)
 
         self.assertEqual(receipt['status'], 'cancelled')
