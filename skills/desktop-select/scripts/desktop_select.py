@@ -635,11 +635,25 @@ def _replay_recorded(plan, args, overrides, background):
     return tasks.replay(plan,args.exe,args.window,overrides,invoke,only=args.only)
 
 
-def edit_recording(owner, storage):
+def edit_recording(owner, storage, *, report_ready=False):
+    try:
+        import tkinter
+    except ImportError as error:
+        raise SelectionError('recorder_tk_unavailable') from error
     from teach_capture import capture
     focus = storage.previous.get('step_number') if storage.previous else None
-    result = capture(owner, title=storage.title, initial_draft=storage.initial_rows(), initial_step=focus,
-                     save_recording=storage.save_recording, save_draft=storage.save_draft)
+
+    def ready():
+        # Escaped JSON also round-trips through Windows PowerShell's legacy output code page.
+        print(json.dumps(dict(status='recorder_ready', task=storage.name, window=storage.title,
+                              input_dispatched=False)), flush=True)
+
+    try:
+        result = capture(owner, title=storage.title, initial_draft=storage.initial_rows(), initial_step=focus,
+                         save_recording=storage.save_recording, save_draft=storage.save_draft,
+                         on_ready=ready if report_ready else None)
+    except tkinter.TclError as error:
+        raise SelectionError('recording_ui_failed') from error
     if storage.saved_plan is not None:
         try:
             result['execution_plan'] = execution_plan_info(saved_execution_plan(storage.saved_plan))
@@ -666,7 +680,46 @@ def attach_recovery(result, name, *, prepare=False):
     return result
 
 
+def recorder_request(path):
+    """Read literal host data, leaving quotes and whitespace out of the shell command."""
+    try:
+        tasks._directory(path.parent)
+        tasks._deny_redirect(path)
+        if not path.is_file():
+            raise SelectionError('recorder_request_unreadable')
+        with path.open('rb') as stream:
+            data = stream.read(65537)
+    except OSError as error:
+        raise SelectionError('recorder_request_unreadable') from error
+    if len(data) > 65536:
+        raise SelectionError('recorder_request_too_large')
+    try:
+        request = json.loads(data.decode('utf-8-sig'), object_pairs_hook=tasks._unique_keys)
+    except (ValueError, RecursionError) as error:
+        raise SelectionError('invalid_recorder_request') from error
+
+    fields = {
+        'record': ({'command', 'task', 'exe', 'window'}, {'hwnd': None}),
+        'review': ({'command', 'task'}, {}),
+        'continue-recording': ({'command', 'task'}, {'from_step': None, 'supplement': None, 'save_as': None}),
+    }
+    if not isinstance(request, dict) or not isinstance(request.get('command'), str) or request['command'] not in fields:
+        raise SelectionError('invalid_recorder_request')
+    required, defaults = fields[request['command']]
+    if not required <= request.keys() <= required.union(defaults):
+        raise SelectionError('invalid_recorder_request')
+    for key, value in request.items():
+        if key in ('hwnd', 'from_step'):
+            if type(value) is not int or value < 1:
+                raise SelectionError('invalid_recorder_request')
+        elif not tasks._text(value):
+            raise SelectionError('invalid_recorder_request')
+    return argparse.Namespace(**{**defaults, **request}, report_ready=True)
+
+
 def run(args):
+    if args.command == 'recorder':
+        args = recorder_request(args.request)
     if args.command == 'storage':
         return storage_info()
     if args.command == 'review':
@@ -680,7 +733,7 @@ def run(args):
         review_drafts.validate(doc)
         storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
         bridge.set_dpi_awareness()
-        result = edit_recording(None, storage)
+        result = edit_recording(None, storage, report_ready=getattr(args, 'report_ready', False))
         if result.get('status') == 'recorded' and (result.get('draft') or
                 result.get('execution_plan', {}).get('status') == 'not_compatible'):
             return attach_recovery(result, args.task, prepare=True)
@@ -802,7 +855,7 @@ def run(args):
                         host_action='continue_recording_from_saved_task',
                         continue_args=['continue-recording', '--task', args.task], input_dispatched=False)
         guard(owner, owner, args.window)
-        result = edit_recording(owner, storage)
+        result = edit_recording(owner, storage, report_ready=getattr(args, 'report_ready', False))
         if result.get('status') == 'recorded' and (result.get('draft') or
                 result.get('execution_plan', {}).get('status') == 'not_compatible'):
             return attach_recovery(result, args.task, prepare=True)
@@ -876,6 +929,8 @@ def replay_step():
 def parser():
     p = argparse.ArgumentParser(description='Select an exact field or command in one Windows business window.')
     commands = p.add_subparsers(dest='command', required=True)
+    host = commands.add_parser('recorder', help='open a recording editor from a literal JSON request; stream readiness and final result')
+    host.add_argument('--request', required=True, type=Path, help='UTF-8 JSON file for record, review or continue-recording')
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
@@ -967,7 +1022,7 @@ def worker(args):
         dispatched = getattr(error, 'input_dispatched', False)
         result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': getattr(error, 'code', 'invalid_request'),
                   'input_dispatched': dispatched}
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(result, ensure_ascii=args is not None and args.command == 'recorder'))
     return result_code(result)
 
 
@@ -1029,7 +1084,14 @@ def main():
     is_worker = argv[:1] == ['_worker']
     if is_worker:
         argv = argv[1:]
-    args = parser().parse_args(argv)
+    try:
+        args = parser().parse_args(argv)
+    except SystemExit as error:
+        if error.code != 2 or argv[:1] not in (['recorder'], ['record'], ['review'], ['continue-recording']):
+            raise
+        print(json.dumps(dict(status='blocked', diagnostic='invalid_recorder_arguments',
+                              hint='recorder --request <UTF-8 JSON file>', input_dispatched=False)))
+        return 2
     if args.command in ('inspect', 'select', 'fill', 'open') and (
             bool(args.task) != bool(args.near) or (args.popup is not None and args.near)):
         print(json.dumps({'status': 'blocked', 'diagnostic': 'near_requires_task_and_main_window', 'input_dispatched': False}))
@@ -1039,7 +1101,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('record', 'review', 'continue-recording', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('recorder', 'record', 'review', 'continue-recording', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
 
 
 if __name__ == '__main__':

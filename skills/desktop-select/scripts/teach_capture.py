@@ -1701,7 +1701,8 @@ def pick_recording_window(root, session):
     return result
 
 
-def capture(binding, *, title, save_recording=None, save_draft=None, initial_draft=None, initial_step=None):
+def capture(binding, *, title, save_recording=None, save_draft=None, initial_draft=None, initial_step=None,
+            on_ready=None):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
     from tkinter import font as tkfont, ttk
@@ -2448,6 +2449,17 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         result = {'status': 'blocked', 'diagnostic': 'recording_ui_failed', 'input_dispatched': False}
         root.destroy()
     root.report_callback_exception = failed
+    if on_ready is not None:
+        def report_ready(event=None):
+            nonlocal on_ready
+            if event is not None and event.widget is not root:
+                return
+            if on_ready is not None and root.winfo_viewable():
+                callback, on_ready = on_ready, None
+                callback()
+
+        root.bind('<Map>', report_ready, add='+')
+        report_ready()  # Some window managers may have mapped the editor during setup.
     if review is None:
         root.after(200, tick)
     try:

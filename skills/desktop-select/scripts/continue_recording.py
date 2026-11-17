@@ -35,7 +35,7 @@ def run(app, args):
         if destination.casefold() == supplement.casefold():
             raise tasks.TaskError('supplement_name_conflict')
         storage = review_drafts.ReviewStorage(supplement, source['exe'], source['window'], directory)
-        saved = app.edit_recording(owner, storage)
+        saved = app.edit_recording(owner, storage, report_ready=getattr(args, 'report_ready', False))
         if saved['status'] != 'recorded':
             return saved
     if args.task.casefold() == supplement.casefold():
