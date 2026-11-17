@@ -34,6 +34,51 @@ class RecorderRequestTests(unittest.TestCase):
                 args = vars(app.recorder_request(self.path))
                 self.assertEqual(args, dict(self.request, report_ready=True))
 
+    def test_exe_only_opens_one_named_window_in_the_original_request(self):
+        self.write(dict(command='record', task='처음 녹화', exe='Test.exe'))
+        row = dict(title='업무  "창"', hwnd=1)
+        with (patch.object(app.bridge, 'set_dpi_awareness'), patch.object(app, 'guard') as guard,
+              patch.object(app, 'task_directory', return_value=self.folder),
+              patch.object(app, 'windows', return_value=[dict(title='', hwnd=2), row]) as windows,
+              patch.object(app.bridge, 'Binding') as bind, patch.object(app, 'edit_recording') as edit):
+            edit.return_value = dict(status='cancelled', input_dispatched=False)
+            self.assertEqual(app.run(self.cli), edit.return_value)
+            windows.assert_called_once_with('Test.exe')
+            bind.assert_called_once_with(row)
+            guard.assert_called_once_with(bind.return_value, bind.return_value, row['title'])
+            self.assertEqual(edit.call_args.args[1].title, row['title'])
+            self.assertTrue(edit.call_args.kwargs['report_ready'])
+
+    def test_candidate_choices_are_returned_without_opening_an_editor(self):
+        rows = [dict(title='A', hwnd=1), dict(title='A', hwnd=2), dict(title='B', hwnd=3)]
+        for window, expected in ((None, rows), ('A', rows[:2])):
+            request = dict(command='record', task='처음 녹화', exe='Test.exe')
+            if window is not None:
+                request['window'] = window
+            self.write(request)
+            with (self.subTest(window=window), patch.object(app.bridge, 'set_dpi_awareness'),
+                  patch.object(app, 'windows', return_value=rows), patch.object(app, 'edit_recording') as edit):
+                self.assertEqual(app.run(self.cli), dict(status='needs_input', diagnostic='ambiguous_window',
+                                                         windows=expected, input_dispatched=False))
+                edit.assert_not_called()
+
+    def test_known_hwnd_never_reads_a_foreign_title_or_traverses_other_windows(self):
+        with (patch.object(app.bridge, '_windows'), patch.object(app.bridge, '_sig') as enumerate_windows,
+              patch.object(app.bridge, 'root_window', return_value=42) as root,
+              patch.object(app.bridge, 'user32', create=True) as api, patch.object(app.bridge, 'hwnd_pid', return_value=7),
+              patch.object(app.bridge, '_process_identity', return_value=('Other.exe', '123')) as identity,
+              patch.object(app.bridge, 'window_text', return_value='Title') as caption):
+            api.IsWindowVisible.return_value = True
+            self.assertEqual(app.windows('Test.exe', only_hwnd=42), [])
+            caption.assert_not_called()
+            identity.return_value = ('Test.exe', '4545')
+            self.assertEqual(app.windows('Test.exe', only_hwnd=42), [
+                dict(title='Title', hwnd=42, exe_name='Test.exe', pid=7, process_started_utc_ticks='4545')])
+            root.return_value = 8
+            self.assertEqual(app.windows('Test.exe', only_hwnd=42), [])
+            caption.assert_called_once_with(42)
+            enumerate_windows.assert_not_called()
+
     def test_review_and_continuation_use_the_existing_command_defaults(self):
         for command in ('review', 'continue-recording'):
             for extra in ([{}, {'from_step': 2, 'save_as': '저장 사본', 'supplement': '보완 녹화'}]

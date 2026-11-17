@@ -50,9 +50,18 @@ def _recorded_targets(app, surface, uia, lookups):
         app.add_display_properties(node, element, surface, uia, root)
         if node['offscreen']:
             raise app.bridge.BridgeError('target_offscreen')
-        if node['role'] in tasks.VALUE_ACTIONS.values():
+        if node['role'] in tasks.VALUE_ACTIONS.values() and not node.get('label_source'):
             node.update(app.field_label(surface, uia, element, root))
         targets.append(node)
+    # A legacy frame binding names a region without saying whether the string
+    # was its ID or caption. Keep collisions across both identities visible.
+    for name, role in lookups.get('regions', ()):
+        seen = []
+        for key in ('automation_id', 'name'):
+            for element in control_lookup.find_all(uia, root, roles=(role,), **{key: name}):
+                if not any(uia.same(element, previous) for previous in seen):
+                    seen.append(element)
+                    targets.append(uia.basic(element))
     if lookups['captions']:
         captions = {' '.join(label.split()).casefold() for label in lookups['captions']}
         for button in control_lookup.find_all(uia, root, roles=tasks.INVOKE - {'menuitem'}, limit=256):
@@ -65,9 +74,10 @@ def _recorded_targets(app, surface, uia, lookups):
     return targets
 
 
-def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None):
+def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None, bindings_only=False):
     check = _guard(app, main, surface, title)
     check()
+    app.visibility.require_observable(surface)
     result = dict(exe=surface.exe, window=app.bridge.window_text(surface.hwnd),
                   targets=[], owned_popups=[], input_dispatched=False)
     with app.bridge.UIA() as uia:
@@ -84,7 +94,9 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None):
         except (app.SelectionError, app.bridge.BridgeError) as error:
             # A nonstandard provider may still expose its rendered window.
             result['tree_diagnostic'] = error.code
-        for popup in app.owned_popups(surface):
+        # Explicit bindings are checked only against their own recorded window.
+        # Popup inventories aid discovery but cannot satisfy these bindings.
+        for popup in (() if bindings_only else app.owned_popups(surface)):
             entry = dict(popup)
             try:
                 owned = app.bind_surface(surface, popup['hwnd'])
@@ -95,7 +107,7 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None):
             except (app.SelectionError, app.bridge.BridgeError) as error:
                 entry['diagnostic'] = error.code
             result['owned_popups'].append(entry)
-        if context_menu._native_menu_owner(surface):
+        if not bindings_only and context_menu._native_menu_owner(surface):
             try:
                 result['open_menu_items'] = [item.name for item in context_menu._menus(surface, uia)]
             except app.bridge.BridgeError as error:
@@ -129,6 +141,7 @@ def _same_patch(previous, current, point):
 def menu_from_frame(app, main, surface, title, frame_key, binding, *, observation=None, inventory=None):
     check = _guard(app, main, surface, title)
     check()
+    app.visibility.require_observable(surface)
     anchor = binding.get('menu_anchor')
     menu = None
     if anchor is not None and 'frame' not in binding:

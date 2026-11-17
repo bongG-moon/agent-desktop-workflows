@@ -38,6 +38,38 @@ def recording():
 
 
 class CompilationTests(unittest.TestCase):
+    def test_quoted_combo_assignments_preserve_spelling_and_explicit_older_bindings(self):
+        step = recording()['steps'][0]
+        for literal in ("'N'", '"N"', '‘N’', '“N”'):
+            sentence = f'MES SETUP조건을 {literal}으로 설정'
+            self.assertEqual(tasks.compile_instruction(step, sentence), dict(mode='fixed', value='N', text=sentence))
+            with self.assertRaisesRegex(tasks.TaskError, 'instruction_binding_conflict'):
+                tasks.compile_instruction(step, sentence, mode='fixed', argument='P')
+        for literal in ("''", "'N", "N’"):
+            self.assertEqual(tasks.compile_instruction(step, f'MES Setup을 {literal}으로 설정')['mode'], 'draft')
+        step['instruction'] = dict(mode='fixed', text="MES Setup을 'Open'으로 설정", value='O')
+        self.assertEqual(tasks.compile_instruction(step, step['instruction']['text'], mode='fixed', argument='O'),
+                         step['instruction'])
+
+    def test_identified_query_and_grid_menu_compile_without_editing_recording(self):
+        task = recording()
+        menu = dict(action='result-menu', label='내보내기', context=dict(trigger=None, ready=None, output=None,
+                    menu=dict(target=dict(role='group', automation_id='Results'), point=[.3, .4], path=['Export'])))
+        task['steps'].append(menu)
+        source = deepcopy(task)
+        compiled = plans.compile_plan(task)['envelope']
+        self.assertEqual(task, source)
+        self.assertEqual(compiled['recipe']['steps'][-2], dict(action='wait', seconds=5))
+        self.assertEqual(compiled['notes'], [dict(step=3, diagnostic='default_query_settle',
+                                                  seconds=5, business_result='not_verified')])
+        menu['context']['ready'] = dict(kind='text', target=dict(role='statictext', name='State'), expected='Done')
+        compiled = plans.compile_plan(task)['envelope']
+        self.assertNotIn('wait', [s['action'] for s in compiled['recipe']['steps']])
+        self.assertEqual(compiled['recipe']['steps'][-1]['context']['ready'], menu['context']['ready'])
+        # A different button must not inherit an implicit continuation.
+        task['steps'][2].update(command_name='Delete', instruction=dict(mode='recorded', text=''))
+        self.assertEqual(plans.compile_plan(task)['diagnostic'], 'execution_plan_wait_required')
+
     def test_query_wait_and_exact_group_menu_survive_compilation(self):
         task = recording()
         task['steps'][-1]['wait_after'] = 5
@@ -190,6 +222,17 @@ class CompilationTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def test_missing_or_stale_plan_compiles_once_per_get(self):
+        task = recording()
+        with tempfile.TemporaryDirectory() as folder:
+            for status in ('saved', 'loaded', 'saved'):
+                with patch.object(plans, 'compile_saved', wraps=plans.compile_saved) as compile_saved:
+                    result = plans.get_plan(task, folder)
+                    self.assertEqual(result['status'], status)
+                    compile_saved.assert_called_once_with(task, folder)
+                if status == 'loaded':
+                    Path(result['path']).write_text('{}', encoding='utf8')
+
     def test_atomic_sidecar_roundtrip_does_not_replace_or_list_as_original_recording(self):
         task = recording()
         with tempfile.TemporaryDirectory() as folder:

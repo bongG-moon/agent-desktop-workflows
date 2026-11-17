@@ -207,6 +207,11 @@ def click_menu_path(sentence):
             return parts
 
 
+def _quoted_literal(text):
+    match = re.fullmatch(r"""(?:'([^']*)'|"([^"]*)"|‘([^’]*)’|“([^”]*)”)""", text)
+    return next(v for v in match.groups() if v is not None) if match else None
+
+
 def _field_request(sentence):
     """Recognize a single target-first assignment, preserving the literal's spelling."""
     if not isinstance(sentence, str) or _conditional_sentence(sentence):
@@ -221,9 +226,9 @@ def _field_request(sentence):
     variable = re.fullmatch(r'\{([^{}]+)\}', literal)
     if variable or re.fullmatch(r'(?:실행\s*(?:할\s*)?때\s*)?입력\s*받(?:은|는)\s*(?:변수|값)', literal):
         return subject, 'required', variable[1] if variable else None
-    quoted = re.fullmatch(r"""(?:'([^']*)'|"([^"]*)"|‘([^’]*)’|“([^”]*)”)""", literal)
-    if quoted:
-        return subject, 'fixed', next(v for v in quoted.groups() if v is not None)
+    quoted = _quoted_literal(literal)
+    if quoted is not None:
+        return subject, 'fixed', quoted
     if re.fullmatch(r'[\w./+()-]+', literal) and literal not in ('값', '변수'):
         return subject, 'fixed', literal
     return None
@@ -479,7 +484,7 @@ def _instruction_subject(step, subject):
     raise TaskError('instruction_target_mismatch')
 
 
-def _parse_sentence(step, sentence):
+def _parse_sentence(step, sentence, *, infer_quoted_option=True):
     """Only parse one bounded, field-specific instruction. No shell or model evaluation."""
     verb = r'(?:선택|설정|입력|변경|해)(?:해)?\s*(?:줘|주세요)?'
     tail = r'(?:[.!。])?'
@@ -510,6 +515,10 @@ def _parse_sentence(step, sentence):
             except (ValueError, RecursionError):
                 return None
             return ('fixed', literal) if valid_value(literal, 'textfield') else None
+        if infer_quoted_option and step.get('action') == 'select':
+            literal = _quoted_literal(val)
+            if literal is not None and valid_value(literal, 'combobox'):
+                return 'fixed', literal
         if not re.fullmatch(r'[\w +./()-]+', val):
             return None
         # Descriptions such as "이번 시험에 맞는 상태" are not literal option
@@ -672,7 +681,13 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
                 or (role is not None and role != step.get('role'))
                 or (within is not None and within != step.get('within'))):
             raise TaskError('instruction_target_mismatch')
-    parsed = _parse_sentence(step, sentence)
+    # Older saved instructions could bind a quoted display name to a different
+    # provider code or runtime parameter. Keep that explicit binding on load.
+    previous = step.get('instruction', {})
+    preserved = (isinstance(previous, dict) and previous.get('text') == sentence
+                 and mode in ('fixed', 'required') and previous.get('mode') == mode
+                 and previous.get('value' if mode == 'fixed' else 'parameter') == argument)
+    parsed = _parse_sentence(step, sentence, infer_quoted_option=not preserved)
     if mode is None:
         if not parsed or argument is not None:
             if argument is not None:

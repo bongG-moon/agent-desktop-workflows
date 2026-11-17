@@ -139,7 +139,7 @@ class NamedWorkflowTests(unittest.TestCase):
             self.addCleanup(handle.stop)
 
     def test_compilation_preserves_exact_names_ancestors_and_variables(self):
-        self.assertEqual(plans.COMPILER, 10)
+        self.assertEqual(plans.COMPILER, 11)
         first, second, last = self.recipe['steps']
         self.assertEqual(first['selector'], dict(name='Find what:', role='combobox',
                                                ancestors=[dict(name='Conditions', role='group')]))
@@ -164,7 +164,7 @@ class NamedWorkflowTests(unittest.TestCase):
 
     def test_single_session_replays_current_values_without_full_tree(self):
         calls = []
-        def execute(binding, uia, element, node, action, value, *, still_valid):
+        def execute(binding, uia, element, node, action, value, *, still_valid, just_resolved):
             still_valid()
             calls.append((element, action, value))
             return dict(status='verified', input_dispatched=True) if action == 'select' else dict(

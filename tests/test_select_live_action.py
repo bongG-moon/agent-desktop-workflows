@@ -162,6 +162,25 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual(self.run_action(guard=guard)['diagnostic'], 'target_changed')
         self.assertFalse(self.calls)
 
+    def test_fresh_literal_selector_is_rechecked_before_write_and_readback(self):
+        checks = []
+        self.after = lambda item, op, arg: self.combo.props.update({30045: arg})
+
+        def execute(check):
+            return live.execute(self.binding, self.uia, self.combo, {'role': 'combobox'},
+                                'select', 'N', just_resolved=True, still_valid=check)
+
+        def changed():
+            raise ValueError('target_changed')
+
+        blocked = execute(changed)
+        self.assertEqual((blocked['diagnostic'], blocked['input_dispatched']), ('target_changed', False))
+        self.assertEqual(self.calls, [])
+        verified = execute(lambda: checks.append(len(self.calls)))
+        self.assertEqual(verified['status'], 'verified')
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N')])
+        self.assertEqual(checks, [0, 1])
+
     def test_menu_invoke_has_no_business_result_and_choose_rejects_offscreen_item(self):
         menu = Element(50011, self.root, ['Click'])
         self.assertEqual(self.run_action('invoke', None, item=menu)['status'], 'delivered_unverified')

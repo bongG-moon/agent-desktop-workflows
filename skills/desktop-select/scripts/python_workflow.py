@@ -743,7 +743,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                      'choose' if step['action'] == 'choose-item' else step['action'])
                         try:
                             receipt = live.execute(surface, uia, element, {'role': selector['role']}, operation,
-                                                   value, still_valid=check)
+                                                   value, still_valid=check, just_resolved='automation_id' in selector)
                         finally:
                             if anchor_proof is not None:
                                 anchor_proof.close()
@@ -916,10 +916,23 @@ GUIDE_END = '<!-- /desktop-select:run -->\n\n'
 def run_instructions(recipe):
     parameters = list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s))
     arguments = ' --set "이름=값"' if parameters else ''
-    note = ('화면 확인과 실제 입력이 필요한 창 및 메뉴 경로를 알린다. '
+    profile = input_policy.profile(recipe['steps'])
+    physical = profile['physical_input_required']
+    scopes = []
+    if physical:
+        for step, mode in zip(recipe['steps'], profile['steps']):
+            if mode['input_mode'] not in ('physical_pointer', 'physical_keyboard'):
+                continue
+            scope = step.get('window_context') or step.get('popup') or {}
+            menu = workflow_repair.menu(step)
+            action = '우클릭 → ' + ' → '.join(menu['path']) if menu else step.get('label') or step['action']
+            line = json.dumps([scope.get('title', recipe['window']), action], ensure_ascii=False)
+            if line not in scopes:
+                scopes.append(line)
+    note = ('등록된 실제 입력의 [작업 창, 동작]은 ' + ', '.join(scopes) + '이다. '
             '현재 요청이나 앞선 대화에서 해당 실행의 실제 입력과 화면 확인을 승인받았으면 다시 묻지 않고 이어 간다. '
-            '승인이 없으면 마우스와 키보드를 비울 수 있는지 한 번 묻는다. 거절하면 실행을 멈춘다. '
-            if input_policy.profile(recipe['steps'])['physical_input_required'] else '')
+            '승인이 없으면 해당 범위를 알리고 마우스와 키보드를 비울 수 있는지 한 번 묻는다. 거절하면 실행을 멈춘다. '
+            if physical else '')
     if note:
         arguments += ' --allow-physical'
     return (GUIDE_BEGIN + '## 실행 요청\n\n'
@@ -932,7 +945,8 @@ def run_instructions(recipe):
             '실행 중에는 각 동작 직전에 해당 대상과 창을 확인한다.\n\n'
             + '`python -X utf8 -B scripts/run.py --summary' + arguments + '`\n\n'
             '결과 JSON을 바로 보고한다. outcome=workbook_verified이면 verified_outputs에 적힌 파일 경로를 사용한다. '
-            '출력 폴더를 다시 검색하거나 파일을 다시 열 필요는 없다. '
+            '종료 코드 3이면 JSON의 전달 및 확인 상태를 보고한다. 파일 확인 조건이나 추가 확인 요청이 없으면 '
+            '폴더 검색 없이 그 결과로 마친다. 파일 확인이 요청돼도 지정한 경로나 discover-output 후보만 확인한다. '
             '중단됐으면 stopped_at, diagnostic, input_dispatched를 먼저 확인한다. '
             'menu_repair가 있으면 같은 승인의 범위에서 frame_args로 해당 표를 확인한다. '
             '녹화 지시와 현재 이미지에서 같은 셀을 찾아 resume_args의 X, Y에 이미지 픽셀을 넣고 같은 변수로 이어 간다. '

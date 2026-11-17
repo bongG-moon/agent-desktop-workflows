@@ -251,7 +251,8 @@ class CapturedPlanTests(unittest.TestCase):
             args=argparse.Namespace(task='새 녹화',prepare=True,only=None,image=False,bindings=None,save_as='실행')
             with (patch.object(app,'task_directory',return_value=folder),patch.object(app,'windows',return_value=[]),
                   patch.object(app,'pick_window',return_value={}),patch.object(app.bridge,'Binding',return_value=owner),
-                  patch.object(app,'guard'),patch.object(recovery,'_bind_surface',side_effect=bind),
+                  patch.object(app,'guard'),patch.object(app.visibility, 'require_observable'),
+                  patch.object(recovery,'_bind_surface',side_effect=bind),
                   patch('live_recovery.observe_scope',return_value=inventory) as read):
                 result = recovery.run(app,args)
             self.assertEqual(result['status'],'recorded',result)

@@ -25,6 +25,7 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.directory = Path(temp.name)
         self.inputs = self.directory / 'binding.json'
         self.owner = SimpleNamespace(hwnd=1, pid=2, created=3, exe='Demo.exe')
+        self.observable = Mock()
         self.observe = Mock(return_value=dict(targets=[
             dict(role='combobox', automation_id='c_status', semantic_label='MES Setup', enabled=True, offscreen=False),
             dict(role='combobox', automation_id='c_family', semantic_label='Family', enabled=True, offscreen=False),
@@ -36,6 +37,7 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
                   patch.object(app, 'task_directory', return_value=self.directory),
                   patch.object(app, 'windows', return_value=[dict(hwnd=1, title='업무')]),
                   patch.object(app, 'pick_window', return_value={}), patch.object(app.bridge, 'Binding', return_value=self.owner),
+                  patch.object(app.visibility, 'require_observable', self.observable),
                   patch.object(app, 'guard')):
             p.start()
             self.addCleanup(p.stop)
@@ -107,6 +109,67 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         windows[:] = windows[1:3]
         self.assertEqual(self.bind(info['source_fingerprint'], self.patches())['diagnostic'], 'target_missing')
         self.assertFalse((self.directory/'실행용.json').exists())
+
+    def test_generated_fields_and_named_frame_region_use_one_targeted_scope(self):
+        info = self.probe()
+        fields = info['bindings_template']['steps']
+        self.assertEqual([item['match'] for item in fields], ['automation_id'] * 3)
+        self.observe.reset_mock()
+        result = self.bind(info['source_fingerprint'], fields + [self.patches()[-1]])
+        self.assertEqual(result['status'], 'recorded', result)
+        self.observe.assert_called_once()
+        kwargs = self.observe.call_args.kwargs
+        self.assertTrue(kwargs['bindings_only'])
+        self.assertEqual(kwargs['lookups']['selectors'], [
+            dict(automation_id='c_status', role='combobox'), dict(automation_id='c_family', role='combobox'),
+            dict(automation_id='query', role='button')])
+        self.assertEqual(kwargs['lookups']['regions'], [('results', 'group')])
+
+    def test_explicit_identifier_cannot_bind_another_controls_label(self):
+        inventory = dict(targets=[dict(role='combobox', automation_id='other',
+                                       semantic_label='missing', enabled=True, offscreen=False)])
+        with self.assertRaisesRegex(tasks.TaskError, 'target_missing'):
+            recovery._observed_field(dict(role='combobox', match='automation_id', target='missing'), inventory)
+
+    def test_minimized_window_stops_once_and_only_restores_on_explicit_request(self):
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        self.observable.side_effect = app.bridge.BridgeError('target_window_minimized')
+        with patch.object(app.visibility, 'restore_for_action', return_value=True) as restore:
+            result = recovery.run(app, self.args(prepare=True))
+            self.assertEqual(result['diagnostic'], 'target_window_minimized')
+            self.assertEqual(result['host_action'], 'retry_same_recovery_with_restore_window')
+            self.assertEqual(result['retry_args'], ['recover', '--task', '내 녹화', '--restore-window', '--prepare'])
+            self.assertLess(list(result).index('diagnostic'), list(result).index('steps'))
+            self.assertFalse(result['input_dispatched'])
+            self.observe.assert_not_called()
+            self.observable.assert_called_once_with(self.owner)
+            fingerprint = recovery._fingerprint(tasks.read_document(self.args().task, self.directory))
+            result = self.bind(fingerprint, self.patches())
+            self.assertEqual(result['retry_args'], ['recover', '--task', '내 녹화', '--restore-window',
+                                                    '--bindings', str(self.inputs), '--save-as', '실행용'])
+            self.observe.assert_not_called()
+            restore.assert_not_called()
+            result = recovery.run(app, self.args(restore_window=True))
+            self.assertEqual(result['status'], 'observed')
+            self.assertTrue(result['window_restored'])
+            restore.assert_called_once_with(self.owner, '업무')
+
+    def test_demonstrated_result_area_can_bind_only_exact_point_on_a_single_table(self):
+        sentence = '데이터 조회 결과가 나오면 이 영역에서 우클릭해줘'
+        self.rows[3]['form']['text'] = sentence
+        self.rows[3]['step']['menu_window_point'] = [.4, .6]
+        self.assertFalse(recovery._any_body_cell(sentence))
+        self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
+        table = dict(role='table', automation_id='table', enabled=True, offscreen=False)
+        self.observe.return_value['targets'].append(table)
+        self.assertEqual(self.recover_cli('--prepare')['status'], 'recorded')
+        grounded = self.menu.call_args.args[-1]
+        self.assertEqual((grounded['target'], grounded['menu_window_point']), ('table', [.4, .6]))
+        self.assertNotIn('point_policy', grounded)
+        self.observe.return_value['targets'].append(dict(table, automation_id='otherTable'))
+        self.menu.reset_mock()
+        self.assertEqual(self.recover_cli('--prepare')['status'], 'needs_grounding')
+        self.menu.assert_not_called()
 
     def test_bad_source_revision_does_not_open_windows_or_publish(self):
         self.probe()

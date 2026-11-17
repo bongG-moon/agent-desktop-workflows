@@ -51,9 +51,9 @@ def exercise(archive, work):
         # An old draft with separate captions, a saved click and no menu-item selectors.
         rows = []
         for reason, text in [
-            ('capture_target_unavailable', 'MES Setup을 N으로 설정해줘'),
-            ('capture_target_unavailable', 'Family를 Hybrid로 설정해줘'),
-            ('capture_target_unavailable', 'Search 버튼을 누르고 2초 기다려줘'),
+            ('capture_target_unavailable', "MES SETUP조건을 'N'으로 설정"),
+            ('capture_target_unavailable', "Family 조건에 'Hybrid' 설정"),
+            ('capture_target_unavailable', 'Search 버튼을 눌러줘'),
             ('right_click_requires_menu_teaching', '조회된 결과 표에서 우클릭해줘'),
             ('popup_needs_live_binding', 'Export to excel 선택'),
             ('unsupported_recorded_action', 'Active sheet 선택'),
@@ -74,6 +74,8 @@ def exercise(archive, work):
         assert registration['status'] == 'registered' and not registration['input_dispatched'], registration
         recipe_path = registered / 'workflow.json'
         stored = json.loads(recipe_path.read_bytes())
+        assert [s['seconds'] for s in stored['steps'] if s['action'] == 'wait'] == [5], stored
+        assert [s['value'] for s in stored['steps'] if s['action'] == 'set-value'] == ['N', 'Hybrid'], stored
         menu = stored['steps'][-1]['context']['menu']
         assert menu['path'] == ['Export to excel', 'Active sheet'] and menu['point'] == anchor['point'], menu
         # The fixture now displays a separate sibling panel over the formerly valid point.

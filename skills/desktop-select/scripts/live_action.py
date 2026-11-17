@@ -316,7 +316,7 @@ def submit(binding, uia, element, node, *, still_valid):
                       None if pending else False)
 
 
-def execute(binding, uia, element, node, action, value=None, *, still_valid):
+def execute(binding, uia, element, node, action, value=None, *, still_valid, just_resolved=False):
     """The caller re-resolves this exact business field/window in still_valid()."""
     if action == 'submit':
         if value is not None:
@@ -329,8 +329,8 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
         nonlocal method, pending
         method, pending = next_method, True
 
-    def check_target(full=True):
-        if full:
+    def check_target(full=True, *, resolve_again=True):
+        if full and resolve_again:
             still_valid()
         binding.check()
         root = uia.from_handle(binding.hwnd)
@@ -359,7 +359,9 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid):
         return None
 
     try:
-        check_target()
+        # The workflow already found this exact ID and checked its recorded label.
+        # Every pattern call still re-resolves immediately before its mutation.
+        check_target(resolve_again=not just_resolved)
         role = win.ROLES.get(element.property(30003))
         _require(role and role == node.get('role'), 'target_role_changed')
 

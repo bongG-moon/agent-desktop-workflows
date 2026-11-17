@@ -5,7 +5,6 @@ import json
 import os
 from contextlib import ExitStack
 from pathlib import Path
-import secrets
 import tempfile
 import time
 
@@ -105,6 +104,7 @@ class RepairSession:
         tasks._deny_redirect(self.pending)
 
     def start(self, recipe, overrides, number, scope, only, checked_fields, query_sent, routes=None):
+        import secrets
         ticket = secrets.token_hex(24)
         pending = dict(ticket=ticket, recipe=digest(recipe), variables=digest(overrides),
                        number=number, scope=scope, only=only, checked_fields=checked_fields,
@@ -122,6 +122,7 @@ class RepairSession:
                     host_action='inspect_menu_repair_frame', frame_args=['--repair-frame', ticket, '--allow-physical'])
 
     def read(self, ticket, recipe):
+        import secrets
         need(self.pending.is_file() and self.pending.stat().st_size < tasks.MAX_FILE_BYTES, 'menu_repair_expired')
         record = json.loads(self.pending.read_text(encoding='utf8'))
         need(secrets.compare_digest(record['ticket'], ticket) and time.time() < record['expires'],

@@ -37,13 +37,12 @@ import review_drafts
 import input_policy
 
 
-def windows(exe):
-    """Enumerate top-level windows. Only obtain captions from the requested app."""
+def windows(exe, *, only_hwnd=None):
+    """Read captions only in the requested app; a specific top-level HWND needs no inventory."""
     bridge._windows()
     if not exe or Path(exe).name != exe or not exe.casefold().endswith('.exe'):
         raise SelectionError('exact_exe_name_required')
     records, truncated = [], False
-    callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
 
     def visit(hwnd, _):
         nonlocal truncated
@@ -62,6 +61,11 @@ def windows(exe):
                 return False
         return True
 
+    if only_hwnd is not None:
+        if 0 < only_hwnd <= 0x7fffffffffffffff and bridge.root_window(only_hwnd) == only_hwnd:
+            visit(only_hwnd, 0)
+        return records
+    callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
     enum = bridge._sig(bridge.user32, 'EnumWindows', W.BOOL, callback_type, W.LPARAM)
     if not enum(callback_type(visit), 0) or truncated:
         raise SelectionError('window_list_incomplete')
@@ -79,7 +83,8 @@ def pick_window(records, title, hwnd):
 
 def guard(owner, surface, title, mutate=False):
     owner.check()
-    surface.check()
+    if surface is not owner:
+        surface.check()
     if bridge.window_text(owner.hwnd) != title or not bridge.user32.IsWindowVisible(owner.hwnd):
         raise SelectionError('business_window_changed')
     if owner.hwnd != surface.hwnd and (not bridge.owned(surface.hwnd, owner.hwnd)
@@ -403,6 +408,8 @@ def execution_plan_info(result):
     if recipe:
         info.update(source_fingerprint=envelope['source_fingerprint'], steps=len(recipe['steps']),
                     required_parameters=list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s)))
+        if envelope.get('notes'):
+            info['notes'] = envelope['notes']
         conditional = [dict(number=n, seconds=s['seconds'], when_present=s['when_present']['name'],
                             dismiss=s['dismiss']['name'], always=s['always']['name'])
                        for n, s in zip(envelope['source_steps'], recipe['steps']) if s['action'] == 'conditional-open']
@@ -699,7 +706,7 @@ def recorder_request(path):
         raise SelectionError('invalid_recorder_request') from error
 
     fields = {
-        'record': ({'command', 'task', 'exe', 'window'}, {'hwnd': None}),
+        'record': ({'command', 'task', 'exe'}, {'window': None, 'hwnd': None}),
         'review': ({'command', 'task'}, {}),
         'continue-recording': ({'command', 'task'}, {'from_step': None, 'supplement': None, 'save_as': None}),
     }
@@ -776,18 +783,22 @@ def run(args):
         return {'status': 'observed', 'task': tasks.summary(plan), 'input_dispatched': False}
     if args.command == 'replay':
         original = plan
-        plan = tasks.resolve_saved_intents(original)
-        requirements = replay_input_requirements(original, args.only)
         if getattr(args, 'input_plan', False):
-            return dict(status='observed', input_dispatched=False, input_requirements=requirements)
+            return dict(status='observed', input_dispatched=False,
+                        input_requirements=replay_input_requirements(original, args.only))
         background = getattr(args, 'background_only', False)
+        requirements = None
         if background:
+            requirements = replay_input_requirements(original, args.only)
             refusal = input_policy.blocked(requirements)
             if refusal:
                 return refusal
         overrides = tasks.parse_overrides(args.set)
         quick = fast_replay(original, args, overrides)
         if quick is None:
+            plan = tasks.resolve_saved_intents(original)
+            if requirements is None:
+                requirements = replay_input_requirements(original, args.only)
             report = _replay_recorded(plan, args, overrides, background)
             if report.get('diagnostic') == 'instruction_requires_structure':
                 report['host_action'] = 'interpret_recorded_instructions'
@@ -799,9 +810,21 @@ def run(args):
             return attach_recovery(quick, args.task, prepare=quick.get('input_dispatched') is False
                                    and not (quick.get('grounding_steps') or args.only or background))
         return quick
-    rows = windows(args.exe)
+    if args.command == 'record' and args.hwnd is not None:
+        rows = windows(args.exe, only_hwnd=args.hwnd)
+    else:
+        rows = windows(args.exe)
     if args.command == 'windows':
         return {'status': 'observed', 'windows': rows, 'input_dispatched': False}
+    if args.command == 'record' and getattr(args, 'report_ready', False):
+        choices = [dict(title=r['title'], hwnd=r['hwnd']) for r in rows
+                   if tasks._text(r['title']) and (args.window is None or r['title'] == args.window)]
+        if not choices:
+            raise SelectionError('window_not_found')
+        if len(choices) > 1:
+            return dict(status='needs_input', diagnostic='ambiguous_window', windows=choices,
+                        input_dispatched=False)
+        args.window = choices[0]['title']
     binding = pick_window(rows, args.window, args.hwnd)
     owner = bridge.Binding(binding)
     if args.command == 'row-launch':
@@ -941,6 +964,7 @@ def parser():
     repair.add_argument('--image', action='store_true', help='also capture the selected step window locally')
     repair.add_argument('--bindings', type=Path, help='local JSON with source_fingerprint and interpreted steps')
     repair.add_argument('--prepare', action='store_true', help='resolve the recording once and save a ready copy without input')
+    repair.add_argument('--restore-window', action='store_true', help='permit restoring the identified minimized application window for observation')
     repair.add_argument('--save-as', help='derived task name when applying bindings')
     continuation = commands.add_parser('continue-recording', help='record or merge a supplement while preserving the source')
     continuation.add_argument('--task', required=True)

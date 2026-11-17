@@ -45,8 +45,10 @@ class NaturalPlanCLI(unittest.TestCase):
 
     def test_normal_replay_uses_one_worker_and_literal_plan(self):
         receipt = dict(status='completed_unverified', input_dispatched=True)
-        with patch.object(app, 'worker_receipt', return_value=receipt) as worker:
+        with (patch.object(app, 'worker_receipt', return_value=receipt) as worker,
+              patch.object(recorded_plan, 'compile_saved', wraps=recorded_plan.compile_saved) as compiler):
             result = app.run(self.args(extra=['--set', 'Family=Hybrid']))
+        compiler.assert_called_once()
         self.assertEqual(result['execution_engine'], 'saved_python_plan')
         worker.assert_called_once()
         self.assertEqual(worker.call_args.args[0], ['_plan'])

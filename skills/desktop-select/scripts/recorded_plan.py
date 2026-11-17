@@ -15,8 +15,9 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 10
+COMPILER = 11
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
+DEFAULT_QUERY_SETTLE_SECONDS = 5
 
 
 def _canonical(value):
@@ -30,6 +31,16 @@ def fingerprint(task):
 
 def _result(status, **fields):
     return dict(status=status, input_dispatched=False, **fields)
+
+
+def _query_before_result_menu(button, following):
+    """Only an identified query button followed by its own window's separate grid menu."""
+    if (button['role'] != 'button' or following['action'] != 'result-menu'
+            or following['context']['trigger'] is not None
+            or button.get('window_context') != following.get('window_context')):
+        return False
+    caption = button.get('command_name') or (button['target'] if button['match'] == 'name' else '')
+    return caption.strip().casefold() in {'조회', '검색', 'search', 'query', 'find', 'refresh', '새로고침'}
 
 
 def compile_plan(task, *, replacements=None):
@@ -113,7 +124,8 @@ def compile_plan(task, *, replacements=None):
             continue
         # Original recorded playback stopped at a command whose business result
         # was unverified. Do not silently turn that into immediate continuation.
-        if step['action'] == 'open' and number < len(steps) and not step.get('wait_after') and number not in openers:
+        wait_after = step.get('wait_after')
+        if step['action'] == 'open' and number < len(steps) and not wait_after and number not in openers:
             # Independent clicks in two separately recorded device windows do not
             # make the next device depend on the first one's business outcome.
             next_step = steps[number]
@@ -125,7 +137,14 @@ def compile_plan(task, *, replacements=None):
             # next page of that same dialog. Each next target is read live.
             dialog_sequence = (current_scope and current_scope.get('related') is True and
                                current_scope == next_scope)
-            if not independent and not dialog_sequence:
+            if _query_before_result_menu(step, next_step):
+                # A taught indicator is checked by result-menu itself. With no
+                # signal retain a settling interval and report its limited scope.
+                if next_step['context']['ready'] is None:
+                    wait_after = DEFAULT_QUERY_SETTLE_SECONDS
+                    notes.append(dict(step=number, diagnostic='default_query_settle',
+                                      seconds=wait_after, business_result='not_verified'))
+            elif not independent and not dialog_sequence:
                 return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])
         if step['match'] == 'query':
@@ -160,8 +179,8 @@ def compile_plan(task, *, replacements=None):
                                   parameter=step['parameter']))
         converted.append(current)
         source_steps.append(number)
-        if step['action'] == 'open' and 'wait_after' in step:
-            wait = dict(action='wait', seconds=step['wait_after'])
+        if step['action'] == 'open' and wait_after:
+            wait = dict(action='wait', seconds=wait_after)
             if context is not None:
                 wait['window_context'] = deepcopy(context)
             converted.append(wait)
@@ -217,7 +236,10 @@ def save_plan(task, directory=None):
     Store failure is a separate status so saving the original recording can
     still succeed. Invalid source tasks raise their original validation error.
     """
-    result = compile_saved(task, directory)
+    return _store_compiled(task, directory, compile_saved(task, directory))
+
+
+def _store_compiled(task, directory, result):
     if result['status'] != 'compiled':
         return result
     data = (json.dumps(result['envelope'], ensure_ascii=False, indent=2) + '\n').encode('utf8')
@@ -249,7 +271,10 @@ def save_plan(task, directory=None):
 
 def load_plan(task, directory=None):
     """Never expose a stale or altered recipe, even if its fingerprint was kept."""
-    expected = compile_saved(task, directory)
+    return _read_compiled(task, directory, compile_saved(task, directory))
+
+
+def _read_compiled(task, directory, expected):
     if expected['status'] != 'compiled':
         return expected
     try:
@@ -279,7 +304,8 @@ def load_plan(task, directory=None):
 
 def get_plan(task, directory=None):
     """Reuse a matching plan, or regenerate from the current validated recording."""
-    existing = load_plan(task, directory)
-    if existing['status'] in ('loaded', 'not_compatible', 'plan_unavailable'):
+    expected = compile_saved(task, directory)
+    existing = _read_compiled(task, directory, expected)
+    if existing['status'] not in ('missing', 'invalid', 'stale'):
         return existing
-    return save_plan(task, directory)
+    return _store_compiled(task, directory, expected)

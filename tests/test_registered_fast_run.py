@@ -48,6 +48,20 @@ class RegisteredFastRunTests(unittest.TestCase):
         del self.result['steps'][1]['receipt']['verified_path']
         self.assertEqual(self.cli(self.result, '--summary')[0], 3)
 
+    def test_guide_exposes_physical_scope_and_expected_output_without_an_extra_probe(self):
+        recipe = dict(self.recipe, steps=[
+            dict(action='set-value', parameter='Family'),
+            dict(action='context-menu', spec=dict(path=['Export', 'Active sheet']),
+                 window_context=dict(title='Results')),
+            dict(action='context-menu', spec=dict(path=['Show details']))])
+        guide = flow.run_instructions(recipe)
+        self.assertIn('["Results", "우클릭 → Export → Active sheet"]', guide)
+        self.assertIn('["Example", "우클릭 → Show details"]', guide)
+        self.assertIn('["Family"]', guide)
+        self.assertIn('--allow-physical', guide)
+        self.assertIn('폴더 검색 없이', guide)
+        self.assertNotIn('--allow-physical', flow.run_instructions(self.recipe))
+
     def test_live_root_is_checked_once_before_two_actions_without_scanning_children(self):
         binding = MagicMock(hwnd=31, pid=42)
         uia = MagicMock()

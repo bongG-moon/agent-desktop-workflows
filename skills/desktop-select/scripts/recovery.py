@@ -118,18 +118,23 @@ def _summary(number, row, doc):
 
 def _observed_field(item, inventory):
     query, role = item.get('target'), item.get('role')
+    identity = item.get('match')
+    _require(identity in (None, 'automation_id', 'name'), 'invalid_recovery_target')
     _require(tasks._text(query) and isinstance(role, str) and role in (tasks.INVOKE | set(tasks.VALUE_ACTIONS.values())),
              'invalid_recovery_target')
     def matches(value):
         return isinstance(value, str) and value.strip().casefold() == query.strip().casefold()
     candidates = [node for node in inventory['targets'] if node.get('role') == role and
-                  any(matches(node.get(key)) for key in ('automation_id', 'name', 'semantic_label'))]
+                  (node.get(identity) == query if identity else
+                   any(matches(node.get(key)) for key in ('automation_id', 'name', 'semantic_label')))]
     _require(len(candidates) == 1, 'target_ambiguous' if candidates else 'target_missing')
     node = candidates[0]
     _require(node.get('enabled') is True, 'target_disabled')
     _require(node.get('offscreen') is False, 'target_offscreen')
     aid = node.get('automation_id')
-    if tasks._text(aid) and not aid.isdecimal():
+    if identity:
+        match = identity
+    elif tasks._text(aid) and not aid.isdecimal():
         match = 'automation_id'
     elif tasks._text(node.get('name')):
         match = 'name'
@@ -157,7 +162,7 @@ def _post_click_wait(text):
 
 
 def _field(row, item, inventory):
-    _require(set(item) <= {'number', 'mode', 'target', 'role', 'argument', 'wait_after'}, 'invalid_recovery_binding')
+    _require(set(item) <= {'number', 'mode', 'target', 'role', 'argument', 'wait_after', 'match'}, 'invalid_recovery_binding')
     original, mode, argument = row['step'], item['mode'], item.get('argument')
     _require(original['action'] in (*tasks.VALUE_ACTIONS, 'open') or tasks.is_recoverable(original),
              'step_requires_dedicated_binding')
@@ -234,6 +239,8 @@ def _suggest_binding(number, row, inventory):
                 if spec is None or spec['mode'] not in ('fixed', 'required', 'recorded'):
                     continue
                 request.update(target=identity['target'], mode=spec['mode'])
+                if identity['match'] in ('automation_id', 'name'):
+                    request['match'] = identity['match']
                 if spec['mode'] != 'recorded':
                     request['argument'] = spec.get('parameter', spec.get('value'))
                 _field(row, request, inventory)
@@ -364,6 +371,14 @@ def _any_body_cell(text):
         text.strip(), re.IGNORECASE))
 
 
+def _demonstrated_result_point(text):
+    # A demonstrative refers to this exact recorded point, never any other cell.
+    return bool(re.fullmatch(r'(?:(?:데이터\s*)?(?:조회|검색)\s*결과가\s*(?:나오면|표시되면)\s*)?'
+                             r'(?:이|해당)\s*(?:영역|위치)에서\s*우클릭(?:을)?\s*(?:해|눌러)?\s*(?:줘|주세요)?[.!。]?'
+                             r'|right[- ]click\s+(?:here|in this area|at this point)[.!]?',
+                             text.strip(), re.IGNORECASE))
+
+
 def _menu(app, rows, item, owner, surface, title, fingerprint, *, prepare=False, detail=None, inventory=None):
     import live_recovery
     number, end = item['number'], item.get('through', item['number'])
@@ -461,6 +476,26 @@ def _binding_map(file, fingerprint, count):
     return indexed
 
 
+def _blocked(result, diagnostic, **fields):
+    # Hosts sometimes display just the first part of a long window inventory.
+    # Keep the cause and the next action ahead of the original step evidence.
+    header = dict(status='needs_grounding', diagnostic=diagnostic, **fields)
+    if result.get('host_action'):
+        header.setdefault('host_action', result['host_action'])
+    return {**header, **{key: value for key, value in result.items() if key not in header}}
+
+
+def _restore_args(args):
+    retry = ['recover', '--task', args.task, '--restore-window']
+    for option in ('prepare', 'image', 'only', 'bindings', 'save_as'):
+        value = getattr(args, option, None)
+        if value:
+            retry.append('--' + option.replace('_', '-'))
+            if value is not True:
+                retry.append(str(value))
+    return retry
+
+
 def _suggest(number, rows, detail, observation, name):
     if detail.get('reason') != 'right_click_requires_menu_teaching':
         return _suggest_binding(number, rows[number-1], observation)
@@ -473,7 +508,8 @@ def _suggest(number, rows, detail, observation, name):
                        if all(node.get(k) == v for k, v in anchor['target'].items())]
             if len(matches) == 1 and matches[0].get('enabled') is True and matches[0].get('offscreen') is False:
                 return hint
-        elif detail.get('menu_window_point') and _any_body_cell(rows[number-1]['text']):
+        elif detail.get('menu_window_point') and (_any_body_cell(rows[number-1]['text']) or
+                                                  _demonstrated_result_point(rows[number-1]['text'])):
             # A window-relative point is only a hint. Require a single actual
             # table and later prove this point belongs to that table.
             tables = [n for n in observation['targets'] if n.get('role') == 'table'
@@ -519,6 +555,30 @@ def _recorded_lookups(rows):
         if selector not in selectors:
             selectors.append(selector)
     return dict(selectors=selectors, captions=captions)
+
+
+def _binding_lookups(operations, rows, context):
+    """Generated bindings carry exact identities; hand-written label queries still need discovery."""
+    selectors, regions = [], []
+    for number, item in operations.items():
+        if rows[number-1]['context'] != context:
+            continue
+        if item['mode'] == 'context-menu':
+            # _menu revalidates the region/point independently. A supplied frame
+            # also needs to disambiguate an untyped region name in the inventory.
+            if 'frame' in item:
+                name, role = item.get('target'), item.get('role')
+                if not tasks._text(name) or not tasks._text(role):
+                    return None
+                if (name, role) not in regions:
+                    regions.append((name, role))
+            continue
+        if item.get('match') not in ('automation_id', 'name'):
+            return None
+        selector = {item['match']: item.get('target'), 'role': item.get('role')}
+        if selector not in selectors:
+            selectors.append(selector)
+    return dict(selectors=selectors, captions=[], regions=regions)
 
 
 def _observe_command(step, inventory, app=None, surface=None):
@@ -578,8 +638,18 @@ def run(app, args):
                   live_scopes=[], input_dispatched=False)
     try:
         owner = app.bridge.Binding(app.pick_window(app.windows(doc['exe']), doc['window'], None))
+        if getattr(args, 'restore_window', False):
+            result['window_restored'] = app.visibility.restore_for_action(owner, doc['window'])
+        else:
+            # A child-only request can otherwise report a missing popup before
+            # it ever observes the minimized business window that owns it.
+            app.visibility.require_observable(owner)
     except (ValueError, app.bridge.BridgeError) as error:
-        return dict(result, status='needs_grounding', diagnostic=getattr(error, 'code', 'recorded_window_not_open'))
+        reason = getattr(error, 'code', 'recorded_window_not_open')
+        if reason == 'target_window_minimized' and not getattr(args, 'restore_window', False):
+            return _blocked(result, reason, step_number=min(operations, default=selection[0]),
+                            retry_args=_restore_args(args), host_action='retry_same_recovery_with_restore_window')
+        return _blocked(result, reason)
 
     observations, revised, remap = {}, [], {}
     skip_until = 0
@@ -616,9 +686,12 @@ def run(app, args):
                     continue
                 key = surface.hwnd, surface.pid, surface.created
                 if key not in observations:
+                    scoped_lookups = (_binding_lookups(operations, rows, row['context']) if args.bindings
+                                      else lookups if row['context'] is None else None)
                     observation = live_recovery.observe_scope(app, owner, surface, doc['window'],
                                             frame_key=[fingerprint, number] if args.image else None,
-                                            **({'lookups': lookups} if lookups else {}))
+                                            **({'bindings_only': True} if args.bindings else {}),
+                                            **({'lookups': scoped_lookups} if scoped_lookups else {}))
                     observations[key] = len(result['live_scopes'])
                     result['live_scopes'].append(observation)
                 detail['scope_index'] = observations[key]
@@ -662,6 +735,15 @@ def run(app, args):
         except (ValueError, app.bridge.BridgeError) as error:
             reason = getattr(error, 'code', 'target_unavailable')
             detail['diagnostic'] = reason
+            if reason == 'target_window_minimized':
+                # Reading the other controls on this minimized surface would
+                # repeat the same failure and can turn it into target_missing.
+                if not row['context'] and not getattr(args, 'restore_window', False):
+                    return _blocked(result, reason, step_number=number, retry_args=_restore_args(args),
+                                    host_action='retry_same_recovery_with_restore_window')
+                return _blocked(result, reason, step_number=number, host_action='show_recorded_window_then_retry')
+            if reason == 'context_point_occluded':
+                detail['recovery_hint'] = '녹화한 창의 표 지점이 가려져 있습니다. 해당 위치가 보이는 상태에서 같은 보정을 계속하세요.'
             if reason == 'menu_step_range_mismatch':
                 detail['conflicting_step'] = error.step_number
                 detail['recovery_hint'] = f"{error.step_number}번의 창, 컨트롤 및 메뉴 이름을 원문과 대조하세요."
@@ -671,7 +753,8 @@ def run(app, args):
                           'recorded_window_opener_unresolved') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
             if args.bindings:
-                return dict(result, status='needs_grounding', diagnostic=reason, step_number=number)
+                return _blocked(result, reason, step_number=number,
+                                **({'recovery_hint': detail['recovery_hint']} if 'recovery_hint' in detail else {}))
             if prepare:
                 pending[number] = reason
                 if 'menu_binding_hint' in detail:
@@ -696,9 +779,9 @@ def run(app, args):
         result['bindings_template'] = dict(source_fingerprint=fingerprint, steps=suggested)
         if pending:
             n = next(iter(pending))
-            result.update(status='needs_grounding', diagnostic=pending[n], step_number=n)
+            return _blocked(result, pending[n], step_number=n)
         if not result['live_scopes']:
-            result.update(status='needs_grounding', diagnostic=details[0].get('diagnostic', 'target_unavailable'))
+            return _blocked(result, details[0].get('diagnostic', 'target_unavailable'))
         return result
     app.guard(owner, owner, doc['window'])
     task = dict(schema=1, name=destination, exe=doc['exe'], window=doc['window'], steps=revised)
@@ -706,9 +789,9 @@ def run(app, args):
         import recorded_plan
         plan = recorded_plan.compile_plan(task)
         if not plan.get('envelope'):
-            return dict(result, status='needs_grounding', diagnostic=plan.get('diagnostic', 'instruction_requires_structure'),
-                        step_number=next((i for i, n in remap.items() if n == plan.get('step')), None),
-                        host_action='bind_recorded_instructions_from_live_scopes')
+            return _blocked(result, plan.get('diagnostic', 'instruction_requires_structure'),
+                            step_number=next((i for i, n in remap.items() if n == plan.get('step')), None),
+                            host_action='bind_recorded_instructions_from_live_scopes')
     try:
         # Compare and publish under the same short lock used to revise editor
         # drafts. The source may have been edited while live targets were read.
@@ -725,10 +808,12 @@ def run(app, args):
         if not error.step_number:
             raise
         original_number = next(i for i, n in remap.items() if n == error.step_number)
-        return dict(result, status='needs_grounding', diagnostic=error.code, step_number=original_number)
+        return _blocked(result, error.code, step_number=original_number)
     saved = dict(status='recorded', source_task=doc['name'], task=tasks.summary(task), input_dispatched=False,
                  source_fingerprint=fingerprint, source_steps=remap,
                  execution_plan=app.execution_plan_info(app.saved_execution_plan(task)))
+    if 'window_restored' in result:
+        saved['window_restored'] = result['window_restored']
     if prepare:
         saved['host_action'] = 'use_prepared_task'
         saved['observed_scopes'] = len(observations)

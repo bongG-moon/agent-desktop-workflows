@@ -137,7 +137,7 @@ class CompositionTests(unittest.TestCase):
         self.popups = [dict(hwnd=200, title='Export settings')]
         self.disabled = True
 
-    def execute(self, surface, uia, element, node, operation, value, *, still_valid):
+    def execute(self, surface, uia, element, node, operation, value, *, still_valid, just_resolved):
         still_valid()
         self.events.append((operation, surface.hwnd, value))
         if operation in ('fill', 'select'):

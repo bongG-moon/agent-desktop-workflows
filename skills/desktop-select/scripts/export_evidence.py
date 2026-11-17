@@ -6,8 +6,6 @@ import posixpath
 from pathlib import Path
 import stat
 import time
-import zipfile
-from xml.etree import ElementTree as ET
 
 from learned_tasks import TaskError
 
@@ -141,6 +139,8 @@ def inventory(spec):
 
 def workbook(path):
     """Validate small metadata parts without extracting anything or reading business cells."""
+    import zipfile
+    from xml.etree import ElementTree as ET
     try:
         if path.stat().st_size > 268_435_456:
             return False
@@ -225,6 +225,7 @@ def baseline(spec):
 
 
 def wait(spec, before, *, timeout=26, pause=.3):
+    import zipfile
     if isinstance(before, Baseline):
         before.verified_path = None
     deadline, previous = time.monotonic() + timeout, None
