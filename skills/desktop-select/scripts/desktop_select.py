@@ -691,6 +691,54 @@ def edit_recording(owner, storage, *, report_ready=False):
     return result
 
 
+def record_application(hint, name=None):
+    """Resolve a human app name once, then use the existing editor and save path."""
+    from datetime import datetime
+    from uuid import uuid4
+    from recorder_targets import inventory, choose_window
+
+    if not tasks._text(hint, 200):
+        raise SelectionError('invalid_recorder_app')
+    if name is not None:
+        tasks._name(name)
+    bridge.set_dpi_awareness()
+
+    def selecting():
+        print(json.dumps(dict(status='recorder_selection_required', app=hint,
+                              input_dispatched=False)), flush=True)
+
+    row = choose_window(hint, inventory(), on_ready=selecting)
+    if row is None:
+        return dict(status='cancelled', input_dispatched=False)
+    # Pin the inventory's process lifetime and preserve the actual caption,
+    # including whitespace. A stale HWND must not bind to a replacement app.
+    owner = bridge.Binding(row)
+    name = name or f"녹화 {datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}"
+    return record_editor(owner, name, row['exe_name'], row['title'], report_ready=True, report_progress=True)
+
+
+def record_editor(owner, name, exe, title, *, report_ready=False, report_progress=False):
+    try:
+        storage = review_drafts.ReviewStorage(name, exe, title, task_directory())
+    except tasks.TaskError as error:
+        if error.code != 'task_already_exists':
+            raise
+        source = tasks.load_task(name, task_directory())
+        tasks.check_binding(source, exe, title)
+        return dict(status='needs_review', diagnostic=error.code, task=tasks.summary(source),
+                    host_action='continue_recording_from_saved_task',
+                    continue_args=['continue-recording', '--task', name], input_dispatched=False)
+    guard(owner, owner, title)
+    result = edit_recording(owner, storage, report_ready=report_ready)
+    if result.get('status') == 'recorded' and (result.get('draft') or
+            result.get('execution_plan', {}).get('status') == 'not_compatible'):
+        if report_progress:
+            print(json.dumps(dict(status='recorder_processing', task=name, saved=True,
+                                  input_dispatched=False)), flush=True)
+        return attach_recovery(result, name, prepare=True)
+    return result
+
+
 def attach_recovery(result, name, *, prepare=False):
     """After an incomplete recording, give the host current app evidence in the same response."""
     result['recover_args'] = ['recover', '--task', name]
@@ -745,7 +793,20 @@ def recorder_request(path):
 
 
 def run(args):
+    if args.command == '_record_app':
+        return record_application(args.app, args.task)
     if args.command == 'recorder':
+        if getattr(args, 'app', None) is not None or getattr(args, 'session', None) is not None:
+            from recorder_launch import launch, status
+            if args.session is not None:
+                if args.task is not None:
+                    raise SelectionError('invalid_recorder_arguments')
+                return status(args.session, wait_seconds=args.wait) if args.wait is not None else status(args.session)
+            if args.wait is not None:
+                raise SelectionError('invalid_recorder_arguments')
+            return launch(args.app, task=args.task)
+        if getattr(args, 'task', None) is not None or getattr(args, 'wait', None) is not None:
+            raise SelectionError('invalid_recorder_arguments')
         args = recorder_request(args.request)
     if args.command == 'storage':
         return storage_info()
@@ -890,22 +951,8 @@ def run(args):
             result.append({'number': number, 'label': step['label'], 'observed_state': state})
         return {'status': 'observed', 'steps': result, 'input_dispatched': False}
     if args.command == 'record':
-        try:
-            storage = review_drafts.ReviewStorage(args.task, args.exe, args.window, task_directory())
-        except tasks.TaskError as error:
-            if error.code != 'task_already_exists':
-                raise
-            source = tasks.load_task(args.task, task_directory())
-            tasks.check_binding(source, args.exe, args.window)
-            return dict(status='needs_review', diagnostic=error.code, task=tasks.summary(source),
-                        host_action='continue_recording_from_saved_task',
-                        continue_args=['continue-recording', '--task', args.task], input_dispatched=False)
-        guard(owner, owner, args.window)
-        result = edit_recording(owner, storage, report_ready=getattr(args, 'report_ready', False))
-        if result.get('status') == 'recorded' and (result.get('draft') or
-                result.get('execution_plan', {}).get('status') == 'not_compatible'):
-            return attach_recovery(result, args.task, prepare=True)
-        return result
+        return record_editor(owner, args.task, args.exe, args.window,
+                             report_ready=getattr(args, 'report_ready', False))
     anchor = context = None
     if getattr(args, 'near', None) is not None:
         plan = tasks.load_task(args.task, task_directory())
@@ -992,8 +1039,13 @@ def replay_step():
 def parser():
     p = argparse.ArgumentParser(description='Select an exact field or command in one Windows business window.')
     commands = p.add_subparsers(dest='command', required=True)
-    host = commands.add_parser('recorder', help='open a recording editor from a literal JSON request; stream readiness and final result')
-    host.add_argument('--request', required=True, type=Path, help='UTF-8 JSON file for record, review or continue-recording')
+    host = commands.add_parser('recorder', help='open a recorder by app name and return when visible; or use a literal JSON request')
+    start = host.add_mutually_exclusive_group(required=True)
+    start.add_argument('--app', help='human app name or title fragment; opens a window picker if ambiguous')
+    start.add_argument('--session', help='read the saved or cancelled result of an earlier recorder launch')
+    start.add_argument('--request', type=Path, help='UTF-8 JSON file for record, review or continue-recording (streaming)')
+    host.add_argument('--task', help='optional task name with --app; defaults to a new timestamped name')
+    host.add_argument('--wait', type=float, help='with --session, wait up to 30 seconds only for startup or saved-draft processing')
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
@@ -1086,12 +1138,17 @@ def worker(args):
         dispatched = getattr(error, 'input_dispatched', False)
         result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': getattr(error, 'code', 'invalid_request'),
                   'input_dispatched': dispatched}
+    if result.get('status') in ('recorded', 'needs_grounding'):
+        from recording_followup import followup
+        result = followup(result)
     print(json.dumps(result, ensure_ascii=args is not None and args.command == 'recorder'))
     return result_code(result)
 
 
 def result_code(result):
-    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'bound', 'completed', 'planned'):
+    if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'bound', 'completed', 'planned',
+                           'recorder_ready', 'recorder_selection_required', 'recorder_starting',
+                           'recorder_processing', 'recording'):
         return 0
     return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review',
                                      'needs_grounding', 'needs_scene') else 3

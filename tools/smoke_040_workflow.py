@@ -143,7 +143,8 @@ def exercise(source, work, repeats=3):
               and registration["receipt"].get("required_parameters") == ["Family"]
               and registration["receipt"].get("input_dispatched") is False and registration["state"] == before, registration)
         files = sorted(str(path.relative_to(generated)).replace("\\", "/") for path in generated.rglob("*") if path.is_file())
-        check("registration_creates_three_text_files", files == ["SKILL.md", "scripts/run.py", "workflow.json"], files)
+        check("registration_creates_runner_recipe_and_guides",
+              files == ["SKILL.md", "scripts/run.py", "workflow-guide.md", "workflow.json"], files)
         stored = json.loads((generated / "workflow.json").read_text(encoding="utf8"))
         check("variable_binding_stays_required", stored["steps"][1].get("parameter") == "Family"
               and "value" not in stored["steps"][1], stored)

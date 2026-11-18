@@ -155,8 +155,12 @@ class DraftClickTests(TestCase):
             self.assertEqual([s['number'] for s in registered['pending_scopes']], [3,4])
             guide = (dest/'SKILL.md').read_text(encoding='utf8')
             self.assertIn('${CLAUDE_SKILL_DIR}/scripts/run.py', guide)
+            self.assertIn(f'Claude Code에서 사용자가 `/{dest.name}`으로 직접 호출했고 Company Agent', guide)
+            self.assertIn(f'아직 성공하지 않은 경우에만 `Skill(skill="{dest.name}")`을 한 번 먼저 호출', guide)
             self.assertIn(plan['name'], guide.split('---')[1])
-            self.assertEqual([s for s in guide.splitlines() if s[:1].isdecimal()],
+            self.assertNotIn('## 녹화한 순서', guide)
+            details = (dest / flow.GUIDE_REFERENCE).read_text(encoding='utf8')
+            self.assertEqual([s for s in details.splitlines() if s[:1].isdecimal()],
                              [f'{i}. {text}' for i,text in enumerate(captions,1)])
             self.assertEqual(json.loads((dest/'source-task.json').read_text(encoding='utf8')), original)
             self.assertEqual(flow.load(dest/'workflow.json'), recorded_plan.compile_plan(original)['envelope']['recipe'])

@@ -54,13 +54,43 @@ class RegisteredFastRunTests(unittest.TestCase):
             dict(action='context-menu', spec=dict(path=['Export', 'Active sheet']),
                  window_context=dict(title='Results')),
             dict(action='context-menu', spec=dict(path=['Show details']))])
-        guide = flow.run_instructions(recipe)
+        guide = flow.run_instructions(recipe, 'device-report')
         self.assertIn('["Results", "우클릭 → Export → Active sheet"]', guide)
         self.assertIn('["Example", "우클릭 → Show details"]', guide)
         self.assertIn('["Family"]', guide)
         self.assertIn('--allow-physical', guide)
-        self.assertIn('폴더 검색 없이', guide)
-        self.assertNotIn('--allow-physical', flow.run_instructions(self.recipe))
+        self.assertIn('`' + flow.RUN_COMMAND + ' --summary --set "Family=<값>" --allow-physical`', guide)
+        self.assertIn('화면 확인까지 승인받았으면 `--auto-repair-frame`', guide)
+        self.assertIn('verified_outputs', guide)
+        self.assertIn(flow.GUIDE_REFERENCE, guide)
+        self.assertNotIn('--auto-repair-frame', flow.run_instructions(self.recipe, 'device-report'))
+        self.assertNotIn('--allow-physical', flow.run_instructions(self.recipe, 'device-report'))
+        keyboard = flow.run_instructions(dict(self.recipe, steps=[dict(action='submit')]), 'device-report')
+        self.assertIn('--allow-physical', keyboard)
+        self.assertNotIn('--auto-repair-frame', keyboard)
+        self.assertNotIn('창 이미지 확인', keyboard)
+        self.assertNotIn('창 이미지 확인', guide)
+
+    def test_conditional_scene_requires_input_and_only_its_scoped_window_images(self):
+        conditional = dict(action='conditional-open', label='Open the item', window_context=dict(title='Viewer'))
+        menu = dict(action='context-menu', spec=dict(path=['Export']), window_context=dict(title='Results'))
+        for steps in ([conditional, conditional], [conditional, menu]):
+            with self.subTest(steps=steps):
+                guide = flow.run_instructions(dict(self.recipe, steps=steps), 'device-report')
+                self.assertIn('조건을 판단할 때 ["Viewer"] 창의 현재 이미지를 읽는다', guide)
+                self.assertIn('실제 입력과 해당 창 이미지 확인이 모두 승인', guide)
+                self.assertIn('실행 전에 한 번에 묻는다', guide)
+                self.assertIn('`needs_scene`', guide)
+                self.assertNotIn('실제 입력만 승인됐으면', guide)
+                self.assertEqual('--auto-repair-frame' in guide, menu in steps)
+
+    def test_shell_syntax_in_a_registered_name_stays_out_of_the_command(self):
+        name = 'Family$(Get-Location)'
+        guide = flow.run_instructions(dict(self.recipe, steps=[dict(action='set-value', parameter=name)]), 'device-report')
+        self.assertIn(json.dumps([name]), guide)
+        command = next(line for line in guide.splitlines() if line.startswith('`python '))
+        self.assertNotIn(name, command)
+        self.assertIn('--set "<변수명>=<값>"', command)
 
     def test_live_root_is_checked_once_before_two_actions_without_scanning_children(self):
         binding = MagicMock(hwnd=31, pid=42)
@@ -96,6 +126,21 @@ class RegisteredFastRunTests(unittest.TestCase):
                          ('window_root', 1, 'observed', False))
         self.assertEqual(flow.summarize_execution(report, flow.selected_steps(recipe, None))['readability_check'], check)
 
+    def test_supplied_hwnd_uses_only_that_window_and_still_guards_the_binding(self):
+        row = dict(hwnd=42, title='Report')
+        with (patch.object(flow.app.bridge, 'set_dpi_awareness'), patch.object(flow.app.bridge, 'Binding') as binding,
+              patch.object(flow.app, 'guard') as guard, patch.object(flow.app, 'windows', return_value=[row]) as windows):
+            self.assertIs(flow.bind('App.exe', 'Report', 42), binding.return_value)
+            windows.assert_called_once_with('App.exe', only_hwnd=42)
+            binding.assert_called_once_with(row)
+            guard.assert_called_once_with(binding.return_value, binding.return_value, 'Report')
+            for title, hwnd in [('Changed', 42), ('Report', 71)]:
+                with self.assertRaisesRegex(flow.app.SelectionError, 'window_not_found'):
+                    flow.bind('App.exe', title, hwnd)
+            self.assertEqual(binding.call_count, 1)
+            self.assertIs(flow.bind('App.exe', 'Report'), binding.return_value)
+            windows.assert_called_with('App.exe')
+
     def test_unreadable_or_mismatched_root_stops_before_first_business_input(self):
         binding = MagicMock(hwnd=31, pid=42)
         recipe = dict(self.recipe, steps=self.recipe['steps'][:1])
@@ -125,13 +170,37 @@ class RegisteredFastRunTests(unittest.TestCase):
             recipe.write_text(json.dumps(self.recipe), encoding='utf8')
             original = recipe.read_bytes()
             guide = skill / 'SKILL.md'
+            legacy = flow.workflow_notes(self.recipe, None, False)
             guide.write_text('---\nname: registered\ndescription: "test"\n---\n\n' + flow.REGISTERED_HEADING +
+                             flow.GUIDE_BEGIN + 'Old run command\n' + flow.GUIDE_END + legacy +
                              'Extra user instructions\n', encoding='utf8')
             self.assertEqual(flow.refresh_guide(skill)['status'], 'guide_updated')
             saved = guide.read_bytes()
             self.assertEqual(flow.refresh_guide(skill)['status'], 'guide_current')
             self.assertEqual(saved, guide.read_bytes())
             self.assertIn(b'--summary', saved)
+            self.assertIn(b' `/registered`', saved)
+            self.assertIn(b'Skill(skill="registered")', saved)
             self.assertIn(b'Extra user instructions', saved)
+            self.assertNotIn(b'Old run command', saved)
+            self.assertNotIn('업무명, 대상 창과 순서'.encode(), saved)
+            self.assertIn(legacy, (skill / flow.GUIDE_REFERENCE).read_text(encoding='utf8'))
             self.assertEqual(recipe.read_bytes(), original)
             bind.assert_not_called()
+
+    def test_migration_preserves_an_existing_user_reference_with_the_same_filename(self):
+        with tempfile.TemporaryDirectory() as folder:
+            skill = Path(folder) / 'registered'
+            (skill / 'scripts').mkdir(parents=True)
+            (skill / 'scripts/run.py').write_text(flow.RUNNER.replace('RUNTIME_PARENT', '2'), encoding='utf8')
+            (skill / 'workflow.json').write_text(json.dumps(self.recipe), encoding='utf8')
+            guide = skill / 'SKILL.md'
+            guide.write_text('---\nname: registered\ndescription: "test"\n---\n\n' + flow.REGISTERED_HEADING +
+                             'Additional operating condition\n', encoding='utf8')
+            old = guide.read_bytes()
+            reference = skill / flow.GUIDE_REFERENCE
+            reference.write_text('My existing document', encoding='utf8')
+            with self.assertRaisesRegex(flow.WorkflowError, 'guide_reference_conflict'):
+                flow.refresh_guide(skill)
+            self.assertEqual(guide.read_bytes(), old)
+            self.assertEqual(reference.read_text(encoding='utf8'), 'My existing document')

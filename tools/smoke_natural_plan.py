@@ -262,8 +262,8 @@ def exercise(source, work):
         check('registered_workflow_preserves_required_family',
               json.loads((generated / 'workflow.json').read_text(encoding='utf8'))['steps'][1].get('parameter') == 'Family')
         files = sorted(str(p.relative_to(generated)).replace('\\', '/') for p in generated.rglob('*') if p.is_file())
-        check('generated_skill_retains_original_natural_instructions_in_four_text_files',
-              files == ['SKILL.md', 'scripts/run.py', 'source-task.json', 'workflow.json']
+        check('generated_skill_retains_original_natural_instructions_and_reference',
+              files == ['SKILL.md', 'scripts/run.py', 'source-task.json', 'workflow-guide.md', 'workflow.json']
               and json.loads((generated / 'source-task.json').read_text(encoding='utf8')) == changed, files)
         exported = call('run_exported_skill', generated / 'scripts/run.py', '--set', 'Family=DRAM')
         check('exported_python_skill_uses_edited_natural_plan',

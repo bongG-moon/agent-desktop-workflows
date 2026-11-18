@@ -18,7 +18,9 @@ class PackagedReferences(unittest.TestCase):
         with TemporaryDirectory() as folder, redirect_stdout(StringIO()):
             archive = build(Path(folder))
             with ZipFile(archive) as package:
-                documents = ('desktop-select/SKILL.md', 'desktop-select/references/host-details.md')
+                documents = ['desktop-select/SKILL.md']
+                documents.extend(name for name in package.namelist()
+                                 if name.startswith('desktop-select/references/') and name.endswith('.md'))
                 for document in documents:
                     markdown = package.read(document).decode('utf-8')
                     for link in re.findall(r'\]\(([^)]+)\)', markdown):

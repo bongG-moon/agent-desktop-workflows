@@ -144,7 +144,7 @@ class RuntimeTests(unittest.TestCase):
                 flow.app.visibility.restore_for_action.assert_not_called()
                 execute.assert_not_called()
 
-    def test_register_creates_only_three_text_files_and_does_not_overwrite(self):
+    def test_register_creates_runner_recipe_and_two_guides_without_overwriting(self):
         with tempfile.TemporaryDirectory() as folder:
             destination = Path(folder) / 'query-skill'
             with patch.object(flow.live, 'combo_readback', return_value={}):
@@ -152,7 +152,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result['status'], 'registered')
             self.assertEqual(sorted(str(p.relative_to(destination)).replace('\\', '/')
                                     for p in destination.rglob('*') if p.is_file()),
-                             ['SKILL.md', 'scripts/run.py', 'workflow.json'])
+                             ['SKILL.md', 'scripts/run.py', 'workflow-guide.md', 'workflow.json'])
             self.assertEqual(flow.load(destination / 'workflow.json'), recipe())
             compile((destination / 'scripts/run.py').read_text(encoding='utf8'), '<runner>', 'exec')
             with self.assertRaisesRegex(flow.WorkflowError, 'workflow_destination_exists'):

@@ -355,7 +355,7 @@ class CompositionTests(unittest.TestCase):
                 destination = Path(temporary) / ('registered-' + name)
                 result = flow.register(recipe(step), destination)
                 self.assertEqual(result['status'], 'registered')
-                guide = (destination / 'SKILL.md').read_text(encoding='utf8')
+                guide = (destination / flow.GUIDE_REFERENCE).read_text(encoding='utf8')
                 self.assertIn(expected, guide)
                 self.assertNotIn(excluded, guide)
                 self.assertNotIn('submit 단계', guide)

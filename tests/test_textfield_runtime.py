@@ -246,7 +246,7 @@ class TextFieldWorkflowTests(unittest.TestCase):
             self.assertEqual(result['required_parameters'], ['Family', '검색어'])
             self.assertEqual(flow.load(target / 'workflow.json')['steps'][1]['parameter'], '검색어')
             self.assertNotIn('value', flow.load(target / 'workflow.json')['steps'][1])
-            self.assertIn('검색어=00123', (target / 'SKILL.md').read_text(encoding='utf8'))
+            self.assertIn('검색어=00123', (target / flow.GUIDE_REFERENCE).read_text(encoding='utf8'))
 
     def test_cli_preflight_failure_reports_no_input_before_starting_worker(self):
         for worker in ([], ['--_worker']):

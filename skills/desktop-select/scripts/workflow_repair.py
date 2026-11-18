@@ -46,7 +46,8 @@ def identity(binding):
 
 
 def point_failed(receipt):
-    return (receipt.get('diagnostic') in ('context_point_outside_region', 'context_point_unproven',
+    return (receipt.get('status') == 'blocked'
+            and receipt.get('diagnostic') in ('context_point_outside_region', 'context_point_unproven',
                                          'context_data_cell_unconfirmed', 'context_visual_patch_changed',
                                          'context_visual_patch_blank', 'context_point_not_data')
             and receipt.get('menu_input_dispatched', receipt['input_dispatched']) is False
@@ -200,6 +201,61 @@ def inspect_or_adjust(flow, recipe, record, frame=None, point=None):
         return result
 
 
+def parameter_args(args, overrides):
+    """Keep CLI spelling in the reply without storing variable values in a ticket."""
+    supplied = getattr(args, 'set', None)
+    if supplied is None or tasks.parse_overrides(supplied) != overrides:
+        supplied = [key + '=' + value for key, value in overrides.items()]
+    return [token for item in supplied for token in ('--set', item)]
+
+
+def frame_reply(observed, record, args, overrides):
+    observed = dict(observed)
+    recipe_path = getattr(args, 'recipe', None)
+    if recipe_path is not None and 'resume_args' in observed:
+        runner = Path(recipe_path).resolve().parent / 'scripts' / 'run.py'
+        if runner.is_file():
+            observed['resume_script'] = str(runner)
+    if digest(overrides) == record['variables']:
+        if 'resume_args' in observed:
+            observed['resume_args'] = [*observed['resume_args'], *parameter_args(args, overrides)]
+    else:
+        # Standalone inspection still needs no variables. Their plaintext is
+        # deliberately absent from the ticket, so this reply cannot recover it.
+        observed['resume_requires_original_set'] = True
+    return observed
+
+
+def reserve_surface(stack, recipe, record):
+    """Use the same declared-window and live-handle exclusions for every frame."""
+    contexts = coordination.scopes_for(recipe['steps'], recipe['exe'])
+    owner = dict(hwnd=record['scope'][0][0], exe_name=recipe['exe'])
+    stack.enter_context(coordination.window(owner, recipe['window'], contexts))
+    surface_hwnd = record['scope'][1][0]
+    if surface_hwnd != owner['hwnd']:
+        stack.enter_context(coordination.handle({'hwnd': surface_hwnd}))
+
+
+def attach_frame(flow, recipe, args, overrides, session, repair):
+    repair['frame_args'] = [*repair['frame_args'], *parameter_args(args, overrides)]
+    if not (getattr(args, 'auto_repair_frame', False) and getattr(args, 'allow_physical', False)
+            and not getattr(args, 'background_only', False)):
+        return
+    try:
+        need(flow.load(args.recipe) == recipe, 'workflow_changed_during_repair')
+        record = session.read(repair['ticket'], recipe)
+        with ExitStack() as stack:
+            reserve_surface(stack, recipe, record)
+            observed = inspect_or_adjust(flow, recipe, record)
+        repair.update(frame_reply(observed, record, args, overrides))
+        repair['host_action'] = 'inspect_menu_repair_image'
+    except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
+        # The completed run remains authoritative. A failed read-only capture
+        # neither consumes its ticket nor replaces its original action receipt.
+        repair['frame_capture'] = dict(status='unavailable', input_dispatched=False,
+                                      diagnostic=getattr(error, 'code', 'menu_repair_frame_unavailable'))
+
+
 def saved_routes(routes, number):
     # Record only scopes whose lifetime and relationship had already been established.
     saved = []
@@ -270,14 +326,9 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                     stack.enter_context(coordination.reserve_outputs(active, verify_steps=checks))
                 # Hold the same window scopes through inspection and the
                 # resumed operation. flow.run reenters them on this thread.
-                contexts = coordination.scopes_for(recipe['steps'], recipe['exe'])
-                owner = dict(hwnd=resume['scope'][0][0], exe_name=recipe['exe'])
-                stack.enter_context(coordination.window(owner, recipe['window'], contexts))
-                surface_hwnd = resume['scope'][1][0]
-                if surface_hwnd != owner['hwnd']:
-                    stack.enter_context(coordination.handle({'hwnd': surface_hwnd}))
+                reserve_surface(stack, recipe, resume)
                 if args.repair_frame:
-                    return inspect_or_adjust(flow, recipe, resume)
+                    return frame_reply(inspect_or_adjust(flow, recipe, resume), resume, args, overrides)
                 need(digest(overrides) == resume['variables'], 'menu_repair_parameters_changed')
                 point = inspect_or_adjust(flow, recipe, resume, args.frame, args.point)
                 run_recipe = deepcopy(recipe)
@@ -305,9 +356,14 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                 need(flow.load(args.recipe) == recipe, 'workflow_changed_during_repair')
                 recorded_surface(flow, recipe, resume)
                 report['menu_repair'] = session.write(resume)
+                attach_frame(flow, recipe, args, overrides, session, report['menu_repair'])
             if scope:
                 number = report['stopped_at']
                 row = next(r for r in report['steps'] if r['number'] == number)
+                # A scope alone is not proof that another menu input is safe.
+                # Refuse stale or malformed scopes after uncertain/leaf delivery.
+                if not point_failed(row['receipt']):
+                    return report
                 # Preserve the original scope selection across multiple before-input repairs.
                 only = resume['only'] if resume else args.only
                 fields = list(resume['checked_fields']) if resume else []
@@ -322,6 +378,7 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                     resume and number == resume['number'] and resume['query_sent'])
                 updated = flow.load(args.recipe) if report.get('menu_corrections') else recipe
                 report['menu_repair'] = session.start(updated, overrides, number, scope, only, fields, query_sent, routes)
+                attach_frame(flow, updated, args, overrides, session, report['menu_repair'])
         except (OSError, ValueError, flow.app.bridge.BridgeError) as error:
             # The actual menu/leaf receipt remains authoritative even if the disk write failed.
             report['repair_storage'] = dict(status='not_saved',
