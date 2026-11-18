@@ -10,6 +10,7 @@ import time
 
 import learned_tasks as tasks
 import coordination
+import input_policy
 
 
 def need(ok, reason):
@@ -24,6 +25,91 @@ def digest(value):
 
 def registered(path):
     return bool(path and path.name == 'workflow.json' and (path.parent / 'scripts/run.py').is_file())
+
+
+def approval_path(path):
+    """A copied project must not carry another user's permission with it."""
+    home = os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()
+    directory = tasks._directory(Path(home) / 'DesktopSelect' / 'repeat-input')
+    result = directory / (digest(os.path.normcase(str(path.resolve()))) + '.txt')
+    tasks._deny_redirect(result)
+    return result
+
+
+def approval_state(path):
+    try:
+        marker = approval_path(path)
+        if not marker.exists():
+            return ''
+        if marker.is_file() and marker.stat().st_size <= 80:
+            return marker.read_text(encoding='ascii')
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def approved(path, recipe):
+    return approval_state(path) == digest(recipe)
+
+
+def write_approval(path, value):
+    marker = approval_path(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=marker.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(value.encode('ascii'))
+        os.replace(temporary, marker)
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+
+
+def forget_approval(path):
+    import secrets
+    with coordination.recipe(path):
+        # A forget must also invalidate enrollment pending in a repair ticket.
+        write_approval(path, 'revoked:' + secrets.token_hex(24))
+
+
+def tested_rows(recipe, rows, start, stop):
+    if [r['number'] for r in rows] != list(range(start, stop)):
+        return False
+    modes = input_policy.profile(recipe['steps'][start - 1:stop - 1])['steps']
+    for row, mode in zip(rows, modes):
+        receipt = row['receipt']
+        if receipt.get('status') not in ('verified', 'waited', 'delivered_unverified'):
+            return False
+        if (mode['input_mode'] in ('physical_pointer', 'physical_keyboard')
+                and receipt.get('input_dispatched') is not True):
+            return False
+    return True
+
+
+def remember_test(path, recipe, report, prior_state, start=1):
+    """Remember a scoped input mechanism only after the entire tested sequence finished."""
+    rows = report.get('steps', [])
+    if (not rows or report.get('input_dispatched') is not True
+            or not tested_rows(recipe, rows, start, len(recipe['steps']) + 1)):
+        return
+    terminal = rows[-1]['receipt']
+    # A final export without an output condition proves the requested menu path was
+    # sent. This is still not a claim that the business result was verified.
+    last_menu_sent = (report.get('status') == 'delivered_unverified'
+                      and report.get('stopped_at') == len(recipe['steps'])
+                      and terminal.get('diagnostic') == 'menu_delivered_no_output_condition'
+                      and terminal.get('menu_path_completed') is True and terminal.get('leaf_dispatched') is True)
+    if (not last_menu_sent and (report.get('status') not in ('verified', 'completed_unverified')
+                                or 'stopped_at' in report)):
+        return
+    try:
+        with coordination.recipe(path):
+            if prior_state is not None and approval_state(path) == prior_state:
+                write_approval(path, digest(recipe))
+                report['repeat_physical_input'] = 'approved'
+    except (OSError, ValueError):
+        report['repeat_physical_input'] = 'not_saved'
 
 
 def menu(step):
@@ -45,13 +131,23 @@ def identity(binding):
     return [binding.hwnd, binding.pid, binding.created]
 
 
-def point_failed(receipt):
+INPUT_CHANGED = ('foreground_or_input_changed', 'physical_input_changed')
+
+
+def unsent_menu(receipt):
     return (receipt.get('status') == 'blocked'
-            and receipt.get('diagnostic') in ('context_point_outside_region', 'context_point_unproven',
-                                         'context_data_cell_unconfirmed', 'context_visual_patch_changed',
-                                         'context_visual_patch_blank', 'context_point_not_data')
             and receipt.get('menu_input_dispatched', receipt['input_dispatched']) is False
             and receipt.get('leaf_dispatched') is False and not receipt.get('menu_items'))
+
+
+def point_failed(receipt):
+    return (unsent_menu(receipt) and receipt.get('diagnostic') in ('context_point_outside_region', 'context_point_unproven',
+                                         'context_data_cell_unconfirmed', 'context_visual_patch_changed',
+                                         'context_visual_patch_blank', 'context_point_not_data'))
+
+
+def input_paused(receipt):
+    return unsent_menu(receipt) and receipt.get('diagnostic') in INPUT_CHANGED
 
 
 def persist(path, original, report, load, replacements=None):
@@ -75,7 +171,7 @@ def persist(path, original, report, load, replacements=None):
             replace_menu(revised['steps'][number - 1], replacement)
             changed.append(number)
     if not changed:
-        return
+        return original
     import context_menu
     for number in changed:
         context_menu.validate_spec(menu(revised['steps'][number - 1]))
@@ -95,6 +191,7 @@ def persist(path, original, report, load, replacements=None):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+    return revised
 
 
 class RepairSession:
@@ -105,12 +202,14 @@ class RepairSession:
         self.pending = self.directory / 'pending.json'
         tasks._deny_redirect(self.pending)
 
-    def start(self, recipe, overrides, number, scope, only, checked_fields, query_sent, routes=None):
+    def start(self, recipe, overrides, number, scope, only, checked_fields, query_sent, routes=None,
+              *, pause=False, remember=False, approval_before=None):
         import secrets
         ticket = secrets.token_hex(24)
         pending = dict(ticket=ticket, recipe=digest(recipe), variables=digest(overrides),
                        number=number, scope=scope, only=only, checked_fields=checked_fields,
-                       query_sent=query_sent, routes=routes or [], expires=time.time() + 600)
+                       query_sent=query_sent, routes=routes or [], pause=pause, remember=remember, approval_before=approval_before,
+                       expires=time.time() + 600)
         self.discard()
         return self.write(pending)
 
@@ -120,6 +219,9 @@ class RepairSession:
         with self.pending.open('x', encoding='utf8') as stream:
             json.dump(record, stream)
         ticket = record['ticket']
+        if record.get('pause'):
+            return dict(ticket=ticket, step=record['number'], expires_seconds=int(remaining),
+                        host_action='wait_for_user_idle_then_resume', resume_args=['--resume-input', ticket, '--summary'])
         return dict(ticket=ticket, step=record['number'], expires_seconds=int(remaining),
                     host_action='inspect_menu_repair_frame', frame_args=['--repair-frame', ticket, '--allow-physical'])
 
@@ -290,6 +392,8 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
     """One worker owns the stored ticket until its checked input has been consumed."""
     import review_drafts
     session = RepairSession(args.recipe)
+    resume_input = getattr(args, 'resume_input', None)
+    remember = getattr(args, 'remember_physical', False)
     with ExitStack() as stack:
         try:
             stack.enter_context(coordination.recipe(args.recipe))
@@ -316,10 +420,14 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                             else:
                                 now.pop(key, None)
                 need(original == recipe, 'workflow_changed_during_repair')
+            if getattr(args, 'repeat_approval_used', False):
+                need(approved(args.recipe, current), 'registered_physical_consent_required')
+            approval_before = approval_state(args.recipe) if remember else None
             recipe = run_recipe = current
-            if args.repair_frame or args.resume_menu:
-                resume = session.read(args.repair_frame or args.resume_menu, recipe)
-                if args.resume_menu:
+            if args.repair_frame or args.resume_menu or resume_input:
+                resume = session.read(args.repair_frame or args.resume_menu or resume_input, recipe)
+                need(bool(resume.get('pause')) == bool(resume_input), 'wrong_continuation_type')
+                if args.resume_menu or resume_input:
                     active = [step for number, step in flow.selected_steps(recipe, resume['only'])
                               if number >= resume['number']]
                     checks = recipe['steps'] if resume['only'] is not None else ()
@@ -330,10 +438,13 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                 if args.repair_frame:
                     return frame_reply(inspect_or_adjust(flow, recipe, resume), resume, args, overrides)
                 need(digest(overrides) == resume['variables'], 'menu_repair_parameters_changed')
-                point = inspect_or_adjust(flow, recipe, resume, args.frame, args.point)
-                run_recipe = deepcopy(recipe)
-                replacements[resume['number']] = point
-                replace_menu(run_recipe['steps'][resume['number'] - 1], point)
+                if not resume_input:
+                    point = inspect_or_adjust(flow, recipe, resume, args.frame, args.point)
+                    run_recipe = deepcopy(recipe)
+                    replacements[resume['number']] = point
+                    replace_menu(run_recipe['steps'][resume['number'] - 1], point)
+                remember = resume.get('remember', False) and resume['only'] is None
+                approval_before = resume.get('approval_before')
             session.discard()
         except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
             return dict(status='blocked', diagnostic=getattr(error, 'code', 'menu_repair_unavailable'),
@@ -346,7 +457,9 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
         scope = report.pop('menu_repair_scope', None)
         routes = report.pop('menu_repair_routes', None)
         try:
-            persist(args.recipe, recipe, report, flow.load, replacements)
+            updated = persist(args.recipe, recipe, report, flow.load, replacements)
+            if remember:
+                remember_test(args.recipe, updated, report, approval_before, resume['number'] if resume else 1)
             if (resume and report.get('status') == 'blocked' and report.get('input_dispatched') is False
                     and report.get('steps') == [] and report.get('diagnostic') == 'window_root_unreadable'
                     and report.get('readability_check', {}).get('status') == 'unavailable'
@@ -355,14 +468,19 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                 # for a positive, pre-input transient receipt on the identical live scope.
                 need(flow.load(args.recipe) == recipe, 'workflow_changed_during_repair')
                 recorded_surface(flow, recipe, resume)
-                report['menu_repair'] = session.write(resume)
-                attach_frame(flow, recipe, args, overrides, session, report['menu_repair'])
+                continuation = session.write(resume)
+                if resume.get('pause'):
+                    report['input_pause'] = frame_reply(continuation, resume, args, overrides)
+                else:
+                    report['menu_repair'] = continuation
+                    attach_frame(flow, recipe, args, overrides, session, continuation)
             if scope:
                 number = report['stopped_at']
                 row = next(r for r in report['steps'] if r['number'] == number)
                 # A scope alone is not proof that another menu input is safe.
                 # Refuse stale or malformed scopes after uncertain/leaf delivery.
-                if not point_failed(row['receipt']):
+                pause = input_paused(row['receipt'])
+                if not pause and not point_failed(row['receipt']):
                     return report
                 # Preserve the original scope selection across multiple before-input repairs.
                 only = resume['only'] if resume else args.only
@@ -376,9 +494,16 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                         fields.append(entry['number'])
                 query_sent = row['receipt'].get('query_dispatched') is True or bool(
                     resume and number == resume['number'] and resume['query_sent'])
-                updated = flow.load(args.recipe) if report.get('menu_corrections') else recipe
-                report['menu_repair'] = session.start(updated, overrides, number, scope, only, fields, query_sent, routes)
-                attach_frame(flow, updated, args, overrides, session, report['menu_repair'])
+                if remember:
+                    prior_rows = [r for r in report['steps'] if r['number'] < number]
+                    remember = tested_rows(recipe, prior_rows, resume['number'] if resume else 1, number)
+                continuation = session.start(updated, overrides, number, scope, only, fields, query_sent, routes,
+                                             pause=pause, remember=remember, approval_before=approval_before)
+                if pause:
+                    report['input_pause'] = frame_reply(continuation, {'variables': digest(overrides)}, args, overrides)
+                else:
+                    report['menu_repair'] = continuation
+                    attach_frame(flow, updated, args, overrides, session, continuation)
         except (OSError, ValueError, flow.app.bridge.BridgeError) as error:
             # The actual menu/leaf receipt remains authoritative even if the disk write failed.
             report['repair_storage'] = dict(status='not_saved',

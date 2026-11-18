@@ -212,6 +212,22 @@ def _quoted_literal(text):
     return next(v for v in match.groups() if v is not None) if match else None
 
 
+def _runtime_value_request(sentence):
+    """Return the preceding assignment, or '' when the request refers to the recorded field."""
+    if '물어' not in sentence:
+        return None
+    text = sentence.strip()
+    match = re.search(
+        r'(?P<sep>^|[.,，。(（])\s*(?:(?:이건|이\s*값은)\s*)?'
+        r'(?:매번\s*)?실행\s*(?:전(?:에)?|시(?:에)?|할\s*때(?:마다)?)\s*'
+        r'(?:사용자(?:에게|한테)\s*)?(?:(?:어떤|무슨)\s*)?(?:값(?:을|으로)?\s*)?'
+        r'(?:(?:넣을|입력할|선택할|설정할)\s*지\s*)?'
+        r'(?:물어봐|물어보(?:기|세요))\s*(?:줘|주세요)?[.!?]?\s*(?P<close>[)）]?)[.!。]?\Z', text)
+    if not match or match['close'] != {'(': ')', '（': '）'}.get(match['sep'], ''):
+        return None
+    return text[:match.start()].strip()
+
+
 def _field_request(sentence):
     """Recognize a single target-first assignment, preserving the literal's spelling."""
     if not isinstance(sentence, str) or _conditional_sentence(sentence):
@@ -238,6 +254,9 @@ def instruction_subject(sentence):
     """Return the field named in a supported sentence for an explicit alias link."""
     if not isinstance(sentence, str):
         return None
+    assignment = _runtime_value_request(sentence)
+    if assignment is not None:
+        sentence = assignment
     field = _field_request(sentence)
     if field:
         return re.sub(r'\s*(?:조건|콤보박스|콤보|항목|필드|입력란)$', '', field[0]).strip()
@@ -429,13 +448,20 @@ def _validate_capture_command(step):
                 raise TaskError('instruction_binding_conflict')
 
 
+def _has_saved_binding(step, sentence, mode, argument):
+    previous = step.get('instruction')
+    return (mode in ('fixed', 'required') and isinstance(previous, dict)
+            and previous.get('mode') == mode and previous.get('text') == sentence
+            and previous.get('value' if mode == 'fixed' else 'parameter') == argument)
+
+
 def _command_instruction(step, sentence, mode=None, argument=None):
     if not _text(sentence, 1000):
         raise TaskError('invalid_step_instruction')
     if step['action'] == 'field-input':
         fake = dict(action='fill', role='textfield', target=step['label'], label=step['label'],
                     **_annotations(step))
-        parsed = _parse_sentence(fake, sentence)
+        parsed = _parse_sentence(fake, sentence, saved_binding=_has_saved_binding(step, sentence, mode, argument))
         if mode is None:
             if not parsed:
                 return dict(mode='draft', text=sentence)
@@ -484,10 +510,26 @@ def _instruction_subject(step, subject):
     raise TaskError('instruction_target_mismatch')
 
 
-def _parse_sentence(step, sentence, *, infer_quoted_option=True):
+def _parse_sentence(step, sentence, *, saved_binding=False):
     """Only parse one bounded, field-specific instruction. No shell or model evaluation."""
     verb = r'(?:선택|설정|입력|변경|해)(?:해)?\s*(?:줘|주세요)?'
     tail = r'(?:[.!。])?'
+    # Older explicit bindings could resolve a display name or free-form note
+    # differently. Apply the new inference when interpreting a fresh request.
+    example = _runtime_value_request(sentence) if not saved_binding else None
+    if example is not None and step.get('action') in VALUE_ACTIONS:
+        if not example:
+            return 'required', _instruction_subject(step, '이 항목')
+        if (_runtime_value_request(example) is not None or _conditional_sentence(example)
+                or re.search(r'(?:입력|설정|선택|변경|실행|조회|클릭)(?:하고|해서|한\s*(?:뒤|후)|해(?:줘|주세요)\s*[.,，。])'
+                             r'|누르고|말고|대신', example)):
+            return None
+        parsed = _parse_sentence(step, example)
+        if parsed and parsed[0] == 'required':
+            return parsed
+        if parsed and parsed[0] == 'fixed' and parsed[1]:
+            return 'required', _instruction_subject(step, instruction_subject(example) or '이 항목')
+        return None
     field = _field_request(sentence)
     if field and step.get('action') in VALUE_ACTIONS:
         subject = _instruction_subject(step, field[0])
@@ -515,7 +557,7 @@ def _parse_sentence(step, sentence, *, infer_quoted_option=True):
             except (ValueError, RecursionError):
                 return None
             return ('fixed', literal) if valid_value(literal, 'textfield') else None
-        if infer_quoted_option and step.get('action') == 'select':
+        if not saved_binding and step.get('action') == 'select':
             literal = _quoted_literal(val)
             if literal is not None and valid_value(literal, 'combobox'):
                 return 'fixed', literal
@@ -565,7 +607,10 @@ def _instruction_agrees(parsed, sentence, mode, argument):
     # A plain "input variable" sentence names only the field. Its field label
     # supplies an initial parameter name, which the explicit editor can rename.
     # Braced names are explicit instructions and must still match.
-    field = _field_request(sentence)
+    example = _runtime_value_request(sentence)
+    if example is not None and '{' not in example:
+        return True
+    field = _field_request(example or sentence)
     return (argument.casefold() == actual_arg.casefold() or (field is not None and field[1:] == ('required', None))
             or bool(re.match(r'^입력\s*받은\s*변수(?:를|을)\s*', sentence)))
 
@@ -683,11 +728,7 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
             raise TaskError('instruction_target_mismatch')
     # Older saved instructions could bind a quoted display name to a different
     # provider code or runtime parameter. Keep that explicit binding on load.
-    previous = step.get('instruction', {})
-    preserved = (isinstance(previous, dict) and previous.get('text') == sentence
-                 and mode in ('fixed', 'required') and previous.get('mode') == mode
-                 and previous.get('value' if mode == 'fixed' else 'parameter') == argument)
-    parsed = _parse_sentence(step, sentence, infer_quoted_option=not preserved)
+    parsed = _parse_sentence(step, sentence, saved_binding=_has_saved_binding(step, sentence, mode, argument))
     if mode is None:
         if not parsed or argument is not None:
             if argument is not None:

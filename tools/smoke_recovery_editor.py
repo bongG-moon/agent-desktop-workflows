@@ -115,9 +115,11 @@ def main():
 
         def semantic():
             assert named('instruction').get() == ''
-            assert button('행 버튼으로 지정').winfo_viewable()
+            assert not button('행 버튼으로 지정').winfo_viewable()
+            assert '행 버튼' not in str(root.getvar(named('preview').cget('textvariable')))
             write('MES Setup 조건을 N으로 설정해줘')
             button('적용하고 다음 단계').invoke()
+            checks.append('ordinary_recovery_needs_only_the_sentence')
             later(prose)
 
         def prose():
@@ -137,6 +139,9 @@ def main():
             before = listing.get_children()
             assert listing.selection() == ('repair',)
             repair = button('행 버튼으로 지정')
+            assert not repair.winfo_viewable()
+            button('상세 설정').invoke()
+            root.update_idletasks()
             assert repair.winfo_viewable()
             repair.invoke()  # Cancel the first teaching dialog.
             assert listing.get_children() == before and listing.set('repair', 'status') == '확인 필요'
@@ -149,6 +154,7 @@ def main():
         def command():
             assert named('steps').selection() == ('query',)
             assert named('instruction').get() == '조회 버튼을 눌러줘'
+            assert not button('행 버튼 다시 지정').winfo_viewable()
             checks.append('apply_next_accepts_unknown_prose')
             named('steps').selection_set('prose')
             later(revisit)

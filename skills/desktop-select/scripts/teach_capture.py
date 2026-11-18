@@ -1864,7 +1864,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         if isinstance(exc, learned_tasks.TaskError):
             reason = {'instruction_target_mismatch': '화면 이름이 다르면 ‘문장의 이름을 이 대상에 연결’을 누르세요. 또는 ‘이 항목을 N으로 설정’처럼 입력하세요.',
                       'instruction_target_unavailable': '이 단계는 보호된 입력이나 별도 절차가 필요한 동작입니다. 일반 대상 인식 실패는 설명을 저장한 뒤 실행할 때 다시 찾을 수 있습니다.',
-                      'instruction_requires_structure': '값 지정에서 고정값이나 필수 변수를 선택하고 값을 입력하세요.',
+                      'instruction_requires_structure': '값을 문장에 적거나 상세 설정에서 고정값이나 필수 변수를 지정하세요.',
                       'invalid_step_alias': '다른 별칭을 입력하세요.'}.get(
                           exc.code, '이 단계에서 실행할 수 있는 문장과 값을 입력하세요.')
             preview.set(reason + ' (' + exc.code + ')')
@@ -1880,9 +1880,9 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
                 if (editing['action'] == 'manual' and not instruction.get().strip()
                         and row_repairable(editing)):
                     if editing.get('recognition', {}).get('reason') == 'row_capture_requires_review':
-                        preview.set('행은 찾았습니다. 예를 들어 “첫 번째 행의 실행 버튼을 눌러줘”라고 적거나, 행 버튼과 완료 표시를 지정하세요.')
+                        preview.set('몇 번째 행의 어떤 버튼을 누를지 적으세요. 예: 두 번째 행의 실행 버튼을 눌러줘.')
                     else:
-                        preview.set('화면에 보이는 이름과 동작을 적거나, 목록 안의 버튼이면 행 버튼으로 지정하세요.')
+                        preview.set('화면에 보이는 대상 이름과 실행할 동작을 적으세요.')
                 else:
                     preview.set(instruction_view(editing, data.get('instruction')))
                 if review is not None:
@@ -1922,9 +1922,9 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         show_step_window(step, steps_now())
         if session is not None and row_repairable(step):
             repair_btn.configure(text='행 버튼 다시 지정' if step['action'] == 'row-action' else '행 버튼으로 지정')
-            repair_btn.pack(side='left', padx=(0, 5), before=details_btn)
+            repair_btn.grid(row=2, column=1, sticky='w', pady=(3, 0))
         else:
-            repair_btn.pack_forget()
+            repair_btn.grid_remove()
         alias_btn.configure(state='disabled' if configured else 'normal')
         refresh_preview()
 
@@ -1965,8 +1965,8 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         update_save_button(steps)
         phase.set(f'단계 검토   {len(steps)}')
         message.set(f'{unlinked}단계의 창 연결을 나중에 지정하려면 초안 저장을 누르세요.' if unlinked else
-                    f'{missing}단계는 실행 전 보완해야 합니다. 해당 행을 선택해 수정하세요.' if missing
-                    else '단계를 선택해 실행 문장을 수정하세요.' if steps else '단계를 추가하거나 취소하세요.')
+                    f'{missing}개 단계가 확인 필요 상태입니다. 설명을 확인하고 초안 저장을 누르세요.' if missing
+                    else '실행 문장을 확인하고 저장하세요. 별칭이나 값을 직접 지정하려면 상세 설정을 여세요.' if steps else '단계를 추가하거나 취소하세요.')
 
     def render(steps):
         nonlocal editing
@@ -2130,7 +2130,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         dialog.grab_set()
         picker.focus_set()
     opener_btn = ttk.Button(editing_controls, text='창을 연 단계 지정', command=choose_opener)
-    repair_btn = ttk.Button(editing_controls, command=lambda: teach_extra('row', replace=True))
+    repair_btn = ttk.Button(advanced_form, command=lambda: teach_extra('row', replace=True))
     ttk.Button(editing_controls, text='선택 단계 삭제', command=delete_step).pack(side='left', padx=4)
     ttk.Button(editing_controls, text='적용하고 다음 단계', command=apply_next).pack(side='right')
     alias_btn = ttk.Button(advanced_form, text='문장의 이름을 이 대상에 연결', command=link_subject)

@@ -4,6 +4,7 @@ from copy import deepcopy
 from io import StringIO
 import json
 from pathlib import Path
+import os
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -56,6 +57,87 @@ class RegisteredRepairTests(unittest.TestCase):
                         leaf_dispatched=False, menu_path_completed=False, menu_items=[])
         return dict(status='delivered_unverified', diagnostic='menu_leaf_sent', input_dispatched=True,
                     leaf_dispatched=True, menu_path_completed=True, menu_items=spec['path'])
+
+    def test_opted_in_repaired_test_enables_only_same_full_workflow_then_can_forget(self):
+        self.recipe['steps'].append(output())
+        self.write(self.recipe)
+        flow.context_menu.execute.side_effect = self.menu
+        with patch.dict(os.environ, LOCALAPPDATA=str(self.path.parent / 'profile')):
+            self.assertEqual(self.cli('--remember-physical')['input_dispatched'], False)
+            first = self.cli('--allow-physical', '--remember-physical')
+            self.assertFalse(repair.approved(self.path, self.recipe))
+            adjusted = dict(self.recipe['steps'][1]['spec'], point=self.after)
+            with patch.object(repair, 'inspect_or_adjust', return_value=adjusted):
+                resumed = self.cli('--resume-menu', first['menu_repair']['ticket'], '--allow-physical',
+                                   '--frame', 'probe', '--point', '30', '40')
+            self.assertEqual(resumed['repeat_physical_input'], 'approved')
+            self.assertFalse(repair.approved(self.path, self.recipe))
+            current = flow.load(self.path)
+            self.assertTrue(repair.approved(self.path, current))
+            self.assertEqual(self.cli()['steps'][-1]['receipt']['status'], 'verified')
+            self.assertEqual(self.cli('--background-only')['diagnostic'], 'background_requires_desktop_interaction')
+            for extra in [('--only', '2'), ('--auto-repair-frame',), ('--repair-frame', 'pretend')]:
+                self.assertEqual(self.cli(*extra)['status'], 'needs_consent')
+            edited = deepcopy(current)
+            edited['steps'][1]['spec']['path'] = ['Different command']
+            self.write(edited)
+            self.assertEqual(self.cli()['status'], 'needs_consent')
+            self.write(current)
+            self.assertEqual(self.cli('--forget-physical')['status'], 'forgotten')
+            self.assertEqual(self.cli()['status'], 'needs_consent')
+
+    def test_interference_after_query_continues_at_unsent_menu_without_screen_or_requery(self):
+        self.recipe['steps'].append(output())
+        self.write(self.recipe)
+        normal = dict(status='delivered_unverified', diagnostic='menu_leaf_sent', input_dispatched=True,
+                      leaf_dispatched=True, menu_path_completed=True, menu_items=self.recipe['steps'][1]['spec']['path'])
+        paused = dict(status='blocked', diagnostic='foreground_or_input_changed', input_dispatched=False,
+                      leaf_dispatched=False, menu_items=[])
+        flow.context_menu.execute.side_effect = [paused, normal]
+        first = self.cli('--allow-physical')
+        pause = first['input_pause']
+        self.assertTrue(first['input_dispatched'])
+        self.assertEqual(pause['host_action'], 'wait_for_user_idle_then_resume')
+        self.assertNotIn('menu_repair', first)
+        with patch.object(repair, 'inspect_or_adjust') as inspect:
+            result = self.cli(*pause['resume_args'])
+            self.assertEqual(result['resumed_at'], 2)
+            self.assertEqual(result['steps'][-1]['receipt']['status'], 'verified')
+            self.assertEqual(self.cli(*pause['resume_args'])['diagnostic'], 'menu_repair_expired')
+            inspect.assert_not_called()
+        self.assertEqual(flow.context_menu.execute.call_count, 2)
+        flow.live.execute.assert_called_once()
+        self.assertEqual(self.cli()['status'], 'needs_consent')
+
+    def test_activity_after_a_right_click_cannot_replay_the_menu_or_enroll_permission(self):
+        partial = dict(status='blocked', diagnostic='foreground_or_input_changed', input_dispatched=True,
+                       leaf_dispatched=False, menu_items=[], menu_path_completed=False)
+        flow.context_menu.execute.side_effect = [partial]
+        with patch.dict(os.environ, LOCALAPPDATA=str(self.path.parent / 'profile')):
+            result = self.cli('--allow-physical', '--remember-physical')
+            self.assertEqual(result['input_pause'], dict(host_action='check_current_effect_before_continuing'))
+            self.assertNotIn('repeat_physical_input', result)
+            self.assertEqual(self.cli()['status'], 'needs_consent')
+
+    def test_forget_between_failure_and_resume_cancels_pending_repeat_permission(self):
+        flow.context_menu.execute.side_effect = self.menu
+        with patch.dict(os.environ, LOCALAPPDATA=str(self.path.parent / 'profile')):
+            failure = self.cli('--allow-physical', '--remember-physical')
+            self.assertEqual(self.cli('--forget-physical')['status'], 'forgotten')
+            adjusted = dict(self.recipe['steps'][1]['spec'], point=self.after)
+            with patch.object(repair, 'inspect_or_adjust', return_value=adjusted):
+                resumed = self.cli('--resume-menu', failure['menu_repair']['ticket'], '--allow-physical',
+                                   '--frame', 'fresh', '--point', '4', '9')
+            self.assertEqual(resumed['steps'][-1]['receipt']['status'], 'delivered_unverified')
+            self.assertNotIn('repeat_physical_input', resumed)
+            self.assertEqual(self.cli()['status'], 'needs_consent')
+
+    def test_input_interference_in_a_resumed_tail_never_suggests_replaying_prior_query(self):
+        pause = dict(status='blocked', input_dispatched=False, steps=[], resumed_at=2,
+                     diagnostic='foreground_or_input_changed')
+        with patch.object(repair, 'run_registered', return_value=pause):
+            result = self.cli('--resume-input', 'ticket')
+        self.assertEqual(result['input_pause']['host_action'], 'check_current_effect_before_continuing')
 
     def test_before_click_failure_resumes_without_duplicate_query_and_updates_next_run(self):
         self.recipe['steps'].append(output())

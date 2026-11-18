@@ -266,53 +266,59 @@ def _menu_caption(label):
     return ' '.join(label.split()).casefold()
 
 
+def _captured_menu_name(row):
+    step = row['step']
+    if row.get('capture_role') == 'menuitem' and row.get('capture_name'):
+        return row['capture_name']
+    if step.get('role') == 'menuitem' and step.get('match') in ('name', 'automation_id'):
+        return step['target'] if step['match'] == 'name' else step.get('command_name')
+
+
 def _menu_tail(row, known_captions=()):
     """Return witnessed captions or the user's complete, explicit menu path."""
     step = row['step']
     if (row.get('field_problem') or row['mode'] not in (None, 'recorded') or 'wait_after' in step
             or row.get('capture_role') not in (None, 'menuitem')):
         return []
-    route = tasks.click_menu_path(row['text'])
-    name = row.get('capture_name')
+    text = row['text'].strip()
+    name = _captured_menu_name(row)
+    if name and not tasks._text(name):
+        return []
+    # A witnessed caption may itself read "Do Not Disturb". Check the direction
+    # around the literal caption for conditions and negation.
+    direction = re.sub(re.escape(name), '', text, flags=re.I) if name else text
+    if tasks._conditional_sentence(direction) or re.search(r'하지\s*(?:마|말)|말고|대신|\b(?:never|instead|do not)\b', direction, re.I):
+        return []
+    route = tasks.click_menu_path(text)
+    click = tasks.click_request(text)
     if step['action'] == 'open':
         if step.get('match') == 'query':
             # The editor can turn an unrecognized popup click into a query for
             # its caption. It has no witnessed button identity. A real captured
             # button is excluded above (draft) or by its stable match (task).
-            click = tasks.click_request(row['text'])
             role = step.get('role')
             if (not click or role not in ('button', 'menuitem')
                     or step.get('within') or step.get('expand') or step.get('target') != click[0]):
                 return []
-        elif step.get('role') == 'menuitem':
-            name = step.get('command_name') or (step.get('target') if step.get('match') == 'name' else name)
-        else:
+        elif step.get('role') != 'menuitem':
             return []
     elif (step['action'] != 'manual' or step.get('reason') not in (
             'popup_needs_live_binding', 'capture_target_unavailable', 'unsupported_recorded_action', 'unsupported_demonstration')):
         return []
-    if name and not tasks._text(name):
-        return []
     if route:
         return route if not name or _menu_caption(name) == _menu_caption(route[-1]) else []
-    if name:
-        return [name]
-    text = row['text'].strip()
-    if tasks._conditional_sentence(text) or re.search(r'하지\s*(?:마|말)|말고|대신|\b(?:never|instead|do not)\b', text, re.I):
-        return []
-    click = tasks.click_request(text)
     if click:
-        return [click[0]]
-    # An unwitnessed sentence following the menu may describe a separate task.
-    # Treat a bare caption as such only when the supplied path/live popup names it.
-    if _menu_caption(text) in known_captions:
-        return [text]
-    selection = re.fullmatch(r'(.+?)\s*(?:을|를)?\s*선택(?:해\s*(?:줘|주세요))?[.!。]?', text)
-    if selection is None:
-        selection = re.fullmatch(r'select\s+(.+?)[.!]?', text, re.IGNORECASE)
-    if selection and tasks._text(selection[1], 200):
-        return [selection[1].strip()]
-    return []
+        caption = click[0]
+    elif _menu_caption(text) in known_captions:
+        caption = text
+    else:
+        selection = re.fullmatch(r'(.+?)\s*(?:을|를)?\s*선택(?:해\s*(?:줘|주세요))?[.!。]?', text)
+        if selection is None:
+            selection = re.fullmatch(r'select\s+(.+?)[.!]?', text, re.IGNORECASE)
+        caption = selection[1].strip() if selection and tasks._text(selection[1], 200) else None
+    if name and caption and _menu_caption(name) != _menu_caption(caption):
+        return []
+    return [name or caption] if name or caption else []
 
 
 def _next_menu_index(path, index, row):
@@ -343,9 +349,10 @@ def _menu_hint(rows, number, inventory):
         caption = labels[0]
         # An unknown click with a caption shared by a live ordinary control
         # needs host inspection. Do not turn a toolbar or dialog into a menu.
-        if any(node.get('role') in tasks.INVOKE - {'menuitem'} and node.get('offscreen') is False
-               and _menu_caption(node.get('name') or '') == _menu_caption(caption)
-               for scope in [inventory, *inventory.get('owned_popups', [])] for node in scope.get('targets', [])):
+        if not _captured_menu_name(following) and any(
+                node.get('role') in tasks.INVOKE - {'menuitem'} and node.get('offscreen') is False
+                and _menu_caption(node.get('name') or '') == _menu_caption(caption)
+                for scope in [inventory, *inventory.get('owned_popups', [])] for node in scope.get('targets', [])):
             break
         if path and (len(tails) >= len(path) or _menu_caption(caption) != _menu_caption(path[len(tails)])):
             break
@@ -382,11 +389,23 @@ def _demonstrated_result_point(text):
 def _menu(app, rows, item, owner, surface, title, fingerprint, *, prepare=False, detail=None, inventory=None):
     import live_recovery
     number, end = item['number'], item.get('through', item['number'])
-    _require(set(item) <= {'number', 'mode', 'through', 'target', 'role', 'frame', 'point', 'path', 'output'},
-             'invalid_recovery_binding')
     start, path = rows[number - 1], item.get('path')
     _require(start['step'].get('reason') == 'right_click_requires_menu_teaching' and start['step']['action'] == 'manual',
              'recorded_right_click_required')
+    allowed = {'number', 'mode', 'through', 'target', 'role', 'frame', 'point', 'path', 'output',
+               'menu_anchor', 'menu_window_point'}
+    extras = sorted(set(item) - allowed)
+    if extras:
+        if detail is not None:
+            detail['unsupported_fields'] = extras
+            detail['recovery_hint'] = '메뉴 연결에 지원하지 않는 키가 있습니다. 메뉴 경로는 path에 지정하세요.'
+        raise tasks.TaskError('invalid_recovery_binding')
+    for evidence in ('menu_anchor', 'menu_window_point'):
+        if evidence in item:
+            # Hosts may copy recorded evidence from the receipt. Only the
+            # recording can supply this point; changing it needs a fresh frame.
+            _require(start['step'].get(evidence) is not None and item[evidence] == start['step'][evidence]
+                     and 'frame' not in item and 'point' not in item, 'context_region_changed')
     _require(isinstance(path, list) and 0 < len(path) <= 8 and all(tasks._text(label, 200) for label in path),
              'invalid_menu_path')
     _require(type(end) is int and number <= end <= len(rows) and end - number <= len(path), 'invalid_menu_step_range')
@@ -653,6 +672,8 @@ def run(app, args):
 
     observations, revised, remap = {}, [], {}
     skip_until = 0
+    suggestions, suggested_through = [], 0
+    template = dict(source_fingerprint=fingerprint, steps=suggestions)
     pending = {}
     for number, detail in zip(selection, details):
         row, operation = rows[number-1], operations.get(number)
@@ -699,9 +720,16 @@ def run(app, args):
                 if args.image and detail.get('menu_window_point') and observation.get('width') and observation.get('height'):
                     detail['recorded_image_point'] = [min(extent-1, round(fraction*extent)) for fraction, extent in
                         zip(detail['menu_window_point'], [observation['width'], observation['height']])]
-            if prepare:
-                operation = (None if row['step']['action'] in tasks.CAPTURE_COMMANDS else
+            if not args.bindings and (prepare or number > suggested_through):
+                candidate = (None if row['step']['action'] in tasks.CAPTURE_COMMANDS else
                              _suggest(number, rows, detail, observation, doc['name']))
+                if number > suggested_through:
+                    if candidate:
+                        suggestions.append(candidate)
+                    if detail.get('menu_binding_hint'):
+                        suggested_through = detail['menu_binding_hint']['through']
+                if prepare:
+                    operation = candidate
             if not args.bindings and not prepare:
                 continue
             if row.get('scope_problem'):
@@ -753,8 +781,16 @@ def run(app, args):
                           'recorded_window_opener_unresolved') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
             if args.bindings:
-                return _blocked(result, reason, step_number=number,
-                                **({'recovery_hint': detail['recovery_hint']} if 'recovery_hint' in detail else {}))
+                if (row['step'].get('reason') == 'right_click_requires_menu_teaching' and operation
+                        and reason in ('invalid_recovery_binding', 'step_requires_dedicated_binding',
+                                       'invalid_menu_path', 'invalid_menu_step_range', 'invalid_context_point')):
+                    hint = _menu_hint(rows, number, observation)
+                    if hint:
+                        detail['menu_binding_hint'] = hint
+                    if operation['mode'] != 'context-menu':
+                        detail['recovery_hint'] = '녹화된 우클릭과 이어지는 항목은 mode가 context-menu인 한 단계로 연결하세요.'
+                return _blocked(result, reason, step_number=number, **{key: detail[key] for key in
+                                ('unsupported_fields', 'menu_binding_hint', 'recovery_hint') if key in detail})
             if prepare:
                 pending[number] = reason
                 if 'menu_binding_hint' in detail:
@@ -762,24 +798,10 @@ def run(app, args):
                     detail['capture_requires_consent'] = True
     if not args.bindings and (not prepare or pending):
         result['host_action'] = 'bind_recorded_instructions_from_live_scopes'
-        suggested = []
-        menu_end = 0
-        for detail in details:
-            if 'scope_index' not in detail:
-                continue
-            n = detail['number']
-            inventory = result['live_scopes'][detail['scope_index']]
-            if n <= menu_end:
-                continue
-            item = _suggest(n, rows, detail, inventory, doc['name'])
-            if detail.get('menu_binding_hint'):
-                menu_end = detail['menu_binding_hint']['through']
-            if item:
-                suggested.append(item)
-        result['bindings_template'] = dict(source_fingerprint=fingerprint, steps=suggested)
         if pending:
             n = next(iter(pending))
-            return _blocked(result, pending[n], step_number=n)
+            return _blocked(result, pending[n], step_number=n, bindings_template=template)
+        result['bindings_template'] = template
         if not result['live_scopes']:
             return _blocked(result, details[0].get('diagnostic', 'target_unavailable'))
         return result
@@ -791,6 +813,7 @@ def run(app, args):
         if not plan.get('envelope'):
             return _blocked(result, plan.get('diagnostic', 'instruction_requires_structure'),
                             step_number=next((i for i, n in remap.items() if n == plan.get('step')), None),
+                            bindings_template=template,
                             host_action='bind_recorded_instructions_from_live_scopes')
     try:
         # Compare and publish under the same short lock used to revise editor

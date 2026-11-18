@@ -38,6 +38,28 @@ def recording():
 
 
 class CompilationTests(unittest.TestCase):
+    def test_run_time_values_on_unrelated_combo_and_text_field(self):
+        zone = combo('배송 권역', 'deliveryZone', '배송 권역에 "서울"을 선택해줘. 매번 실행할 때 물어봐')
+        level = combo('배송 등급', 'serviceLevel', '배송 등급에 "당일"을 선택해줘')
+        part = dict(action='set-value', field_label='주문 번호', value='ORD-17',
+                    target=dict(kind='element', locator=dict(role='textfield', automation_id='orderRef')),
+                    recognition=dict(action='supported', target='identified', result='checkable'))
+        part['instruction'] = tasks.compile_instruction(part, '실행할 때 값을 물어봐줘')
+        task = tasks.from_recording('배송 조건', 'Dispatch.exe', '배송 관리', [zone, level, part])
+        recipe = plans.compile_plan(task)['envelope']['recipe']
+        self.assertEqual([step.get('parameter') for step in recipe['steps']], ['배송 권역', None, '주문 번호'])
+        self.assertEqual([step.get('value') for step in recipe['steps']], [None, '당일', None])
+        self.assertEqual(workflow.values_for(recipe, {}), ({}, ['배송 권역', '주문 번호']))
+        overrides = {'배송 권역': '부산', '주문 번호': 'ORD-28'}
+        self.assertEqual(workflow.values_for(recipe, overrides), (overrides, []))
+
+    def test_ask_at_run_without_an_identified_field_preserves_draft(self):
+        question = '실행할 때 값을 물어봐줘'
+        for step in (dict(action='manual', reason='capture_target_unavailable'), button()):
+            spec = tasks.compile_instruction(step, question)
+            self.assertEqual(spec, dict(mode='draft', text=question))
+        self.assertIsNone(tasks.instruction_subject(question))
+
     def test_quoted_combo_assignments_preserve_spelling_and_explicit_older_bindings(self):
         step = recording()['steps'][0]
         for literal in ("'N'", '"N"', '‘N’', '“N”'):

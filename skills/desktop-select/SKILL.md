@@ -21,7 +21,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" recorder --app
 
 저장 영수증이 이미 있으면 바로 `effective_task`와 `next_action`을 사용한다. `preparation=ready`인 작업의 등록과 첫 시험은 `next_action.register_and_test.script`와 그 `args`에 `--out "<프로젝트>/.claude/skills/<새 업무 이름>"`과 요청받은 `--set "이름=값"`을 붙여 **한 번** 실행한다. 이 명령은 `register --task … --run --summary`다. 등록만 원하면 `register --task "<effective_task>" --out "<새 업무 스킬 폴더>"`만, 일회성 실행은 `next_action.script`와 그 `args`의 `replay`를 쓴다.
 
-등록과 첫 시험에서 실제 입력과 보정용 화면 확인을 승인받았으면 `--allow-physical --auto-repair-frame`을 함께 준다. `menu_repair.image`가 오면 그 로컬 이미지를 한 번 읽고 지시한 표의 셀을 식별한다. `menu_repair.resume_script`와 `resume_args`에서 `<x>`, `<y>`만 이미지 원본 픽셀로 바꿔 바로 실행한다. 티켓과 변수는 그대로 쓴다. 이미지 없이 티켓만 왔을 때만 승인 범위에서 `frame_args`로 캡처한다. 원래 조회나 우클릭을 반복하지 않는다.
+첫 시험의 실제 입력을 승인받으면 `--allow-physical`을 사용한다. 같은 등록 업무의 반복 입력까지 허용한 경우 `--remember-physical`을 함께 준다. 보정용 화면 확인도 승인받았으면 `--auto-repair-frame`을 추가한다. `menu_repair.image`가 오면 이미지를 한 번 읽고 표의 셀을 찾는다. `resume_script`와 `resume_args`에서 `<x>`, `<y>`만 원본 픽셀로 바꿔 이어간다. 티켓과 변수는 유지한다. 이미지 없이 티켓만 왔을 때만 승인 범위에서 `frame_args`로 캡처한다.
 
 `bind_existing_observation`은 영수증의 원문, `live_scopes`, `bindings_template`으로 연결한 뒤 반환된 인자에 `--bindings <JSON> --save-as "<실행용 사본>"`을 추가한다. 이전 초안, 정확한 창 지정, 보완 녹화 또는 미확정 대상이 있을 때 [녹화 편집과 복구](references/recording-recovery.md)를 읽는다.
 
@@ -31,7 +31,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" recorder --app
 
 ## 입력과 결과
 
-- 필수 변수 중 빠진 값만 묻는다. 실제 입력을 쓸 창과 동작을 알리고 이번 실행에 대한 동의가 있으면 이어간다. 등록 업무의 실제 입력을 승인받았을 때만 `--allow-physical`을 준다. 동의가 필요하면 한 번 묻고 화면 캡처가 필요한 경우 그 범위도 포함한다. 접근성 조작은 바로 실행한다. 사용자가 자신의 마우스와 키보드를 계속 쓰려면 `--background-only`를 사용하고 차단되면 멈춘다.
+- 등록 업무를 실행해 달라면 받은 변수로 실행기를 바로 호출한다. 필요한 값이나 실제 입력 허용 범위가 빠졌으면 한 번에 묻는다. 반복 허용을 저장한 업무는 같은 범위에서 바로 실행한다. 입력 충돌로 멈추면 사용자가 손을 뗀 뒤 영수증의 재개 지시를 따른다. 입력이 전혀 없을 때만 처음부터 다시 시작한다. 사용자가 자신의 마우스와 키보드를 계속 쓰려면 `--background-only`를 사용한다.
 - 영수증의 JSON을 읽고 검증한 범위만 보고한다. `verified`는 기대 상태 확인, `delivered_unverified`는 전달 확인이다. 파일 생성은 `verified_outputs`의 경로를 보고한다. 종료 코드 3 또는 `uncertain`이면 이미 전달한 단계와 현재 결과를 확인하고 불확실한 입력을 재전송하지 않는다.
 - 명령이 이미 창을 확인하므로 일반 실행 전후의 `--help`, `inspect`, `--read-only`, `plan`, 소스나 파일 검색은 생략한다. 녹화 문장은 현재 요청 범위 안에서 쓰고 업무 데이터와 화면은 로컬에서만 사용한다.
 

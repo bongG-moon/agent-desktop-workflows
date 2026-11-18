@@ -1,8 +1,15 @@
 """Exercise offline review, raw editor drafts and retry through real Tk callbacks."""
+import gc
 import unittest
 from unittest.mock import Mock, patch
 
 from test_teach_capture import capture, combo
+
+
+def tearDownModule():
+    # Finalize the closed Tk interpreters on their owning thread before the
+    # next test module starts a background window scan.
+    gc.collect()
 
 
 def row(key, text, **form):
@@ -46,10 +53,13 @@ class DraftSaveUITests(unittest.TestCase):
             root.destroy()
 
         root.after(60, exercise)
-        root.after(5000, timeout)
-        with patch.object(tk, 'Tk', return_value=root), patch.object(capture, 'CaptureSession') as session:
-            receipt = capture.capture(None, title='Example window', initial_draft=rows,
-                                      save_recording=persist, save_draft=draft, initial_step=initial_step)
+        deadline = root.after(5000, timeout)
+        try:
+            with patch.object(tk, 'Tk', return_value=root), patch.object(capture, 'CaptureSession') as session:
+                receipt = capture.capture(None, title='Example window', initial_draft=rows,
+                                          save_recording=persist, save_draft=draft, initial_step=initial_step)
+        finally:
+            root.after_cancel(deadline)
         session.assert_not_called()
         if errors:
             raise errors[0]

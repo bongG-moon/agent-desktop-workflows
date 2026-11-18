@@ -807,7 +807,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     if popup:
                         receipt['popup'] = dict(title=popup['title'])
                 routes.after(number, receipt)
-                if track_menu and workflow_repair.menu(step) and workflow_repair.point_failed(receipt):
+                if track_menu and workflow_repair.menu(step) and (workflow_repair.point_failed(receipt)
+                                                                  or workflow_repair.input_paused(receipt)):
                     report['menu_repair_scope'] = [workflow_repair.identity(owner), workflow_repair.identity(binding)]
                     report['menu_repair_routes'] = workflow_repair.saved_routes(routes, number)
                 if context:
@@ -1000,27 +1001,33 @@ def run_instructions(recipe, skill_name):
             note += ('조건을 판단할 때 ' + json.dumps(scene_windows, ensure_ascii=False) + ' 창의 현재 이미지를 읽는다. '
                      '이번 실행의 실제 입력과 해당 창 이미지 확인이 모두 승인됐으면 바로 실행한다. '
                      '빠진 승인은 실행 전에 한 번에 묻는다. `needs_scene`이면 상세 안내에 따라 같은 실행을 이어간다.\n\n')
+            arguments += ' --allow-physical'
         else:
-            note += ('이번 실행의 실제 입력이 승인됐으면 바로 실행한다. '
-                     '승인이 없으면 이 범위에서 마우스와 키보드를 비울 수 있는지 한 번 묻고 승인 후 실행한다.\n\n')
-        arguments += ' --allow-physical'
+            note += ('반복 실행은 아래 명령으로 바로 시작한다. '
+                     '첫 시험이거나 실행안이 바뀌어 `needs_consent`가 오면 위 범위를 한 번 확인한다. '
+                     '이번만 승인받으면 `--allow-physical`, 이후 요청하는 같은 업무에도 동의하면 '
+                     '`--allow-physical --remember-physical`을 붙인다. 이번 실행 승인이 이미 있으면 처음부터 해당 옵션을 쓴다. '
+                     '반복 승인을 취소할 때는 실행기에 `--forget-physical`만 준다.\n\n')
     repair = ''
     if any(workflow_repair.menu(step) for step in recipe['steps']):
-        repair = '이번 실행에서 표 위치 보정용 화면 확인까지 승인받았으면 `--auto-repair-frame`을 추가한다. '
+        repair = '이번 실행에서 표 위치 보정용 화면 확인까지 승인받았으면 `--auto-repair-frame`과 `--allow-physical`을 함께 준다. '
         repair += ('표 보정 승인이 없으면 이 옵션을 생략한다.\n\n' if scene_windows else
-                   '실제 입력만 승인됐으면 위 명령 그대로 실행한다.\n\n')
+                   '저장된 반복 승인은 보정 이미지를 볼 권한을 포함하지 않는다.\n\n')
     return (GUIDE_BEGIN
             + f'Claude Code에서 사용자가 `/{skill_name}`으로 직접 호출했고 Company Agent가 이번 턴의 기본 Skill 도구 호출을 '
             f'요구하며 이 업무의 Skill 호출이 아직 성공하지 않은 경우에만 `Skill(skill="{skill_name}")`을 한 번 먼저 호출한다.\n\n'
             '실행 요청이면 다음 명령을 첫 셸 명령으로 한 번 실행한다. '
             + ('필수 변수 ' + json.dumps(parameters, ensure_ascii=False) + '에 요청값을 넣고 빠진 값만 묻는다. '
                if parameters else '')
+            + ('빠진 변수와 실제 입력 승인이 함께 필요하면 한 번에 묻는다. ' if parameters and physical else '')
             + '실행기가 대상 창을 확인한다.\n\n' + note
             + '`' + RUN_COMMAND + ' --summary' + arguments + '`\n\n' + repair +
             '현재 상태만 요청하면 실행 인자 대신 `--read-only`, 입력 방식만 요청하면 `--input-plan`을 쓴다. '
             '백그라운드 전용 요청은 실행 변수와 `--background-only`로 호출한다.\n\n'
             'JSON의 상태를 보고하고 workbook_verified이면 verified_outputs의 파일 경로를 전달한다. '
-            '중단되면 보낸 입력을 반복하지 않는다. 녹화 순서 설명이나 중단 후 복구가 필요할 때만 '
+            'input_pause이면 사용자에게 입력을 잠시 멈춰 달라고 안내한다. 사용자가 멈췄다고 하면 제공된 resume_args로 이어간다. '
+            'retry_full_run_after_idle은 전체를 다시 시작할 수 있다. 그 밖에는 이미 보낸 입력의 결과부터 확인한다. '
+            '녹화 순서 설명이나 중단 후 복구가 필요할 때만 '
             f'[업무 상세 안내]({GUIDE_REFERENCE})를 읽는다.\n' + GUIDE_END)
 
 
@@ -1314,15 +1321,19 @@ def register_first_run(recipe, args):
         return dict(status='blocked', diagnostic='workflow_destination_exists', input_dispatched=False,
                     path=str(destination), host_action='check_existing_registration_without_rerunning')
     requirements = input_policy.profile(recipe['steps'])
+    if args.remember_physical:
+        need(args.allow_physical and requirements['physical_input_required'] and not args.background_only
+             and args.hwnd is None and not any(s['action'] == 'conditional-open' for s in recipe['steps']),
+             'repeat_approval_requires_full_physical_test')
     if args.background_only:
         refusal = input_policy.blocked(requirements)
         if refusal:
             return refusal
+    _, missing = values_for(recipe, app.tasks.parse_overrides(args.set))
     if requirements['physical_input_required'] and not args.allow_physical:
         return dict(status='needs_consent', diagnostic='registered_physical_consent_required',
-                    window=recipe['window'], input_requirements=requirements, steps=[],
+                    window=recipe['window'], input_requirements=requirements, steps=[], missing_parameters=missing,
                     approval_flag='--allow-physical', input_dispatched=False)
-    _, missing = values_for(recipe, app.tasks.parse_overrides(args.set))
     if missing:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     register_args = ['register', '--out', str(destination)]
@@ -1337,7 +1348,7 @@ def register_first_run(recipe, args):
         run_args += ['--hwnd', str(args.hwnd)]
     for value in args.set:
         run_args += ['--set', value]
-    for option in ('summary', 'allow_physical', 'background_only', 'auto_repair_frame'):
+    for option in ('summary', 'allow_physical', 'remember_physical', 'background_only', 'auto_repair_frame'):
         if getattr(args, option):
             run_args.append('--' + option.replace('_', '-'))
     try:
@@ -1390,11 +1401,14 @@ def main(argv=None):
             repair = p.add_mutually_exclusive_group()
             repair.add_argument('--repair-frame', metavar='TICKET', help='inspect the failed result area without input')
             repair.add_argument('--resume-menu', metavar='TICKET', help='resume a before-click failure from the approved frame')
+            repair.add_argument('--resume-input', metavar='TICKET', help='after the user pauses, continue at the unsent menu')
+            p.add_argument('--forget-physical', action='store_true', help='remove the repeat permission for this registration')
             p.add_argument('--frame', metavar='TOKEN')
             p.add_argument('--point', nargs=2, type=int, metavar=('X', 'Y'))
         p.add_argument('--set', action='append', default=[])
         p.add_argument('--summary', action='store_true', help='return a compact receipt; exit 0 for a verified final workbook')
         p.add_argument('--allow-physical', action='store_true', help='the user approved the registered screen/input scope for this run')
+        p.add_argument('--remember-physical', action='store_true', help='after an approved full test, allow future requested runs of the identical workflow')
         p.add_argument('--background-only', action='store_true', help='refuse physical input, foregrounding and window restoration')
         p.add_argument('--auto-repair-frame', action='store_true',
                        help='include the approved result-area image after a before-input menu point failure')
@@ -1414,7 +1428,7 @@ def main(argv=None):
         source_task = None
         recipe = None
         if args.command == 'register':
-            need(args.run or not (args.set or args.summary or args.allow_physical or
+            need(args.run or not (args.set or args.summary or args.allow_physical or args.remember_physical or
                                  args.background_only or args.auto_repair_frame), 'register_run_required')
         if args.command == 'refresh-guide':
             result = refresh_guide(args.skill)
@@ -1443,7 +1457,14 @@ def main(argv=None):
         overrides = {}
         if args.command == 'run':
             registered = workflow_repair.registered(args.recipe)
-            repairing = bool(args.repair_frame or args.resume_menu)
+            if args.forget_physical:
+                need(registered and not any((args.only, args.hwnd, args.resume_input, args.resume_menu, args.repair_frame,
+                     args.set, args.remember_physical, args.allow_physical, args.background_only, args.frame, args.point,
+                     args.input_plan, args.read_only, args.auto_repair_frame)), 'invalid_forget_physical_arguments')
+                workflow_repair.forget_approval(args.recipe)
+                print(json.dumps(dict(status='forgotten', input_dispatched=False)))
+                return 0
+            repairing = bool(args.repair_frame or args.resume_menu or args.resume_input)
             need(not repairing or (registered and not args.read_only and not args.input_plan and
                                    not args.background_only and args.only is None and args.hwnd is None),
                  'invalid_registered_repair_arguments')
@@ -1452,6 +1473,11 @@ def main(argv=None):
             entries = selected_steps(recipe, args.only)
             active = dict(recipe, steps=[step for _, step in entries])
             requirements = input_policy.profile(active['steps'], [n for n, _ in entries])
+            eligible = (registered and args.only is None and args.hwnd is None and not args.background_only
+                        and not args.read_only and not args.input_plan and requirements['physical_input_required']
+                        and not any(s['action'] == 'conditional-open' for s in recipe['steps']))
+            need(not args.remember_physical or (eligible and args.allow_physical and not repairing),
+                 'repeat_approval_requires_full_physical_test')
             if args.input_plan:
                 print(json.dumps(dict(status='observed', input_dispatched=False,
                                       input_requirements=requirements), ensure_ascii=False))
@@ -1461,14 +1487,17 @@ def main(argv=None):
                 if refusal:
                     print(json.dumps(refusal, ensure_ascii=False))
                     return 2
-            if (registered and not args.allow_physical and
+            args.repeat_approval_used = (eligible and not args.allow_physical and not repairing
+                                         and not args.auto_repair_frame and workflow_repair.approved(args.recipe, recipe))
+            overrides = app.tasks.parse_overrides(args.set)
+            _, missing = values_for(active, overrides)
+            if (registered and not args.allow_physical and not args.repeat_approval_used and not args.resume_input and
                     (repairing or (mutating and requirements['physical_input_required']))):
                 print(json.dumps(dict(status='needs_consent', diagnostic='registered_physical_consent_required',
                                       window=recipe['window'], input_requirements=requirements, steps=[],
+                                      missing_parameters=[] if repairing else missing,
                                       approval_flag='--allow-physical', input_dispatched=False), ensure_ascii=False))
                 return 2
-            overrides = app.tasks.parse_overrides(args.set)
-            _, missing = values_for(active, overrides)
             if missing and not args.read_only and not repairing:
                 print(json.dumps(dict(status='needs_input', missing_parameters=missing,
                                       steps=[], input_dispatched=False), ensure_ascii=False))
@@ -1485,7 +1514,7 @@ def main(argv=None):
                 executing = mutating
                 if not args.repair_frame and any(s['action'] == 'conditional-open' for _, s in entries):
                     from scene_session import start
-                    session_args = {k: getattr(args, k) for k in ('repair_frame', 'resume_menu', 'frame',
+                    session_args = {k: getattr(args, k) for k in ('repair_frame', 'resume_menu', 'resume_input', 'frame',
                                                                   'point', 'only', 'hwnd', 'auto_repair_frame',
                                                                   'allow_physical', 'background_only', 'set')}
                     session_args['recipe'] = str(args.recipe.absolute())
@@ -1495,8 +1524,17 @@ def main(argv=None):
                     result = workflow_repair.run_registered(sys.modules[__name__], recipe, args, overrides)
             else:
                 executing = mutating
-                result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd,
-                             background_only=args.background_only, only=args.only)
+                with ExitStack() as permission:
+                    if args.remember_physical or args.repeat_approval_used:
+                        permission.enter_context(coordination.recipe(args.recipe))
+                        need(load(args.recipe) == recipe, 'registered_workflow_changed')
+                        if args.repeat_approval_used:
+                            need(workflow_repair.approved(args.recipe, recipe), 'registered_physical_consent_required')
+                    approval_before = workflow_repair.approval_state(args.recipe) if args.remember_physical else None
+                    result = run(recipe, overrides, read_only=args.read_only, hwnd=args.hwnd,
+                                 background_only=args.background_only, only=args.only)
+                    if args.remember_physical:
+                        workflow_repair.remember_test(args.recipe, recipe, result, approval_before)
         else:
             timeout = worker_timeout(active if args.command == 'run' else recipe) if recipe else 90
             launched = True
@@ -1513,6 +1551,11 @@ def main(argv=None):
                     executed = {r['number'] for r in result.get('steps', [])}
                     entries = [(n, s) for n, s in entries if n in executed]
                 result = summarize_execution(result, entries)
+        if (mutating and result.get('diagnostic') in workflow_repair.INPUT_CHANGED
+                and not result.get('input_pause')):
+            untouched = result.get('input_dispatched') is False and not (args.resume_input or args.resume_menu)
+            result['input_pause'] = dict(host_action='retry_full_run_after_idle' if untouched
+                                         else 'check_current_effect_before_continuing')
     except (Exception, KeyboardInterrupt) as error:
         uncertain = (launched or executing) and mutating
         result = dict(status='uncertain' if uncertain else 'blocked', input_dispatched=None if uncertain else False,

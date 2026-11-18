@@ -296,6 +296,62 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.assertEqual(self.recover_cli('--prepare')['task']['name'], result['task']['name'])
         self.assertEqual((self.directory/'내 녹화.json').read_bytes(), original)
 
+    def field_and_export_task(self, first_sentence):
+        # Persist the shape emitted by the old recorder, including its
+        # instruction_draft on an otherwise identified combo and two popup queries.
+        rows = [tasks.instructed_step(combo(identifier='c_status'), dict(mode='draft', text=first_sentence)),
+                tasks.instructed_step(combo('Family', 'c_family', 'Family에 Hybrid 입력'),
+                                      dict(mode='draft', text="Family 조건에 'Hybrid'선택")),
+                tasks.recorded_step(button()),
+                dict(action='manual', reason='right_click_requires_menu_teaching',
+                     instruction_draft='조회 결과 테이블에서 우클릭',
+                     menu_anchor=dict(target=dict(role='group', automation_id='results'), point=[.37, .22]))]
+        for caption in ('Export to excel', 'Active Sheet'):
+            rows.append(dict(action='open', role='button', match='query', expand=False, target=caption,
+                             instruction=dict(mode='recorded', text=caption + ' 클릭')))
+        tasks.save_task(dict(schema=1, name='내 녹화', exe='Demo.exe', window='업무', steps=rows), self.directory)
+        self.observe.return_value['targets'].append(dict(role='group', automation_id='results',
+                                                        enabled=True, offscreen=False))
+        self.menu.return_value['menu'].update(point=[.37, .22], path=['Export to excel', 'Active Sheet'])
+        return rows
+
+    def test_existing_example_with_runtime_question_prepares_in_one_observation(self):
+        sentence = "MES Setup 조건에  'N'을 입력해줘 (이건 실행 전 어떤 값을 넣을 지 물어봐줘)"
+        self.field_and_export_task(sentence)
+        original = (self.directory/'내 녹화.json').read_bytes()
+        result = self.recover_cli('--prepare')
+        self.assertEqual(result['status'], 'recorded', result)
+        self.assertEqual(result['execution_plan']['required_parameters'], ['MES Setup'])
+        self.assertEqual(result['source_steps'], {1:1, 2:2, 3:3, 4:4, 5:4, 6:4})
+        steps = tasks.load_task(result['task']['name'], self.directory)['steps']
+        self.assertEqual(steps[0]['instruction'], dict(text=sentence, mode='required', parameter='MES Setup'))
+        self.assertEqual(steps[1]['instruction']['value'], 'Hybrid')
+        self.assertEqual(steps[-1]['context']['menu']['path'], ['Export to excel', 'Active Sheet'])
+        self.assertEqual((self.directory/'내 녹화.json').read_bytes(), original)
+        self.observe.assert_called_once()
+        self.menu.assert_called_once()
+        self.assertFalse(result['input_dispatched'])
+
+    def test_incomplete_plan_returns_reusable_valid_bindings_and_diagnoses_extra_menu_keys(self):
+        rows = self.field_and_export_task('실행 환경을 고려해 정할 값')
+        info = self.recover_cli('--prepare')
+        self.assertEqual((info['diagnostic'], info['step_number']), ('instruction_requires_structure', 1))
+        template = info['bindings_template']
+        self.assertEqual([item['number'] for item in template['steps']], [2, 3, 4])
+        menu = template['steps'][-1]
+        self.assertEqual(menu, dict(number=4, through=6, mode='context-menu', path=['Export to excel', 'Active Sheet']))
+        fields = [dict(self.patches()[0], mode='required', argument='State'), *template['steps'][:-1]]
+        bad = self.bind(template['source_fingerprint'], [*fields, dict(menu, extra='ignored?')])
+        self.assertEqual((bad['step_number'], bad['unsupported_fields'], bad['menu_binding_hint']), (4, ['extra'], menu))
+        wrong_mode = self.bind(template['source_fingerprint'], [*fields, dict(menu, mode='recorded')])
+        self.assertEqual(wrong_mode['menu_binding_hint'], menu)
+        self.assertIn('context-menu', wrong_mode['recovery_hint'])
+        changed = self.bind(template['source_fingerprint'], [*fields, dict(menu, menu_anchor={'point':[0.,0.]})])
+        self.assertEqual(changed['diagnostic'], 'context_region_changed')
+        accepted = self.bind(template['source_fingerprint'], [*fields, dict(menu, menu_anchor=rows[3]['menu_anchor'])])
+        self.assertEqual(accepted['execution_plan']['required_parameters'], ['State'])
+        self.assertFalse(accepted['input_dispatched'])
+
     def test_one_prepare_on_legacy_task_with_separate_unidentified_popup_queries(self):
         self.rows[3]['step']['menu_anchor'] = dict(target=dict(role='group', automation_id='results'), point=[.3,.5])
         self.observe.return_value['targets'].append(dict(role='group', automation_id='results', enabled=True, offscreen=False))
@@ -325,6 +381,41 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.assertEqual(result['status'], 'needs_grounding', result)
         self.assertTrue(result['steps'][3]['capture_requires_consent'])
         self.menu.assert_not_called()
+
+    def test_captured_mail_menu_beats_same_named_toolbar_and_keeps_specific_column(self):
+        title, task = 'Mail Archive', '보관함에서 복사'
+        anchor = dict(target=dict(role='table', automation_id='messageList'), point=[.67, .24])
+        captions = ['Message', 'Copy', 'Message ID']
+        rows = [dict(action='manual', reason='right_click_requires_menu_teaching',
+                     instruction_draft='메시지 번호 열에서 우클릭', menu_anchor=anchor)]
+        for caption in captions:
+            rows.append(dict(action='open', role='menuitem', match='name', target=caption,
+                             expand=False,
+                             instruction=dict(mode='recorded', text=caption + ' 클릭')))
+        tasks.save_task(dict(schema=1, name=task, exe='MailArchive.exe', window=title, steps=rows), self.directory)
+        self.owner.exe = 'MailArchive.exe'
+        app.windows.return_value = [dict(hwnd=1, title=title)]
+        self.observe.return_value['targets'] = [dict(anchor['target'], enabled=True, offscreen=False),
+            dict(role='button', automation_id='copyToolbar', name='Copy', enabled=True, offscreen=False)]
+        self.menu.return_value['menu'] = dict(anchor, path=captions)
+        prepared = app.run(app.parser().parse_args(['recover', '--task', task, '--prepare']))
+        self.assertEqual(prepared['status'], 'recorded', prepared)
+        self.assertEqual(prepared['source_steps'], {1: 1, 2: 1, 3: 1, 4: 1})
+        self.observe.assert_called_once()
+        self.menu.assert_called_once()
+        binding = self.menu.call_args.args[-1]
+        self.assertEqual((binding['menu_anchor'], binding['path']), (anchor, captions))
+        self.assertNotIn('point_policy', binding)
+
+    def test_edited_caption_does_not_silently_replay_old_captured_menu(self):
+        old = dict(action='open', role='menuitem', match='name', target='Copy')
+        for text in ('Archive 클릭', 'Archive 선택', 'Copy 클릭하지 마'):
+            with self.subTest(text=text):
+                self.assertEqual(recovery._menu_tail(dict(step=old, text=text, mode=None)), [])
+        quiet = dict(old, target='Do Not Disturb')
+        self.assertEqual(recovery._menu_tail(dict(step=quiet, text='Click Do Not Disturb', mode=None)),
+                         ['Do Not Disturb'])
+        self.assertEqual(recovery._menu_tail(dict(step=quiet, text='Do not click Do Not Disturb', mode=None)), [])
 
     def test_prepare_reports_a_missing_recorded_field_before_publishing_the_copy(self):
         self.observe.return_value['targets'].pop(1)

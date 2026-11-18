@@ -111,6 +111,28 @@ class RegisterFirstRunTests(unittest.TestCase):
             execution.assert_not_called()
             engine.assert_not_called()
 
+    def test_missing_runtime_value_and_first_consent_are_reported_together_without_inspection(self):
+        from test_python_context_workflow import context
+        self.recipe['steps'].append(context())
+        self.write_source()
+        with self.workers() as (registration, execution, engine):
+            code, first = self.cli('--run')
+            self.assertFalse(self.destination.exists())
+            (self.destination / 'scripts').mkdir(parents=True)
+            (self.destination / 'scripts/run.py').write_text(flow.RUNNER.replace('RUNTIME_PARENT', '2'))
+            recipe = self.destination / 'workflow.json'
+            recipe.write_bytes(self.source.read_bytes())
+            with redirect_stdout(StringIO()) as stdout:
+                self.assertEqual(flow.main(['run', '--recipe', str(recipe)]), 2)
+            for result in (first, json.loads(stdout.getvalue())):
+                self.assertEqual(result['status'], 'needs_consent')
+                self.assertEqual(result['missing_parameters'], ['Family'])
+                self.assertFalse(result['input_dispatched'])
+            self.assertEqual(code, 2)
+            registration.assert_not_called()
+            execution.assert_not_called()
+            engine.assert_not_called()
+
     def test_existing_destination_never_runs_or_modifies_the_previous_registration(self):
         self.destination.mkdir()
         marker = self.destination / 'keep.txt'
