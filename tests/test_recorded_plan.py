@@ -38,6 +38,35 @@ def recording():
 
 
 class CompilationTests(unittest.TestCase):
+    def test_visual_double_click_preserves_legacy_draft_and_waits_for_the_recorded_row_after_view(self):
+        from test_visual_target import image, visual, VisualTargets
+        sentence = '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'
+        raw = dict(action='manual', target={'kind':'manual'}, recognition={'reason':'double_click_needs_review'})
+        draft = tasks.instructed_step(raw, tasks.compile_instruction(raw, sentence))
+        self.assertEqual(draft, dict(action='manual', reason='double_click_needs_review', instruction_draft=sentence))
+        self.assertTrue(tasks.has_groundable_draft(draft))
+        self.assertFalse(tasks.is_recoverable(draft))
+        marker = visual.from_frame(VisualTargets.window, image((35,42)), (235,162))
+        hinted = dict(raw, visual_hint=marker)
+        step = tasks.instructed_step(hinted, tasks.compile_instruction(hinted, sentence))
+        self.assertEqual(step['visual'], dict(marker, gesture='double-click'))
+        self.assertEqual(tasks.compile_instruction(step, '버튼을 한 번 눌러줘')['mode'], 'draft')
+        self.assertEqual(tasks.compile_instruction(step, '더블 클릭하지 마')['mode'], 'draft')
+        self.assertFalse(tasks.is_double_click_step(dict(raw, protected=True)))
+        src = recording()
+        src['steps'] = [dict(action='open', role='button', match='automation_id', target='view',
+                             command_name='VIEW', expand=False), draft]
+        self.assertEqual(plans.compile_plan(src)['diagnostic'], 'instruction_requires_structure')
+        self.assertEqual(plans.compile_plan(src, replacements={2:dict(step, visual=marker)})['status'], 'not_compatible')
+        src['steps'][1] = step
+        envelope = plans.compile_plan(src)['envelope']
+        self.assertEqual([row['action'] for row in envelope['recipe']['steps']], ['invoke','visual-click'])
+        self.assertEqual(envelope['recipe']['steps'][1]['visual']['gesture'], 'double-click')
+        self.assertEqual(envelope['notes'][0]['diagnostic'], 'wait_for_double_click_target')
+        for caption in ('Delete', 'Apply'):
+            src['steps'][0]['command_name'] = caption
+            self.assertEqual(plans.compile_plan(src)['diagnostic'], 'execution_plan_wait_required')
+
     def test_run_time_values_on_unrelated_combo_and_text_field(self):
         zone = combo('배송 권역', 'deliveryZone', '배송 권역에 "서울"을 선택해줘. 매번 실행할 때 물어봐')
         level = combo('배송 등급', 'serviceLevel', '배송 등급에 "당일"을 선택해줘')

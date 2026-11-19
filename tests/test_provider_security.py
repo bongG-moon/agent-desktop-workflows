@@ -146,6 +146,19 @@ class SecurityTests(unittest.TestCase):
         self.win.window_class.return_value = 'SysListView32'
         self.assertFalse(self.protected(item))
         self.assertFalse(self.protected(caption))
+        wrapped = 'WindowsForms10.SysListView32.app.0.34f5582_r6_ad1'
+        self.win.window_class.return_value = wrapped
+        self.assertTrue(self.protected(caption))
+        owner.props.update({30090:True, 30095:33, 30096:1048580})
+        self.assertFalse(self.protected(caption))
+        for wrong in (wrapped + '.Edit', wrapped.replace('SysListView32', 'Edit')):
+            self.win.window_class.return_value = wrong
+            self.assertTrue(self.protected(caption))
+        self.win.window_class.return_value = wrapped
+        for prop, value in ((30043, True), (30095, 41), (30096, 0x20000000)):
+            with patch.dict(owner.props, {prop:value}):
+                self.assertTrue(self.protected(caption))
+        self.win.window_class.return_value = 'SysListView32'
         self.assertNotIn(30005, item.reads)
         self.assertNotIn(30045, item.reads)
         for props in ({30019: True}, {30096: 0x20000000}, {30043: True}, {30002: 99}):

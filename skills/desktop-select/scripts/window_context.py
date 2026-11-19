@@ -32,18 +32,32 @@ def validate_context(spec):
     raise ContextError('invalid_window_context')
 
 
-def validate_sequence(steps):
+def validate_sequence(steps, *, allow_unbound_double=False):
     for number, step in enumerate(steps, 1):
         if isinstance(step, dict) and 'window_context' in step:
             spec = validate_context(step['window_context'])
             source = spec.get('after_step')
-            if source is not None and (source >= number or not isinstance(steps[source-1], dict) or
-                    steps[source-1].get('action') in ('wait', 'verify-file', 'manual')):
-                raise ContextError('invalid_window_origin_step', step_number=number)
+            if source is not None:
+                origin = steps[source-1] if source < number else None
+                if (not isinstance(origin, dict) or origin.get('action') in ('wait', 'verify-file')
+                        or (origin.get('action') == 'manual' and not
+                            (allow_unbound_double and origin.get('reason') == 'double_click_needs_review'))):
+                    raise ContextError('invalid_window_origin_step', step_number=number)
 
 
 def _key(spec):
     return spec['exe'].casefold(), spec['title'], spec.get('after_step'), spec.get('related', False)
+
+
+def effect_scopes(steps, active):
+    """A single-step test still observes the window its recorded gesture should open."""
+    numbers = set(active)
+    openers = {n for n in numbers if steps[n-1]['action'] == 'row-open' or
+               (steps[n-1]['action'] == 'visual-click' and steps[n-1]['visual'].get('gesture') == 'double-click')}
+    if openers:
+        numbers.update(n for n, step in enumerate(steps, 1)
+                       if step.get('window_context', {}).get('after_step') in openers)
+    return sorted(numbers)
 
 
 def _identity(row):
@@ -58,7 +72,7 @@ class WindowRoutes:
         self.steps, self.owner, self.title, self.read_only = steps, owner, title, read_only
         self.origins = defaultdict(dict)
         self.baselines, self.outcomes, self.bindings, self.openers = {}, {}, {}, {}
-        validate_sequence(steps)
+        validate_sequence(steps, allow_unbound_double=True)
         for number in (range(1, len(steps)+1) if active is None else active):
             spec = steps[number-1].get('window_context')
             if spec is None:
@@ -100,6 +114,10 @@ class WindowRoutes:
         for key, spec in self.origins.get(number, {}).items():
             rows = self._rows(spec)
             exact = self._match(spec, rows)
+            opener = self.steps[number-1]
+            if (exact is not None and opener.get('action') == 'visual-click'
+                    and opener['visual'].get('gesture') == 'double-click'):
+                raise ContextError('expected_new_window_already_open')
             self.baselines[key] = ({_identity(row) for row in rows},
                                    _identity(exact) if exact is not None else None)
 

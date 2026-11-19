@@ -7,6 +7,7 @@ import grounding
 import learned_tasks as tasks
 import result_menu
 import row_vision
+import targeting
 
 
 def _scope_key(main, surface, frame_key):
@@ -14,15 +15,49 @@ def _scope_key(main, surface, frame_key):
                        surface.hwnd, surface.pid, surface.created]).encode('ascii')
 
 
-def _targets(app, binding, uia):
+def _scoped_selectors(app, nodes, fields):
+    """Prove each requested region with the same locator that replay will use."""
+    scopes = {}
+    by_path = {node['path']: node for node in nodes}
+    for query, role, within in fields:
+        try:
+            index, _ = app.resolve(nodes, query, role=role, within=within)
+        except app.SelectionError:
+            continue
+        field = tasks._selector(nodes[index])
+        if not field:
+            continue
+        parent = by_path.get(nodes[index].get('parent_path'))
+        while parent:
+            parent_selector = tasks._selector(parent)
+            if parent_selector and within.casefold() in (
+                    (targeting._alias(parent) or '').casefold(), (parent.get('name') or '').casefold(),
+                    (parent.get('automation_id') or '').casefold()):
+                match = 'automation_id' if 'automation_id' in field else 'name'
+                selector = dict(role=role, target=field[match], match=match, ancestors=[parent_selector])
+                try:
+                    resolved, _ = tasks.locate_target(nodes, selector)
+                except tasks.TaskError:
+                    break
+                if resolved == index:
+                    scopes.setdefault(index, {})[within] = selector
+                break
+            parent = by_path.get(parent.get('parent_path'))
+    return scopes
+
+
+def _targets(app, binding, uia, scoped_fields=()):
     nodes, _ = app.observe(binding, uia)
     regions, labels = app.scope_map(nodes), app.field_labels(nodes)
+    scopes = _scoped_selectors(app, nodes, scoped_fields) if scoped_fields else {}
     targets = []
     for i, node in enumerate(nodes):
         if (node['secure'] or node.get('role') not in app.LIST_ROLES | context_menu.REGIONS or
                 not (node.get('automation_id') or node.get('name') or i in labels)):
             continue
         description = app.describe(node, regions[i], labels.get(i, {}))
+        if i in scopes:
+            description['binding_scopes'] = scopes[i]
         if node['role'] in context_menu.REGIONS and node.get('bounds_valid') and not node.get('offscreen'):
             description['screen_bounds'] = node['bounds']
         targets.append(description)
@@ -82,14 +117,16 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None, bi
                   targets=[], owned_popups=[], input_dispatched=False)
     with app.bridge.UIA() as uia:
         try:
-            if lookups:
+            scoped_fields = (lookups or {}).get('scoped_fields', ())
+            if lookups and not scoped_fields:
                 try:
                     result['targets'] = _recorded_targets(app, surface, uia, lookups)
                     result['lookup_mode'] = 'recorded_selectors'
                 except app.bridge.BridgeError:
                     lookups = None
-            if not lookups:
-                result['targets'] = _targets(app, surface, uia)
+            if not lookups or scoped_fields:
+                result['targets'] = (_targets(app, surface, uia, scoped_fields) if scoped_fields
+                                     else _targets(app, surface, uia))
                 result['lookup_mode'] = 'window_inventory'
         except (app.SelectionError, app.bridge.BridgeError) as error:
             # A nonstandard provider may still expose its rendered window.

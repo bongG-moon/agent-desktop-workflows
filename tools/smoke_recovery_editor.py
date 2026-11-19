@@ -82,6 +82,14 @@ def main():
         def button(text):
             return next(w for w in widgets(root) if isinstance(w, ttk.Button) and w.cget('text') == text)
 
+        def step_menu():
+            return root.nametowidget(named('step_tools')['menu'])
+
+        def has_step_command(label):
+            menu = step_menu()
+            return any(menu.type(i) == 'command' and menu.entrycget(i, 'label') == label
+                       and menu.entrycget(i, 'state') != 'disabled' for i in range(menu.index('end') + 1))
+
         def write(text):
             widget = named('instruction')
             widget.delete(0, 'end')
@@ -115,7 +123,7 @@ def main():
 
         def semantic():
             assert named('instruction').get() == ''
-            assert not button('행 버튼으로 지정').winfo_viewable()
+            assert has_step_command('행 버튼으로 지정')
             assert '행 버튼' not in str(root.getvar(named('preview').cget('textvariable')))
             write('MES Setup 조건을 N으로 설정해줘')
             button('적용하고 다음 단계').invoke()
@@ -138,14 +146,10 @@ def main():
             listing = named('steps')
             before = listing.get_children()
             assert listing.selection() == ('repair',)
-            repair = button('행 버튼으로 지정')
-            assert not repair.winfo_viewable()
-            button('상세 설정').invoke()
-            root.update_idletasks()
-            assert repair.winfo_viewable()
-            repair.invoke()  # Cancel the first teaching dialog.
+            assert has_step_command('행 버튼으로 지정')
+            step_menu().invoke('행 버튼으로 지정')  # Cancel the first teaching dialog.
             assert listing.get_children() == before and listing.set('repair', 'status') == '확인 필요'
-            repair.invoke()
+            step_menu().invoke('행 버튼으로 지정')
             assert listing.get_children() == before and listing.selection() == ('repair',)
             assert listing.set('repair', 'instruction') == '두 번째 행 실행' and listing.set('repair', 'status') == '준비됨'
             button('적용하고 다음 단계').invoke()
@@ -154,7 +158,7 @@ def main():
         def command():
             assert named('steps').selection() == ('query',)
             assert named('instruction').get() == '조회 버튼을 눌러줘'
-            assert not button('행 버튼 다시 지정').winfo_viewable()
+            assert not has_step_command('행 버튼 다시 지정')
             checks.append('apply_next_accepts_unknown_prose')
             named('steps').selection_set('prose')
             later(revisit)
@@ -166,13 +170,13 @@ def main():
             later(remove)
 
         def remove():
-            button('선택 단계 삭제').invoke()
+            step_menu().invoke('선택 단계 삭제')
             assert 'remove' not in named('steps').get_children()
             checks.append('incorrect_step_deleted')
             later(save)
 
         def save():
-            add = next(w for w in widgets(root) if isinstance(w, ttk.Menubutton))
+            add = next(w for w in widgets(root) if isinstance(w, ttk.Menubutton) and w.cget('text').startswith('단계 추가'))
             assert add.winfo_viewable()
             root.nametowidget(add['menu']).invoke('직접 설명 입력')
             write('두번째 요소 실행버튼 누르기')

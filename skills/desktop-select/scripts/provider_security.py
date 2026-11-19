@@ -4,11 +4,13 @@ Editable inputs require explicit unprotected metadata. Native list captions
 and items can also be proved through their current noneditable metadata and
 positively unprotected SysListView32 owner.
 """
+import re
 
 
 _WINDOW = 50032
 _DIALOG_CLASS = '#32770'
 _INPUT_PATTERNS = (30033, 30040, 30043, 30149)  # RangeValue, Text, Value, TextEdit.
+_WINFORMS_LIST = re.compile(r'WindowsForms10\.SysListView32\.app\.\d+\.[0-9a-fA-F]+_r\d+_ad\d+')
 
 
 def _passive_list_peer(win, uia, element):
@@ -30,9 +32,17 @@ def _passive_list_peer(win, uia, element):
         return False
     hwnd = owner.property(30020)
     if (type(hwnd) is not int or hwnd <= 0 or type(pid) is not int or pid <= 0
-            or not win.user32.IsWindow(hwnd) or win.hwnd_pid(hwnd) != pid
-            or win.window_class(hwnd) != 'SysListView32'):
+            or not win.user32.IsWindow(hwnd) or win.hwnd_pid(hwnd) != pid):
         return False
+    native_class = win.window_class(hwnd)
+    if native_class != 'SysListView32':
+        if not _WINFORMS_LIST.fullmatch(native_class):
+            return False
+        state = owner.property(30096)
+        if (owner.property(30090) is not True or owner.property(30095) != 33
+                or type(state) is not int or state & 0x20000000
+                or any(owner.property(k) is True for k in _INPUT_PATTERNS)):
+            return False
     current = uia.from_handle(hwnd)
     if (current is None or not uia.same(current, owner) or uia.pid(current) != pid
             or current.property(30019) is not False):

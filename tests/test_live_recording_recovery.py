@@ -63,6 +63,22 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
         return recovery.run(app, self.args())
 
+    def test_prepare_and_instruct_on_original_draft_point_straight_to_double_click_grounding(self):
+        from recording_followup import followup
+        text = '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'
+        self.rows = [dict(step=teach_capture.manual('double_click_needs_review'),
+                          form=dict(alias='',text=text,mode=None,argument=''))]
+        self.store.save_draft(self.rows, 'invalid_step_instruction', 1)
+        report = followup(recovery.run(app,self.args(prepare=True)))
+        self.assertEqual(report['next_action']['args'], ['ground','--task','내 녹화','--only','1'])
+        self.assertFalse(report['input_dispatched'])
+        self.assertEqual(report['host_action'],'ground_recorded_double_click')
+        self.observe.assert_called_once()
+        with patch.object(app,'attach_recovery') as rescan:
+            response = app.save_instruction(self.args(only='1',text=text,save_as='실행용'))
+            rescan.assert_not_called()
+            self.assertEqual(response['ground_args'], report['next_action']['args'])
+
     def bind(self, fingerprint, patches, **args):
         self.inputs.write_text(json.dumps(dict(source_fingerprint=fingerprint, steps=patches)), encoding='utf8')
         return recovery.run(app, self.args(bindings=self.inputs, save_as='실행용', **args))
@@ -207,6 +223,27 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         ops = self.patches()
         ops[1].update(mode='fixed', argument='Hybrid')
         self.assertEqual(self.bind(info['source_fingerprint'], ops)['diagnostic'], 'instruction_binding_conflict')
+
+    def test_explicit_region_is_proved_once_and_kept_for_replay(self):
+        info = self.probe()
+        self.observe.reset_mock()
+        ops = self.patches()
+        ops[0].update(match='automation_id', within='content')
+        field = self.observe.return_value['targets'][0]
+        parent = dict(role='group', automation_id='psView')
+        selector = dict(role='combobox', match='automation_id', target='c_status', ancestors=[parent])
+        field.update(binding_scopes={'content': selector})
+        self.observe.return_value['targets'].append(dict(field, binding_scopes={}))
+        bad = [dict(ops[0], within='not present'), *ops[1:]]
+        self.assertEqual(self.bind(info['source_fingerprint'], bad)['diagnostic'], 'target_missing_in_scope')
+        self.observe.reset_mock()
+        result = self.bind(info['source_fingerprint'], ops)
+        self.assertEqual(result['status'], 'recorded', result)
+        self.assertEqual(self.observe.call_count, 1)
+        command = tasks.load_task('실행용', self.directory)['steps'][0]
+        self.assertEqual(command['ancestors'], [parent])
+        self.assertEqual(command['within'], 'psView')
+        self.assertEqual(command['target'], 'c_status')
 
     def test_reversed_or_unrelated_menu_path_cannot_consume_user_steps(self):
         info = self.probe()

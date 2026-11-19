@@ -166,7 +166,8 @@ class CaptureTrail:
                     if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click','submit')
                             or reason in ('row_capture_requires_review', 'stable_locator_unavailable',
                                           'capture_target_unavailable', 'unsupported_recorded_action',
-                                          'right_click_requires_menu_teaching', 'popup_scope_unproven')):
+                                          'right_click_requires_menu_teaching', 'popup_scope_unproven',
+                                          'double_click_needs_review')):
                         result.append((when, part, key))
         # A completed transition followed by another demonstrated action in
         # the same origin starts a new sequence. Two actions both preceding
@@ -193,7 +194,9 @@ class CaptureTrail:
             menu_command = (step['action'] == 'result-menu' or
                             step.get('target', {}).get('locator', {}).get('role') == 'menuitem' or
                             reason == 'popup_scope_unproven')
-            if menu_command and all(row[1] is part for row in result):
+            immediate_double = (at - last[0] <= 1.5 and (len(result) == 1 or last[0] - result[-2][0] > 1.5)
+                                and learned_tasks.is_double_click_step(step))
+            if (menu_command or immediate_double) and all(row[1] is part for row in result):
                 return [last]
         return result
 

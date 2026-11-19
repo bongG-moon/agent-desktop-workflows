@@ -429,6 +429,18 @@ def save_instruction(args):
     """Keep freeform source prose and its once-interpreted action in a new task."""
     source = tasks.load_task(args.task, task_directory(), allow_review=True)
     if source.get('kind') == review_drafts.KIND:
+        # Ground the user's original double-click directly from the editor draft.
+        # Dispatching a generic button action or surveying every other row cannot bind it.
+        rows = source['rows']
+        number = tasks._step_number({'steps': [row['form'] for row in rows]}, args.only)
+        row = rows[number-1]
+        stored_text = row['form']['text'].strip()
+        if (tasks.is_double_click_step(row['step'].get('saved',row['step'])) and tasks.double_click_instruction(stored_text)
+                and args.text.strip() == stored_text):
+            from recovery import double_click_handoff
+            return dict(status='needs_grounding', diagnostic='double_click_target_requires_grounding',
+                        source_task=source['name'], step=number, input_dispatched=False,
+                        **double_click_handoff(source['name'],number))
         result = review_drafts.receipt(source, 'needs_review')
         result['save_as'] = args.save_as
         return attach_recovery(result, args.task)
@@ -436,6 +448,13 @@ def save_instruction(args):
     tasks.check_new_task(args.save_as, task_directory())
     number = tasks._step_number(plan, args.only)
     step = plan['steps'][number - 1]
+    if (tasks.is_double_click_step(step) and step.get('action') == 'manual'
+            and tasks.double_click_instruction(args.text) and args.text.strip() == step.get('instruction_draft')
+            and any(value is not None for value in (args.target,args.role,getattr(args,'row',None)))):
+        from recovery import double_click_handoff
+        return dict(status='needs_grounding',diagnostic='double_click_target_requires_grounding',
+                    source_task=source['name'],step=number,input_dispatched=False,
+                    **double_click_handoff(source['name'],number))
     if args.alias is not None:
         step['alias'] = args.alias
     ordinal = getattr(args, 'row', None)
@@ -508,7 +527,10 @@ def fast_replay(plan, args, overrides):
     if args.only is not None:
         number = tasks._step_number(plan, args.only)
         matches = [i for i, n in enumerate(source_steps) if n == number]
-        if len(matches) != 1 or recipe['steps'][matches[0]]['action'] not in ('conditional-open','row-open'):
+        if len(matches) != 1:
+            return None
+        chosen = recipe['steps'][matches[0]]
+        if chosen['action'] not in ('conditional-open','row-open') and not tasks.is_double_click_step(chosen):
             return None
         only = str(matches[0] + 1)
         active = dict(recipe, steps=[recipe['steps'][matches[0]]])
@@ -598,11 +620,12 @@ def _opener_record(routes, context):
 def _replay_recorded(plan, args, overrides, background):
     # Specialized steps may use individual action workers. Their window routing
     # must follow the same lifetime checks as a compiled Python workflow.
-    from window_context import WindowRoutes, ContextError
+    from window_context import WindowRoutes, ContextError, effect_scopes
     steps = plan['steps']
     active = [tasks._step_number(plan,args.only)] if args.only is not None else range(1,len(steps)+1)
     numbers = iter(active)
-    linked = any('window_context' in steps[n-1] for n in active)
+    scope_numbers = effect_scopes(steps, active)
+    linked = any('window_context' in steps[n-1] for n in scope_numbers)
     main = routes = None
     held_windows = set()
 
@@ -612,13 +635,13 @@ def _replay_recorded(plan, args, overrides, background):
         try:
             if main is None:
                 main = pick_window(windows(args.exe), args.window, args.hwnd)
-                contexts = [steps[n-1]['window_context'] for n in active if 'window_context' in steps[n-1]]
+                contexts = [steps[n-1]['window_context'] for n in scope_numbers if 'window_context' in steps[n-1]]
                 # Per-step workers run their result-menu under these parent-held
                 # reservations, including its leaf baseline and workbook check.
                 leases.enter_context(coordination.reserve_outputs(steps[n-1] for n in active))
                 leases.enter_context(coordination.window(main, args.window, contexts))
                 if linked:
-                    routes = WindowRoutes(steps,bridge.Binding(main),args.window,active=active)
+                    routes = WindowRoutes(steps,bridge.Binding(main),args.window,active=scope_numbers)
                     coordination.reserve_handles(leases, held_windows,
                                                  (bound.hwnd for bound in routes.bindings.values() if bound is not None))
             target = main
@@ -642,9 +665,11 @@ def _replay_recorded(plan, args, overrides, background):
         receipt = worker_receipt(['_step'], mutating=True, payload=payload)
         if routes:
             routes.after(number,receipt)
-            if (routes.origins.get(number) and step['action']=='open' and not step.get('expand')
-                    and receipt.get('status')=='delivered_unverified' and receipt.get('input_dispatched') is True
-                    and receipt.get('diagnostic')=='business_result_not_verified'):
+            invoked = (step['action']=='open' and not step.get('expand')
+                       and receipt.get('diagnostic')=='business_result_not_verified')
+            double_clicked = tasks.is_double_click_step(step) and receipt.get('diagnostic')=='visual_double_click_dispatched'
+            if (routes.origins.get(number) and (invoked or double_clicked)
+                    and receipt.get('status')=='delivered_unverified' and receipt.get('input_dispatched') is True):
                 # Only the appearance of the specifically recorded window is
                 # verified here. The application's business outcome is separate.
                 try:
@@ -675,10 +700,16 @@ def edit_recording(owner, storage, *, report_ready=False):
         print(json.dumps(dict(status='recorder_ready', task=storage.name, window=storage.title,
                               input_dispatched=False)), flush=True)
 
+    def locate_window(scope):
+        exe, title = (scope['exe'], scope['title']) if scope else (storage.exe, storage.title)
+        current = bridge.Binding(pick_window(windows(exe), title, None))
+        guard(current, current, title)
+        return current
+
     try:
         result = capture(owner, title=storage.title, initial_draft=storage.initial_rows(), initial_step=focus,
                          save_recording=storage.save_recording, save_draft=storage.save_draft,
-                         on_ready=ready if report_ready else None)
+                         on_ready=ready if report_ready else None, locate_window=locate_window)
     except tkinter.TclError as error:
         raise SelectionError('recording_ui_failed') from error
     if storage.saved_plan is not None:
@@ -750,6 +781,9 @@ def attach_recovery(result, name, *, prepare=False):
     elif prepare:
         if result['live_recovery'].get('host_action') == 'use_prepared_task':
             result['host_action'] = 'use_prepared_task'
+        elif result['live_recovery'].get('host_action') == 'ground_recorded_double_click':
+            result.update(host_action='ground_recorded_double_click', ground_args=result['live_recovery']['ground_args'],
+                          capture_requires_consent=True)
         else:
             result.setdefault('host_action', 'bind_recorded_instructions_from_live_scopes')
     return result
@@ -775,7 +809,7 @@ def recorder_request(path):
 
     fields = {
         'record': ({'command', 'task', 'exe'}, {'window': None, 'hwnd': None}),
-        'review': ({'command', 'task'}, {}),
+        'review': ({'command', 'task'}, {'edit': False}),
         'continue-recording': ({'command', 'task'}, {'from_step': None, 'supplement': None, 'save_as': None}),
     }
     if not isinstance(request, dict) or not isinstance(request.get('command'), str) or request['command'] not in fields:
@@ -784,7 +818,10 @@ def recorder_request(path):
     if not required <= request.keys() <= required.union(defaults):
         raise SelectionError('invalid_recorder_request')
     for key, value in request.items():
-        if key in ('hwnd', 'from_step'):
+        if key == 'edit':
+            if type(value) is not bool:
+                raise SelectionError('invalid_recorder_request')
+        elif key in ('hwnd', 'from_step'):
             if type(value) is not int or value < 1:
                 raise SelectionError('invalid_recorder_request')
         elif not tasks._text(value):
@@ -815,16 +852,22 @@ def run(args):
         doc = tasks.read_document(args.task, directory)
         if doc.get('kind') != review_drafts.KIND:
             tasks._validate(doc)
-            return dict(status='observed', task=tasks.summary(doc), diagnostic='task_already_saved',
-                        continue_args=['continue-recording', '--task', args.task],
-                        recover_args=['recover', '--task', args.task], input_dispatched=False)
-        review_drafts.validate(doc)
-        storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
+            if not getattr(args, 'edit', False):
+                return dict(status='observed', task=tasks.summary(doc), diagnostic='task_already_saved',
+                            edit_args=['review', '--task', args.task, '--edit'],
+                            continue_args=['continue-recording', '--task', args.task],
+                            recover_args=['recover', '--task', args.task], input_dispatched=False)
+            from continue_recording import _new_name
+            name = _new_name(doc['name'], '수정본', directory)
+            storage = review_drafts.ReviewStorage(name, doc['exe'], doc['window'], directory, source=doc)
+        else:
+            review_drafts.validate(doc)
+            storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
         bridge.set_dpi_awareness()
         result = edit_recording(None, storage, report_ready=getattr(args, 'report_ready', False))
         if result.get('status') == 'recorded' and (result.get('draft') or
                 result.get('execution_plan', {}).get('status') == 'not_compatible'):
-            return attach_recovery(result, args.task, prepare=True)
+            return attach_recovery(result, storage.name, prepare=True)
         return result
     bridge.set_dpi_awareness()
     if args.command == 'continue-recording':
@@ -848,6 +891,20 @@ def run(args):
     if args.command in ('plan', 'show', 'replay'):
         plan = tasks.load_task(args.task, task_directory(), allow_review=True)
         if plan.get('kind') == review_drafts.KIND:
+            if args.command == 'replay' and args.only is not None:
+                import recovery
+                selected = recovery.selected_draft_double(plan, args.only)
+                if selected is not None:
+                    single, number = selected
+                    tasks.check_binding(single,args.exe,args.window)
+                    requirements = input_policy.profile([single['steps'][number-1]], [number])
+                    if args.input_plan:
+                        return dict(status='observed', input_dispatched=False, input_requirements=requirements)
+                    if args.background_only:
+                        return input_policy.blocked(requirements)
+                    report = _replay_recorded(single,args,tasks.parse_overrides(args.set),False)
+                    recovery.missing_double_target(report,single)
+                    return dict(report, draft=True, tested_step=number, input_requirements=requirements)
             result = review_drafts.receipt(plan, 'observed' if args.command == 'show' else 'needs_review')
             if args.command == 'replay' and not getattr(args, 'input_plan', False):
                 if args.exe.casefold() != plan['exe'].casefold() or args.window != plan['window']:
@@ -884,6 +941,14 @@ def run(args):
             if report.get('diagnostic') == 'instruction_requires_structure':
                 report['host_action'] = 'interpret_recorded_instructions'
             quick = dict(report, input_policy='background_only' if background else 'auto', input_requirements=requirements)
+        if quick.get('diagnostic') == 'query_result_freshness_unproven' and quick.get('source_stopped_at'):
+            quick['test_step_args'] = ['replay', '--task', original['name'], '--only', str(quick['source_stopped_at']),
+                                       '--exe', args.exe, '--window', args.window]
+            return quick
+        if quick.get('diagnostic','') and quick['diagnostic'].startswith('visual_target_'):
+            from recovery import missing_double_target
+            if missing_double_target(quick,original):
+                return quick
         missing_target = quick.get('diagnostic') in (
             'target_missing', 'target_ambiguous', 'target_grounding_required', 'new_context_menu_item_missing',
             'context_menu_item_changed', 'recorded_window_not_open')
@@ -1049,7 +1114,9 @@ def parser():
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
-    commands.add_parser('review', help='reopen an editable recording draft without its application').add_argument('--task', required=True)
+    review = commands.add_parser('review', help='reopen a recording for review')
+    review.add_argument('--task', required=True)
+    review.add_argument('--edit', action='store_true', help='edit a copy when the source is already saved')
     repair = commands.add_parser('recover', help='inspect the live task windows or bind interpreted steps into a new task')
     repair.add_argument('--task', required=True)
     repair.add_argument('--only', type=int, help='observe one original step')

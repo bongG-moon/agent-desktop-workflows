@@ -21,6 +21,8 @@ def validate_conditional(step):
             raise tasks.TaskError('invalid_conditional_marker')
         if 'visual' in marker:
             visual.validate_spec(marker['visual'])
+            if 'gesture' in marker['visual']:
+                raise tasks.TaskError('invalid_conditional_marker')
     return step
 
 

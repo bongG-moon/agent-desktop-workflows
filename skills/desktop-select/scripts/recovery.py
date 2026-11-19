@@ -116,6 +116,39 @@ def _summary(number, row, doc):
     return item
 
 
+def selected_draft_double(doc, selector):
+    """Build an in-memory, single-gesture test. All sibling actions remain non-executable."""
+    forms = [row['form'] for row in doc['rows']]
+    number = tasks._step_number({'steps': forms},selector)
+    raw = doc['rows'][number-1]['step']
+    saved = raw.get('saved',raw)
+    if saved.get('action') != 'visual-click' or not tasks.is_double_click_step(saved):
+        return None
+    rows = _rows(doc)
+    selected = rows[number-1]
+    if selected.get('field_problem') or selected.get('scope_problem'):
+        raise tasks.TaskError(selected.get('field_problem') or selected['scope_problem'], step_number=number)
+    step = selected['step']
+    if step.get('action') != 'visual-click' or not tasks.is_double_click_step(step):
+        return None
+    # Testing just a child cannot establish that its earlier opener actually ran.
+    if (selected['context'] or {}).get('after_step'):
+        raise tasks.TaskError('window_origin_step_not_run', step_number=number)
+    sequence = [tasks._manual('recording_draft_requires_review') for _ in rows]
+    sequence[number-1] = step
+    for index,row in enumerate(rows):
+        context = row['context'] or {}
+        capture_scope = doc['rows'][index]['step'].get('_capture_window', {})
+        linked = (capture_scope.get('after_id') == raw['id'] or raw['id'] in capture_scope.get('_openers', ()))
+        if linked and row.get('scope_problem'):
+            raise tasks.TaskError(row['scope_problem'], step_number=index+1)
+        if context.get('after_step') == number:
+            sequence[index]['window_context'] = context
+    plan = dict(schema=1,name=doc['name'],exe=doc['exe'],window=doc['window'],steps=sequence)
+    tasks._validate(plan)
+    return plan, number
+
+
 def _observed_field(item, inventory):
     query, role = item.get('target'), item.get('role')
     identity = item.get('match')
@@ -127,6 +160,11 @@ def _observed_field(item, inventory):
     candidates = [node for node in inventory['targets'] if node.get('role') == role and
                   (node.get(identity) == query if identity else
                    any(matches(node.get(key)) for key in ('automation_id', 'name', 'semantic_label')))]
+    within = item.get('within')
+    if 'within' in item:
+        _require(tasks._text(within) and within == within.strip(), 'invalid_task_scope')
+        candidates = [node for node in candidates if within in node.get('binding_scopes', ())]
+        _require(candidates, 'target_missing_in_scope')
     _require(len(candidates) == 1, 'target_ambiguous' if candidates else 'target_missing')
     node = candidates[0]
     _require(node.get('enabled') is True, 'target_disabled')
@@ -142,6 +180,10 @@ def _observed_field(item, inventory):
         match = 'query'
     target = node.get(match) if match != 'query' else node.get('semantic_label')
     _require(tasks._text(target), 'stable_locator_unavailable')
+    if within:
+        selector = node['binding_scopes'][within]
+        parent = selector['ancestors'][0]
+        return node, dict(selector, within=parent.get('automation_id') or parent['name'])
     if match != 'query':
         _require(sum(candidate.get('role') == role and candidate.get(match) == target
                      for candidate in inventory['targets']) == 1, 'target_ambiguous')
@@ -162,7 +204,7 @@ def _post_click_wait(text):
 
 
 def _field(row, item, inventory):
-    _require(set(item) <= {'number', 'mode', 'target', 'role', 'argument', 'wait_after', 'match'}, 'invalid_recovery_binding')
+    _require(set(item) <= {'number', 'mode', 'target', 'role', 'argument', 'wait_after', 'match', 'within'}, 'invalid_recovery_binding')
     original, mode, argument = row['step'], item['mode'], item.get('argument')
     _require(original['action'] in (*tasks.VALUE_ACTIONS, 'open') or tasks.is_recoverable(original),
              'step_requires_dedicated_binding')
@@ -441,6 +483,8 @@ def _routes(rows, operations):
     menu_end = 0
     for number, row in enumerate(rows, 1):
         step = dict(action=row['step']['action'])
+        if step['action'] == 'manual' and tasks.is_double_click_step(row['step']):
+            step['reason'] = 'double_click_needs_review'
         item = operations.get(number, {})
         if not item and row['step'].get('reason') == 'right_click_requires_menu_teaching':
             # Reserve only a structurally supported demonstrated menu route as
@@ -461,7 +505,7 @@ def _routes(rows, operations):
         if context:
             origin = context.get('after_step')
             if origin and (not 1 <= origin < number or rows[origin-1].get('scope_problem') or
-                           sequence[origin-1]['action'] == 'manual'):
+                           (sequence[origin-1]['action'] == 'manual' and not tasks.is_double_click_step(sequence[origin-1]))):
                 row['scope_problem'] = 'invalid_window_origin_step'
             else:
                 step['window_context'] = context
@@ -515,7 +559,32 @@ def _restore_args(args):
     return retry
 
 
+def double_click_handoff(name, number):
+    return dict(host_action='ground_recorded_double_click', ground_args=['ground','--task',name,'--only',str(number)],
+                capture_requires_consent=True)
+
+
+def missing_double_target(report, plan):
+    """A changed visual after earlier steps needs one new observation of this step only."""
+    if report.get('diagnostic') not in ('visual_target_not_found','visual_target_ambiguous','visual_target_too_common',
+                                        'visual_target_changed_before_input','visual_target_lacks_detail'):
+        return False
+    number = report.get('source_stopped_at', report.get('stopped_at'))
+    if type(number) is not int or not 1 <= number <= len(plan['steps']):
+        return False
+    last = (report.get('steps') or [{}])[-1]
+    if (last.get('source_step',last.get('number')) != number or last.get('receipt',{}).get('input_dispatched') is not False
+            or not tasks.is_double_click_step(plan['steps'][number-1])):
+        return False
+    report.update(double_click_handoff(plan['name'],number))
+    return True
+
+
 def _suggest(number, rows, detail, observation, name):
+    if (tasks.is_double_click_step(rows[number-1]['step']) and detail.get('action') == 'manual'
+            and tasks.double_click_instruction(detail['text'])):
+        detail.update(double_click_handoff(name, number))
+        return None
     if detail.get('reason') != 'right_click_requires_menu_teaching':
         return _suggest_binding(number, rows[number-1], observation)
     hint = _menu_hint(rows, number, observation)
@@ -578,6 +647,11 @@ def _recorded_lookups(rows):
 
 def _binding_lookups(operations, rows, context):
     """Generated bindings carry exact identities; hand-written label queries still need discovery."""
+    scoped_fields = [(item.get('target'), item.get('role'), item['within']) for number, item in operations.items()
+                     if rows[number-1]['context'] == context and item['mode'] != 'context-menu' and 'within' in item]
+    if scoped_fields:
+        _require(all(all(tasks._text(s) for s in field) for field in scoped_fields), 'invalid_task_scope')
+        return dict(scoped_fields=scoped_fields)
     selectors, regions = [], []
     for number, item in operations.items():
         if rows[number-1]['context'] != context:
@@ -781,6 +855,9 @@ def run(app, args):
                           'recorded_window_opener_unresolved') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
             if args.bindings:
+                if (reason == 'step_requires_dedicated_binding' and tasks.is_double_click_step(row['step'])
+                        and tasks.double_click_instruction(row['text'])):
+                    return _blocked(result, reason, step_number=number, **double_click_handoff(doc['name'], number))
                 if (row['step'].get('reason') == 'right_click_requires_menu_teaching' and operation
                         and reason in ('invalid_recovery_binding', 'step_requires_dedicated_binding',
                                        'invalid_menu_path', 'invalid_menu_step_range', 'invalid_context_point')):
@@ -800,6 +877,9 @@ def run(app, args):
         result['host_action'] = 'bind_recorded_instructions_from_live_scopes'
         if pending:
             n = next(iter(pending))
+            if details[n-1].get('ground_args') and pending[n] in ('double_click_needs_review', 'instruction_requires_structure'):
+                return _blocked(result, pending[n], step_number=n, bindings_template=template,
+                                **double_click_handoff(doc['name'], n))
             return _blocked(result, pending[n], step_number=n, bindings_template=template)
         result['bindings_template'] = template
         if not result['live_scopes']:

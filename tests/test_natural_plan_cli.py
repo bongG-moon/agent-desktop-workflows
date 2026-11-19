@@ -66,6 +66,16 @@ class NaturalPlanCLI(unittest.TestCase):
         worker.assert_not_called()
         windows.assert_not_called()
 
+    def test_existing_query_result_keeps_targeted_handoff_without_restarting_discovery(self):
+        receipt = dict(status='needs_review', source_stopped_at=3, input_dispatched=True,
+                       diagnostic='query_result_freshness_unproven',
+                       host_action='verify_current_query_result_then_test_only_this_step')
+        with patch.object(app, 'fast_replay', return_value=receipt), patch.object(app, 'attach_recovery') as recovery:
+            result = app.run(self.args())
+        recovery.assert_not_called()
+        self.assertEqual(result['test_step_args'], ['replay', '--task', self.task['name'], '--only', '3',
+                                                  '--exe', self.task['exe'], '--window', self.task['window']])
+
     def test_manual_step_falls_back_as_whole_task_before_any_input(self):
         task = deepcopy(self.task)
         task['steps'].append(dict(action='manual', reason='capture_target_unavailable'))

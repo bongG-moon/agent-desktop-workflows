@@ -9,6 +9,53 @@ import learned_tasks as tasks
 KIND = 'recording-review'
 
 
+def saved_form(step):
+    instruction = step.get('instruction', {})
+    text = instruction.get('text') or step.get('instruction_draft') or step.get('description') or step.get('label', '')
+    mode = instruction.get('mode')
+    return dict(alias=step.get('alias', ''), text=text, mode=mode if mode in ('fixed', 'required') else None,
+                argument=instruction.get('parameter', instruction.get('value', '')))
+
+
+def retain_saved_arguments(source, fresh):
+    """Earlier recordings can carry a default and an overridable parameter without an instruction."""
+    prior = source.get('saved', {})
+    if 'wait_after' in prior and fresh['action'] == 'click':
+        fresh = dict(fresh, wait_after=prior['wait_after'])
+    if 'instruction' in prior or 'instruction_draft' in prior or not {'value', 'parameter'} & prior.keys():
+        return fresh
+    current = tasks.recorded_step(fresh)
+    if current['action'] != prior['action']:
+        raise tasks.TaskError('instruction_action_mismatch')
+    for key in ('value', 'parameter'):
+        current.pop(key, None)
+        if key in prior:
+            current[key] = prior[key]
+    if current.get('recorded_effect') == 'matched' and prior.get('value') != fresh.get('value'):
+        current['recorded_effect'] = 'unverified'
+    if 'description' in prior or prior.get('label'):
+        current['description'] = prior.get('description') or prior['label']
+    tasks._validate_step(current, set())
+    return dict(action='saved-step', id=fresh['id'], label=fresh['label'], saved=current)
+
+
+def rows_from_task(plan):
+    """Retain compiled selectors and gestures verbatim; express window links in stable editor IDs."""
+    tasks._validate(plan)
+    rows = []
+    for number, step in enumerate(plan['steps'], 1):
+        saved = deepcopy(step)
+        context = saved.pop('window_context', None)
+        label = step.get('label') or step.get('command_name') or step.get('alias') or step.get('target') or step['action']
+        row = dict(id=f'saved-{number}', action='saved-step', label=label, saved=saved)
+        if context:
+            if 'after_step' in context:
+                context['after_id'] = f"saved-{context.pop('after_step')}"
+            row['_capture_window'] = context
+        rows.append(dict(step=row, form=saved_form(step)))
+    return rows
+
+
 def validate(doc):
     def require(condition):
         if not condition:
@@ -32,8 +79,12 @@ def validate(doc):
                 and step['id'] not in ids and isinstance(step.get('label'), str))
         ids.add(step['id'])
         require(step.get('action') in ('manual', 'click', 'set-value', 'select', 'expand', 'teach-target', 'submit',
-                                       'result-menu', 'row-action', 'visual-click'))
-        if step['action'] == 'result-menu':
+                                       'result-menu', 'row-action', 'visual-click', 'saved-step'))
+        if step['action'] == 'saved-step':
+            require(set(step) <= {'id', 'action', 'label', 'saved', '_capture_window'}
+                    and isinstance(step.get('saved'), dict) and 'window_context' not in step['saved'])
+            tasks._validate_step(step['saved'], set())
+        elif step['action'] == 'result-menu':
             context = step.get('context')
             require(isinstance(context, dict) and {'trigger', 'menu', 'output'} <= context.keys()
                     and isinstance(context['menu'], dict) and isinstance(context['menu'].get('path'), list)
@@ -106,7 +157,7 @@ def _edit_lock(directory):
 
 
 class ReviewStorage:
-    def __init__(self, name, exe, title, directory, *, existing=None):
+    def __init__(self, name, exe, title, directory, *, existing=None, source=None):
         self.name, self.exe, self.title, self.directory = name, exe, title, directory
         current = existing
         if current is None:
@@ -116,12 +167,13 @@ class ReviewStorage:
                 if error.code != 'task_not_found':
                     raise
         if current is not None:
-            if current.get('kind') != KIND:
+            if source is not None or current.get('kind') != KIND:
                 raise tasks.TaskError('task_already_exists')
             validate(current)
             if current['exe'].casefold() != exe.casefold() or current['window'] != title:
                 raise tasks.TaskError('recorded_window_mismatch')
         self.previous = current
+        self.source = source
         self.saved_plan = None
 
     def _write(self, document):
@@ -136,6 +188,8 @@ class ReviewStorage:
             raise tasks.TaskError('task_store_unavailable') from error
 
     def initial_rows(self):
+        if self.source is not None:
+            return rows_from_task(self.source)
         return deepcopy(self.previous['rows']) if self.previous is not None else None
 
     def save_draft(self, rows, diagnostic, step_number):

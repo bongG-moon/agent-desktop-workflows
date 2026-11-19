@@ -66,6 +66,28 @@ class LinkedWindowTests(TestCase):
         self.assertEqual(report['steps'][0]['receipt']['verification_scope'],'recorded_window_opened')
         self.assertEqual(report['steps'][1]['receipt']['window_context'],self.child['window_context'])
 
+    def test_double_click_step_alone_observes_its_popup_and_never_sends_again(self):
+        from test_visual_target import image, visual, VisualTargets
+        marker = visual.from_frame(VisualTargets.window, image((35,42)), (235,162))
+        self.recipe['steps'][0] = dict(action='visual-click', label='Open result details',
+                                       visual=dict(marker, gesture='double-click'))
+        def click(bound, marker, guard, **options):
+            self.assertEqual(marker['gesture'], 'double-click')
+            self.assertEqual(options['first_match_timeout'], 0)
+            self.records.append(window(2))
+            return dict(status='delivered_unverified', input_dispatched=True,
+                        diagnostic='visual_double_click_dispatched', physical_input=True)
+        with (mock.patch.object(visual,'execute',side_effect=click) as send,
+              mock.patch.object(flow.live,'execute') as child_action):
+            report = flow.run(self.recipe, only=1)
+            self.assertEqual(report['status'], 'verified', report)
+            self.assertEqual(report['steps'][0]['receipt']['verification_scope'], 'recorded_window_opened')
+            blocked = flow.run(self.recipe, only=1)
+            self.assertEqual(blocked['diagnostic'], 'expected_new_window_already_open')
+            self.assertFalse(blocked['input_dispatched'])
+            send.assert_called_once()
+            child_action.assert_not_called()
+
     def test_duplicate_or_renamed_existing_window_never_receives_followup(self):
         for scenario in ('duplicate','renamed','missing'):
             with self.subTest(scenario=scenario):

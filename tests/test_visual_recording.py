@@ -60,6 +60,45 @@ class VisualRecordingTests(TestCase):
         self.assertFalse(self.worker._use_visual(dict(self.event,scope_proven=False),None))
         self.assertFalse(self.worker._use_visual(dict(self.event,action='right-click'),None))
 
+    def test_pair_replaces_only_first_click_using_its_pre_press_sample(self):
+        first = dict(self.proof, gesture='double-click')
+        self.worker.visual_tracker.before.side_effect = [first, None]
+        up = dict(self.event,kind='up',inside=True)
+        with (mock.patch.object(capture.recorder.CaptureWorker, 'observe_down',return_value=None),
+              mock.patch.object(capture.recorder.time,'sleep')):
+            self.worker.handle(dict(self.event))
+            self.worker.handle(up)
+            original, = self.notes.snapshot()
+            self.assertEqual(original['action'], 'manual')
+            self.worker.handle(dict(self.event,token=43,previous_token=42,double=True,at=2.08))
+            self.worker.handle(dict(up,token=43,at=2.1))
+        bound, = self.notes.snapshot()
+        self.assertEqual((bound['id'],bound['action'],bound['visual']), (original['id'],'visual-click',first))
+
+    def test_second_press_drag_does_not_create_double_click(self):
+        self.worker.visual_tracker.before.return_value = dict(self.proof,gesture='double-click')
+        up = dict(self.event,kind='up',inside=True)
+        with (mock.patch.object(capture.recorder.CaptureWorker, 'observe_down',return_value=None),
+              mock.patch.object(capture.recorder.time,'sleep')):
+            self.worker.handle(dict(self.event))
+            self.worker.handle(up)
+            self.worker.handle(dict(self.event,token=43,previous_token=42,double=True,at=2.08))
+            self.worker.handle(dict(up,token=43,x=350,at=2.1))
+        first,second = self.notes.snapshot()
+        self.assertEqual([r['action'] for r in (first,second)], ['manual','manual'])
+        self.assertEqual(second['recognition']['reason'], 'drag_needs_review')
+
+    def test_gesture_prose_accepts_natural_open_phrasing_and_preserves_changed_intent_for_review(self):
+        recorded = dict(action='visual-click',visual=dict(self.proof,gesture='double-click'),label='녹화한 항목 더블클릭')
+        for text in ('이 행을 두 번 눌러 상세 창을 열어 줘','결과 행 더블클릭해서 상세 팝업을 띄워 줘',
+                     '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘','이 항목을 두 번 눌러 주세요'):
+            with self.subTest(text=text):
+                self.assertEqual(tasks.compile_instruction(recorded,text)['mode'],'visual-click')
+        for text in ('이 행을 한 번만 클릭해줘','더블 클릭하지 말고 이 행을 삭제해줘','열렸으면 이 행을 더블 클릭해줘',
+                     '팝업을 닫고 이 행을 두 번 눌러줘','이 행을 두 번 눌러 상세를 삭제해줘'):
+            with self.subTest(text=text):
+                self.assertEqual(tasks.compile_instruction(recorded,text)['mode'],'draft')
+
     def test_disappearing_peer_keeps_only_scope_checked_evidence_from_before_click(self):
         with mock.patch.object(capture.recorder.CaptureWorker, 'observe_down',
                                side_effect=capture.bridge.BridgeError('element_unavailable')):

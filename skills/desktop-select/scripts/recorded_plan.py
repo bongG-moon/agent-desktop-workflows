@@ -58,7 +58,8 @@ def compile_plan(task, *, replacements=None):
     if replacements:
         for number, replacement in replacements.items():
             original = steps[number - 1]
-            if original['action'] == 'manual' and not tasks.is_recoverable(original):
+            if (original['action'] == 'manual' and not tasks.is_recoverable(original)
+                    and not (tasks.is_double_click_step(original) and tasks.is_double_click_step(replacement))):
                 return _result('not_compatible', diagnostic=original['reason'], step=number)
             step = deepcopy(replacement)
             if 'window_context' in original:
@@ -144,6 +145,10 @@ def compile_plan(task, *, replacements=None):
                     wait_after = DEFAULT_QUERY_SETTLE_SECONDS
                     notes.append(dict(step=number, diagnostic='default_query_settle',
                                       seconds=wait_after, business_result='not_verified'))
+            elif tasks.query_before_double_click(step, next_step):
+                # The runner compares the result target before and after the query.
+                notes.append(dict(step=number, diagnostic='wait_for_double_click_target',
+                                  business_result='not_verified'))
             elif not independent and not dialog_sequence:
                 return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])

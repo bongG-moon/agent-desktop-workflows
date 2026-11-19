@@ -13,6 +13,27 @@ from test_recorded_plan import recording
 
 
 class RecoveryCommandsTests(unittest.TestCase):
+    def test_scoped_observation_finds_reusable_button_in_deep_region(self):
+        def element(key, parent, role, name):
+            return dict(path=key, parent_path=parent, role=role, name=name, secure=False,
+                        enabled=True, offscreen=False)
+        nodes = [element('root', '', 'window', 'Dashboard'),
+                 element('content', 'root', 'group', 'Results'),
+                 element('side', 'root', 'group', 'Sidebar')]
+        parent = 'content'
+        for i in range(6):
+            path = 'layout' + str(i)
+            nodes.append(element(path, parent, 'group', path))
+            parent = path
+        nodes += [element('a', parent, 'button', 'View'), element('b', 'side', 'button', 'View')]
+        with patch.object(app, 'observe', return_value=(nodes, [])) as observe:
+            mapping = live_recovery._targets(app, None, None, [('View', 'button', 'Results')])
+            observe.assert_called_once()
+        scoped, = [field for field in mapping if 'binding_scopes' in field]
+        selector = scoped['binding_scopes']['Results']
+        self.assertEqual(selector['ancestors'], [dict(role='group', name='Results')])
+        self.assertEqual(nodes[app.tasks.locate_target(nodes, selector)[0]]['path'], 'a')
+
     def test_continue_saved_supplement_preserves_prefix_and_moves_window_source(self):
         base = recording()
         tail = dict(base, name='supplement', steps=[deepcopy(base['steps'][-1]), dict(

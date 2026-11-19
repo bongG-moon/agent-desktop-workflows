@@ -61,7 +61,9 @@ class TextfieldCaptureTests(unittest.TestCase):
         edits.store(step, '', '검색어 입력란을 비워줘', 'fixed', '')
         instruction = edits.get(step)['instruction']
         self.assertEqual(instruction['value'], '')
-        self.assertIn('비우기', capture.instruction_view(step, instruction))
+        label, mode, arg, editable = capture.review_interpretation(step, edits.get(step))
+        self.assertIn('비우기', label)
+        self.assertEqual((mode, arg, editable), ('fixed', '', True))
         tasks.recorded_step(edits.apply([step])[0])
 
     def test_password_and_combo_editor_values_do_not_survive_capture(self):

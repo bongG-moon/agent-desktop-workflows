@@ -97,10 +97,19 @@ class VisualTargets(unittest.TestCase):
             self.assertEqual(delivered['status'],'delivered_unverified')
             send.assert_called_once_with(235,162,'click')
             send.reset_mock()
+            double = dict(spec, gesture='double-click')
+            self.assertEqual(visual.execute(binding,double,lambda:None,background_only=True)['status'],'blocked')
+            self.assertEqual(visual.execute(binding,double,lambda:None,read_only=True)['status'],'observed')
+            send.assert_not_called()
+            delivered = visual.execute(binding,double,lambda:None)
+            self.assertEqual(delivered['diagnostic'],'visual_double_click_dispatched')
+            self.assertEqual(delivered['status'],'delivered_unverified')
+            send.assert_called_once_with(235,162,'double-click')
+            send.reset_mock()
             send.return_value = dict(ok=False, input_dispatched=None, diagnostic='delivery_unknown')
-            uncertain = visual.execute(binding,spec,lambda:None,first_match_timeout=30)
+            uncertain = visual.execute(binding,double,lambda:None,first_match_timeout=30)
             self.assertEqual(uncertain['status'],'uncertain')
-            send.assert_called_once_with(235,162,'click')
+            send.assert_called_once_with(235,162,'double-click')
             send.reset_mock()
             send.side_effect = ValueError('transport failed after dispatch began')
             uncertain = visual.execute(binding,spec,lambda:None)
@@ -162,6 +171,40 @@ class VisualTargets(unittest.TestCase):
             user.IsChild.return_value = True
             pid.return_value = 2
             self.assertFalse(visual.safe_provider(binding,uia,el))
+
+    def test_row_double_click_patch_requires_noneditable_nonprotected_data(self):
+        binding = SimpleNamespace(hwnd=1, pid=2, check=lambda: None)
+        props = {30003:50029, 30010:True, 30040:True, 30043:True, 30046:True}
+        row = SimpleNamespace(property=props.get)
+        uia = mock.Mock()
+        uia.from_point.return_value = uia.from_handle.return_value = row
+        uia.secure.return_value = False
+        uia.within.return_value = True
+        uia.pid.return_value = 2
+        uia.children.return_value = []
+        def client(_hwnd, rect):
+            rect._obj.right = rect._obj.bottom = 150
+            return True
+        def native(_user, name, *_):
+            return client if name == 'GetClientRect' else lambda *args: True
+        with (mock.patch.object(visual.bridge, '_sig', side_effect=native),
+              mock.patch.object(visual.bridge, 'window_from_point', return_value=1),
+              mock.patch.object(visual.bridge, 'foreground', return_value=1),
+              mock.patch.object(visual.bridge, 'root_window', return_value=1),
+              mock.patch.object(visual.bridge, 'hwnd_pid', return_value=2),
+              mock.patch.object(visual.vision, '_bounds', return_value=[0,0,140,140])):
+            args = (binding, uia, [10,10,41,41], (30,30))
+            marked = set()
+            self.assertEqual(visual._safe_patch(*args, exposed=True, gesture='double-click', data_surface=marked), 1)
+            self.assertEqual(marked, {50029})
+            with self.assertRaisesRegex(visual.bridge.BridgeError, 'visual_hit_not_actionable'):
+                visual._safe_patch(*args, exposed=True)
+            for change in ({30046:False}, {30046:None}, {30149:True}, {30003:50004}):
+                with mock.patch.dict(props, change), self.assertRaises(visual.bridge.BridgeError):
+                    visual._safe_patch(*args, exposed=True, gesture='double-click')
+            uia.secure.return_value = True
+            with self.assertRaises(visual.bridge.BridgeError):
+                visual._safe_patch(*args, exposed=True, gesture='double-click')
 
     def test_disabled_renderer_must_have_the_actual_enabled_input_parent(self):
         binding = SimpleNamespace(hwnd=1,pid=2)

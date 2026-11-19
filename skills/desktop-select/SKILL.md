@@ -23,7 +23,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" recorder --app
 
 첫 시험의 실제 입력을 승인받으면 `--allow-physical`을 사용한다. 같은 등록 업무의 반복 입력까지 허용한 경우 `--remember-physical`을 함께 준다. 보정용 화면 확인도 승인받았으면 `--auto-repair-frame`을 추가한다. `menu_repair.image`가 오면 이미지를 한 번 읽고 표의 셀을 찾는다. `resume_script`와 `resume_args`에서 `<x>`, `<y>`만 원본 픽셀로 바꿔 이어간다. 티켓과 변수는 유지한다. 이미지 없이 티켓만 왔을 때만 승인 범위에서 `frame_args`로 캡처한다.
 
-`bind_existing_observation`은 영수증의 원문, `live_scopes`, `bindings_template`으로 연결한 뒤 반환된 인자에 `--bindings <JSON> --save-as "<실행용 사본>"`을 추가한다. 이전 초안, 정확한 창 지정, 보완 녹화 또는 미확정 대상이 있을 때 [녹화 편집과 복구](references/recording-recovery.md)를 읽는다.
+`bind_existing_observation`은 영수증의 원문, `live_scopes`, `bindings_template`으로 연결한 뒤 반환된 인자에 `--bindings <JSON> --save-as "<실행용 사본>"`을 추가한다. `ground_recorded_double_click`이면 현재 결과 화면에서 `ground_args`로 해당 단계만 보정한다. 이전 초안을 고치거나 한 단계만 다시 시연할 때 [녹화 편집과 복구](references/recording-recovery.md)를 읽는다.
 
 ## 등록된 업무 실행
 

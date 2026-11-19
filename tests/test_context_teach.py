@@ -29,9 +29,9 @@ class MenuRecordingTests(unittest.TestCase):
         changed = deepcopy(self.step)
         changed['context']['menu']['path'] = ['다른 메뉴', '파일']
         self.assertNotIn('alias', edits.apply([changed])[0])
-        view = teach_capture.instruction_view(self.step, None)
-        self.assertIn('조회 완료 확인 → 표 우클릭 → 내보내기 → 파일', view)
-        self.assertIn('전달까지만 확인', view)
+        self.assertEqual(teach_capture.review_interpretation(self.step, {}),
+                         ('조회 완료 확인 → 표 우클릭 → 내보내기 → 파일', None, '', False))
+        self.assertIsNone(teach_capture.learned_tasks.recorded_step(self.step)['context']['output'])
         self.assertEqual(teach_capture.default_text(self.step), self.step['label'])
 
     def test_merge_proposal_is_for_an_identical_host_button_only(self):
@@ -54,6 +54,5 @@ class MenuRecordingTests(unittest.TestCase):
                                           'target': {'kind': 'region', 'locator': {'role': 'group'}}})
         self.assertEqual('manual', step['action'])
         self.assertIn('우클릭', step['label'])
-        hint = teach_capture.instruction_view(step, None)
-        self.assertIn('현재 창의 우클릭 위치', hint)
-        self.assertIn('상위 메뉴 > 하위 메뉴를 눌러줘', hint)
+        self.assertEqual(teach_capture.review_interpretation(step, {}),
+                         ('우클릭 위치 확인 필요', None, '', False))

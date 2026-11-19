@@ -9,7 +9,8 @@ def followup(result):
     scripts = Path(__file__).absolute().parent
     recovered = result.get('live_recovery')
     nested = isinstance(recovered, dict)
-    if not nested and result.get('status') == 'needs_grounding' and 'live_scopes' in result:
+    if not nested and result.get('status') == 'needs_grounding' and (
+            'live_scopes' in result or result.get('host_action') == 'ground_recorded_double_click'):
         recovered = result
     ready = (recovered if isinstance(recovered, dict)
              and recovered.get('host_action') == 'use_prepared_task' else result)
@@ -36,6 +37,10 @@ def followup(result):
     if recovered.get('retry_args'):
         result['next_action'] = dict(kind='continue_preparation',
             script=str(scripts / 'desktop_select.py'), args=recovered['retry_args'])
+    elif recovered.get('host_action') == 'ground_recorded_double_click' and recovered.get('ground_args'):
+        result['next_action'] = dict(kind='ground_recorded_double_click', script=str(scripts / 'desktop_select.py'),
+                                     args=recovered['ground_args'], capture_requires_consent=True)
+        result.pop('recover_args', None)
     elif recovered.get('bindings_template'):
         name = recovered.get('source_task') or task.get('name')
         if not isinstance(name, str) or not name:

@@ -123,6 +123,33 @@ def _point_target(raw):
 
 
 def is_recoverable(step):
+    return _recoverable_capture(step, RECOVERABLE_CAPTURE_REASONS)
+
+
+def is_double_click_step(step):
+    if not isinstance(step, dict):
+        return False
+    if step.get('action') == 'visual-click':
+        spec = step.get('visual')
+        return isinstance(spec, dict) and spec.get('gesture') == 'double-click'
+    if step.get('action') != 'manual':
+        return False
+    return _recoverable_capture(step, {'double_click_needs_review'})
+
+
+def query_before_double_click(button, following):
+    if (not is_double_click_step(following) or button.get('action') not in ('open', 'invoke')
+            or button.get('window_context') != following.get('window_context') or 'popup' in button):
+        return False
+    selector = button.get('selector', button)
+    caption = button.get('command_name') or selector.get('name')
+    if not caption and button.get('match') == 'name':
+        caption = button.get('target')
+    return (selector.get('role') == 'button' and isinstance(caption, str) and
+            caption.strip().casefold() in {'view', '조회', '검색', 'search', 'query', 'find', 'refresh', '새로고침'})
+
+
+def _recoverable_capture(step, reasons):
     """An absent capture identity may be replaced by a fresh, named lookup.
 
     This does not authorize recovery from a protected control, uncertain input,
@@ -149,7 +176,7 @@ def is_recoverable(step):
     else:
         converted = step
     return (converted.get('action') == 'manual'
-            and converted.get('reason') in RECOVERABLE_CAPTURE_REASONS)
+            and converted.get('reason') in reasons)
 
 
 def _conditional_sentence(sentence):
@@ -157,6 +184,24 @@ def _conditional_sentence(sentence):
     return re.search(r'(?:있으|없으|열리|보이|나오|나타나|뜨|표시되|발견되)면(?:\s|[,，])'
                      r'|(?:있든|없든|유무와\s*(?:관계|상관)없이)|\b(?:if|unless|otherwise|whether)\b',
                      sentence, re.I) is not None
+
+
+def double_click_instruction(sentence):
+    """An affirmative gesture, optionally followed by the expected open effect."""
+    if not isinstance(sentence, str) or _conditional_sentence(sentence):
+        return False
+    if re.search(r'하지\s*마|말고|대신|않|금지|그리고|(?:으|라|다)면|경우에|일\s*때|삭제|닫[고기는아]|종료|취소|'
+                 r'(?:한|1)\s*번(?:만)?\s*(?:누르|눌러|클릭)|[,;?\n]|'
+                 r'\b(?:not|never|instead|then|and|or|single[ -]?click|delete|remove|close|cancel)\b',
+                 sentence, re.I):
+        return False
+    gesture = r'(?:(?:더블\s*클릭|두\s*번\s*클릭)(?:\s*(?:해서|하여|으로|하기|해))?|두\s*번\s*(?:눌러서|눌러|누르기))'
+    # Only the expected opening effect can follow the gesture. Other instructions stay editable.
+    opening = (r'(?:\s*[\w ()-]*?(?:팝업|창|화면|대화\s*상자|페이지|상세\s*(?:보기|정보))(?:을|를)?'
+               r'\s*(?:띄워|열어|열기|표시해))?')
+    return bool(re.fullmatch(
+        r'[^,;!?\n]*?' + gesture + opening + r'\s*(?:줘|주세요)?[.!]?'
+        r'|double[ -]?click\s+[^,;!?]+[.!]?', sentence.strip(), re.I))
 
 
 def click_request(sentence):
@@ -697,7 +742,16 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         return _command_instruction(special, sentence, mode, argument)
     if _conditional_sentence(sentence) and all(value is None for value in (mode, argument, target, role, within)):
         return {'mode': 'draft', 'text': sentence}
-    if ('visual_hint' in raw_step and is_recoverable(raw_step) and click_request(sentence)
+    if is_double_click_step(raw_step):
+        if any(value is not None for value in (mode, argument, target, role, within)):
+            raise TaskError('double_click_target_requires_grounding')
+        if ((raw_step.get('action') == 'visual-click' or 'visual_hint' in raw_step)
+                and (double_click_instruction(sentence) or
+                     (raw_step.get('action') == 'visual-click' and sentence == raw_step.get('label')))):
+            return {'mode': 'visual-click', 'text': sentence}
+        return {'mode': 'draft', 'text': sentence}
+    if ('visual_hint' in raw_step and 'gesture' not in raw_step['visual_hint']
+            and is_recoverable(raw_step) and click_request(sentence)
             and all(value is None for value in (mode, argument, target, role, within))):
         return {'mode': 'visual-click', 'text': sentence}
     if raw_step.get('action') == 'visual-click':
@@ -782,10 +836,14 @@ def instructed_step(raw_step, spec):
         special.update(_annotations(raw_step))
         _validate_capture_command(special)
         return special
-    if spec.get('mode') == 'visual-click' and 'visual_hint' in raw_step and is_recoverable(raw_step):
+    if (spec.get('mode') == 'visual-click' and 'visual_hint' in raw_step
+            and (is_recoverable(raw_step) or is_double_click_step(raw_step))):
         if compile_instruction(raw_step, spec.get('text')) != spec:
             raise TaskError('invalid_step_instruction')
-        return _visual_step(dict(raw_step, visual=raw_step['visual_hint']), spec['text'])
+        marker = raw_step['visual_hint']
+        if is_double_click_step(raw_step):
+            marker = dict(marker, gesture='double-click')
+        return _visual_step(dict(raw_step, visual=marker), spec['text'])
     if raw_step.get('action') == 'visual-click':
         if spec.get('mode') == 'visual-click':
             if compile_instruction(raw_step, spec.get('text')) != spec:
@@ -793,7 +851,8 @@ def instructed_step(raw_step, spec):
             return _visual_step(raw_step, spec['text'])
         if spec.get('mode') == 'draft':
             marker = _visual_step(raw_step, raw_step.get('label'))['visual']
-            step = instructed_step({**_manual('capture_target_unavailable'), **_annotations(raw_step)}, spec)
+            reason = 'double_click_needs_review' if is_double_click_step(raw_step) else 'capture_target_unavailable'
+            step = instructed_step({**_manual(reason), **_annotations(raw_step)}, spec)
             return dict(step, visual_hint=marker)
         raw_step = {**_manual('capture_target_unavailable'), **_annotations(raw_step)}
     row_hint = None
@@ -830,7 +889,7 @@ def instructed_step(raw_step, spec):
             if 'menu_window_point' in raw_step:
                 result['menu_window_point'] = _menu_window_point(raw_step['menu_window_point'], reason)
             if 'visual_hint' in raw_step:
-                if not is_recoverable(result):
+                if not (is_recoverable(result) or is_double_click_step(result)):
                     raise TaskError('invalid_visual_step')
                 result['visual_hint'] = raw_step['visual_hint']
             return result
@@ -867,6 +926,12 @@ def instructed_step(raw_step, spec):
 def recorded_step(raw):
     if not isinstance(raw, dict):
         return _manual('capture_target_unavailable')
+    if raw.get('action') == 'saved-step':
+        step = dict(raw['saved'])
+        if 'window_context' in raw:
+            step['window_context'] = raw['window_context']
+        _validate_step(step, set())
+        return step
     spec = raw.get('instruction')
     if 'instruction_draft' in raw:
         if spec is not None:
@@ -988,7 +1053,7 @@ def resolve_saved_intents(plan):
     _validate(plan)
     steps = []
     for step in plan['steps']:
-        if is_recoverable(step):
+        if step.get('action') == 'manual' and (is_recoverable(step) or is_double_click_step(step)):
             text = step.get('instruction_draft', '')
             is_user_text = bool(text and text != LEGACY_INSTRUCTION_HINT)
             if not is_user_text:
@@ -1024,7 +1089,8 @@ def grounding_request(number, step):
 
 
 def has_groundable_draft(step):
-    return bool(step.get('instruction_draft')) and (step['action'] != 'manual' or is_recoverable(step))
+    return bool(step.get('instruction_draft')) and (step['action'] != 'manual' or is_recoverable(step)
+                                                     or is_double_click_step(step))
 
 
 def _validate_step(s, parameters):
@@ -1065,9 +1131,11 @@ def _validate_step(s, parameters):
             expected.add('menu_anchor')
         if 'visual_hint' in s:
             from visual_target import validate_spec
-            if not is_recoverable(s) or 'instruction_draft' not in s:
+            if not (is_recoverable(s) or is_double_click_step(s)) or 'instruction_draft' not in s:
                 raise TaskError('invalid_visual_step')
             validate_spec(s['visual_hint'])
+            if 'gesture' in s['visual_hint'] and not is_double_click_step(s):
+                raise TaskError('invalid_visual_step')
             expected.add('visual_hint')
         if 'instruction_draft' in s:
             expected.add('instruction_draft')
@@ -1160,7 +1228,7 @@ def _validate(plan):
     if any('window_context' in s for s in plan['steps']):
         from window_context import validate_sequence, ContextError
         try:
-            validate_sequence(plan['steps'])
+            validate_sequence(plan['steps'], allow_unbound_double=True)
         except ContextError as error:
             raise TaskError(error.code, step_number=error.step_number) from error
 

@@ -98,6 +98,35 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(result['input_dispatched'])
         execute.assert_called_once()
 
+    def test_view_then_double_click_requires_a_new_target_or_independent_recheck(self):
+        from test_visual_target import image, visual, VisualTargets
+        marker = visual.from_frame(VisualTargets.window, image((35,42)), (235,162))
+        data = recipe()
+        data['steps'] = [dict(action='invoke', selector=dict(role='button', name='VIEW')),
+                         dict(action='visual-click', label='결과 행 더블 클릭', visual=dict(marker, gesture='double-click'))]
+        delivery = dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched', input_dispatched=True)
+        with (patch.object(visual,'observe') as observe, patch.object(visual,'execute', return_value=delivery) as click,
+              patch.object(flow.live,'execute', side_effect=self.execute) as query):
+            for stale in ('already_visible', 'visual_target_ambiguous'):
+                observe.side_effect = None if stale == 'already_visible' else visual.bridge.BridgeError(stale)
+                report = flow.run(data)
+                self.assertEqual(report['diagnostic'], 'query_result_freshness_unproven', report)
+                self.assertEqual(report['steps'][1]['receipt']['before_query'], stale)
+                self.assertTrue(report['input_dispatched'])
+                self.assertFalse(report['steps'][1]['receipt']['input_dispatched'])
+                query.assert_called_once()
+                query.reset_mock()
+                click.assert_not_called()
+            observe.side_effect = visual.bridge.BridgeError('visual_target_not_found')
+            self.assertEqual(flow.run(data)['status'], 'completed_unverified')
+            self.assertEqual(click.call_args.kwargs['first_match_timeout'], flow.RESULT_VISUAL_TIMEOUT)
+            observe.reset_mock()
+            query.reset_mock()
+            self.assertEqual(flow.run(data, only=2)['status'], 'completed_unverified')
+            self.assertEqual(click.call_args.kwargs['first_match_timeout'], 0)
+            observe.assert_not_called()
+            query.assert_not_called()
+
     def test_registered_command_caption_change_blocks_reused_id(self):
         data = recipe()
         data['steps'] = [dict(action='invoke', selector=dict(automation_id='search', role='button'),

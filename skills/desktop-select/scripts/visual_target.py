@@ -17,6 +17,7 @@ import win_bridge as bridge
 SIDE = 41
 _CANVAS = {50000, 50006, 50020, 50025, 50026, 50032, 50033}
 _INPUT = {50003, 50004, 50008, 50009, 50010, 50011, 50028, 50029, 50036}
+_DATA = {50007, 50008, 50028, 50029, 50036}  # ListItem, List, DataGrid, DataItem, Table
 
 
 def _require(condition, diagnostic):
@@ -25,7 +26,8 @@ def _require(condition, diagnostic):
 
 
 def _decoded(spec):
-    _require(isinstance(spec, dict) and set(spec) == {'size', 'offset', 'rgb'}, 'invalid_visual_target')
+    _require(isinstance(spec, dict) and set(spec) - {'gesture'} == {'size', 'offset', 'rgb'}
+             and ('gesture' not in spec or spec['gesture'] == 'double-click'), 'invalid_visual_target')
     size, offset, encoded = spec['size'], spec['offset'], spec['rgb']
     _require(type(size) is list and size == [SIDE, SIDE] and all(type(v) is int for v in size)
              and type(offset) is list and len(offset) == 2
@@ -197,7 +199,7 @@ def _enabled_canvas(binding, uia, painted, hit):
             and not any(receiver.property(k) is True for k in (30040,30043,30149)))
 
 
-def _safe_patch(binding, uia, box, point, *, exposed):
+def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface=None):
     """Check control metadata only on branches intersecting the intended image."""
     binding.check()
     client = bridge.RECT()
@@ -213,23 +215,25 @@ def _safe_patch(binding, uia, box, point, *, exposed):
     if bridge._sig(user,'GetWindowDisplayAffinity',W.BOOL,W.HWND,C.POINTER(W.DWORD))(binding.hwnd,C.byref(affinity)):
         _require(affinity.value == 0, 'visual_window_capture_protected')
     hit = None
+    allow_data = gesture == 'double-click'
     if exposed:
         hit = bridge.window_from_point(*point)
         _require(bridge.root_window(bridge.foreground()) == binding.hwnd and _hit_belongs(binding, hit),
                  'visual_point_not_exposed')
         element = uia.from_point(*point)
         _require(element is not None and safe_provider(binding, uia, element)
-                 and element.property(30003) in _CANVAS and uia.within(element, root)
+                 and (element.property(30003) in _CANVAS or allow_data and element.property(30003) in _DATA)
+                 and uia.within(element, root)
                  and _enabled_canvas(binding,uia,element,hit), 'visual_hit_not_actionable')
         if bridge.hwnd_pid(hit) != binding.pid:
             embedded = uia.from_handle(hit)
             _require(embedded is not None and embedded.property(30020) == hit
                      and uia.pid(embedded) == bridge.hwnd_pid(hit) and safe_provider(binding,uia,embedded),
                      'visual_hit_not_actionable')
-    pending = deque([root])
+    pending = deque([(root, False)])
     count = 0
     while pending:
-        element = pending.popleft()
+        element, in_data = pending.popleft()
         count += 1
         _require(count <= 1600, 'visual_scope_incomplete')
         rect = vision._bounds(uia, element)
@@ -239,11 +243,15 @@ def _safe_patch(binding, uia, box, point, *, exposed):
         elif element.property(30022) is True:
             continue
         role = element.property(30003)
-        _require(safe_provider(binding,uia,element) and role not in _INPUT
-                 and element.property(30040) is not True and element.property(30149) is not True
-                 and (element.property(30043) is not True or role in (50026,50032,50033)),
+        data = allow_data and (role in _DATA or in_data and role == 50020)
+        _require(safe_provider(binding,uia,element) and (role not in _INPUT or data)
+                 and (element.property(30040) is not True or data) and element.property(30149) is not True
+                 and (element.property(30043) is not True or role in (50026,50032,50033)
+                      or data and element.property(30046) is True),
                  'visual_target_protected_or_editable')
-        pending.extend(uia.children(element))
+        if data and data_surface is not None:
+            data_surface.add(role)
+        pending.extend((child, in_data or data) for child in uia.children(element))
     return hit
 
 
@@ -254,7 +262,7 @@ def observe(binding, spec):
     pixels = vision._frame(binding, window)
     box, point = _locate(window, pixels, spec)
     with bridge.UIA() as uia:
-        _safe_patch(binding, uia, box, point, exposed=False)
+        _safe_patch(binding, uia, box, point, exposed=False, gesture=spec.get('gesture'))
     _require(vision._window_rect(binding) == window, 'visual_window_moved')
     return dict(point=point, box=box, window=window)
 
@@ -270,7 +278,7 @@ def teach(binding, screen_point):
 
 
 def execute(binding, spec, guard, *, read_only=False, background_only=False, first_match_timeout=0, before_input=None):
-    """Deliver at most one click after independently matching the current window."""
+    """Deliver one gesture in a single SendInput batch after matching the current window."""
     def blocked(reason):
         return dict(status='blocked', input_dispatched=False, diagnostic=reason)
     if background_only and not read_only:
@@ -301,7 +309,7 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
             _require(found['window'] == current['window'] and found['point'] == point,
                      'visual_target_changed_before_input')
             with bridge.UIA() as uia:
-                shown = _safe_patch(binding, uia, box, point, exposed=True)
+                shown = _safe_patch(binding, uia, box, point, exposed=True, gesture=spec.get('gesture'))
             if before_input is not None:
                 before_input(point)
             guard()
@@ -315,7 +323,8 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
                      and vision._window_rect(binding) == current['window'], 'visual_point_not_exposed')
             _require(row_action._input_tick() == tick, 'foreground_or_input_changed')
             try:
-                result = bridge._send_point(*point, 'click')
+                gesture = spec.get('gesture', 'click')
+                result = bridge._send_point(*point, gesture)
             except Exception as error:
                 result = dict(ok=False, input_dispatched=getattr(error,'input_dispatched', None),
                               diagnostic=getattr(error,'code','visual_click_delivery_uncertain'))
@@ -323,9 +332,11 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
         return blocked(getattr(error,'code','visual_observation_failed'))
     delivered = result.get('ok') and result.get('input_dispatched') is True
     return dict(status='delivered_unverified' if delivered else 'uncertain',
-                diagnostic='visual_click_dispatched' if delivered else result.get('diagnostic','visual_click_delivery_uncertain'),
+                diagnostic=('visual_double_click_dispatched' if gesture == 'double-click' else 'visual_click_dispatched')
+                if delivered else result.get('diagnostic','visual_click_delivery_uncertain'),
                 input_dispatched=result.get('input_dispatched'), input_mode='physical_pointer', physical_input=True,
-                effect_verification='unverified', verification_scope='click_delivery', business_commit='not_verified')
+                effect_verification='unverified', verification_scope='click_delivery', business_commit='not_verified',
+                **({'gesture': gesture} if gesture == 'double-click' else {}))
 
 
 class HoverTracker(threading.Thread):
@@ -345,7 +356,8 @@ class HoverTracker(threading.Thread):
         point = tuple(bridge.cursor())
         window = vision._window_rect(binding)
         box = _box(window, point)
-        hit = _safe_patch(binding, uia, box, point, exposed=True)
+        data_surface = set()
+        hit = _safe_patch(binding, uia, box, point, exposed=True, gesture='double-click', data_surface=data_surface)
         start = time.monotonic()
         pixels = vision._frame(binding, window, crop=box)
         rgb = vision._rgb((box, (), pixels), box)
@@ -354,9 +366,11 @@ class HoverTracker(threading.Thread):
         if point != tuple(bridge.cursor()) or hit != bridge.window_from_point(*point):
             return None
         # Recheck input protection on the same UIA region before keeping pixels.
-        _safe_patch(binding, uia, box, point, exposed=True)
+        _safe_patch(binding, uia, box, point, exposed=True, gesture='double-click', data_surface=data_surface)
         spec = dict(size=[SIDE, SIDE], offset=[point[i]-box[i] for i in range(2)],
                     rgb=base64.b64encode(rgb).decode('ascii'))
+        if data_surface:
+            spec['gesture'] = 'double-click'  # Only a measured double-click may adopt a row crop.
         return start, end, hit, box, point, spec
 
     def run(self):

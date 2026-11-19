@@ -18,8 +18,8 @@ SRC = Path(__file__).resolve().parents[1] / 'skills/desktop-select'
 
 class Review:
     """Drive Tk's event queue exactly as a user moving between fields and buttons."""
-    def __init__(self, root, ttk):
-        self.root, self.ttk = root, ttk
+    def __init__(self, root, ttk, baseline):
+        self.root, self.ttk, self.baseline = root, ttk, baseline
 
     def widgets(self, parent):
         for child in parent.winfo_children():
@@ -37,6 +37,16 @@ class Review:
         entry = self.field('instruction')
         entry.delete(0, 'end')
         entry.insert(0, text)
+
+    def menu(self, label):
+        tools = self.field('step_tools')
+        self.root.nametowidget(tools.cget('menu')).invoke(label)
+
+    def delete_selected(self):
+        if self.baseline:
+            self.button('선택 단계 삭제').invoke()
+        else:
+            self.menu('선택 단계 삭제')
 
     def save(self):
         return self.button('초안 저장', '저장')
@@ -97,7 +107,7 @@ def exercise(skill, project, baseline):
                 destroy()
 
             root.destroy = close
-            runner = iter(actions(Review(root, ttk)))
+            runner = iter(actions(Review(root, ttk, baseline)))
 
             def tick():
                 try:
@@ -153,7 +163,7 @@ def exercise(skill, project, baseline):
 
     def remove_and_save(editor):
         yield from fill(editor)
-        editor.button('선택 단계 삭제').invoke()
+        editor.delete_selected()
         yield
         assert editor.field('steps').get_children() == ('search', 'gesture')
         assert editor.field('instruction').get() == GESTURE
@@ -168,7 +178,7 @@ def exercise(skill, project, baseline):
         editor.field('steps').selection_set('details')
         yield
         assert editor.field('instruction').get() == CHILD
-        editor.button('선택 단계 삭제').invoke()
+        editor.delete_selected()
         yield
         assert editor.field('instruction').get() == GESTURE
         editor.save().invoke()
@@ -182,7 +192,7 @@ def exercise(skill, project, baseline):
         for step in ('details', 'gesture'):
             table.selection_set(step)
             yield
-            editor.button('선택 단계 삭제').invoke()
+            editor.delete_selected()
             yield
         assert table.get_children() == ('search',)
         editor.edit('조회 버튼을 눌러줘')
@@ -198,22 +208,21 @@ def exercise(skill, project, baseline):
 
     def save_invalid_fields(editor):
         yield from fill(editor)
-        editor.button('선택 단계 삭제').invoke()
+        editor.delete_selected()
         yield
         assert editor.field('instruction').get() == GESTURE
-        editor.button('상세 설정').invoke()
+        editor.menu('단계 별칭')
         editor.field('alias').insert(0, '범위=미정')
-        editor.field('mode').set('필수 변수')
-        editor.field('argument').insert(0, '입력값')
         editor.save().invoke()
 
     def fix_fields(editor):
         editor.field('steps').selection_set('gesture')
         yield
-        editor.button('상세 설정').invoke()
+        editor.menu('단계 별칭')
         assert editor.field('instruction').get() == GESTURE
         assert editor.field('alias').get() == '범위=미정'
-        assert editor.field('mode').get() == '필수 변수'
+        editor.field('preview').invoke()
+        assert editor.field('mode').get() == '실행할 때 입력'
         assert editor.field('argument').get() == '입력값'
         editor.field('alias').delete(0, 'end')
         editor.field('mode').set('문장 해석')
@@ -263,6 +272,11 @@ def exercise(skill, project, baseline):
             checks.append('retry_atomically_publishes')
             result = record('Explicit fields', save_invalid_fields)
             assert result['draft'] and result['step_number'] == 2, result
+            # Older recorders allowed a variable override even on a gesture.
+            # Such a draft must stay editable after upgrading.
+            legacy = app.tasks.read_document('Explicit fields', store)
+            legacy['rows'][1]['form'].update(mode='required', argument='입력값')
+            app.tasks._write_document(legacy, store, replace_review=True)
             result = record('Explicit fields', fix_fields, offline=True)
             assert result['status'] == 'recorded' and 'draft' not in result, result
             saved = app.tasks.load_task('Explicit fields', store)

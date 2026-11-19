@@ -1,5 +1,6 @@
 """Let the host associate a recorded instruction with a freshly observed window image."""
 from collections import deque
+from copy import deepcopy
 from hashlib import sha256
 import json
 import ctypes as C
@@ -149,7 +150,7 @@ def read_frame(folder, scope, token):
 
 
 def _usable(step):
-    return (tasks.is_recoverable(step) or step.get('action')=='visual-click'
+    return (tasks.is_recoverable(step) or tasks.is_double_click_step(step) or step.get('action')=='visual-click'
             or (step.get('action')=='open' and step.get('match')=='query'))
 
 
@@ -161,7 +162,7 @@ def _row_candidate(plan, number):
     from row_intent import conflicts_with_launch
     step = plan['steps'][number-1]
     children = {(s['exe'].casefold(),s['title']) for s in _children(plan,number)}
-    return (len(children)==1 and (step.get('action')=='row-launch' or _usable(step))
+    return (len(children)==1 and not tasks.is_double_click_step(step) and (step.get('action')=='row-launch' or _usable(step))
             and not conflicts_with_launch(_instruction(step)))
 
 
@@ -226,23 +227,72 @@ def _save_row(plan, store, number, spec):
             temp.unlink(missing_ok=True)
 
 
+def _save_bound_copy(doc, plan, rows, number, fingerprint, store):
+    """Preserve the form of every unresolved sibling in a new draft if compilation is incomplete."""
+    import recovery
+    import review_drafts
+    problem = next(((i, reason) for i, row in enumerate(rows or [], 1) if i != number
+                    and (reason := row.get('scope_problem') or row.get('field_problem'))), None)
+    if rows and not problem:
+        try:
+            tasks._validate(plan)
+        except tasks.TaskError as error:
+            problem = error.step_number, error.code
+    try:
+        with review_drafts._edit_lock(store):
+            if recovery._fingerprint(tasks.read_document(doc['name'],store)) != fingerprint:
+                raise tasks.TaskError('recording_draft_changed')
+            if not problem:
+                tasks.save_task(plan,store)
+                return None
+            draft_rows = deepcopy(doc['rows'])
+            bound, row = plan['steps'][number-1], draft_rows[number-1]
+            old = row['step']
+            row['step'] = dict(id=old['id'],action='visual-click',label=bound['label'],visual=bound['visual'])
+            if '_capture_window' in old:
+                row['step']['_capture_window'] = old['_capture_window']
+            row['form'].update(text=bound['label'], mode=None, argument='')
+            revised = dict(doc, name=plan['name'], rows=draft_rows, diagnostic=problem[1], step_number=problem[0])
+            tasks._write_document(review_drafts.validate(revised), store)
+            return review_drafts.receipt(revised, 'recorded')
+    except OSError as error:
+        raise tasks.TaskError('task_store_unavailable') from error
+
+
 def run(app, args):
-    from recorded_plan import fingerprint
+    import recovery
+    import review_drafts
     store = app.task_directory()
-    plan = tasks.load_task(args.task,store)
+    doc = tasks.load_task(args.task,store,allow_review=True)
+    is_draft = doc.get('kind') == review_drafts.KIND
+    rows = recovery._rows(doc) if is_draft else None
+    plan = (dict(schema=1, name=doc['name'], exe=doc['exe'], window=doc['window'],
+                 steps=[row['step'] for row in rows]) if is_draft else deepcopy(doc))
     number = tasks._step_number(plan,args.only)
     step = plan['steps'][number-1]
+    double = tasks.is_double_click_step(step)
+    if is_draft:
+        if not double:
+            raise tasks.TaskError('recording_draft_requires_review')
+        if rows[number-1].get('mode') in ('fixed','required') or rows[number-1].get('argument'):
+            raise tasks.TaskError('instruction_binding_conflict')
+        if rows[number-1].get('scope_problem'):
+            raise tasks.TaskError(rows[number-1]['scope_problem'])
     children = _children(plan,number)
     if args.command == 'bind-row' and not _row_candidate(plan,number):
         raise tasks.TaskError('row_binding_requires_recorded_child')
     if not _usable(step) and not children:
         raise tasks.TaskError('grounding_requires_recoverable_target')
-    sentence = _instruction(step)
+    sentence = (rows[number-1]['text'] if is_draft else None) or _instruction(step)
     if not sentence or sentence==tasks.LEGACY_INSTRUCTION_HINT:
         raise tasks.TaskError('grounding_instruction_required')
+    if double and step.get('action') == 'manual' and not tasks.double_click_instruction(sentence):
+        raise tasks.TaskError('double_click_instruction_requires_review')
     owner = app.bridge.Binding(app.pick_window(app.windows(plan['exe']),plan['window'],None))
-    routes = WindowRoutes(plan['steps'],owner,plan['window'],active=[number],read_only=True)
+    # A subsequent popup can legitimately refer to this as-yet-unbound opener.
+    # Only the route to the step being grounded has to exist on the current screen.
     context = step.get('window_context')
+    routes = WindowRoutes(plan['steps'][:number],owner,plan['window'],active=[number],read_only=True) if context else None
     binding = routes.resolve(context) if context else owner
     if binding is None:
         return dict(status='needs_grounding',diagnostic='recorded_window_not_open',step=number,
@@ -251,7 +301,8 @@ def run(app, args):
         app.guard(owner,owner,plan['window'])
         if context:
             routes.check(context,binding)
-    scope = json.dumps([fingerprint(plan),number,owner.hwnd,owner.pid,owner.created,
+    fingerprint = recovery._fingerprint(doc)
+    scope = json.dumps([fingerprint,number,owner.hwnd,owner.pid,owner.created,
                         binding.hwnd,binding.pid,binding.created]).encode('ascii')
     folder = _directory()
     if args.command=='ground':
@@ -259,6 +310,9 @@ def run(app, args):
         token, path = store_frame(folder, scope, data)
         return dict(status='observed',frame=token,image=str(path),width=window[2],height=window[3],
                     step=number,instruction=sentence,expires_seconds=TTL,input_dispatched=False,
+                    **({'gesture':'double-click','host_action':'bind_demonstrated_double_click',
+                        'bind_args':['bind-visual','--task',doc['name'],'--only',str(number),'--frame',token,
+                                     '--point','<x>','<y>','--save-as','<new task>']} if double else {}),
                     **({'expected_windows': children} if children else {}),
                     **({'row_binding_command':'bind-row'} if _row_candidate(plan,number) else {}))
     if args.command == 'bind-visual':
@@ -275,9 +329,17 @@ def run(app, args):
     frame,pixels = _pixels(data)
     try:
         spec = visual_target.from_frame(frame,pixels,tuple(args.point))
+        if double:
+            spec['gesture'] = 'double-click'
         check()
         visual_target.observe(binding,spec)
     except visual_target.bridge.BridgeError as error:
+        if double and error.code in ('visual_target_ambiguous','visual_target_lacks_detail','visual_target_too_common'):
+            return dict(status='needs_grounding', diagnostic=error.code, input_dispatched=False,
+                        host_action='choose_distinct_point_in_same_target', gesture='double-click', step=number,
+                        instruction=sentence, frame=args.frame, image=str(path),
+                        bind_args=['bind-visual','--task',doc['name'],'--only',str(number),'--frame',args.frame,
+                                   '--point','<x>','<y>','--save-as',args.save_as])
         if error.code != 'visual_target_ambiguous' or not _row_candidate(plan,number):
             raise
         return dict(status='needs_grounding', diagnostic=error.code, input_dispatched=False,
@@ -289,10 +351,15 @@ def run(app, args):
     step = dict(action='visual-click',label=sentence,visual=spec,**tasks._annotations(step))
     plan['steps'][number-1] = step
     plan['name'] = args.save_as
-    tasks.save_task(plan,store)
+    draft_receipt = _save_bound_copy(doc, plan, rows, number, fingerprint, store)
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass  # A previewer can keep the PNG open until the next expiry sweep.
+    test = {'gesture':'double-click', 'test_step_args':['replay','--task',plan['name'],'--only',str(number),
+                                                        '--exe',plan['exe'],'--window',plan['window']]} if double else {}
+    if draft_receipt is not None:
+        return dict(draft_receipt, bound_step=number, **test)
     return dict(status='recorded',task=plan['name'],step=number,input_dispatched=False,
+                **test,
                 execution_plan=app.execution_plan_info(app.saved_execution_plan(plan)))

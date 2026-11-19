@@ -97,11 +97,12 @@ def main():
         def first():
             assert len(named('steps').get_children()) == 4
             assert not named('alias').winfo_viewable()
-            button('상세 설정').invoke()
+            menu = root.nametowidget(named('step_tools')['menu'])
+            menu.invoke('단계 별칭')
             root.update_idletasks()
             assert named('alias').winfo_viewable()
             write('instruction', 'MES Setup조건을 N으로 설정')
-            button('문장의 이름을 이 대상에 연결').invoke()
+            menu.invoke('문장의 이름을 이 대상에 연결')
             assert named('alias').get() == 'MES Setup'
             button('적용하고 다음 단계').invoke()
             later(second)
@@ -116,7 +117,7 @@ def main():
 
         def remove():
             assert named('steps').selection() == ('bad',)
-            button('선택 단계 삭제').invoke()
+            root.nametowidget(named('step_tools')['menu']).invoke('선택 단계 삭제')
             assert len(named('steps').get_children()) == 3
             assert 'bad' not in named('steps').get_children()
             checks.append('delete_unrecognized_step')

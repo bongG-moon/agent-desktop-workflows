@@ -124,6 +124,34 @@ class RecorderRequestTests(unittest.TestCase):
             self.assertTrue(output.getvalue().isascii())
             ui.assert_not_called()
 
+    def test_explicit_edit_round_trips_saved_task_and_remaps_child_after_reorder(self):
+        from capture_trail import finalize_contexts
+        from teach_capture import StepEdits
+        task = recording()
+        task['steps'][2]['wait_after'] = 1
+        task['steps'][2]['window_context'] = dict(title='Child', exe='Child.exe', after_step=1, related=True)
+        app.tasks.save_task(task, self.folder)
+        self.write(dict(command='review', task=task['name'], edit=True))
+
+        def edit(owner, storage, *, report_ready):
+            self.assertIsNone(owner)
+            self.assertTrue(report_ready)
+            edits = StepEdits()
+            rows = edits.restore_rows(storage.initial_rows())
+            rows[0], rows[1] = rows[1], rows[0]
+            return storage.save_recording(finalize_contexts(edits.apply(rows)))
+
+        with (patch.object(app, 'task_directory', return_value=self.folder),
+              patch.object(app, 'edit_recording', side_effect=edit), patch.object(app, 'windows') as windows):
+            result = app.run(self.cli)
+        windows.assert_not_called()
+        self.assertEqual(result['task']['name'], task['name'] + ' - 수정본')
+        saved = app.tasks.load_task(result['task']['name'], self.folder)
+        self.assertEqual(saved['steps'][:2], [task['steps'][1], task['steps'][0]])
+        self.assertEqual(saved['steps'][2], dict(task['steps'][2], window_context=dict(
+                                task['steps'][2]['window_context'], after_step=2)))
+        self.assertEqual(app.tasks.load_task(task['name'], self.folder), task)
+
     def test_split_native_arguments_report_actionable_json(self):
         child = subprocess.run([sys.executable, '-X', 'utf8', '-B', app.__file__, 'record', '--task', '새',
                                 '녹화', '--exe', 'Demo.exe', '--window', '업무', '창'],

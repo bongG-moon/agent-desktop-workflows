@@ -49,6 +49,19 @@ class ReviewDraftStorageTests(unittest.TestCase):
         self.assertEqual(restored.initial_rows(), self.rows)
         self.assertEqual(tasks.load_task('draft', self.directory, allow_review=True)['rows'], self.rows)
 
+    def test_retaking_a_parameterized_legacy_field_preserves_its_optional_default(self):
+        from test_teach_capture import combo
+        original = teach_capture.capture_step(combo('Mode', 'Hybrid'))
+        task = tasks.from_recording('Old', 'Demo.exe', '조건', [original])
+        task['steps'][0]['parameter'] = '사용자 변수'
+        source = review_drafts.rows_from_task(task)[0]['step']
+        fresh = teach_capture.capture_step(combo('NewMode', 'N'))
+        captured = review_drafts.retain_saved_arguments(source, fresh)
+        edited = tasks.recorded_step(captured)
+        self.assertEqual((edited['value'], edited['parameter'], edited['target']),
+                         ('Hybrid', '사용자 변수', 'comboNewMode'))
+        self.assertNotEqual(edited['recorded_effect'], 'matched')
+
     def test_interrupted_write_or_replace_preserves_original_and_can_retry(self):
         self.create()
         original = self.path.read_bytes()
@@ -124,7 +137,8 @@ class ReviewDraftStorageTests(unittest.TestCase):
         self.create()
         editor = self.editor()
 
-        def accept_correction(owner, *, title, initial_draft, initial_step, save_recording, save_draft, on_ready):
+        def accept_correction(owner, *, title, initial_draft, initial_step, save_recording, save_draft, on_ready,
+                              locate_window):
             self.assertIsNone(on_ready)
             self.assertEqual(initial_draft, self.rows)
             self.assertEqual(initial_step, editor.previous['step_number'])

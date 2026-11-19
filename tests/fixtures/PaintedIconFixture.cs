@@ -7,13 +7,33 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 sealed class PaintedIconFixture : Form {
-    readonly Panel canvas = new Panel();
+    sealed class DoubleClickPanel : Panel {
+        internal DoubleClickPanel() { SetStyle(ControlStyles.StandardDoubleClick, true); }
+    }
+    readonly Panel canvas = new DoubleClickPanel();
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
-    int left = 64, pressed, missed;
+    int left = 64, pressed, missed, opened;
+    Form detail;
+    ListView list;
+    ListViewItem targetRow;
     Rectangle Icon { get { return new Rectangle(left, 65, 72, 68); } }
 
-    PaintedIconFixture() {
+    void OpenDetails() {
+        if (detail != null) return;
+        opened++;
+        detail = new Form { Text = "Item details", Size = new Size(280, 160), ShowInTaskbar = false };
+        var note = new TextBox { Name = "CommentText", AccessibleName = "Comment",
+            Text = "Ready for inspection", ReadOnly = true, Dock = DockStyle.Top };
+        var close = new Button { Name = "CloseDetails", Text = "Done", Dock = DockStyle.Bottom };
+        close.Click += delegate { detail.Close(); };
+        detail.FormClosed += delegate { detail = null; };
+        detail.Controls.Add(note);
+        detail.Controls.Add(close);
+        detail.Show(this);
+    }
+
+    PaintedIconFixture(bool showDetails, bool useList) {
         Text = "Desktop Select painted icon fixture";
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
@@ -37,7 +57,20 @@ sealed class PaintedIconFixture : Form {
             if (mouse.Button == MouseButtons.Left && Icon.Contains(mouse.Location)) pressed++;
             else missed++;
         };
-        Controls.Add(canvas);
+        if (showDetails) canvas.MouseDoubleClick += delegate(object sender, MouseEventArgs mouse) {
+            if (mouse.Button == MouseButtons.Left && Icon.Contains(mouse.Location)) OpenDetails();
+        };
+        if (useList) {
+            list = new ListView { Name = "Results", Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true };
+            list.Columns.Add("Reference", 300);
+            list.Items.AddRange(new ListViewItem[] { new ListViewItem("Bravo"), new ListViewItem("Charlie"),
+                targetRow = new ListViewItem("Order A123"), new ListViewItem("Echo"), new ListViewItem("Foxtrot") });
+            list.MouseDoubleClick += delegate(object sender, MouseEventArgs mouse) {
+                if (list.GetItemAt(mouse.X, mouse.Y) == targetRow) OpenDetails();
+                else missed++;
+            };
+            Controls.Add(list);
+        } else Controls.Add(canvas);
         Shown += delegate {
             Emit("ready");
             new Thread(ReadCommands) { IsBackground = true }.Start();
@@ -45,9 +78,11 @@ sealed class PaintedIconFixture : Form {
     }
 
     void Emit(string kind) {
-        Point center = canvas.PointToScreen(new Point(left + 33, 95));
+        Point center = list == null ? canvas.PointToScreen(new Point(left + 33, 95)) :
+            list.PointToScreen(new Point(35, targetRow.Bounds.Top + targetRow.Bounds.Height / 2));
         Console.WriteLine(json.Serialize(new { kind, pid = System.Diagnostics.Process.GetCurrentProcess().Id,
-            hwnd = Handle.ToInt64(), title = Text, x = center.X, y = center.Y, pressed, missed }));
+            hwnd = Handle.ToInt64(), title = Text, x = center.X, y = center.Y, pressed, missed, opened,
+            detailHwnd = detail == null ? 0L : detail.Handle.ToInt64() }));
         Console.Out.Flush();
     }
 
@@ -57,15 +92,19 @@ sealed class PaintedIconFixture : Form {
             string command = line;
             Invoke(new Action(delegate {
                 if (command == "quit") { Close(); return; }
-                if (command == "move-icon") { left = 246; canvas.Refresh(); }
+                if (command == "dismiss" && detail != null) { detail.Close(); }
+                if (command == "move-icon") {
+                    if (list == null) { left = 246; canvas.Refresh(); }
+                    else { list.Items.Insert(0, "Alpha"); targetRow.Selected = false; targetRow.Focused = false; list.Refresh(); }
+                }
                 Emit(command);
             }));
         }
     }
 
-    [STAThread] static void Main() {
+    [STAThread] static void Main(string[] args) {
         SetProcessDpiAwarenessContext(new IntPtr(-4));
         Application.EnableVisualStyles();
-        Application.Run(new PaintedIconFixture());
+        Application.Run(new PaintedIconFixture(Array.IndexOf(args, "--details") >= 0, Array.IndexOf(args, "--list") >= 0));
     }
 }

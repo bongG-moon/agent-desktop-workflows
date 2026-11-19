@@ -77,10 +77,9 @@ def gui_driver(cli, work, argv):
                     tree.focus(step)
                     stage = "annotate"
             elif stage == "annotate":
-                details = find(window, caption="상세 설정")
-                if details is not None:
-                    details.invoke()
-                    window.update_idletasks()
+                tools = find(window, name="step_tools")
+                window.nametowidget(tools['menu']).invoke("단계 별칭")
+                window.update_idletasks()
                 for field, value in (("alias", ALIAS if edited == 1 else "상태 조건"),
                                      ("instruction", INSTRUCTIONS[edited])):
                     entry = find(window, name=field)
@@ -224,8 +223,8 @@ def exercise(skill, work):
 
         fixture.command("reset")
         fixture.command("reorder")
-        # After an unverified final button, the task must stop with the
-        # button actually invoked exactly once, even on the changed layout.
+        # Check the saved plan status, each receipt, and the independent WPF
+        # query count after the controls have moved.
         baseline = fixture.command("state")
         run = call("replay", *binding, *task_args)
         check("missing_variable_stops_before_first_fixed_action", run.get("diagnostic") == "required_parameter_missing"
@@ -233,8 +232,10 @@ def exercise(skill, work):
         parameter = steps[1]["instruction"]["parameter"]
         run = call("replay", *binding, *task_args, "--set", parameter + "=P")
         model = fixture.command("state")
+        outcomes = [step["receipt"]["status"] for step in run["steps"]]
         check("replay_after_reorder_invokes_once", (model["mode"], model["state"], model["queries"],
-              model["stale_selects"]) == ("N", "P", 1, 0) and run.get("status") == "delivered_unverified", (run, model))
+              model["stale_selects"]) == ("N", "P", 1, 0) and run.get("status") == "completed_unverified"
+              and outcomes == ["verified", "verified", "delivered_unverified"], (run, model))
         fixture.command("reset")
         run = call("replay", *binding, *task_args, "--only", ALIAS, "--set", ALIAS + "=P")
         model = fixture.command("state")

@@ -36,6 +36,7 @@ import workflow_repair
 
 
 CHILD_VISUAL_TIMEOUT = 30
+RESULT_VISUAL_TIMEOUT = 5
 
 
 class WorkflowError(ValueError):
@@ -239,7 +240,8 @@ def worker_timeout(recipe):
                     + (60 + 3 * len(step['context']['menu']['path']) if step['action'] == 'result-menu' else 0)
                     + (120 if step['action'] in ('row-action', 'row-launch') else 0)
                     + (CHILD_VISUAL_TIMEOUT if step['action'] == 'visual-click'
-                       and 'after_step' in step.get('window_context', {}) else 0)
+                       and 'after_step' in step.get('window_context', {}) else
+                       RESULT_VISUAL_TIMEOUT if app.tasks.is_double_click_step(step) else 0)
                     for step in recipe['steps']) + window_context.OPEN_TIMEOUT * len({
                         (spec['exe'].casefold(), spec['title'], spec['after_step'])
                         for step in recipe['steps'] if 'after_step' in (spec := step.get('window_context', {}))})
@@ -383,11 +385,12 @@ def row_receipt(binding, title, step, *, read_only, context_guard=None):
 
 
 def confirm_opened_window(report, routes, number):
-    if number is None or not routes.origins[number].keys() <= routes.bindings.keys():
+    if number is None or not routes.origins.get(number) or not routes.origins[number].keys() <= routes.bindings.keys():
         return
     receipt = routes.outcomes.get(number)
     if (receipt and (routes.steps[number-1]['action'],receipt.get('diagnostic')) in (
             ('invoke','business_result_not_verified'),('row-open','row_open_dispatched'),
+            ('visual-click','visual_double_click_dispatched'),
             ('result-menu','menu_delivered_no_output_condition'))
             and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True):
         receipt.update(status='verified', effect_verification='matched',
@@ -508,6 +511,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                   business_commit='not_verified', input_requirements=requirements,
                   input_policy='background_only' if background_only else 'auto')
     started = time.monotonic()
+    result_baselines = {}
     number, dispatching = 0, False
     anchor_proof = None
     reservations = ExitStack()
@@ -535,11 +539,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             need(workflow_repair.identity(owner) == resume['scope'][0], 'menu_repair_window_changed')
         if background_only and not read_only:
             input_policy.window_ready(owner)
-        active_scopes = {n for n,_ in entries}
-        row_openers = {n for n,step in entries if step['action']=='row-open'}
-        active_scopes.update(n for n,s in enumerate(recipe['steps'],1) if s.get('window_context',{}).get('after_step') in row_openers)
+        active_scopes = window_context.effect_scopes(recipe['steps'], (n for n, _ in entries))
         routes = window_context.WindowRoutes(recipe['steps'], owner, recipe['window'], read_only=read_only,
-                                              active=sorted(active_scopes))
+                                              active=active_scopes)
         if resume:
             workflow_repair.restore_routes(sys.modules[__name__], recipe, resume, routes)
         if mutates_window and scopes:
@@ -635,6 +637,16 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 # require it to be enabled/restored; missing popups never do.
                 if 'popup' not in step and step['action'] not in ('wait', 'verify-file'):
                     prepare(binding, title)
+                if (not read_only and step['action'] == 'invoke' and not routes.origins.get(number)
+                        and app.tasks.query_before_double_click(step, requested.get(number + 1))):
+                    import visual_target
+                    # A matching row may still be left over from the previous query.
+                    try:
+                        visual_target.observe(binding, requested[number + 1]['visual'])
+                    except app.bridge.BridgeError as error:
+                        result_baselines[number + 1] = error.code
+                    else:
+                        result_baselines[number + 1] = 'already_visible'
                 if step['action'] == 'wait':
                     if read_only:
                         continue
@@ -667,10 +679,21 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     def click_guard():
                         check_target(binding, mutate=not read_only)
                     click_guard()
+                    baseline = result_baselines.get(number)
+                    if baseline is not None and baseline != 'visual_target_not_found':
+                        diagnostic = 'query_result_freshness_unproven'
+                        report.update(status='needs_review', stopped_at=number, diagnostic=diagnostic,
+                                      host_action='verify_current_query_result_then_test_only_this_step')
+                        report['steps'].append(dict(number=number, label=step['label'],
+                            receipt=dict(status='needs_review', input_dispatched=False, diagnostic=diagnostic,
+                                         before_query=baseline), elapsed_seconds=round(time.monotonic()-stage_started, 4)))
+                        break
                     dispatching = not read_only
                     try:
                         opener = routes.outcomes.get((context or {}).get('after_step'), {})
                         first_match_timeout = CHILD_VISUAL_TIMEOUT if not read_only and opener.get('input_dispatched') is True else 0
+                        if baseline == 'visual_target_not_found' and not first_match_timeout:
+                            first_match_timeout = RESULT_VISUAL_TIMEOUT
                         receipt = visual_target.execute(binding, step['visual'], click_guard,
                                                         read_only=read_only, background_only=background_only,
                                                         first_match_timeout=first_match_timeout)
@@ -823,8 +846,12 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                          'row_launch_button_not_found','row_launch_button_ambiguous',
                                                          'row_launch_button_outside_recorded_column')):
                     return _grounding_report(report, [_grounding_step(recipe, number, step, receipt['diagnostic'])])
-                if (not read_only and step['action']=='row-open' and (receipt['status']=='verified' or
-                        (receipt.get('diagnostic')=='row_open_dispatched' and receipt['input_dispatched'] is True))):
+                row_opened = (step['action']=='row-open' and (receipt['status']=='verified' or
+                              (receipt.get('diagnostic')=='row_open_dispatched' and receipt['input_dispatched'] is True)))
+                double_sent = (app.tasks.is_double_click_step(step) and receipt['status']=='delivered_unverified'
+                               and receipt.get('diagnostic')=='visual_double_click_dispatched'
+                               and receipt['input_dispatched'] is True)
+                if not read_only and (row_opened or double_sent) and routes.origins.get(number):
                     for expected in routes.origins[number].values():
                         routes.resolve(expected)
                     confirm_opened_window(report,routes,number)
@@ -864,7 +891,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                     and receipt.get('diagnostic') == 'submit_enter_sent')
                 delivered_visual = (step['action'] == 'visual-click' and receipt['status'] == 'delivered_unverified'
                                     and receipt['input_dispatched'] is True
-                                    and receipt.get('diagnostic') == 'visual_click_dispatched')
+                                    and receipt.get('diagnostic') == ('visual_double_click_dispatched'
+                                        if app.tasks.is_double_click_step(step) else 'visual_click_dispatched'))
                 delivered_conditional = (step['action'] == 'conditional-open' and receipt['status'] == 'delivered_unverified'
                                          and receipt.get('diagnostic') == 'conditional_open_dispatched'
                                          and receipt['input_dispatched'] is True)

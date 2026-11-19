@@ -192,8 +192,13 @@ class CaptureNotes:
 
 
 def default_text(step):
+    if step['action'] == 'saved-step':
+        from review_drafts import saved_form
+        return saved_form(step['saved'])['text']
     if step['action'] in ('row-action', 'result-menu', 'visual-click'):
         return step['label']
+    if step.get('recognition', {}).get('reason') == 'double_click_needs_review':
+        return '녹화한 항목 더블클릭'
     if (step.get('recognition', {}).get('reason') == 'row_capture_requires_review'
             and step.get('label', '').endswith('번째 행 버튼')):
         return step['label'] + '을 눌러줘'
@@ -225,41 +230,46 @@ def default_text(step):
     return ''
 
 
-def instruction_view(step, instruction):
-    if step.get('ordinary_menu') and instruction and instruction.get('mode') == 'draft':
-        return '작성한 설명과 우클릭 위치를 저장합니다. 현재 메뉴에서 지시한 경로를 확인합니다.'
-    if step.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching':
-        return ('실행 전에 현재 창의 우클릭 위치를 대조합니다. 하위 메뉴가 녹화되지 않았으면 '
-                '이 단계에 “상위 메뉴 > 하위 메뉴를 눌러줘”처럼 표시 이름을 순서대로 입력하세요.')
-    if step['action'] == 'result-menu':
-        spec = step['context']
-        route = (['조회 완료 확인'] if spec['trigger'] else []) + ['표 우클릭', *spec['menu']['path']]
-        route.append('Excel 파일 확인' if spec['output'] else '메뉴 전달까지만 확인')
-        return ' → '.join(route)
-    if instruction and instruction['mode'] == 'row-launch':
-        return f"{instruction['ordinal']}번째 행의 실행 버튼을 찾고, 실행 후 같은 행의 상태를 확인합니다."
-    if step['action'] == 'row-action' and not instruction:
-        return step['label'] + ' (버튼 선택 후 같은 행의 완료 표시 확인)'
-    if instruction and instruction['mode'] == 'draft':
-        return '설명은 저장됩니다. 실행 전 Claude가 문장을 해석하고 현재 화면에서 대상을 다시 찾습니다.'
-    if step['action'] == 'visual-click' and (not instruction or instruction['mode'] == 'visual-click'):
-        return '클릭 직전의 항목 모양을 저장했습니다. 재생할 때 해당 창에서 같은 모양을 찾아 한 번 누릅니다.'
-    retry = '실행할 때 현재 화면에서 대상을 다시 찾습니다. ' if instruction and instruction.get('query') else ''
-    if instruction and instruction['mode'] == 'fixed':
-        role = instruction.get('role') or step.get('target', {}).get('locator', {}).get('role')
-        if role == 'textfield':
-            return retry + ('입력란 비우기' if instruction['value'] == '' else '지정한 값 입력: ' + instruction['value'])
-        return retry + '지정한 값으로 선택: ' + instruction['value']
-    if instruction and instruction['mode'] == 'required':
-        return retry + '실행 시 입력할 변수: ' + instruction['parameter']
-    if retry:
-        return retry + instruction['text']
-    if step['action'] == 'teach-target':
-        kind = '입력란' if step['target'].get('locator', {}).get('role') == 'textfield' else '콤보'
-        return kind + ' 대상 확인됨. 고정값이나 입력 변수를 지정하세요.'
-    if learned_tasks.is_recoverable(step):
-        return '대상을 못 읽어도 설명을 저장할 수 있습니다. 대상 이름과 동작을 적으면 실행 시 다시 찾습니다.'
-    return default_text(step) or '직접 확인할 단계'
+def review_interpretation(step, data, *, compiled=None):
+    """Describe exactly what the current editor form would save."""
+    command = compiled if compiled is not None else learned_tasks.recorded_step(StepEdits.edited_step(step, data))
+    action = command['action']
+    instruction = command.get('instruction') or {}
+    field = action in ('select', 'fill', 'field-input')
+    if action == 'manual' and learned_tasks._point_target(step):
+        field = learned_tasks._convert(step, allow_point=True)['action'] in learned_tasks.VALUE_ACTIONS
+    if command.get('instruction_draft') or data.get('instruction', {}).get('mode') == 'draft':
+        return '실행 전 설명 확인', None, '', field
+    if field:
+        binding = instruction if instruction.get('mode') in ('fixed', 'required') else command
+        if 'parameter' in binding:
+            label = '실행할 때 입력 · ' + binding['parameter']
+            if 'value' in binding:
+                label += ' (녹화값 ' + binding['value'] + ')'
+            return label, 'required', binding['parameter'], True
+        if 'value' in binding:
+            value = binding['value']
+            return ('고정값 ' + value if value else '고정값 · 입력란 비우기'), 'fixed', value, True
+        return '값 지정', None, '', True
+    if action == 'manual':
+        label = {'double_click_needs_review': '더블클릭 대상 확인 필요',
+                 'right_click_requires_menu_teaching': '우클릭 위치 확인 필요'}.get(command.get('reason'), '실행 전 대상 확인')
+    elif action == 'visual-click':
+        label = '더블클릭' if command['visual'].get('gesture') == 'double-click' else '클릭'
+    elif action == 'result-menu':
+        context = command['context']
+        route = (['조회 완료 확인'] if context['trigger'] else []) + ['표 우클릭', *context['menu']['path']]
+        if context['output']:
+            route.append('Excel 파일 확인')
+        label = ' → '.join(route)
+    elif action == 'open':
+        label = '펼치기' if command.get('expand') else '클릭'
+    elif action == 'row-launch':
+        label = f"{command['ordinal']}번째 행 실행"
+    else:
+        label = {'submit': 'Enter 입력', 'choose-item': '항목 선택', 'row-action': '행 버튼 실행',
+                 'row-open': '행 열기', 'conditional-open': '조건에 따라 열기'}.get(action, step['label'])
+    return label, None, '', False
 
 
 class StepEdits:
@@ -271,6 +281,8 @@ class StepEdits:
 
     @staticmethod
     def identity(step):
+        if step['action'] == 'saved-step':
+            return 'saved-step', step['saved']
         if step.get('ordinary_menu') or step.get('menu_anchor'):
             anchor = step.get('menu_anchor') or step['context']['menu']
             return 'observed_context_surface', anchor['target'], anchor['point']
@@ -305,6 +317,20 @@ class StepEdits:
         if '=' in alias or alias.isdecimal():
             raise ValueError('별칭에는 등호 또는 숫자만으로 된 이름을 사용할 수 없습니다.')
         data = {'alias': alias} if alias else {}
+        if step['action'] == 'saved-step':
+            from review_drafts import saved_form
+            saved = dict(step['saved'])
+            original = saved_form(saved)
+            saved.pop('alias', None)
+            saved.update(data)
+            if (sentence.strip(), mode, argument or '') != (original['text'], original['mode'], original['argument']):
+                directive = learned_tasks.compile_instruction(saved, sentence, mode=mode, argument=argument)
+                if directive is None:
+                    raise learned_tasks.TaskError('instruction_requires_structure')
+                saved = learned_tasks.instructed_step(saved, directive)
+            if 'instruction' in saved:
+                data['instruction'] = saved['instruction']
+            return dict(data, saved=saved)
         if (mode is None and step.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching'
                 and learned_tasks.click_menu_path(sentence)):
             # Preserve the route as a note until recovery checks the region.
@@ -330,6 +356,34 @@ class StepEdits:
         if directive is not None:
             data['instruction'] = directive
         return data
+
+    def value_sentence(self, step, alias, sentence, mode, argument):
+        """Keep the user's words unless their deliberate value edit contradicts those words."""
+        if mode is None:
+            return sentence
+        if sentence.strip():
+            try:
+                self.compile(step, alias, sentence, mode, argument)
+                return sentence
+            except learned_tasks.TaskError as error:
+                if error.code != 'instruction_binding_conflict':
+                    raise
+        fields = self.compile(step, alias, sentence) if sentence.strip() else {}
+        command = learned_tasks.recorded_step(self.edited_step(step, fields))
+        field = command.get('label') or command.get('target') or step.get('field_label') or step['label']
+        if command.get('match') == 'query':
+            field = command['target']
+        role = command.get('role')
+        if command['action'] == 'field-input' or role == 'textfield':
+            subject = field + ' 입력란'
+        else:
+            subject = field + ' 조건'
+        if mode == 'required':
+            updated = f'입력받은 {{{argument}}} 변수를 {subject}에 입력해줘'
+        else:
+            updated = f'{subject}을 {json.dumps(argument, ensure_ascii=False)}로 설정해줘'
+        self.compile(step, alias, updated, mode, argument)
+        return updated
 
     def store(self, step, alias, sentence, mode=None, argument=None):
         self.drafts[step['id']] = (self.identity(step), (alias, sentence, mode, argument))
@@ -872,7 +926,11 @@ class _Worker(recorder.CaptureWorker):
                 self.captures.pop(event['token'], None)
                 self.model.event_at = down['at']
                 try:
-                    self.model.add(raw)
+                    if not self.capture_double(down, None):
+                        self.model.add(raw)
+                        self.recent_click = dict(token=down['token'], step_id=raw['id'],observation=None,
+                                                 watched_step_id=self.watched_step['id'] if self.watched_step else None)
+                        self._remember_double_target(down)
                 finally:
                     self.model.event_at = None
                 return
@@ -891,7 +949,10 @@ class _Worker(recorder.CaptureWorker):
         try:
             if event['kind'] == 'enter' and self._capture_submit(event):
                 return
-            return super().handle(event)
+            result = super().handle(event)
+            if event['kind'] == 'up' and down and self.recent_click and self.recent_click['token'] == down['token']:
+                self._remember_double_target(down)
+            return result
         finally:
             self.model.event_at = None
 
@@ -1051,13 +1112,40 @@ class _Worker(recorder.CaptureWorker):
                     return
                 self.menu_gesture = None
 
+    def _remember_double_target(self, down):
+        # Manual first clicks don't return an ID from the base worker. Keep the actual
+        # step and pre-press sample so a paired second click only replaces that step.
+        previous = self.recent_click
+        with self.model.lock:
+            last = next(reversed(self.model.steps), None)
+            if previous['step_id'] is None and last and self.model.times[last] == down['at']:
+                previous['step_id'] = last
+            first = self.model.steps.get(previous['step_id'], {})
+            previous['protected'] = first.get('recognition', {}).get('reason') == 'protected_input_not_recorded'
+        if (down.get('visual') and down.get('scope_proven') is True and down.get('window') == self.binding.hwnd
+                and not down.get('menu_pick') and not previous['protected']):
+            previous['double_visual'] = down['visual']
+
     def capture_double(self, down, observation):
-        previous_id = (self.recent_click or {}).get('step_id')
+        previous = self.recent_click or {}
+        previous_id = previous.get('step_id')
         result = super().capture_double(down,observation)
         if result and previous_id and self.row_tracker:
             self.row_tracker.cancel_step(previous_id)
         if result:
             self.menu_gesture = None
+            spec = previous.get('double_visual')
+            if previous_id and (previous.get('protected') or
+                                (observation and observation['node'].get('secure') is not False)):
+                self.model.add(manual('protected_input_not_recorded', previous_id))
+                return result
+            if (spec and previous_id and down.get('scope_proven') is True and down.get('window') == self.binding.hwnd
+                    and not down.get('menu_pick') and (observation is None or observation['node'].get('secure') is False)):
+                with self.model.lock:
+                    step = self.model.steps.get(previous_id, {})
+                    if step.get('recognition', {}).get('reason') == 'double_click_needs_review':
+                        self.model.add(dict(id=previous_id, action='visual-click', label='녹화한 항목 더블클릭',
+                                            visual=dict(spec, gesture='double-click')))
         return result
 
     def _drop_watch(self):
@@ -1368,7 +1456,8 @@ class _Worker(recorder.CaptureWorker):
                         self.model.add(step)
                         self.watched_step = step
                     return self.watched_step['id']
-        if event.get('visual') is not None and pointed is None and self._use_visual(event, observation):
+        if (event.get('visual') is not None and 'gesture' not in event['visual']
+                and pointed is None and self._use_visual(event, observation)):
             self.freeze_watch(event.get('at'))
             self.binding.check()
             step = dict(id=uuid.uuid4().hex, action='visual-click', label='녹화한 화면 항목 누르기',
@@ -1701,8 +1790,52 @@ def pick_recording_window(root, session):
     return result
 
 
+def capture_one_step(root, owner, title):
+    """Observe one demonstration in its original window. A cancelled or incomplete take edits nothing."""
+    import tkinter as tk
+    from tkinter import ttk
+    take = CaptureSession(owner, title)
+    dialog = tk.Toplevel(root)
+    dialog.title('이 단계 다시 녹화')
+    dialog.transient(root)
+    panel = ttk.Frame(dialog, padding=16)
+    panel.pack(fill='both', expand=True)
+    ttk.Label(panel, text=title, wraplength=460).pack(anchor='w')
+    ttk.Label(panel, text='대상 창에서 한 동작을 시연한 뒤 적용을 누르세요.').pack(anchor='w', pady=8)
+    result = None
+    error = None
+    def accept():
+        nonlocal result, error
+        try:
+            result = take.finish(report_empty=False)['steps']
+        except (bridge.BridgeError, OSError, ValueError) as exc:
+            error = exc
+        finally:
+            dialog.destroy()
+    ttk.Button(panel, text='취소', command=dialog.destroy).pack(side='left')
+    ttk.Button(panel, text='이 동작 적용', command=accept).pack(side='right')
+    on_windows = root.tk.call('tk', 'windowingsystem') == 'win32'
+    try:
+        take.start()
+        if on_windows:
+            root.attributes('-disabled', True)
+        root.wait_window(dialog)
+    finally:
+        if on_windows:
+            root.attributes('-disabled', False)
+        if not take.ended:
+            take.cancel()
+        if dialog.winfo_exists():
+            dialog.destroy()
+    if error:
+        raise error
+    if result is not None and (len(result) != 1 or take.notes.partial):
+        raise ValueError(f'{len(result)}개 동작이 기록됐습니다. 대상 창에서 한 동작을 다시 시연하세요.')
+    return result[0] if result else None
+
+
 def capture(binding, *, title, save_recording=None, save_draft=None, initial_draft=None, initial_step=None,
-            on_ready=None):
+            on_ready=None, locate_window=None):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
     from tkinter import font as tkfont, ttk
@@ -1740,7 +1873,11 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     style.configure('Card.TLabel', background=surface)
     style.configure('Title.TLabel', font=(family, text_size + 4, 'bold'))
     style.configure('Muted.TLabel', foreground=muted)
-    style.configure('Note.TLabel', background=surface, foreground=muted)
+    style.layout('Summary.TButton', [('Button.focus', {'sticky': 'nswe', 'children': [
+        ('Button.padding', {'sticky': 'nswe', 'children': [('Button.label', {'sticky': 'nswe'})]})]})])
+    style.configure('Summary.TButton', anchor='w', padding=(1, 4), background=surface, foreground=accent,
+                    justify='left', wraplength=520)
+    style.map('Summary.TButton', foreground=[('disabled', muted), ('active', '#104888')])
     style.configure('Primary.TButton', background=accent, foreground='white', borderwidth=0, padding=(16, 7))
     style.map('Primary.TButton', background=[('disabled', '#D2DBE5'), ('active', '#104888')],
               foreground=[('disabled', '#5F7082'), ('!disabled', 'white')])
@@ -1786,18 +1923,20 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     form.columnconfigure(1, weight=1)
     alias, instruction, argument = tk.StringVar(), tk.StringVar(), tk.StringVar()
     mode = tk.StringVar(value='문장 해석')
-    modes = {'문장 해석': None, '고정값': 'fixed', '필수 변수': 'required'}
+    modes = {'문장 해석': None, '고정값': 'fixed', '실행할 때 입력': 'required'}
+    explicit_value = (None, '')
+    interpreted_value = (None, '')
+    syncing = False
+    value_changed = False
     edit_title = tk.StringVar(value='선택한 단계')
     ttk.Label(form, textvariable=edit_title, style='Card.TLabel').grid(row=0, column=0, columnspan=3, sticky='w')
     sentence_entry = ttk.Entry(form, name='instruction', textvariable=instruction, width=32)
     sentence_entry.grid(row=1, column=0, columnspan=3, pady=(5, 2), sticky='ew')
-    advanced_form = ttk.Frame(form, style='Card.TFrame')
-    advanced_form.columnconfigure(1, weight=1)
-    ttk.Label(advanced_form, text='단계 별칭', style='Card.TLabel').grid(row=0, column=0, padx=(0, 8), sticky='w')
-    ttk.Entry(advanced_form, name='alias', textvariable=alias, width=20).grid(row=0, column=1, sticky='ew')
-    ttk.Label(advanced_form, text='값 지정', style='Card.TLabel').grid(row=1, column=0, padx=(0, 8), sticky='w')
-    choices = ttk.Frame(advanced_form, style='Card.TFrame')
-    choices.grid(row=1, column=1, sticky='w', pady=4)
+    alias_form = ttk.Frame(form, style='Card.TFrame')
+    ttk.Label(alias_form, text='단계 별칭', style='Card.TLabel').pack(side='left', padx=(0, 8))
+    alias_entry = ttk.Entry(alias_form, name='alias', textvariable=alias, width=20)
+    alias_entry.pack(side='left', fill='x', expand=True)
+    choices = ttk.Frame(form, style='Card.TFrame')
     mode_box = ttk.Combobox(choices, name='mode', values=list(modes), state='readonly', textvariable=mode, width=11)
     mode_box.pack(side='left')
     arg_label = ttk.Label(choices, text='값 또는 변수 이름', style='Card.TLabel')
@@ -1805,8 +1944,9 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     arg_box = ttk.Entry(choices, name='argument', textvariable=argument, width=22)
     arg_box.pack(side='left')
     preview = tk.StringVar()
-    preview_label = ttk.Label(form, name='preview', textvariable=preview, wraplength=520, style='Note.TLabel')
-    preview_label.grid(row=2, column=0, columnspan=3, sticky='w', pady=(3, 4))
+    preview_button = ttk.Button(form, name='preview', textvariable=preview, style='Summary.TButton',
+                                command=lambda: toggle_value(), width=1)
+    preview_button.grid(row=2, column=0, columnspan=3, sticky='ew', pady=(2, 3))
     controls = ttk.Frame(frame)
     controls.pack(fill='x', pady=(8, 0))
     shown_rows = {}
@@ -1854,78 +1994,158 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             return '값 확인'
         return '준비됨'
 
-    def fields():
+    def fields(*, normalize=False):
         if editing is not None and editing['action'] == 'result-menu' and not editing.get('ordinary_menu'):
             return alias.get(), '', None, None
-        chosen = modes[mode.get()]
-        return alias.get(), instruction.get(), chosen, argument.get()
+        chosen, arg = explicit_value
+        sentence = instruction.get()
+        if normalize and value_changed and chosen is not None:
+            sentence = edits.value_sentence(editing, alias.get(), sentence, chosen, arg)
+        return alias.get(), sentence, chosen, arg
 
     def show_error(exc):
         if isinstance(exc, learned_tasks.TaskError):
-            reason = {'instruction_target_mismatch': '화면 이름이 다르면 ‘문장의 이름을 이 대상에 연결’을 누르세요. 또는 ‘이 항목을 N으로 설정’처럼 입력하세요.',
+            reason = {'instruction_target_mismatch': '단계 편집에서 ‘문장의 이름을 이 대상에 연결’을 누르거나 ‘이 항목을 N으로 설정’처럼 입력하세요.',
                       'instruction_target_unavailable': '이 단계는 보호된 입력이나 별도 절차가 필요한 동작입니다. 일반 대상 인식 실패는 설명을 저장한 뒤 실행할 때 다시 찾을 수 있습니다.',
-                      'instruction_requires_structure': '값을 문장에 적거나 상세 설정에서 고정값이나 필수 변수를 지정하세요.',
+                      'instruction_requires_structure': '값을 문장에 적거나 이 줄을 눌러 지정하세요.',
                       'invalid_step_alias': '다른 별칭을 입력하세요.'}.get(
                           exc.code, '이 단계에서 실행할 수 있는 문장과 값을 입력하세요.')
             preview.set(reason + ' (' + exc.code + ')')
         else:
             preview.set(str(exc))
 
+    def display_value(chosen, arg):
+        nonlocal syncing
+        syncing = True
+        try:
+            mode.set(next(label for label, value in modes.items() if value == chosen))
+            argument.set(arg or '')
+        finally:
+            syncing = False
+        arg_box.configure(state='disabled' if chosen is None else 'normal')
+        arg_label.configure(text='변수 이름' if chosen == 'required' else '값')
+
+    def toggle_value():
+        if choices.winfo_manager():
+            choices.grid_remove()
+        else:
+            alias_form.grid_remove()
+            display_value(*(explicit_value if explicit_value[0] is not None else interpreted_value))
+            choices.grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 5))
+            mode_box.focus_set()
+        refresh_preview()
+
+    def edit_alias():
+        choices.grid_remove()
+        alias_form.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(0, 5))
+        alias_entry.focus_set()
+        alias_entry.selection_range(0, 'end')
+        refresh_preview()
+
     def refresh_preview(*_):
-        arg_box.configure(state='disabled' if modes[mode.get()] is None else 'normal')
-        arg_label.configure(text='변수 이름' if modes[mode.get()] == 'required' else '값')
-        if editing is not None:
+        nonlocal interpreted_value
+        if editing is not None and not syncing:
             try:
-                data = edits.compile(editing, *fields())
-                if (editing['action'] == 'manual' and not instruction.get().strip()
-                        and row_repairable(editing)):
-                    if editing.get('recognition', {}).get('reason') == 'row_capture_requires_review':
-                        preview.set('몇 번째 행의 어떤 버튼을 누를지 적으세요. 예: 두 번째 행의 실행 버튼을 눌러줘.')
-                    else:
-                        preview.set('화면에 보이는 대상 이름과 실행할 동작을 적으세요.')
-                else:
-                    preview.set(instruction_view(editing, data.get('instruction')))
-                if review is not None:
-                    update_readiness(editing, data)
+                data = edits.compile(editing, *fields(normalize=True))
+                compiled = update_readiness(editing, data) if review is not None else None
+                summary, chosen, arg, editable = review_interpretation(editing, data, compiled=compiled)
+                interpreted_value = chosen, arg
+                if editable:
+                    summary += '  ▴' if choices.winfo_manager() else '  ▾'
+                preview.set(summary)
             except (ValueError, bridge.BridgeError, KeyError) as exc:
                 show_error(exc)
                 unfinished.add(editing['id'])
+                interpreted_value = None, ''
+                # An old draft can carry an invalid explicit value on any kind
+                # of step. Keep it editable so the user can clear that override.
+                editable = explicit_value[0] is not None
+                if not editable:
+                    try:
+                        editable = review_interpretation(editing, {})[3]
+                    except (ValueError, bridge.BridgeError, KeyError):
+                        pass
+            preview_button.configure(state='normal' if editable else 'disabled',
+                                     cursor='hand2' if editable else '', takefocus=editable)
+            if not editable:
+                choices.grid_remove()
             if review is not None:
                 update_save_button(review['steps'])
 
+    def change_value(*_):
+        nonlocal explicit_value, value_changed
+        if syncing or editing is None:
+            return
+        chosen = modes[mode.get()]
+        explicit_value = chosen, argument.get() if chosen else ''
+        value_changed = chosen is not None
+        if chosen is None:
+            display_value(None, '')
+        else:
+            arg_box.configure(state='normal')
+            arg_label.configure(text='변수 이름' if chosen == 'required' else '값')
+        refresh_preview()
+
+    def change_sentence(*_):
+        nonlocal explicit_value, value_changed
+        if syncing or editing is None:
+            return
+        # An unfinished variable name belongs to its recoverable draft.
+        # An empty fixed string, however, is a valid old instruction to clear.
+        if explicit_value != ('required', ''):
+            explicit_value = None, ''
+        value_changed = False
+        refresh_preview()
+        if choices.winfo_manager():
+            display_value(*(explicit_value if explicit_value[0] is not None else interpreted_value))
+
     def flush():
+        nonlocal syncing, value_changed
         if editing is not None:
             try:
-                edits.store(editing, *fields())
+                values = fields(normalize=True)
+            except (ValueError, bridge.BridgeError) as exc:
+                # StepEdits.store keeps even invalid text for a draft save.
+                try:
+                    edits.store(editing, *fields())
+                except (ValueError, bridge.BridgeError):
+                    pass
+                show_error(exc)
+                return False
+            try:
+                edits.store(editing, *values)
             except (ValueError, bridge.BridgeError) as exc:
                 show_error(exc)
                 return False
+            if value_changed:
+                syncing = True
+                try:
+                    instruction.set(values[1])
+                finally:
+                    syncing = False
+                value_changed = False
         return True
 
     def load(step):
+        nonlocal syncing, explicit_value, value_changed
         sentence, chosen, arg = edits.form(step)
-        configured = step['action'] in ('row-action', 'result-menu', 'visual-click')
         fixed_menu = step['action'] == 'result-menu' and not step.get('ordinary_menu')
         sentence_entry.configure(state='readonly' if fixed_menu else 'normal')
-        mode_box.configure(state='disabled' if configured else 'readonly')
-        alias.set(edits.alias(step))
-        instruction.set(step['label'] if fixed_menu else sentence)
-        mode.set(next(label for label, value in modes.items() if value == chosen))
-        argument.set(arg or '')
+        explicit_value = chosen, arg or ''
+        value_changed = False
+        choices.grid_remove()
+        alias_form.grid_remove()
+        syncing = True
+        try:
+            alias.set(edits.alias(step))
+            instruction.set(step['label'] if fixed_menu else sentence)
+        finally:
+            syncing = False
+        display_value(chosen, arg)
         selected_number = next((i for i, s in enumerate(steps_now(), 1) if s['id'] == step['id']), '')
-        scope = step.get('_capture_window')
-        if scope and ('_openers' in scope or 'after_id' in scope):
-            opener_btn.pack(side='left', padx=(0, 5), before=details_btn)
-        else:
-            opener_btn.pack_forget()
         edit_title.set(f'{selected_number}단계   {step["label"]}')
         show_step_window(step, steps_now())
-        if session is not None and row_repairable(step):
-            repair_btn.configure(text='행 버튼 다시 지정' if step['action'] == 'row-action' else '행 버튼으로 지정')
-            repair_btn.grid(row=2, column=1, sticky='w', pady=(3, 0))
-        else:
-            repair_btn.grid_remove()
-        alias_btn.configure(state='disabled' if configured else 'normal')
+        update_step_menu(step)
         refresh_preview()
 
     def select_row(*_):
@@ -1946,6 +2166,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             unfinished.add(step['id'])
         else:
             unfinished.discard(step['id'])
+        return compiled
 
     def update_save_button(steps):
         label = '초안 저장' if unfinished or unresolved_window(steps) else '저장'
@@ -1966,10 +2187,11 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         phase.set(f'단계 검토   {len(steps)}')
         message.set(f'{unlinked}단계의 창 연결을 나중에 지정하려면 초안 저장을 누르세요.' if unlinked else
                     f'{missing}개 단계가 확인 필요 상태입니다. 설명을 확인하고 초안 저장을 누르세요.' if missing
-                    else '실행 문장을 확인하고 저장하세요. 별칭이나 값을 직접 지정하려면 상세 설정을 여세요.' if steps else '단계를 추가하거나 취소하세요.')
+                    else '실행 문장을 확인하고 저장하세요.' if steps else '단계를 추가하거나 취소하세요.')
 
     def render(steps):
         nonlocal editing
+        edit_button.state(['!disabled'] if review is not None else ['disabled'])
         if review is not None:
             update_review_status(steps)
         keep = {step['id'] for step in steps}
@@ -2027,6 +2249,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             return
         subject = learned_tasks.instruction_subject(instruction.get())
         if not subject:
+            edit_alias()
             preview.set('문장의 이름을 찾지 못했습니다. 단계 별칭에 화면 이름을 직접 입력하세요.')
             return
         alias.set(subject)
@@ -2066,24 +2289,131 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             form.pack_forget()
             save.configure(state='disabled')
 
-    listing.bind('<<TreeviewSelect>>', select_row)
-    for variable in (alias, instruction, mode, argument):
-        variable.trace_add('write', refresh_preview)
-    refresh_preview()
-    editing_controls = ttk.Frame(form, style='Card.TFrame')
-    editing_controls.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(4, 0))
-    def toggle_details():
-        if advanced_form.winfo_manager():
-            advanced_form.grid_remove()
-            details_btn.configure(text='상세 설정')
-        else:
-            advanced_form.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(8, 0))
-            details_btn.configure(text='상세 닫기')
+    def move_step(offset):
+        if review is None or editing is None:
+            return
+        from capture_trail import resolve_menu_scope
+        steps = review['steps']
+        index = next(i for i, s in enumerate(steps) if s['id'] == editing['id'])
+        dest = index + offset
+        if not 0 <= dest < len(steps):
+            return
+        ordered = steps.copy()
+        ordered[index], ordered[dest] = ordered[dest], ordered[index]
+        positions = {s['id']: n for n, s in enumerate(ordered, 1)}
+        for n, s in enumerate(steps, 1):
+            scope = s.get('_capture_window', {})
+            opener = resolve_menu_scope(scope, steps, n).get('after_id')
+            if opener and (positions.get(opener, 0) >= positions[s['id']]
+                           or resolve_menu_scope(scope, ordered, positions[s['id']]).get('after_id') != opener):
+                message.set('이 단계는 작업 창을 연 단계 뒤에 있어야 합니다.')
+                return
+        flush()
+        steps[:] = ordered
+        listing.move(editing['id'], '', dest)
+        listing.see(editing['id'])
+        render(steps)
+        load(editing)
 
-    # The instruction is the first editable field. Alias and parameter controls
-    # remain available without competing with the step description.
-    details_btn = ttk.Button(editing_controls, text='상세 설정', command=toggle_details)
-    details_btn.pack(side='left')
+    def relearn_step():
+        nonlocal editing
+        if review is None or editing is None:
+            return
+        flush()
+        source = editing
+        scope = source.get('_capture_window')
+        target_title = scope['title'] if scope else title
+        try:
+            owner = bound_windows.get(id(scope))
+            if owner is None and isinstance(session, CaptureTrail):
+                owner = session.binding_for(source)
+            elif owner is None and session is not None and not scope:
+                owner = session.binding
+            if owner is not None:
+                try:
+                    owner.check()
+                except bridge.BridgeError:
+                    owner = None
+            if owner is None:
+                if locate_window is None:
+                    raise ValueError('작업 창을 다시 열어 주세요.')
+                owner = locate_window(scope)
+            replacement = capture_one_step(root, owner, target_title)
+        except (bridge.BridgeError, OSError, ValueError) as exc:
+            message.set(f'{target_title}에서 다시 녹화하지 못했습니다 ({exc}).')
+            return
+        if replacement is None:
+            return
+        key = source['id']
+        if source['action'] == 'saved-step':
+            from review_drafts import retain_saved_arguments
+            try:
+                replacement = retain_saved_arguments(source, replacement)
+            except (bridge.BridgeError, ValueError):
+                message.set('이번 시연에 기존 값이나 변수를 적용할 수 없어 이전 단계를 유지했습니다.')
+                return
+        replacement = dict(replacement, id=key)
+        if scope:
+            replacement['_capture_window'] = scope
+        text, chosen, arg = edits.form(source)
+        nickname = edits.alias(source)
+        text = text or default_text(replacement)
+        def executable(raw, fields):
+            try:
+                compiled = learned_tasks.recorded_step(edits.edited_step(raw, fields))
+                return compiled['action'] != 'manual' and 'instruction_draft' not in compiled
+            except (bridge.BridgeError, ValueError):
+                return False
+        try:
+            proposed = edits.compile(replacement, nickname, text, chosen, arg)
+        except (bridge.BridgeError, ValueError):
+            proposed = None
+        if executable(source, edits.get(source)) and (proposed is None or not executable(replacement, proposed)
+                or replacement['action'] == 'manual' and not replacement.get('visual_hint')):
+            message.set('이번 시연으로 기존 지시를 실행할 대상을 확인하지 못해 이전 단계를 유지했습니다.')
+            return
+        edits.forget(key)
+        try:
+            edits.store(replacement, nickname, text, chosen, arg)
+        except (bridge.BridgeError, ValueError):
+            pass  # store preserves the original fields for draft review.
+        steps = review['steps']
+        steps[steps.index(source)] = replacement
+        editing = replacement
+        render(steps)
+        load(editing)
+        message.set('선택한 단계에 새 동작을 적용했습니다. 저장하면 반영됩니다.')
+
+    listing.bind('<<TreeviewSelect>>', select_row)
+    alias.trace_add('write', refresh_preview)
+    instruction.trace_add('write', change_sentence)
+    mode.trace_add('write', change_value)
+    argument.trace_add('write', change_value)
+    editing_controls = ttk.Frame(form, style='Card.TFrame')
+    editing_controls.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(4, 0))
+    edit_button = ttk.Menubutton(editing_controls, name='step_tools', text='단계 편집')
+    step_tools = tk.Menu(edit_button, tearoff=False)
+    edit_button.configure(menu=step_tools)
+    edit_button.pack(side='left')
+
+    def update_step_menu(step):
+        step_tools.delete(0, 'end')
+        step_tools.add_command(label='이 단계 다시 녹화', command=relearn_step)
+        step_tools.add_command(label='위로 이동', command=lambda: move_step(-1))
+        step_tools.add_command(label='아래로 이동', command=lambda: move_step(1))
+        step_tools.add_separator()
+        step_tools.add_command(label='단계 별칭', command=edit_alias)
+        if step.get('saved', step)['action'] not in ('row-action', 'result-menu', 'visual-click'):
+            step_tools.add_command(label='문장의 이름을 이 대상에 연결', command=link_subject)
+        if session is not None and row_repairable(step):
+            label = '행 버튼 다시 지정' if step['action'] == 'row-action' else '행 버튼으로 지정'
+            step_tools.add_command(label=label, command=lambda: teach_extra('row', replace=True))
+        scope = step.get('_capture_window', {})
+        if '_openers' in scope or 'after_id' in scope:
+            step_tools.add_command(label='창을 연 단계 지정', command=choose_opener)
+        step_tools.add_separator()
+        step_tools.add_command(label='선택 단계 삭제', command=delete_step)
+
     def choose_opener():
         if not editing:
             return
@@ -2129,12 +2459,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         ttk.Button(panel, text='연결', command=select).pack(side='right')
         dialog.grab_set()
         picker.focus_set()
-    opener_btn = ttk.Button(editing_controls, text='창을 연 단계 지정', command=choose_opener)
-    repair_btn = ttk.Button(advanced_form, command=lambda: teach_extra('row', replace=True))
-    ttk.Button(editing_controls, text='선택 단계 삭제', command=delete_step).pack(side='left', padx=4)
     ttk.Button(editing_controls, text='적용하고 다음 단계', command=apply_next).pack(side='right')
-    alias_btn = ttk.Button(advanced_form, text='문장의 이름을 이 대상에 연결', command=link_subject)
-    alias_btn.grid(row=0, column=2, padx=(5, 0))
     sentence_entry.bind('<Return>', lambda _e: apply_next())
 
     def start(*_):
@@ -2439,7 +2764,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         if event.widget is root:
             status_line.configure(wraplength=max(210, event.width - 40))
             window_detail.configure(wraplength=max(210, event.width - 40))
-            preview_label.configure(wraplength=max(190, event.width - 72))
+            style.configure('Summary.TButton', wraplength=max(160, event.width - 84))
     root.bind('<Configure>', resize)
     root.bind('<Alt-s>', start)
     root.bind('<Alt-f>', finish)

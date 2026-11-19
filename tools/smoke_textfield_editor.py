@@ -75,6 +75,15 @@ def main():
             widget.delete(0, 'end')
             widget.insert(0, text)
 
+        def preview_text():
+            return str(root.getvar(named('preview').cget('textvariable')))
+
+        def choose_mode(text):
+            field = named('mode')
+            assert field.winfo_viewable()
+            field.set(text)
+            field.event_generate('<<ComboboxSelected>>')
+
         def later(fn):
             def run():
                 try:
@@ -94,12 +103,13 @@ def main():
 
         def search():
             assert named('instruction').get() == '검색어 입력란을 "00042"로 설정해줘', named('instruction').get()
-            button('상세 설정').invoke()
+            assert not named('mode').winfo_viewable()
+            assert '00042' in preview_text()
+            write('instruction', '입력받은 변수를 검색어 입력란에 입력해줘')
+            named('preview').invoke()
             root.update_idletasks()
             assert named('mode').winfo_viewable()
-            assert any(isinstance(w, ttk.Label) and w.cget('text') == '값 지정' for w in widgets(root))
-            write('instruction', '입력받은 변수를 검색어 입력란에 입력해줘')
-            named('mode').set('필수 변수')
+            choose_mode('실행할 때 입력')
             write('argument', 'Search')
             button('적용하고 다음 단계').invoke()
             later(combo)
@@ -122,22 +132,27 @@ def main():
         def clear():
             assert named('steps').selection() == ('clear',), (named('steps').selection(), named('preview').cget('text'))
             write('instruction', '초기화 입력란을 비워줘')
-            named('mode').set('고정값')
+            named('preview').invoke()
+            root.update_idletasks()
+            choose_mode('고정값')
             write('argument', '')
-            assert '입력란 비우기' in named('preview').cget('text'), named('preview').cget('text')
+            assert '비우기' in preview_text(), preview_text()
             button('적용하고 다음 단계').invoke()
             later(remove)
 
         def remove():
             assert named('steps').selection() == ('remove',)
-            button('선택 단계 삭제').invoke()
+            root.nametowidget(named('step_tools')['menu']).invoke('선택 단계 삭제')
             assert 'remove' not in named('steps').get_children()
             checks.append('incorrect_step_deleted')
             named('steps').selection_set('search')
             later(revisit)
 
         def revisit():
-            assert named('mode').get() == '필수 변수'
+            assert 'Search' in preview_text()
+            named('preview').invoke()
+            root.update_idletasks()
+            assert named('mode').get() == '실행할 때 입력'
             assert named('argument').get() == 'Search'
             checks.append('parameter_survives_navigation_and_deletion')
             button('저장').invoke()

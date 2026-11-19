@@ -105,7 +105,7 @@ class RecoveryDraftTests(unittest.TestCase):
         final = tasks.recorded_step(raw)
         self.assertEqual((final['match'], final['target'], final['role']), ('query', 'MES Setup', 'combobox'))
         self.assertEqual(final['instruction']['value'], 'N')
-        self.assertIn('현재 화면', capture.instruction_view(step, raw['instruction']))
+        self.assertEqual(capture.review_interpretation(step, edits.get(step)), ('고정값 N', 'fixed', 'N', True))
 
     def test_unknown_target_can_describe_a_runtime_variable(self):
         step = capture.manual('stable_locator_unavailable', 'lost')
@@ -121,7 +121,7 @@ class RecoveryDraftTests(unittest.TestCase):
         edits.store(step, '', sentence)
         final = tasks.recorded_step(edits.apply([step])[0])
         self.assertEqual(final['instruction_draft'], sentence)
-        self.assertIn('Claude', capture.instruction_view(step, edits.get(step)['instruction']))
+        self.assertEqual(capture.review_interpretation(step, edits.get(step)), ('실행 전 설명 확인', None, '', False))
 
     def test_known_target_freeform_preserves_identity_for_later_interpretation(self):
         step = capture.capture_step(combo('Family', 'Hybrid'))

@@ -38,7 +38,11 @@ class RowTeachTests(unittest.TestCase):
             row_teach.selection_box((78, 22), (77, 20), (110, 32))
 
     def test_row_action_review_names_stay_bound_to_the_teaching(self):
-        spec = {'key': 'first example'}
+        from test_ordinary_row_capture import sample
+        import row_capture
+        base = [('a', 'stopped', 'start'), ('b', 'stopped', 'start')]
+        press = row_capture.prepare(sample(base, 1), [157, 205], 1.2)
+        spec = row_capture.infer(press, sample([('a', 'running', 'stop'), base[1]], 2))
         step = row_teach.raw_row_step('  첫 행 시작 후 준비 표시 확인  ', spec)
         different = deepcopy(step)
         different['row']['key'] = 'different example'
@@ -47,6 +51,9 @@ class RowTeachTests(unittest.TestCase):
         self.assertNotIn('alias', edits.apply([different])[0])
         self.assertEqual(edits.apply([step])[0]['alias'], '첫 장비')
         self.assertEqual(teach_capture.default_text(step), '첫 행 시작 후 준비 표시 확인')
-        self.assertIn('같은 행', teach_capture.instruction_view(step, None))
+        self.assertEqual(teach_capture.review_interpretation(step, {}), ('행 버튼 실행', None, '', False))
+        saved = teach_capture.learned_tasks.recorded_step(step)['row']
+        self.assertEqual(saved, spec)
+        self.assertNotEqual(saved['before'], saved['after'])
         with self.assertRaises(ValueError):
             row_teach.raw_row_step(' ', spec)
