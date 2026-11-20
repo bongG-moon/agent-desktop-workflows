@@ -79,7 +79,11 @@ def tested_rows(recipe, rows, start, stop):
     modes = input_policy.profile(recipe['steps'][start - 1:stop - 1])['steps']
     for row, mode in zip(rows, modes):
         receipt = row['receipt']
-        if receipt.get('status') not in ('verified', 'waited', 'delivered_unverified'):
+        if mode['action'] == 'read-value':
+            if not (receipt.get('status') == 'observed' and receipt.get('input_dispatched') is False
+                    and isinstance(receipt.get('value'), str) and receipt.get('value_evidence', {}).get('status') == 'observed'):
+                return False
+        elif receipt.get('status') not in ('verified', 'waited', 'delivered_unverified'):
             return False
         if (mode['input_mode'] in ('physical_pointer', 'physical_keyboard')
                 and receipt.get('input_dispatched') is not True):

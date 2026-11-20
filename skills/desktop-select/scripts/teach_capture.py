@@ -93,7 +93,29 @@ def capture_step(step):
         reason = step.get('recognition', {}).get('reason') if action == 'manual' else None
         if action == 'right-click':
             reason = 'right_click_requires_menu_teaching'
-        return manual(reason or 'unsupported_recorded_action', step['id'])
+        unknown = manual(reason or 'unsupported_recorded_action', step['id'])
+        # The click is only a hint. Preserve its containing result surface
+        # without saving the clicked cell's business value or authorizing input.
+        if (action in ('click', 'select', 'manual') and target.get('kind') in ('element', 'region')
+                and 'window' not in target and learned_tasks.is_recoverable(unknown)):
+            chain = [locator, *locator.get('ancestors', [])]
+            protected = any(isinstance(node, dict) and (node.get('role') == 'password' or any(
+                node.get(key) is True for key in ('secure', 'protected', 'is_password', 'password', 'is_protected')))
+                for node in [step, target, *chain])
+            if protected:
+                return manual('protected_input_not_recorded', step['id'])
+            candidates = [item for item in chain if item.get('role') in ('table', 'list')]
+            if role == 'group':
+                candidates.append(locator)
+            for item in candidates:
+                surface = learned_tasks._selector(item)
+                if surface:
+                    ancestors = [learned_tasks._selector(parent) for parent in chain[chain.index(item) + 1:]]
+                    if all(ancestors) and ancestors:
+                        surface['ancestors'] = ancestors[:4]
+                    unknown['target'] = dict(kind='element', locator=surface)
+                    break
+        return unknown
     result = {'id': step['id'], 'action': action, 'label': (step.get('field_label')
               or locator.get('automation_id') or locator.get('name') or role),
               'target': {'kind': 'element', 'locator': copy.deepcopy(locator)},
@@ -119,6 +141,7 @@ class CaptureNotes:
         self.steps = {}
         self.times = {}
         self.event_at = None
+        self.completed_double_down = 0
         self.row_selections = {}
         self.lock = threading.RLock()
         self.state = 'ready'
@@ -264,6 +287,10 @@ def review_interpretation(step, data, *, compiled=None):
         label = ' → '.join(route)
     elif action == 'open':
         label = '펼치기' if command.get('expand') else '클릭'
+    elif action in learned_tasks.OBSERVE_ACTIONS:
+        label = ('값 읽기 · ' if action == 'read-value' else '값 일치 확인 · ') + command['label']
+    elif action == 'close-popup':
+        label = command['label'] + ' 클릭 후 창 닫힘 확인'
     elif action == 'row-launch':
         label = f"{command['ordinal']}번째 행 실행"
     else:
@@ -324,10 +351,12 @@ class StepEdits:
             saved.pop('alias', None)
             saved.update(data)
             if (sentence.strip(), mode, argument or '') != (original['text'], original['mode'], original['argument']):
-                directive = learned_tasks.compile_instruction(saved, sentence, mode=mode, argument=argument)
+                source = dict(saved, _capture_window=step['_capture_window']) if '_capture_window' in step else saved
+                directive = learned_tasks.compile_instruction(source, sentence, mode=mode, argument=argument)
                 if directive is None:
                     raise learned_tasks.TaskError('instruction_requires_structure')
-                saved = learned_tasks.instructed_step(saved, directive)
+                scoped_intent = directive['mode'] in (*learned_tasks.OBSERVE_ACTIONS, 'close-popup')
+                saved = learned_tasks.instructed_step(source if scoped_intent else saved, directive)
             if 'instruction' in saved:
                 data['instruction'] = saved['instruction']
             return dict(data, saved=saved)
@@ -1130,6 +1159,9 @@ class _Worker(recorder.CaptureWorker):
         previous = self.recent_click or {}
         previous_id = previous.get('step_id')
         result = super().capture_double(down,observation)
+        if result:
+            with self.model.lock:
+                self.model.completed_double_down = down['at']
         if result and previous_id and self.row_tracker:
             self.row_tracker.cancel_step(previous_id)
         if result:
@@ -2430,7 +2462,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
                 action = learned_tasks.recorded_step(dict(step, **data))['action']
             except (ValueError, bridge.BridgeError):
                 continue
-            if action not in ('manual', 'wait', 'verify-file'):
+            if action not in ('manual', 'wait', 'verify-file', *learned_tasks.OBSERVE_ACTIONS):
                 choices.append((step['id'], f'{number}단계   {step["label"]}'))
         dialog = tk.Toplevel(root)
         dialog.title('창을 연 단계 지정')
@@ -2632,8 +2664,13 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     def unresolved_window(steps):
         from capture_trail import resolve_menu_scope
         preceding = set()
+        reviewed = None
         for number, step in enumerate(steps, 1):
-            scope = resolve_menu_scope(step.get('_capture_window', {}), steps, number)
+            scope = step.get('_capture_window', {})
+            if '_openers' in scope:
+                if reviewed is None:
+                    reviewed = [edits.edited_step(s, edits.get(s)) for s in steps]
+                scope = resolve_menu_scope(scope, reviewed, number)
             if '_openers' in scope or ('after_id' in scope and scope['after_id'] not in preceding):
                 return number
             preceding.add(step['id'])

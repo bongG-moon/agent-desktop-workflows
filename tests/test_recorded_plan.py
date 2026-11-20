@@ -38,6 +38,77 @@ def recording():
 
 
 class CompilationTests(unittest.TestCase):
+    def test_new_recording_compiles_result_check_double_click_read_and_business_close(self):
+        import teach_capture as capture
+        from capture_trail import finalize_contexts
+        field = dict(id='field', action='set-value', field_label='Part ID', value='old',
+                     target=dict(kind='element', locator=dict(role='textfield', automation_id='partInput')),
+                     recognition=dict(target='identified', action='supported', result='checkable'))
+        view = dict(button(), id='view')
+        cell = dict(id='cell', action='click',
+                    target=dict(kind='element', locator=dict(role='row', name='old',
+                                ancestors=[dict(role='table', automation_id='results')])))
+        close = dict(id='close', action='click', target=dict(kind='element', locator={
+                    'role':'button', 'automation_id':'SystemClose', 'name':'Close',
+                    'ancestors':[dict(role='titlebar', name='title')]}),
+                    recognition=dict(target='identified', action='supported', result='unobserved'))
+        scope = dict(exe='Example.exe', title='Details', related=True, after_id='double')
+        gestures = [capture.capture_step(field), capture.capture_step(view), capture.capture_step(cell),
+                    capture.manual('double_click_needs_review', 'double'),
+                    dict(capture.manual('capture_target_unavailable', 'comment'), _capture_window=scope),
+                    dict(capture.capture_step(close), _capture_window=scope)]
+        sentences = ['입력받은 {품목} 변수를 Part ID 입력란에 입력해줘', '조회 버튼을 눌러줘', 'Part ID 일치 확인',
+                     '결과 행을 더블클릭해 상세 창을 열어줘', 'Memo 값을 읽어줘', 'Exit 버튼을 눌러줘']
+        edits = capture.StepEdits()
+        for gesture, sentence in zip(gestures, sentences):
+            edits.store(gesture, '', sentence)
+        source = tasks.from_recording('test', 'Example.exe', 'Main', finalize_contexts(edits.apply(gestures)))
+        plan = plans.compile_plan(source)
+        self.assertEqual(plan['status'], 'compiled', plan)
+        steps = plan['envelope']['recipe']['steps']
+        self.assertEqual([s['action'] for s in steps], [
+            'set-value', 'invoke', 'verify-value', 'double-click-result', 'read-value', 'invoke'])
+        self.assertEqual(steps[2]['selector'], {'automation_id':'results', 'role':'table'})
+        self.assertEqual((steps[2]['result_column'], steps[2]['parameter']), ('Part ID', '품목'))
+        self.assertNotIn('old', json.dumps(steps[2:]))
+        self.assertEqual(steps[4]['selector'], {'role':'textfield', 'query':'Memo'})
+        self.assertEqual(steps[5]['selector'], {'role':'button', 'query':'Exit'})
+        self.assertTrue(steps[5]['verify_closed'])
+        self.assertEqual(steps[4]['window_context']['after_step'], 4)
+
+    def test_observations_require_safe_subject_and_compare_only_the_specified_result(self):
+        raw = dict(action='manual', reason='capture_target_unavailable')
+        verify = tasks.instructed_step(raw, tasks.compile_instruction(raw, 'Batch 일치 확인'))
+        self.assertEqual(verify['selector'], {'role':'table'})
+        natural = tasks.compile_instruction(raw, '조회 결과 표에서 Batch 값이 입력한 값과 같은지 확인해줘')
+        self.assertEqual((natural['result_column'], natural['parameter']), ('Batch', 'Batch'))
+        stated_input = tasks.compile_instruction(raw, 'Batch 입력란이 {조회값}과 일치하는지 확인해줘')
+        self.assertEqual(stated_input['selector'], {'role':'textfield', 'query':'Batch'})
+        self.assertNotIn('result_column', stated_input)
+        self.assertIsNone(plans._expected_binding(verify, []))
+        fixed = dict(action='fill', label='Batch', instruction=dict(mode='fixed', value='B4'))
+        self.assertEqual(plans._expected_binding(verify, [fixed]), {'value':'B4'})
+        collision = dict(fixed, instruction=dict(mode='required', parameter='조건'))
+        self.assertIsNone(plans._expected_binding(verify, [fixed, collision]))
+        for sentence in ('Memo 값을 읽고 창을 닫아줘', 'Memo 값을 읽지 마', 'Memo 값을 읽어줘 그리고 조회'):
+            self.assertEqual(tasks.compile_instruction(raw, sentence)['mode'], 'draft')
+        protected = dict(raw, reason='protected_input_not_recorded')
+        with self.assertRaisesRegex(tasks.TaskError, 'instruction_target_unavailable'):
+            tasks.compile_instruction(protected, 'Memo 값을 읽어줘')
+        detail = dict(raw, window_context=dict(exe='Example.exe', title='Detail', after_step=1, related=True))
+        for sentence in ('Exit 버튼을 눌러 상세 창을 닫아줘', '확인 버튼으로 이 창을 닫아 줘'):
+            observed = tasks.instructed_step(detail, tasks.compile_instruction(detail, sentence))
+            self.assertEqual(observed['selector']['query'], sentence.split()[0])
+            self.assertEqual(observed['action'], 'close-popup')
+        saved = dict(detail, reason='popup_needs_live_binding', instruction_draft='Memo 값을 읽어줘')
+        task = tasks.from_recording('read', 'Example.exe', 'Main', [button()])
+        task['steps'].append(saved)
+        self.assertEqual(tasks.resolve_saved_intents(task)['steps'][1]['action'], 'read-value')
+        self.assertFalse(tasks.same_result_double(dict(action='manual', reason='double_click_needs_review',
+                         instruction_draft='다른 결과 행을 더블클릭해줘'), verify))
+        self.assertFalse(tasks.same_result_double(dict(action='manual', reason='double_click_needs_review',
+                         instruction_draft='설정 아이콘을 더블클릭해줘'), verify))
+
     def test_visual_double_click_preserves_legacy_draft_and_waits_for_the_recorded_row_after_view(self):
         from test_visual_target import image, visual, VisualTargets
         sentence = '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'

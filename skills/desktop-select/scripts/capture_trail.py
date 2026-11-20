@@ -10,24 +10,43 @@ import win_bridge as bridge
 
 
 def resolve_menu_scope(scope, steps, number):
-    """Resolve a menu's original ID after its provisional capture completed."""
+    """Link a confirmed menu or reviewed result double-click to its opened window."""
     if not isinstance(scope, dict) or '_openers' not in scope or scope.get('related') is not True:
         return scope
     positions = {step['id']: (index, step) for index, step in enumerate(steps, 1)}
     candidates = [positions[key] for key in scope['_openers'] if key in positions]
     if not candidates or any(index >= number for index, _ in candidates):
         return scope
-    _, latest = max(candidates, key=lambda row: row[0])
+    candidates.sort(key=lambda row: row[0])
+    _, latest = candidates[-1]
     origin = latest.get('_capture_window') or latest.get('window_context')
-    if (latest.get('action') != 'result-menu'
-            or any((step.get('_capture_window') or step.get('window_context')) != origin
-                   for _, step in candidates)):
+    if any((step.get('_capture_window') or step.get('window_context')) != origin for _, step in candidates):
         return scope
-    try:
-        command = learned_tasks.recorded_step(latest)
-        if command['action'] != 'result-menu':
+    if latest.get('action') == 'result-menu':
+        try:
+            if learned_tasks.recorded_step(latest)['action'] != 'result-menu':
+                return scope
+        except (ValueError, bridge.BridgeError):
             return scope
-    except (ValueError, bridge.BridgeError):
+    elif learned_tasks.is_double_click_step(latest):
+        # Review can establish that the preceding clicks were a lookup and a
+        # read-only row check, and the double-click was the requested opener.
+        text = (latest.get('instruction') or {}).get('text', '')
+        if not learned_tasks.double_click_instruction(text) or not any(
+                word in text.casefold() for word in ('열', '띄', 'open')):
+            return scope
+        prior = [step for _, step in candidates[:-1]]
+        if not prior or prior[-1].get('instruction', {}).get('mode') != 'verify-value':
+            return scope
+        for earlier in prior:
+            if earlier.get('instruction', {}).get('mode') in learned_tasks.OBSERVE_ACTIONS:
+                continue
+            try:
+                if not learned_tasks.is_query_button(learned_tasks.recorded_step(earlier)):
+                    return scope
+            except (ValueError, bridge.BridgeError):
+                return scope
+    else:
         return scope
     resolved = dict(scope)
     resolved.pop('_openers')
@@ -257,7 +276,11 @@ class CaptureTrail:
                 down = getattr(part.pump, 'last_scoped_down', None)
                 if isinstance(down, (int,float)) and down <= when:
                     with part.notes.lock:
-                        if down > max(part.notes.times.values(), default=0):
+                        # A double-click produces one step at its FIRST down.
+                        # Its second down is consumed too and must not defer
+                        # attaching the new detail window until another click.
+                        if down > max(max(part.notes.times.values(), default=0),
+                                      getattr(part.notes, 'completed_double_down', 0)):
                             return False
             matches = {}
             for _, parent, _ in options:
@@ -376,7 +399,8 @@ class CaptureTrail:
         if key not in self.appeared:
             return
         options = self._openers(self.appeared[key])
-        signature = key, self.appeared[key], tuple(item[2] for item in options)
+        signature = key, self.appeared[key], tuple((step_id, part.notes.completed_double_down)
+                                                   for _, part, step_id in options)
         if options and (self._last_candidate != signature or time.monotonic() >= self._next_attempt):
             self._last_candidate = signature
             self._next_attempt = time.monotonic() + 1.

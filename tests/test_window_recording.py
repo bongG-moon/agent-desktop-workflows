@@ -175,6 +175,30 @@ class WindowRecordingTests(TestCase):
         self.session.poll()
         self.assertEqual(self.session.scope['_openers'], ('launch-first','launch-second'))
 
+    def test_second_press_of_recorded_double_is_already_consumed(self):
+        part = self.session.primary
+        clicked(part, 'double', 1.2)
+        part.pump.last_scoped_down = 1.35
+        self.keys.add((2, 200))
+        self.foreground = (2, 200)
+        self.now = 2.
+        self.session.poll()
+        self.assertIs(self.session.active, part)
+        part.notes.completed_double_down = 1.35
+        self.now = 2.25
+        self.session.poll()
+        self.assertEqual(self.session.scope['after_id'], 'double')
+
+    def test_read_and_explicit_double_open_identify_opener_but_unrelated_action_stays_ambiguous(self):
+        scope = dict(related=True, _openers=('verify', 'double'))
+        verify = dict(id='verify', action='manual', instruction=dict(mode='verify-value'))
+        double = dict(id='double', action='visual-click', visual=dict(gesture='double-click'),
+                      instruction=dict(text='해당 결과 행을 더블클릭해 상세 창을 열어줘'))
+        self.assertEqual(trail.resolve_menu_scope(scope, [verify, double], 3)['after_id'], 'double')
+        unrelated = dict(id='another', action='manual', reason='unsupported_recorded_action')
+        mixed = dict(scope, _openers=('another', 'verify', 'double'))
+        self.assertEqual(trail.resolve_menu_scope(mixed, [unrelated, verify, double], 4), mixed)
+
     def test_sequential_launches_with_separate_completed_transitions_link_without_question(self):
         clicked(self.session.primary,'launch-first',1.5)
         self.foreground = (2,200)

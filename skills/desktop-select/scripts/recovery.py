@@ -215,6 +215,10 @@ def _field(row, item, inventory):
                  (row['mode'] == 'required' and not row['argument'])), 'instruction_binding_conflict')
     node, step = _observed_field(item, inventory)
     hint = row.get('hint', original)
+    if ('within' not in item and hint.get('ancestors') and all(
+            step.get(key) == hint.get(key) for key in ('role', 'target', 'match'))):
+        step['ancestors'] = deepcopy(hint['ancestors'])
+        step['within'] = hint['within']
     if hint.get('match') in ('name', 'automation_id') and (
             node.get(hint['match']) != hint.get('target') or hint.get('role') != step['role']):
         # A recording is a hint. Rebinding to a different actual control needs
@@ -264,6 +268,9 @@ def _suggest_binding(number, row, inventory):
         choices = []
         for role in roles:
             request = dict(number=number, target=query, role=role)
+            if hint.get('within') and hint.get('role') == role and any(
+                    hint['within'] in node.get('binding_scopes', {}) for node in inventory['targets']):
+                request['within'] = hint['within']
             try:
                 observed, identity = _observed_field(request, inventory)
                 identity.update(action={'combobox':'select', 'textfield':'fill'}.get(role, 'open'))
@@ -638,6 +645,11 @@ def _recorded_lookups(rows):
             selector = step['selector']
         elif step.get('match') in ('automation_id', 'name') and not row.get('field_problem'):
             selector = {step['match']: step['target'], 'role': step['role']}
+            if step.get('ancestors'):
+                selector['ancestors'] = step['ancestors']
+        elif step.get('action') in ('visual-click', 'row-action', 'row-launch', *tasks.OBSERVE_ACTIONS,
+                                     'double-click-result', 'close-popup'):
+            continue  # These are checked against the post-action screen at execution.
         else:
             return None
         if selector not in selectors:
@@ -715,9 +727,32 @@ def run(app, args):
     _require(not args.image or only is not None, 'recovery_image_step_required')
     prepare = getattr(args, 'prepare', False)
     lookups = _recorded_lookups(rows) if prepare else None
+    if prepare:
+        fields = [row.get('hint', row['step']) for row in rows if not row['context']]
+        scopes = [(step['target'], step['role'], step['within']) for step in fields
+                  if step.get('match') in ('name', 'automation_id') and step.get('within')]
+        if scopes:
+            if lookups is None:
+                lookups = dict(scoped_fields=scopes)
+            else:
+                lookups['fallback_scopes'] = scopes
     _require((not prepare and bool(args.save_as) == bool(args.bindings) and not (args.bindings and (args.image or only)))
              or (prepare and not (args.bindings or args.image or only)), 'invalid_recovery_options')
     destination = args.save_as or (f"{doc['name'][:75]} - {fingerprint[:12]}" if prepare else None)
+    # A dialog that only exists after a later action cannot invalidate exact
+    # selectors from the recorded prefix. Resolve that prefix at actual dispatch.
+    deferred_prefix = 0
+    if prepare:
+        for number, row in enumerate(rows, 1):
+            if row.get('scope_problem') or row.get('field_problem') or row['step']['action'] == 'manual':
+                context = row.get('context') or {}
+                if number > 1 and context.get('related') and context.get('after_step'):
+                    import recorded_plan
+                    prefix = {k: doc[k] for k in ('name', 'schema', 'exe', 'window')}
+                    prefix['steps'] = [r['step'] for r in rows[:number-1]]
+                    if recorded_plan.compile_plan(prefix).get('envelope'):
+                        deferred_prefix = number - 1
+                break
     if destination:
         _require(tasks._name(destination).casefold() != doc['name'].casefold(), 'task_already_exists')
     selection = list(range(1, len(rows)+1)) if only is None else [only]
@@ -757,6 +792,11 @@ def run(app, args):
             continue
         try:
             origin = (row['context'] or {}).get('after_step')
+            if number <= deferred_prefix:
+                revised.append(deepcopy(row['step']))
+                remap[number] = len(revised)
+                detail['scope_validation'] = 'at_execution'
+                continue
             if prepare and origin in pending:
                 raise tasks.TaskError('recorded_window_opener_unresolved')
             if not args.bindings or operation:
@@ -770,7 +810,8 @@ def run(app, args):
                     if not (prepare and error.code == 'recorded_window_not_open' and context
                             and context.get('related') is True and origin in remap
                             and not row.get('field_problem') and row['step']['action'] != 'manual'
-                            and (row['step']['action'] in tasks.CAPTURE_COMMANDS
+                            and (row['step']['action'] in (*tasks.CAPTURE_COMMANDS, *tasks.OBSERVE_ACTIONS,
+                                                          'close-popup')
                                  or row['step'].get('match') in ('automation_id', 'name'))):
                         raise
                     step = deepcopy(row['step'])
@@ -823,6 +864,8 @@ def run(app, args):
                     key = step['match']
                     matches = [node for node in observation['targets'] if node.get('role') == step['role']
                                and node.get(key) == step['target']]
+                    if step.get('within') and (len(matches) > 1 or any(n.get('binding_scopes') for n in matches)):
+                        matches = [node for node in matches if step['within'] in node.get('binding_scopes', {})]
                     _require(len(matches) == 1, 'target_ambiguous' if matches else 'target_missing')
                     _require(matches[0].get('enabled') is True, 'target_disabled')
                     _require(matches[0].get('offscreen') is False, 'target_offscreen')
@@ -854,6 +897,11 @@ def run(app, args):
             if reason in ('recorded_window_not_open', 'invalid_window_origin_step',
                           'recorded_window_opener_unresolved') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
+            if deferred_prefix and reason == 'recorded_window_not_open' and number == deferred_prefix + 1:
+                return _blocked(result, reason, step_number=number,
+                        host_action='inspect_recorded_step_when_popup_opens', opener_step=origin,
+                        instruction=detail['text'], window=detail['window'],
+                        inspect_args=['recover', '--task', doc['name'], '--only', str(number)])
             if args.bindings:
                 if (reason == 'step_requires_dedicated_binding' and tasks.is_double_click_step(row['step'])
                         and tasks.double_click_instruction(row['text'])):

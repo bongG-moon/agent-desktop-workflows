@@ -22,7 +22,7 @@ class RecordingFollowupTests(unittest.TestCase):
         result = followup(source)
         self.assertEqual(result['effective_task'], '보정 사본')
         self.assertEqual(result['next_action']['args'], [
-            'replay', '--task', '보정 사본', '--exe', 'App.exe', '--window', '업무 "창" '])
+            'try-recording', '--task', '보정 사본'])
         self.assertEqual(result['next_action']['required_parameters'], ['Family'])
         self.assertEqual(result['live_recovery'], evidence)
         self.assertNotIn('recover_args', result)

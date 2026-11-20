@@ -22,8 +22,9 @@ def followup(result):
         result['preparation'] = 'ready'
         result['next_action'] = dict(
             kind='run_prepared_recording', script=str(scripts / 'desktop_select.py'),
-            args=['replay', '--task', task['name'], '--exe', task['exe'], '--window', task['window']],
+            args=['try-recording', '--task', task['name']],
             required_parameters=plan.get('required_parameters', []),
+            physical_input_required=plan.get('physical_input_required', False),
             register_and_test=dict(script=str(scripts / 'python_workflow.py'),
                 args=['register', '--task', task['name'], '--run', '--summary'],
                 required_options=['--out']))
@@ -37,6 +38,11 @@ def followup(result):
     if recovered.get('retry_args'):
         result['next_action'] = dict(kind='continue_preparation',
             script=str(scripts / 'desktop_select.py'), args=recovered['retry_args'])
+    elif recovered.get('host_action') == 'inspect_recorded_step_when_popup_opens':
+        result['next_action'] = dict(kind=recovered['host_action'], script=str(scripts / 'desktop_select.py'),
+                                     args=recovered['inspect_args'], window=recovered['window'],
+                                     opener_step=recovered['opener_step'], instruction=recovered['instruction'])
+        result.pop('recover_args', None)
     elif recovered.get('host_action') == 'ground_recorded_double_click' and recovered.get('ground_args'):
         result['next_action'] = dict(kind='ground_recorded_double_click', script=str(scripts / 'desktop_select.py'),
                                      args=recovered['ground_args'], capture_requires_consent=True)

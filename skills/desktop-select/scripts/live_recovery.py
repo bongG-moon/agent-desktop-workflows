@@ -82,6 +82,12 @@ def _recorded_targets(app, surface, uia, lookups):
         element = control_lookup.resolve(surface, uia, selector, root)
         node = dict(uia.basic(element), enabled=element.property(30010) is True)
         node['recorded_selector'] = selector
+        if selector.get('ancestors'):
+            key = 'automation_id' if 'automation_id' in selector else 'name'
+            ancestor = selector['ancestors'][0]
+            within = ancestor.get('automation_id') or ancestor['name']
+            node['binding_scopes'] = {within: dict(role=selector['role'], match=key, target=selector[key],
+                                                  ancestors=selector['ancestors'])}
         app.add_display_properties(node, element, surface, uia, root)
         if node['offscreen']:
             raise app.bridge.BridgeError('target_offscreen')
@@ -123,6 +129,7 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None, bi
                     result['targets'] = _recorded_targets(app, surface, uia, lookups)
                     result['lookup_mode'] = 'recorded_selectors'
                 except app.bridge.BridgeError:
+                    scoped_fields = lookups.get('fallback_scopes', ())
                     lookups = None
             if not lookups or scoped_fields:
                 result['targets'] = (_targets(app, surface, uia, scoped_fields) if scoped_fields

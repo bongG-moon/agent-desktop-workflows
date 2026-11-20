@@ -90,6 +90,151 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([s['receipt']['status'] for s in result['steps']],
                          ['verified', 'verified', 'delivered_unverified', 'waited', 'delivered_unverified'])
 
+    def test_reviewed_result_point_requires_the_current_table_and_noneditable_data(self):
+        import grounding
+        target = MagicMock()
+        group = MagicMock()
+        sibling = MagicMock()
+        group.property.side_effect = lambda key: {30003: 50026}.get(key)
+        target.property.side_effect = lambda key: {30003: 50025}.get(key)
+        self.uia.from_point.return_value = target
+        self.uia.secure.return_value = False
+        self.uia.same.side_effect = lambda a, b: a is b
+        self.uia.bounds.return_value = dict(x=105, y=106, width=20, height=20)
+        selector = dict(role='group', automation_id='results')
+        confirmation = dict(receipt='1'*64, frame='2'*64, point=[10, 11], selector=selector)
+        with (patch.object(grounding, '_directory'), patch.object(grounding, 'read_frame', return_value=(None, b'frame')),
+              patch.object(grounding, '_capture', return_value=([100,100,80,70], b'frame')) as capture,
+              patch.object(flow, 'result_surface', return_value=group) as surface,
+              patch.object(flow.live, '_visible', return_value=True),
+              patch.object(flow.lookup, '_raw_parent', side_effect=lambda _, node: group if node is target else None) as parent):
+            def check():
+                flow.check_result_frame(self.binding, confirmation, (110, 111), lambda: None)
+            check()
+            self.assertEqual(surface.call_args.args[-1], selector)
+            for role in (50004, 50000, 50034, 50035):
+                target.property.side_effect = lambda key: {30003: role}.get(key)
+                with self.subTest(role=role), self.assertRaisesRegex(ValueError, 'result_point_not_data'):
+                    check()
+            target.property.side_effect = lambda key: {30003: 50025, 30043: True, 30046: False}.get(key)
+            with self.assertRaisesRegex(ValueError, 'result_point_not_data'):
+                check()
+            target.property.side_effect = lambda key: {30003: 50029}.get(key)
+            parent.side_effect = lambda _, node: sibling if node is target else None
+            with self.assertRaisesRegex(flow.app.bridge.BridgeError, 'target_outside_window'):
+                check()
+            capture.return_value = ([100,100,80,70], b'changed')
+            with self.assertRaisesRegex(ValueError, 'result_frame_changed'):
+                check()
+
+    def test_exact_verified_result_can_change_each_run_and_query_is_never_repeated(self):
+        import result_cell
+        data = recipe()
+        data['steps'] = [
+            dict(action='invoke', selector=dict(role='button', name='VIEW')),
+            dict(action='verify-value', selector=dict(role='table'), result_column='Part', parameter='Part'),
+            dict(action='double-click-result', label='Open matching row'),
+        ]
+        dispatch = dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched',
+                        input_dispatched=True, physical_input=True)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(flow, 'RESULT_VISUAL_TIMEOUT', 0),
+              patch.object(result_cell, 'find') as find, patch.object(result_cell, 'execute', return_value=dispatch) as click,
+              patch.object(flow.live, 'execute', side_effect=self.execute) as invoke):
+            for number, value in enumerate(('LAB-42', 'A401'), 1):
+                report = flow.run(data, {'Part': value})
+                self.assertEqual(report['status'], 'completed_unverified', report)
+                self.assertEqual(find.call_args.args[3], value)
+                self.assertEqual(click.call_args.args[3], value)
+                self.assertEqual(find.call_args.kwargs['column'], 'Part')
+                self.assertEqual(invoke.call_count, number)
+            find.side_effect = flow.app.bridge.BridgeError('result_cell_missing')
+            report = flow.run(data, {'Part': 'absent'})
+            self.assertEqual((report['status'], report['stopped_at']), ('blocked', 2), report)
+            self.assertTrue(report['input_dispatched'])  # the single query was sent
+            self.assertFalse(report['steps'][-1]['receipt']['input_dispatched'])
+            self.assertEqual(click.call_count, 2)
+            self.assertEqual(invoke.call_count, 3)
+        self.assertEqual([n for n, _ in flow.selected_steps(data, 3)], [2, 3])
+        with self.assertRaisesRegex(flow.WorkflowError, 'verified_result_required'):
+            flow.validate(dict(data, steps=[data['steps'][2]]))
+
+    def test_read_and_verify_observe_only_and_keep_literal_in_summary(self):
+        selector = dict(role='textfield', automation_id='Details')
+        data = dict(recipe(), steps=[dict(action='read-value', selector=selector, label='Details'),
+                                     dict(action='verify-value', selector=selector, parameter='Expected')])
+        with (patch.object(flow.live, 'text_readback', return_value={
+                'value': '', 'value_evidence': {'status': 'observed', 'source': 'value_pattern'}}),
+              patch.object(flow.live, 'execute') as mutate):
+            report = flow.run(data, {'Expected': ''})
+            self.assertEqual(report['status'], 'verified', report)
+            self.assertFalse(report['input_dispatched'])
+            self.assertEqual([r['input_mode'] for r in report['input_requirements']['steps']], ['observation'] * 2)
+            summary = flow.summarize_execution(report, flow.selected_steps(data, None))
+            self.assertEqual([r['value'] for r in summary['steps']], ['', ''])
+            mismatch = flow.run(data, {'Expected': 'different'})
+            self.assertEqual((mismatch['status'], mismatch['stopped_at']), ('mismatch', 2))
+            self.assertFalse(mismatch['input_dispatched'])
+            mutate.assert_not_called()
+            flow.app.visibility.restore_for_action.assert_not_called()
+        with patch.object(flow.live, 'text_readback', return_value={'value':None, 'value_evidence':{'status':'unavailable'}}):
+            self.assertEqual(flow.run(data, {'Expected':''})['diagnostic'], 'value_observation_unavailable')
+
+    def test_only_explicit_scoped_close_observes_its_disappearance(self):
+        popup = dict(title='Details')
+        close = dict(action='invoke', selector=dict(role='button', name='Exit'), popup=popup, verify_closed=True)
+        with self.assertRaisesRegex(flow.WorkflowError, 'invalid_close_verification'):
+            flow.validate(dict(recipe(), steps=[{k: v for k, v in close.items() if k != 'popup'}]))
+        surface = MagicMock(hwnd=204, pid=self.binding.pid)
+        with (patch.object(flow, 'popup_surface', return_value=surface),
+              patch.object(flow, 'check_surface'), patch.object(flow, 'open_secondary_handles', return_value=[]),
+              patch.object(flow.app, 'owned_popups', return_value=[]),
+              patch.object(flow.app.bridge.user32, 'IsWindowVisible', return_value=False),
+              patch.object(flow.live, 'execute', side_effect=self.execute) as invoke):
+            report = flow.run(dict(recipe(), steps=[close]))
+            self.assertEqual(report['steps'][0]['receipt']['verification_scope'], 'window_closed', report)
+            self.assertTrue(report['input_dispatched'])
+            invoke.assert_called_once()
+            without_check = {k:v for k,v in close.items() if k != 'verify_closed'}
+            report = flow.run(dict(recipe(), steps=[without_check]))
+            self.assertEqual(report['status'], 'completed_unverified')
+            self.assertNotIn('verification_scope', report['steps'][0]['receipt'])
+
+    def test_query_waits_for_current_field_only_until_match_without_second_invoke(self):
+        selector = dict(role='textfield', automation_id='ResultCode')
+        data = dict(recipe(), steps=[dict(action='invoke', selector=dict(role='button', name='Search')),
+                                     dict(action='verify-value', selector=selector, value='part07')])
+        evidence = {'status':'observed', 'source':'value_pattern'}
+        with (patch.object(flow.live, 'execute', side_effect=self.execute) as invoke,
+              patch.object(flow.live, 'text_readback', side_effect=[
+                  dict(value='stale', value_evidence=evidence), dict(value='part07', value_evidence=evidence)]) as read,
+              patch.object(flow.time, 'sleep') as sleep):
+            report = flow.run(data, read_only=True)
+            self.assertEqual(report['steps'][1]['receipt']['status'], 'deferred')
+            read.assert_not_called()
+            report = flow.run(data)
+            self.assertEqual(report['steps'][1]['receipt']['value'], 'part07', report)
+            self.assertEqual(read.call_count, 2)
+            sleep.assert_called_once()
+            invoke.assert_called_once()
+
+    def test_named_read_proves_unprotected_ancestor_before_accessing_name(self):
+        with patch.object(flow.lookup, 'ancestry', side_effect=flow.app.bridge.BridgeError('target_protected')):
+            with self.assertRaisesRegex(flow.app.bridge.BridgeError, 'target_protected'):
+                flow.observe_field(self.binding, self.uia, self.element, 'statictext', 'read-value')
+            self.element.property.assert_not_called()
+
+    def test_implicit_table_selector_counts_visible_lists_and_rejects_duplicates(self):
+        candidates = [MagicMock(), MagicMock()]
+        root = self.uia.from_handle(self.binding.hwnd)
+        with (patch.object(flow.lookup, 'find_all', return_value=candidates) as search,
+              patch.object(flow.live, '_visible', return_value=True)):
+            with self.assertRaisesRegex(flow.WorkflowError, 'result_table_ambiguous'):
+                flow.result_surface(self.binding, self.uia, {'role':'table'})
+            search.assert_called_once_with(self.uia, root, roles=('table','list'))
+        for candidate in candidates:
+            candidate.close.assert_called_once()
+
     def test_uncertain_combo_never_invokes_next_step_or_retries(self):
         with patch.object(flow.live, 'execute', return_value=dict(status='uncertain', input_dispatched=None)) as execute:
             result = flow.run(recipe(), {'Family': 'Hybrid'})

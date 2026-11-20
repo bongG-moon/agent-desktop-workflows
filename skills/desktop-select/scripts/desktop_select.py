@@ -412,6 +412,7 @@ def execution_plan_info(result):
     recipe = envelope.get('recipe')
     if recipe:
         info.update(source_fingerprint=envelope['source_fingerprint'], steps=len(recipe['steps']),
+                    physical_input_required=input_policy.profile(recipe['steps'])['physical_input_required'],
                     required_parameters=list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s)))
         if envelope.get('notes'):
             info['notes'] = envelope['notes']
@@ -498,12 +499,51 @@ def fast_replay(plan, args, overrides):
     if recipe is None:
         if saved.get('status')=='plan_unavailable':
             return dict(status='blocked',diagnostic=saved.get('diagnostic'),steps=[],input_dispatched=False)
+        selected = tasks._step_number(plan, args.only) if args.only is not None else None
+        rows = tasks.resolve_saved_intents(plan)['steps']
+        if any(s['action'] in (*tasks.OBSERVE_ACTIONS, 'close-popup', 'double-click-result')
+               for n, s in enumerate(rows, 1) if selected is None or selected == n):
+            return dict(status='needs_review', diagnostic=saved.get('diagnostic', 'execution_plan_required'),
+                        stopped_at=saved.get('step'), steps=[], input_dispatched=False)
         return None
     source_steps = saved['envelope']['source_steps']
     has_host_binding = any(step['action'] in ('conditional-open', 'row-open') for step in recipe['steps'])
-    if legacy_values and not has_host_binding:
+    uses_observations = any(step['action'] in (*tasks.OBSERVE_ACTIONS, 'double-click-result') or step.get('verify_closed')
+                            for step in recipe['steps'])
+    if uses_observations and overrides:
+        # Aliases on a value field also refer to the downstream result check.
+        declared = {s['parameter'].casefold() for s in recipe['steps'] if 'parameter' in s}
+        aliases = {key: value for key, value in overrides.items() if key.casefold() not in declared}
+        if aliases:
+            numbered = list(enumerate(plan['steps'], 1))
+            assignments = tasks.recorded_overrides(numbered, aliases)
+            overrides = {k:v for k,v in overrides.items() if k not in aliases}
+            names = {k.casefold() for k in overrides}
+            for position, value in assignments.items():
+                key = tasks._parameter(plan['steps'][position - 1])
+                if not key or key.casefold() in names:
+                    raise tasks.TaskError('duplicate_override')
+                names.add(key.casefold())
+                overrides[key] = value
+    if legacy_values and not (has_host_binding or uses_observations):
         return None
-    if has_host_binding:
+    if uses_observations and legacy_values:
+        # Keep legacy recorded defaults, including when a result assertion
+        # references the same parameter. An explicit required input still wins.
+        recipe = deepcopy(recipe)
+        defaults = {}
+        required = {s['instruction']['parameter'].casefold() for s in plan['steps']
+                    if s.get('instruction', {}).get('mode') == 'required'}
+        for raw in plan['steps']:
+            if raw.get('action') in tasks.VALUE_ACTIONS and 'instruction' not in raw and 'value' in raw and raw.get('parameter'):
+                defaults.setdefault(raw['parameter'].casefold(), set()).add(raw['value'])
+        supplied = {key.casefold() for key in overrides}
+        for step in recipe['steps']:
+            key = step.get('parameter', '').casefold()
+            if key in defaults and key not in supplied | required and len(defaults[key]) == 1:
+                step['value'] = next(iter(defaults[key]))
+                del step['parameter']
+    elif has_host_binding and not uses_observations:
         # A host interpretation can coexist with 0.4 recorded defaults. A raw
         # field whose prose now describes a conditional is no longer an input.
         recipe = deepcopy(recipe)
@@ -530,12 +570,17 @@ def fast_replay(plan, args, overrides):
         if len(matches) != 1:
             return None
         chosen = recipe['steps'][matches[0]]
-        if chosen['action'] not in ('conditional-open','row-open') and not tasks.is_double_click_step(chosen):
+        if chosen['action'] == 'double-click-result':
+            return dict(status='blocked', diagnostic='verified_result_row_required', input_dispatched=False, steps=[])
+        if (chosen['action'] not in ('conditional-open','row-open', *tasks.OBSERVE_ACTIONS)
+                and not chosen.get('verify_closed') and not tasks.is_double_click_step(chosen)):
             return None
         only = str(matches[0] + 1)
         active = dict(recipe, steps=[recipe['steps'][matches[0]]])
     parameters = {s['parameter'].casefold() for s in active['steps'] if 'parameter' in s}
     if any(key.casefold() not in parameters for key in overrides):
+        if uses_observations:
+            raise tasks.TaskError('unknown_parameter')
         return None  # Keep the original alias and fixed-value-override rules.
     import python_workflow
     _, missing = python_workflow.values_for(active, overrides)
@@ -772,6 +817,21 @@ def record_editor(owner, name, exe, title, *, report_ready=False, report_progres
 
 def attach_recovery(result, name, *, prepare=False):
     """After an incomplete recording, give the host current app evidence in the same response."""
+    if prepare and result.get('status') == 'recorded' and result.get('draft'):
+        import first_trial
+        directory = task_directory()
+        doc = tasks.load_task(name, directory, allow_review=True)
+        if doc.get('kind') == review_drafts.KIND:
+            local = first_trial._compiled(doc, directory)
+            if local.get('envelope'):
+                info = execution_plan_info(local)
+                ready = dict(result, preparation='ready', effective_task=name,
+                             next_action=dict(kind='run_prepared_recording', script=str(Path(__file__).absolute()),
+                                 args=['try-recording', '--task', name], required_parameters=info['required_parameters'],
+                                 physical_input_required=info['physical_input_required']),
+                             host_action='test_saved_recording')
+                ready.pop('recover_args', None)
+                return ready
     result['recover_args'] = ['recover', '--task', name]
     if prepare:
         result['recover_args'].append('--prepare')
@@ -830,6 +890,15 @@ def recorder_request(path):
 
 
 def run(args):
+    if args.command == 'try-recording':
+        import first_trial
+        return first_trial.run(sys.modules[__name__], args)
+    if args.command == 'inspect-trial':
+        import first_trial
+        return first_trial.inspect_result(sys.modules[__name__], args.receipt)
+    if args.command == 'resume-trial':
+        import result_trial
+        return result_trial.resume(sys.modules[__name__], args)
     if args.command == '_record_app':
         return record_application(args.app, args.task)
     if args.command == 'recorder':
@@ -1111,6 +1180,25 @@ def parser():
     start.add_argument('--request', type=Path, help='UTF-8 JSON file for record, review or continue-recording (streaming)')
     host.add_argument('--task', help='optional task name with --app; defaults to a new timestamped name')
     host.add_argument('--wait', type=float, help='with --session, wait up to 30 seconds only for startup or saved-draft processing')
+    trial = commands.add_parser('try-recording', help='test the saved recording once, without registering a skill')
+    source = trial.add_mutually_exclusive_group(required=True)
+    source.add_argument('--session', help='recorder session from this project')
+    source.add_argument('--task', help='saved recording name')
+    trial.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
+    policy = trial.add_mutually_exclusive_group()
+    policy.add_argument('--allow-physical', action='store_true')
+    policy.add_argument('--background-only', action='store_true')
+    trial.add_argument('--hwnd', type=int, help='disambiguate identical business windows')
+    trial.add_argument('--trial-id', help='reuse the same ID on interruption; use a new ID for a deliberate repeat')
+    inspection = commands.add_parser('inspect-trial', help='capture the still-open result window from a paused trial without sending input')
+    inspection.add_argument('--receipt', required=True)
+    resume = commands.add_parser('resume-trial', help='continue from a unique result cell confirmed in a scoped trial image')
+    resume.add_argument('--receipt', required=True)
+    resume.add_argument('--frame', required=True)
+    resume.add_argument('--column', required=True)
+    resume.add_argument('--value', required=True)
+    resume.add_argument('--point', type=int, nargs=2, required=True)
+    resume.add_argument('--allow-physical', action='store_true')
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
@@ -1217,7 +1305,7 @@ def result_code(result):
                            'recorder_ready', 'recorder_selection_required', 'recorder_starting',
                            'recorder_processing', 'recording'):
         return 0
-    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review',
+    return 2 if result['status'] in ('blocked', 'cancelled', 'needs_input', 'needs_review', 'needs_consent',
                                      'needs_grounding', 'needs_scene') else 3
 
 
@@ -1266,7 +1354,9 @@ def main():
             payload = json.load(sys.stdin)
             result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
                                          allow_recorded_selection=True,
-                                         background_only=payload.get('background_only', False), only=payload.get('only'))
+                                         background_only=payload.get('background_only', False), only=payload.get('only'),
+                                         **({'result_confirmation': payload['result_confirmation']}
+                                            if 'result_confirmation' in payload else {}))
         except Exception as error:
             result = dict(status='uncertain', diagnostic=getattr(error, 'code', 'execution_plan_unavailable'),
                           input_dispatched=None)
@@ -1294,7 +1384,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('recorder', 'record', 'review', 'continue-recording', 'record-rows', 'replay', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('recorder', 'record', 'review', 'continue-recording', 'record-rows', 'replay', 'try-recording', 'resume-trial', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
 
 
 if __name__ == '__main__':

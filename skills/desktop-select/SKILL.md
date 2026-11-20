@@ -15,15 +15,23 @@ description: Windows 업무 창에서 새 작업을 녹화하거나 저장한 �
 python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" recorder --app "<앱 이름>"
 ```
 
-`recorder_ready`면 녹화창에서 **시작**을 눌러 시연하도록 안내한다. `recorder_selection_required`면 이미 열린 선택창에서 대상을 고르게 한다. 저장했다고 하면 같은 스크립트에 반환된 `status_args`를 한 번 넘긴다. `recorder_starting`과 `recorder_processing`이 계속되면 간격을 두고 같은 세션을 확인한다. `recording`이면 시연 중이다.
+`recorder_ready`면 **시작**을 눌러 시연하도록 안내하고 응답의 `session`을 기억한다. `recorder_selection_required`면 열린 선택창에서 대상을 고른다. 저장 여부만 물으면 `status_args`로 확인한다. 저장 후 테스트까지 요청하면 바로 아래 명령을 사용한다.
 
 ## 저장한 녹화 시험과 보정
 
-저장 영수증이 이미 있으면 바로 `effective_task`와 `next_action`을 사용한다. `preparation=ready`인 작업의 등록과 첫 시험은 `next_action.register_and_test.script`와 그 `args`에 `--out "<프로젝트>/.claude/skills/<새 업무 이름>"`과 요청받은 `--set "이름=값"`을 붙여 **한 번** 실행한다. 이 명령은 `register --task … --run --summary`다. 등록만 원하면 `register --task "<effective_task>" --out "<새 업무 스킬 폴더>"`만, 일회성 실행은 `next_action.script`와 그 `args`의 `replay`를 쓴다.
+“녹화했어. 테스트해줘. 장비 ID는 LAB-42야”처럼 저장 후 시험을 요청하면 **첫 도구 호출에서** 해당 세션과 이번 입력값을 넘긴다. 정확한 변수 이름은 녹화에서 받은 이름을 쓴다. 아래는 `Equip ID`라는 변수의 예다. 세션 대신 작업명만 알면 `--task "<작업명>"`을 쓴다.
 
-첫 시험의 실제 입력을 승인받으면 `--allow-physical`을 사용한다. 같은 등록 업무의 반복 입력까지 허용한 경우 `--remember-physical`을 함께 준다. 보정용 화면 확인도 승인받았으면 `--auto-repair-frame`을 추가한다. `menu_repair.image`가 오면 이미지를 한 번 읽고 표의 셀을 찾는다. `resume_script`와 `resume_args`에서 `<x>`, `<y>`만 원본 픽셀로 바꿔 이어간다. 티켓과 변수는 유지한다. 이미지 없이 티켓만 왔을 때만 승인 범위에서 `frame_args`로 캡처한다.
+```
+python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording --session "<session>" --set "Equip ID=LAB-42"
+```
 
-`bind_existing_observation`은 영수증의 원문, `live_scopes`, `bindings_template`으로 연결한 뒤 반환된 인자에 `--bindings <JSON> --save-as "<실행용 사본>"`을 추가한다. `ground_recorded_double_click`이면 현재 결과 화면에서 `ground_args`로 해당 단계만 보정한다. 이전 초안을 고치거나 한 단계만 다시 시연할 때 [녹화 편집과 복구](references/recording-recovery.md)를 읽는다.
+실제 마우스로 시연한 동작을 시험하도록 허용받았으면 같은 호출에 `--allow-physical`을 붙인다. 이 명령이 저장 상태, 필요한 보정, 시험 결과를 한 번에 처리한다. 별도 상태 조회, 필드별 시험 입력, 등록, 소스 조사와 설치 파일 수정은 생략한다. 응답이 끊겼으면 같은 명령으로 기존 시험 결과를 받는다. 사용자가 의도적으로 **새 시험**을 요청할 때만 새 `--trial-id`를 준다.
+
+`report_completed_trial`이면 관찰된 값과 완료 상태를 보고하고 끝낸다. `inspect_current_result_without_replaying`이면 화면 확인 허용 범위에서 `result_inspection.args`를 실행하고 반환된 이미지를 읽는다. 요청한 열에서 해당 값이 한 행에만 보이고 `resume_args`가 있으면 그 셀의 글자와 이미지 좌표를 넣어 상세창 단계부터 이어간다. 이미 전달한 조회와 더블클릭은 반복하지 않는다.
+
+업무 스킬로 저장해 달라는 요청이 있을 때 `python_workflow.py register --task "<실행용 작업명>" --out "<프로젝트>/.claude/skills/<업무 이름>"`으로 등록한다. 성공한 시험을 등록 때문에 재실행할 필요는 없다.
+
+메뉴 보정 티켓이 있으면 [표 우클릭과 파일 검증](references/table-export.md), 기존 초안의 연결이나 한 단계의 추가 시연이 필요할 때는 [녹화 편집과 복구](references/recording-recovery.md)를 읽는다.
 
 ## 등록된 업무 실행
 

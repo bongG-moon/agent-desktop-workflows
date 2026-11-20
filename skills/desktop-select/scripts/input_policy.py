@@ -5,9 +5,10 @@ import ctypes as C
 from ctypes import wintypes as W
 
 
-_POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open'})
+_POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'row-open', 'visual-click', 'double-click-result', 'conditional-open'})
 _ACCESSIBILITY_ACTIONS = frozenset({'set-value', 'invoke', 'select', 'fill', 'open', 'choose-item'})
-_OBSERVATION_ACTIONS = frozenset({'wait', 'verify-file'})
+VALUE_OBSERVATIONS = frozenset({'read-value', 'verify-value'})
+_OBSERVATION_ACTIONS = frozenset({'wait', 'verify-file'}) | VALUE_OBSERVATIONS
 
 # Windows SDK 10.0.26100.0 UIAutomationClient.idl and UIAutomationClient.h:
 # IUIAutomation2 extends IUIAutomation; the getter/setter occupy slots 58/59.

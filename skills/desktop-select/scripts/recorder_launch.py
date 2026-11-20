@@ -124,7 +124,12 @@ def _events(folder):
 
 
 def _receipt(result, token):
-    return dict(result, session=token, status_args=['recorder', '--session', token, '--wait', '8'])
+    receipt = dict(result, session=token, status_args=['recorder', '--session', token, '--wait', '8'])
+    if result.get('status') == 'recorded':
+        receipt['first_trial_args'] = ['try-recording', '--session', token]
+        if result.get('next_action', {}).get('kind') == 'run_prepared_recording':
+            receipt['next_action'] = dict(result['next_action'], args=receipt['first_trial_args'])
+    return receipt
 
 
 def _failure(error, token=None):

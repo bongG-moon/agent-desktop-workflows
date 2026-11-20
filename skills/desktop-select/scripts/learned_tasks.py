@@ -21,6 +21,7 @@ INVOKE = {'button', 'hyperlink', 'menuitem', 'splitbutton'}
 CHOOSE = {'listitem', 'tab', 'treeitem'}
 EXPAND = {'menuitem', 'combobox', 'treeitem', 'splitbutton'}
 VALUE_ACTIONS = {'select': 'combobox', 'fill': 'textfield'}
+OBSERVE_ACTIONS = {'read-value', 'verify-value'}
 RECOVERABLE_CAPTURE_REASONS = {
     'capture_target_unavailable', 'stable_locator_unavailable', 'unsupported_recorded_action',
     'unsupported_demonstration', 'combo_value_unobserved', 'combo_choice_unproven',
@@ -138,8 +139,30 @@ def is_double_click_step(step):
 
 
 def query_before_double_click(button, following):
-    if (not is_double_click_step(following) or button.get('action') not in ('open', 'invoke')
-            or button.get('window_context') != following.get('window_context') or 'popup' in button):
+    return (is_double_click_step(following) and button.get('window_context') == following.get('window_context')
+            and is_query_button(button))
+
+
+def same_result_double(step, previous):
+    if (not previous or previous['action'] != 'verify-value' or 'result_column' not in previous
+            or previous.get('window_context') != step.get('window_context')
+            or not (is_double_click_step(step) or is_recoverable(step))):
+        return False
+    text = step.get('instruction_draft') or step.get('description') or step.get('label', '')
+    if not double_click_instruction(text):
+        return False
+    subject = re.split(r'더블\s*클릭|두\s*번|double[ -]?click', text, flags=re.I)[0]
+    if text.lower().startswith(('double click', 'double-click')):
+        subject = text[12:]
+    if re.search(r'다른|다음|마지막|번째|첫\s*(?:행|줄)|\d|\b(?:other|next|first|last)\b', subject, re.I):
+        return False
+    column = previous['result_column']
+    return bool(re.search(r'(?:결과|일치한|확인한|해당|같은|이)\s*(?:행|줄|셀|항목)|\b(?:result|matched|same)\s+(?:row|cell)\b', subject, re.I)
+                or column.casefold() in subject.casefold())
+
+
+def is_query_button(button):
+    if button.get('action') not in ('open', 'invoke') or 'popup' in button:
         return False
     selector = button.get('selector', button)
     caption = button.get('command_name') or selector.get('name')
@@ -255,6 +278,105 @@ def click_menu_path(sentence):
 def _quoted_literal(text):
     match = re.fullmatch(r"""(?:'([^']*)'|"([^"]*)"|‘([^’]*)’|“([^”]*)”)""", text)
     return next(v for v in match.groups() if v is not None) if match else None
+
+
+def _recorded_selector(raw):
+    selector = raw.get('selector')
+    if isinstance(selector, dict):
+        return dict(selector)
+    target = raw.get('target')
+    if isinstance(target, str) and raw.get('match') in ('automation_id', 'name', 'query'):
+        selector = {'role': raw['role'], raw['match']: target}
+        if raw.get('ancestors'):
+            selector['ancestors'] = raw['ancestors']
+        elif raw.get('within') and raw['match'] == 'query':
+            selector['within'] = raw['within']
+        return selector
+    locator = target.get('locator', {}) if isinstance(target, dict) else {}
+    selector = _selector(locator)
+    if selector and locator.get('ancestors'):
+        selector['ancestors'] = [parent for item in locator['ancestors'] if (parent := _selector(item))]
+    return selector
+
+
+def _observed_intent(raw, sentence):
+    """Compile one explicit observation or scoped close, independently of the demonstrated click."""
+    if not sentence or not re.search(r'읽|가져|알려|일치|같은지|동일한지|\bread\b|\b(?:exit|close)\b|닫|종료', sentence, re.I):
+        return None
+    if _conditional_sentence(sentence):
+        return None
+    if raw.get('action') not in {'visual-click', 'manual', 'teach-target', 'click', 'open', 'row-action',
+                                 'row-launch', 'choose-item',
+                                 'field-input', 'set-value', 'select', 'fill', 'close-popup', *OBSERVE_ACTIONS}:
+        return None
+    target = raw.get('target')
+    scoped = raw.get('window_context') or raw.get('_capture_window') or raw.get('action') == 'close-popup'
+    if raw.get('role') == 'password' or any(raw.get(k) is True for k in
+            ('secure', 'protected', 'is_protected', 'is_password', 'password')):
+        return None
+    scoped_popup_hint = scoped and raw.get('reason', raw.get('recognition', {}).get('reason')) == 'popup_needs_live_binding'
+    if raw.get('action') == 'manual' and not (is_recoverable(raw) or scoped_popup_hint):
+        return None
+    reason = _convert(raw, allow_point=True).get('reason') if isinstance(target, dict) else None
+    if reason == 'target_protected' or (reason == 'popup_needs_live_binding' and not scoped_popup_hint):
+        return None
+    # The instruction's named subject bounds the read; prose with another operation stays a draft.
+    text = sentence.strip().rstrip('.!。').strip()
+    if re.search(r'[;?!,\n]|(?:말고|하지\s*마|않|대신|하고\s|한\s*뒤|누르고|그리고)|\b(?:not|and|then|or)\b', text, re.I):
+        return None
+    text = re.sub(r'^(?:상세\s*)?(?:팝업|창|화면)(?:\s*안)?에서\s+', '', text)
+    selector = _recorded_selector(raw)
+    click = click_request(text)
+    close = re.fullmatch(r'([\w][\w .()-]{0,99}?)\s*(?:버튼)?(?:으로|로|(?:을|를)?\s*(?:눌러(?:서)?|클릭(?:하여|해서)))\s*'
+                         r'(?:(?:(?:상세|이|현재)\s*)?(?:팝업|창|대화상자)(?:을|를)?\s*)?닫(?:아\s*(?:줘|주세요)?|기)', text)
+    caption = close[1].strip() if close else (click[0] if click and click[1] == 'button'
+              and click[0].casefold() in {'exit', 'close', '닫기', '종료'} else None)
+    if scoped and caption:
+        # A recorded title-bar Close must not stand in for the named business button.
+        if not (selector and selector.get('role') == 'button'
+                and (raw.get('command_name') or (target.get('locator', {}).get('name') if isinstance(target, dict) else '')
+                     or selector.get('name', '')).casefold() == caption.casefold()
+                and not any(a['role'] == 'titlebar' for a in selector.get('ancestors', []))):
+            selector = {'role': 'button', 'query': caption}
+        return dict(mode='close-popup', text=sentence, selector=selector, label=caption)
+
+    field = r'([\w][\w .\-/()]{0,99}?)'
+    read = re.fullmatch(field + r'\s*(?:의\s*)?(?:값|내용|텍스트)?(?:을|를)?\s*'
+                        r'(?:읽(?:어|기)|가져(?:와|오기)|알려)(?:\s*(?:줘|주세요))?', text)
+    if not read:
+        read = re.fullmatch(r'read\s+' + field + r'(?:\s+value)?', text, re.I)
+    comparison = (r'(?:(?:(\{[^{}]+\}|[\x22\x27‘“][^\x22\x27’”]+[\x22\x27’”])|'
+                  r'입력(?:\s*받은|한|했던)?\s*값|조회\s*조건)(?:와|과)\s*)?')
+    match = re.fullmatch(r'(?:(?:조회\s*)?결과(?:\s*(?:표|행|목록))?(?:에서|의|에)?\s+)?' + field
+                         + r'\s*(?:값)?(?:이|가)?\s*' + comparison +
+                         r'(?:일치(?:하는지|\s*여부)?|같은지|동일한지)\s*확인(?:해)?(?:\s*(?:줘|주세요))?', text)
+    if not (read or match):
+        return None
+    name = (read or match)[1].strip()
+    field_check = bool(match and not re.match(r'(?:조회\s*)?결과|(?:표|행)에서', text) and
+                       re.search(r'\s*(?:입력란|입력칸)$', name))
+    if field_check:
+        name = re.sub(r'\s*(?:입력란|입력칸)$', '', name).strip()
+    if not _text(name, 100) or name in {'값', '내용', '이', '현재', '해당'} or re.search(r'클릭해서|눌러서|하고|읽고', name):
+        return None
+    same = lambda a: isinstance(a, str) and ''.join(a.split()).casefold() == ''.join(name.split()).casefold()
+    if read or field_check:
+        if not (selector and (selector['role'] in {'textfield', 'combobox'} or
+                (selector['role'] in {'statictext', 'listitem', 'row'} and same(raw.get('field_label'))))
+                and any(same(v) for v in (raw.get('field_label'), raw.get('label'), raw.get('alias'),
+                        selector.get('name'), selector.get('automation_id'), selector.get('query')))):
+            selector = dict(role='textfield', query=name)
+        if read:
+            return dict(mode='read-value', text=sentence, selector=selector, label=name)
+    # A result check is a cell lookup inside a grid, never a read of the search input.
+    elif not selector or selector['role'] not in {'table', 'list', 'group'}:
+        selector = next((item for item in (selector or {}).get('ancestors', []) if item.get('role') in {'table', 'list'}),
+                        {'role': 'table'})
+    expected = match[2]
+    binding = {'parameter': name} if not expected else (
+        {'parameter': expected[1:-1]} if expected.startswith('{') else {'value': _quoted_literal(expected)})
+    return dict(mode='verify-value', text=sentence, selector=selector, label=name, **binding,
+                **({} if field_check else {'result_column': name}))
 
 
 def _runtime_value_request(sentence):
@@ -735,6 +857,10 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         raise TaskError('invalid_step_instruction')
     if not sentence and all(value is None for value in (mode, argument, target, role, within)):
         return None
+    if all(v is None for v in (mode, argument, target, role, within)):
+        observation = _observed_intent(raw_step, sentence)
+        if observation is not None:
+            return observation
     special = _capture_command(raw_step)
     if special is not None:
         if any(value is not None for value in (target, role, within)):
@@ -813,6 +939,13 @@ def instructed_step(raw_step, spec):
     """
     if not isinstance(raw_step, dict) or not isinstance(spec, dict):
         raise TaskError('invalid_step_instruction')
+    if spec.get('mode') in (*OBSERVE_ACTIONS, 'close-popup'):
+        if compile_instruction(raw_step, spec.get('text')) != spec:
+            raise TaskError('invalid_step_instruction')
+        result = {**_annotations(raw_step), 'description': spec['text'], 'action': spec['mode'],
+                  **{k: v for k, v in spec.items() if k not in ('mode', 'text')}}
+        _validate_observation(result)
+        return result
     special = _capture_command(raw_step)
     if special is not None:
         sentence = spec.get('text')
@@ -980,10 +1113,10 @@ def from_recording(name, exe, window, steps):
         with _at_step(number):
             converted.append(recorded_step(raw))
     counts = Counter(s['parameter'].casefold() for s in converted
-                     if 'parameter' in s and s['action'] not in CAPTURE_COMMANDS)
+                     if 'parameter' in s and s['action'] in VALUE_ACTIONS)
     used = set()
     for number, s in enumerate(converted, 1):
-        if 'parameter' in s and s['action'] not in CAPTURE_COMMANDS:
+        if 'parameter' in s and s['action'] in VALUE_ACTIONS:
             parameter = s['parameter']
             if counts[parameter.casefold()] > 1:
                 parameter += f' [{number}]'
@@ -1053,6 +1186,13 @@ def resolve_saved_intents(plan):
     _validate(plan)
     steps = []
     for step in plan['steps']:
+        # A single click could be the user's location hint for a read. Older
+        # recordings kept that explanation on an otherwise recognized button.
+        if step.get('instruction_draft') and (step.get('action') in ('open', *VALUE_ACTIONS)
+                or (step.get('reason') == 'popup_needs_live_binding' and step.get('window_context'))):
+            observation = _observed_intent(step, step['instruction_draft'])
+            if observation is not None:
+                step = instructed_step(step, observation)
         if step.get('action') == 'manual' and (is_recoverable(step) or is_double_click_step(step)):
             text = step.get('instruction_draft', '')
             is_user_text = bool(text and text != LEGACY_INSTRUCTION_HINT)
@@ -1093,12 +1233,42 @@ def has_groundable_draft(step):
                                                      or is_double_click_step(step))
 
 
+def _validate_observation(step):
+    from python_workflow import validate_selector
+    selector = step.get('selector')
+    verify = step['action'] == 'verify-value'
+    allowed = {'action', 'label', 'description', 'alias', 'window_context', 'selector'}
+    if not _text(step.get('label'), 200) or not isinstance(selector, dict):
+        raise TaskError('invalid_observation_target')
+    column = 'result_column' in step
+    if not (verify and column and selector == {'role': 'table'}):
+        validate_selector(selector)
+    if verify:
+        allowed.update(('parameter', 'value', 'result_column'))
+        if (('parameter' in step) == ('value' in step)
+                or (column and (not _text(step['result_column'], 200) or selector.get('role') not in ('table', 'list', 'group')))
+                or (not column and selector.get('role') not in ('textfield', 'combobox', 'statictext', 'listitem', 'row'))
+                or ('value' in step and not valid_value(step['value'], 'textfield'))
+                or ('parameter' in step and (not _text(step['parameter'], 200) or '=' in step['parameter']))):
+            raise TaskError('invalid_result_verification')
+    elif step['action'] == 'close-popup':
+        if selector.get('role') != 'button':
+            raise TaskError('invalid_popup_close')
+    elif selector.get('role') not in ('textfield', 'combobox', 'statictext', 'listitem', 'row'):
+        raise TaskError('invalid_observation_target')
+    if set(step) - allowed:
+        raise TaskError('unexpected_task_step_data')
+
+
 def _validate_step(s, parameters):
     if not isinstance(s, dict) or not isinstance(s.get('action'), str):
         raise TaskError('invalid_task_step')
     annotation = _annotations(s)
     if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
         raise TaskError('invalid_step_annotation')
+    if s['action'] in (*OBSERVE_ACTIONS, 'close-popup'):
+        _validate_observation(s)
+        return
     if s['action'] in CAPTURE_COMMANDS:
         _validate_capture_command(s)
         return
@@ -1481,6 +1651,8 @@ def replay(plan, exe, window, overrides, invoke, *, only=None):
     results = []
     report = {'status': 'verified', 'steps': results, 'input_dispatched': False}
     for number, s in sequence:
+        if s['action'] in (*OBSERVE_ACTIONS, 'close-popup'):
+            return dict(report, status='needs_review', stopped_at=number, diagnostic='execution_plan_required')
         if has_groundable_draft(s):
             unresolved = [grounding_request(i, step) for i, step in sequence if has_groundable_draft(step)]
             return dict(report, status='needs_review', stopped_at=number, diagnostic='instruction_requires_structure',

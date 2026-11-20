@@ -37,6 +37,12 @@ import workflow_repair
 
 CHILD_VISUAL_TIMEOUT = 30
 RESULT_VISUAL_TIMEOUT = 5
+RESULT_SURFACES = {'table', 'list', 'group'}
+OBSERVABLE_FIELDS = {'textfield', 'combobox', 'statictext', 'row', 'listitem'}
+RESULT_INSPECTION_ERRORS = {
+    'result_table_missing', 'result_table_ambiguous', 'result_cell_missing', 'result_cell_ambiguous',
+    'result_column_unavailable', 'result_column_ambiguous', 'target_missing', 'target_ambiguous',
+}
 
 
 class WorkflowError(ValueError):
@@ -114,11 +120,18 @@ def validate(recipe):
     steps = recipe.get('steps')
     need(isinstance(steps, list) and 0 < len(steps) <= 100, 'invalid_workflow_steps')
     window_context.validate_sequence(steps)
-    for raw in steps:
+    for index, raw in enumerate(steps):
         step = raw
         if isinstance(raw, dict) and 'window_context' in raw:
             step = {key: value for key, value in raw.items() if key != 'window_context'}
         need(isinstance(step, dict), 'invalid_workflow_step')
+        if step.get('action') == 'double-click-result':
+            previous = steps[index - 1] if index else {}
+            need(set(step) <= {'action', 'label'} and text(step.get('label', 'step'), 200)
+                 and previous.get('action') == 'verify-value' and 'result_column' in previous
+                 and raw.get('window_context') == previous.get('window_context') and 'popup' not in previous,
+                 'verified_result_required')
+            continue
         if step.get('action') == 'conditional-open':
             conditional_action.validate_conditional(step)
             continue
@@ -169,8 +182,12 @@ def validate(recipe):
             need(type(timeout) in (int, float) and 0 <= timeout <= 120, 'invalid_file_timeout')
             continue
         need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label', 'popup',
-                              'grounding_text', 'allow_option_select'}, 'unknown_step_field')
-        need(step.get('action') in ('set-value', 'invoke', 'submit', 'choose-item'), 'unsupported_workflow_action')
+                              'grounding_text', 'allow_option_select', 'verify_closed', 'result_column'}, 'unknown_step_field')
+        observation = step.get('action') in input_policy.VALUE_OBSERVATIONS
+        need(observation or step.get('action') in ('set-value', 'invoke', 'submit', 'choose-item'), 'unsupported_workflow_action')
+        if 'verify_closed' in step:
+            need(step['verify_closed'] is True and step['action'] == 'invoke'
+                 and ('popup' in step or 'window_context' in raw), 'invalid_close_verification')
         if 'popup' in step:
             popup = step['popup']
             need(isinstance(popup, dict) and not set(popup) - {'title', 'timeout'}
@@ -179,7 +196,14 @@ def validate(recipe):
             timeout = popup.get('timeout', 3)
             need(type(timeout) in (int, float) and 0 <= timeout <= 10, 'invalid_popup_timeout')
         selector = step.get('selector')
-        validate_selector(selector)
+        if 'result_column' in step:
+            need(step['action'] == 'verify-value' and text(step['result_column'], 200)
+                 and isinstance(selector, dict) and selector.get('role') in RESULT_SURFACES, 'invalid_result_column')
+        if not ('result_column' in step and selector == {'role': 'table'}):
+            validate_selector(selector)
+        if observation:
+            need('anchor' not in selector, 'named_observation_target_required')
+            need('result_column' in step or selector['role'] in OBSERVABLE_FIELDS, 'invalid_observation_role')
         if 'allow_option_select' in step:
             need(step['action'] == 'set-value' and selector['role'] == 'combobox' and
                  step['allow_option_select'] is True, 'invalid_combo_selection')
@@ -189,14 +213,18 @@ def validate(recipe):
         need(text(step.get('label', 'step'), 200), 'invalid_step_label')
         need('command_name' not in step or (step['action'] == 'invoke' and text(step['command_name'])),
              'invalid_command_name')
-        need('field_label' not in step or (step['action'] == 'set-value' and text(step['field_label'], 200)),
+        need('field_label' not in step or ((observation or step['action'] == 'set-value') and text(step['field_label'], 200)),
              'invalid_field_label')
-        if step['action'] == 'set-value':
-            need(selector['role'] in ('combobox', 'textfield'), 'value_field_required')
+        if step['action'] == 'read-value':
+            need('value' not in step and 'parameter' not in step, 'invalid_read_value')
+        elif step['action'] in ('set-value', 'verify-value'):
+            role = selector['role'] if not observation else 'textfield'
+            need(role in ('combobox', 'textfield'), 'value_field_required')
             need(('value' in step) != ('parameter' in step), 'fixed_value_or_parameter_required')
             if 'value' in step:
-                need(app.tasks.valid_value(step['value'], selector['role']),
+                need(app.tasks.valid_value(step['value'], role),
                      'invalid_text_value' if selector['role'] == 'textfield' else 'invalid_combo_value')
+                need('result_column' not in step or bool(step['value'].strip()), 'result_value_required')
             else:
                 need(text(step['parameter'], 100) and step['parameter'] == step['parameter'].strip()
                      and '=' not in step['parameter'], 'invalid_parameter')
@@ -230,11 +258,15 @@ def selected_steps(recipe, only):
     else:
         selected = [(n, s) for n, s in entries if key and key in (s.get('alias'), s.get('label'))]
     need(len(selected) == 1, 'workflow_step_ambiguous' if selected else 'workflow_step_not_found')
+    if selected[0][1]['action'] == 'double-click-result':
+        number = selected[0][0]
+        return entries[number - 2:number]
     return selected
 
 
 def worker_timeout(recipe):
     return 90 + sum(step.get('seconds', 0) + step.get('popup', {}).get('timeout', 3 if 'popup' in step else 0)
+                    + (RESULT_VISUAL_TIMEOUT if step['action'] == 'verify-value' else 0) + (3 if step.get('verify_closed') else 0)
                     + (step.get('timeout', 26) if step['action'] == 'verify-file' else 0)
                     + (3 * len(step['spec']['path']) + 3 if step['action'] == 'context-menu' else 0)
                     + (60 + 3 * len(step['context']['menu']['path']) if step['action'] == 'result-menu' else 0)
@@ -256,7 +288,9 @@ def values_for(recipe, overrides):
     for step in recipe['steps']:
         key = step.get('parameter', '').casefold()
         if key in values:
-            need(app.tasks.valid_value(values[key], step['selector']['role']), 'invalid_override')
+            role = 'textfield' if step['action'] == 'verify-value' else step['selector']['role']
+            need(app.tasks.valid_value(values[key], role), 'invalid_override')
+            need('result_column' not in step or bool(values[key].strip()), 'result_value_required')
     return values, [name for key, name in parameters.items() if key not in values]
 
 
@@ -300,6 +334,109 @@ def wait(binding, title, seconds):
 
 def combine(previous, current):
     return None if previous is None or current is None else bool(previous or current)
+
+
+def result_surface(binding, uia, selector):
+    root = uia.from_handle(binding.hwnd)
+    if selector != {'role': 'table'}:
+        return resolve_step(binding, uia, root, selector)[0]
+    candidates = lookup.find_all(uia, root, roles=('table', 'list'))
+    kept = None
+    try:
+        visible = [item for item in candidates if live._visible(uia, item, binding, root)]
+        need(len(visible) == 1, 'result_table_ambiguous' if visible else 'result_table_missing')
+        kept = visible[0]
+        return kept
+    finally:
+        for item in candidates:
+            if item is not kept:
+                item.close()
+
+
+def observe_result(binding, uia, step, expected, guard, *, wait_seconds):
+    """Wait only for the explicitly requested result. Never submit the query again."""
+    import result_cell
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        guard()
+        try:
+            table = result_surface(binding, uia, step['selector'])
+            result_cell.find(binding, uia, table, expected, column=step['result_column'])
+            return dict(status='verified', input_dispatched=False, diagnostic='result_value_matched',
+                        value=expected, value_evidence=dict(status='observed', source='result_column'))
+        except (ValueError, app.bridge.BridgeError) as error:
+            if getattr(error, 'code', None) not in {'target_missing', 'result_cell_missing',
+                                                      'result_table_missing', 'result_column_unavailable'}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(.2, remaining))
+
+
+def observe_field(binding, uia, element, role, action, expected=None):
+    if role == 'textfield':
+        observed = live.text_readback(binding, uia, element)
+    elif role == 'combobox':
+        observed = live.combo_readback(binding, uia, element)
+    else:
+        root = uia.from_handle(binding.hwnd)
+        lookup.ancestry(uia, element, root, pid=binding.pid)
+        need(app.bridge.ROLES.get(element.property(30003)) == role, 'target_changed')
+        pattern = element.property(30043) is True
+        value = element.property(30045) if pattern else element.property(30005)
+        need(pattern or (isinstance(value, str) and bool(value)), 'value_observation_unavailable')
+        binding.check()
+        observed = dict(value=value, value_evidence=dict(status='observed', source='value_pattern' if pattern else 'name'))
+    evidence = observed['value_evidence']
+    need(isinstance(observed['value'], str) and evidence.get('status') == 'observed', 'value_observation_unavailable')
+    need(len(observed['value']) <= 10000 and len(observed['value'].encode('utf8')) <= 10000, 'observed_value_too_large')
+    matched = action == 'read-value' or expected == observed['value']
+    if action == 'read-value':
+        return dict(**observed, status='observed', diagnostic='value_observed', input_dispatched=False)
+    return dict(**observed, status='verified' if matched else 'mismatch',
+                diagnostic='current_state_matched' if matched else 'current_state_mismatch', input_dispatched=False)
+
+
+def lookup_observation(binding, uia, step, expected, guard, *, read_only, wait_seconds):
+    deadline = time.monotonic() + wait_seconds
+    selector = step['selector']
+    while True:
+        guard()
+        try:
+            root = uia.from_handle(binding.hwnd)
+            element, stable, resolution = resolve_step(binding, uia, root, selector)
+            if step.get('field_label'):
+                app.tasks.check_display({'label': step['field_label']}, app.field_label(binding, uia, element, root))
+            receipt = observe_field(binding, uia, element, selector['role'],
+                                    'read-value' if read_only else step['action'], expected)
+            if resolution is not None and stable is not None:
+                receipt['resolved_selector'] = stable
+            if receipt['status'] != 'mismatch' or time.monotonic() >= deadline:
+                return receipt
+        except (ValueError, app.bridge.BridgeError) as error:
+            if getattr(error, 'code', None) not in {'target_missing', 'value_observation_unavailable'} or time.monotonic() >= deadline:
+                raise
+        time.sleep(min(.2, max(0, deadline - time.monotonic())))
+
+
+def confirm_closed(owner, title, surface, list_matching, uia, receipt):
+    """Observe the exact bound child after a delivered close, retaining dispatch evidence on failure."""
+    deadline = time.monotonic() + 3
+    try:
+        while True:
+            app.guard(owner, owner, title)
+            if not app.bridge.user32.IsWindowVisible(surface.hwnd) and not list_matching():
+                if check_window_readability(owner, uia)['status'] == 'observed':
+                    return dict(receipt, status='verified', diagnostic='recorded_window_closed',
+                                effect_verification='matched', verification_scope='window_closed')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(.1, remaining))
+    except (ValueError, OSError, app.bridge.BridgeError):
+        pass
+    return dict(receipt, diagnostic='window_close_unverified')
 
 
 def inspect_menu(binding, uia, step, preceding):
@@ -390,6 +527,7 @@ def confirm_opened_window(report, routes, number):
     receipt = routes.outcomes.get(number)
     if (receipt and (routes.steps[number-1]['action'],receipt.get('diagnostic')) in (
             ('invoke','business_result_not_verified'),('row-open','row_open_dispatched'),
+            ('double-click-result','visual_double_click_dispatched'),
             ('visual-click','visual_double_click_dispatched'),
             ('result-menu','menu_delivered_no_output_condition'))
             and receipt['status'] == 'delivered_unverified' and receipt['input_dispatched'] is True):
@@ -397,7 +535,7 @@ def confirm_opened_window(report, routes, number):
                        verification_scope='recorded_window_opened', business_commit='not_verified')
         receipt.pop('diagnostic')
         if report['status'] == 'completed_unverified' and all(
-                item['receipt']['status'] in ('verified','waited') for item in report['steps']):
+                item['receipt']['status'] in ('verified','observed','waited') for item in report['steps']):
             report['status'] = 'verified'
 
 
@@ -458,10 +596,45 @@ def _missing_groundings(recipe, entries, owner, uia, prepare=None):
     return missing
 
 
+def check_result_point(binding, uia, selector, point):
+    table = result_surface(binding, uia, selector)
+    root = uia.from_handle(binding.hwnd)
+    need(live._visible(uia, table, binding, root), 'result_point_outside_table')
+    box = uia.bounds(table)
+    x, y = point
+    need(box['x'] <= x < box['x'] + box['width'] and box['y'] <= y < box['y'] + box['height'],
+         'result_point_outside_table')
+    # Owner-drawn cells may expose only their group, image or pane. A sibling grid,
+    # header, button overlay or editable field must never become a result-row click.
+    chain = lookup.ancestry(uia, uia.from_point(x, y), table, pid=binding.pid)
+    data_roles = {50006, 50007, 50008, 50020, 50025, 50026, 50028, 50029, 50033, 50036}
+    need(all(item.property(30003) in data_roles and item.property(30149) is not True
+             and (item.property(30043) is not True or item.property(30046) is True) for item in chain),
+         'result_point_not_data')
+
+
+def check_result_frame(binding, confirmation, point, guard):
+    """Authenticate the reviewed, masked window image directly before the pointer gesture."""
+    import grounding
+    scope = confirmation['receipt'].encode('ascii')
+    _, witnessed = grounding.read_frame(grounding._directory(), scope, confirmation['frame'])
+    rect, current = grounding._capture(app, binding, guard)
+    relative_point = [point[0] - rect[0], point[1] - rect[1]]
+    need(current == witnessed and relative_point == confirmation['point'], 'result_frame_changed')
+    with app.bridge.UIA() as uia:
+        check_result_point(binding, uia, confirmation['selector'], point)
+
+
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
         background_only=False, only=None, scene_session=None, resume=None, track_menu=False,
-        registered_session=None):
+        registered_session=None, result_confirmation=None):
     recipe = validate(recipe)
+    if result_confirmation is not None:
+        first = recipe['steps'][0]
+        need(not read_only and only is None and resume is None and registered_session is None and
+             first['action'] == 'visual-click' and app.tasks.is_double_click_step(first) and
+             not first.get('window_context') and all(s['action'] != 'conditional-open' for s in recipe['steps']) and
+             hwnd == result_confirmation['owner']['hwnd'], 'invalid_result_resume')
     if registered_session is not None:
         # A conditional screen prompt returns control to the host while its worker
         # remains alive. Keep correction receipts and the single-use lock in that worker.
@@ -475,7 +648,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     if resume is not None:
         entries = [(n, s) for n, s in entries if n >= resume['number']]
     active = [step for _, step in entries]
-    mutates_window = not read_only and any(s['action'] not in ('wait', 'verify-file') for s in active)
+    mutates_window = not read_only and any(s['action'] not in input_policy._OBSERVATION_ACTIONS for s in active)
     requirements = input_policy.profile(active, [n for n, _ in entries])
     if background_only and not read_only:
         refusal = input_policy.blocked(requirements)
@@ -519,6 +692,11 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     stage_started = started
     try:
         owner = bind(recipe['exe'], recipe['window'], hwnd)
+        if result_confirmation:
+            identity = result_confirmation['owner']
+            need(workflow_repair.identity(owner) == [identity['hwnd'], identity['pid'], identity['process_started_utc_ticks']]
+                 and recipe['window'] == identity['title'] and recipe['exe'].casefold() == identity['exe_name'].casefold(),
+                 'result_window_changed')
         reserved_handles = {owner.hwnd}
         if not read_only:
             # A selected action can still produce a file checked by a later,
@@ -575,7 +753,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             if mutates_window:
                 first = active[0]
                 if ('window_context' not in first and 'popup' not in first
-                        and first['action'] not in ('wait', 'verify-file')):
+                        and first['action'] not in input_policy._OBSERVATION_ACTIONS):
                     prepare(owner, recipe['window'])
                 check = check_window_readability(owner, uia)
                 report['readability_check'] = check
@@ -633,9 +811,14 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 def check_target(surface, popup=None, *, mutate=False):
                     check_context()
                     check_surface(binding, surface, title, popup, mutate=mutate)
+                after_query = (step['action'] == 'verify-value' and number > 1 and
+                               app.tasks.is_query_button(recipe['steps'][number-2]) and
+                               recipe['steps'][number-2].get('window_context') == context)
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
-                if 'popup' not in step and step['action'] not in ('wait', 'verify-file'):
+                if 'popup' not in step and step['action'] in input_policy.VALUE_OBSERVATIONS:
+                    app.visibility.require_observable(binding)
+                elif 'popup' not in step and step['action'] not in ('wait', 'verify-file'):
                     prepare(binding, title)
                 if (not read_only and step['action'] == 'invoke' and not routes.origins.get(number)
                         and app.tasks.query_before_double_click(step, requested.get(number + 1))):
@@ -668,6 +851,44 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                        business_commit='not_verified')
                         if ok and getattr(baselines[number], 'verified_path', None):
                             receipt['verified_path'] = baselines[number].verified_path
+                elif 'result_column' in step or (read_only and after_query):
+                    popup = step.get('popup')
+                    if read_only:
+                        # Registration cannot inspect the result of a query it never sent.
+                        receipt = dict(status='deferred', input_dispatched=False, verification='pending_execution',
+                                       diagnostic='validate_result_on_execution')
+                    else:
+                        surface = popup_surface(binding, title, popup) if popup else binding
+                        reserve_surface(surface)
+                        expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
+                        try:
+                            receipt = observe_result(surface, uia, step, expected, lambda: check_target(surface, popup),
+                                                     wait_seconds=RESULT_VISUAL_TIMEOUT)
+                        except (ValueError, app.bridge.BridgeError) as error:
+                            diagnostic = getattr(error, 'code', None)
+                            if diagnostic not in RESULT_INSPECTION_ERRORS:
+                                raise
+                            check_target(surface, popup)
+                            identity = dict(hwnd=surface.hwnd, pid=surface.pid, exe_name=surface.exe,
+                                            title=popup['title'] if popup else title, process_started_utc_ticks=surface.created)
+                            receipt = dict(status='blocked', input_dispatched=False, diagnostic=diagnostic,
+                                           result_window=identity)
+                elif step['action'] == 'double-click-result':
+                    if read_only:
+                        receipt = dict(status='deferred', input_dispatched=False, verification='pending_execution',
+                                       diagnostic='validate_result_on_execution')
+                    else:
+                        import result_cell
+                        prior = recipe['steps'][number - 2]
+                        expected = (values[prior['parameter'].casefold()] if 'parameter' in prior else prior['value'])
+                        check_target(binding, mutate=True)
+                        table = result_surface(binding, uia, prior['selector'])
+                        def result_guard():
+                            check_target(binding, mutate=True)
+                            need(uia.same(result_surface(binding, uia, prior['selector']), table), 'result_table_changed')
+                        # execute() reports all attempted input as a receipt.
+                        # Its lookup/foreground guards can raise before input.
+                        receipt = result_cell.execute(binding, uia, table, expected, result_guard, column=prior['result_column'])
                 elif step['action'] == 'conditional-open':
                     if read_only:
                         receipt = dict(status='observed',input_dispatched=False,condition='pending_execution')
@@ -694,9 +915,13 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         first_match_timeout = CHILD_VISUAL_TIMEOUT if not read_only and opener.get('input_dispatched') is True else 0
                         if baseline == 'visual_target_not_found' and not first_match_timeout:
                             first_match_timeout = RESULT_VISUAL_TIMEOUT
+                        options = {}
+                        if result_confirmation and number == 1:
+                            options['before_input'] = lambda point: check_result_frame(
+                                binding, result_confirmation, point, click_guard)
                         receipt = visual_target.execute(binding, step['visual'], click_guard,
                                                         read_only=read_only, background_only=background_only,
-                                                        first_match_timeout=first_match_timeout)
+                                                        first_match_timeout=first_match_timeout, **options)
                     except app.bridge.BridgeError as error:
                         dispatching = getattr(error, 'input_dispatched', False) is not False
                         raise
@@ -750,15 +975,20 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                     elapsed_seconds=round(time.monotonic() - stage_started, 4)))
                         continue
                     reserve_surface(surface)
-                    check_target(surface, popup, mutate=not read_only)
+                    observation = step['action'] in input_policy.VALUE_OBSERVATIONS
+                    check_target(surface, popup, mutate=not read_only and not observation)
                     if read_only and popup:
                         app.visibility.require_observable(surface)
                     if background_only and not read_only:
                         input_policy.window_ready(surface)
-                    root = uia.from_handle(surface.hwnd)
                     selector = step['selector']
-                    anchor_proof = None
-                    if not read_only and 'anchor' in selector:
+                    if observation:
+                        expected = values.get(step.get('parameter','').casefold(), step.get('value'))
+                        receipt = lookup_observation(surface, uia, step, expected, lambda: check_target(surface, popup),
+                                                     read_only=read_only, wait_seconds=RESULT_VISUAL_TIMEOUT if after_query else 0)
+                    else:
+                        root = uia.from_handle(surface.hwnd)
+                    if not observation and not read_only and 'anchor' in selector:
                         # Point-based identity needs the actual target surface
                         # exposed. Ordinary UIA actions remain background-capable.
                         from row_action import foreground
@@ -768,17 +998,17 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         check_target(surface, popup, mutate=True)
                         anchor_proof = lookup.bind_anchored(surface, uia, selector, root=root)
                         element, stable, resolution = anchor_proof.element, None, None
-                    else:
+                    elif not observation:
                         element, stable, resolution = resolve_step(surface, uia, root, selector)
                     if step.get('grounding_text'):
                         need('Click' in uia.actions(element), 'workflow_pattern_unavailable')
                     need('command_name' not in step or element.property(30005) == step['command_name'],
                          'command_name_changed')
-                    if step.get('field_label'):
+                    if not observation and step.get('field_label'):
                         app.tasks.check_display({'label': step['field_label']},
                                                 app.field_label(surface, uia, element, root))
                     lookup_elapsed = round(time.monotonic() - lookup_started, 4)
-                    if read_only:
+                    if not observation and read_only:
                         receipt = dict(status='observed', input_dispatched=False, actions=uia.actions(element))
                         if resolution is not None:
                             receipt['target_resolution'] = resolution
@@ -792,7 +1022,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             receipt['submit_validation'] = 'editable_field_observed'
                         else:
                             receipt['command_name'] = element.property(30005) or ''
-                    else:
+                    elif not observation:
                         def check():
                             check_target(surface, popup, mutate=True)
                             if background_only:
@@ -824,6 +1054,17 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                 anchor_proof = None
                             anchor_input.close()
                         dispatching = False
+                        if (step.get('verify_closed') and receipt['status'] == 'delivered_unverified'
+                                and receipt.get('input_dispatched') is True):
+                            if popup:
+                                def matches():
+                                    return [r for r in app.owned_popups(binding) if r['title'] == popup['title']
+                                            and app.bridge.user32.IsWindowVisible(r['hwnd'])]
+                                receipt = confirm_closed(binding, title, surface, matches, uia, receipt)
+                            else:
+                                def matches():
+                                    return [r for r in app.windows(context['exe']) if r['title'] == title]
+                                receipt = confirm_closed(owner, recipe['window'], surface, matches, uia, receipt)
                         if resolution is not None:
                             receipt['target_resolution'] = resolution
                     receipt['lookup_seconds'] = lookup_elapsed
@@ -848,7 +1089,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     return _grounding_report(report, [_grounding_step(recipe, number, step, receipt['diagnostic'])])
                 row_opened = (step['action']=='row-open' and (receipt['status']=='verified' or
                               (receipt.get('diagnostic')=='row_open_dispatched' and receipt['input_dispatched'] is True)))
-                double_sent = (app.tasks.is_double_click_step(step) and receipt['status']=='delivered_unverified'
+                double_sent = ((app.tasks.is_double_click_step(step) or step['action'] == 'double-click-result') and receipt['status']=='delivered_unverified'
                                and receipt.get('diagnostic')=='visual_double_click_dispatched'
                                and receipt['input_dispatched'] is True)
                 if not read_only and (row_opened or double_sent) and routes.origins.get(number):
@@ -877,7 +1118,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     report.update(status='blocked' if receipt['status'] == 'verified' else receipt['status'],
                                   stopped_at=number, diagnostic=receipt.get('diagnostic', 'step_not_verified'))
                     break
-                if read_only or (step['action'] not in ('context-menu', 'submit') and receipt['status'] in ('verified', 'waited')):
+                if read_only or (step['action'] == 'read-value' and receipt['status'] == 'observed'
+                                 or step['action'] not in ('context-menu', 'submit') and receipt['status'] in ('verified', 'waited')):
                     continue
                 delivered = (step['action'] == 'invoke' and receipt['status'] == 'delivered_unverified'
                              and receipt['input_dispatched'] is True
@@ -896,7 +1138,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 delivered_conditional = (step['action'] == 'conditional-open' and receipt['status'] == 'delivered_unverified'
                                          and receipt.get('diagnostic') == 'conditional_open_dispatched'
                                          and receipt['input_dispatched'] is True)
-                if delivered or delivered_menu or delivered_submit or delivered_visual or delivered_conditional:
+                if delivered or delivered_menu or delivered_submit or delivered_visual or delivered_conditional or double_sent:
                     report['status'] = 'completed_unverified'
                     if delivered and routes.origins.get(number):
                         pending_opener = number
@@ -1122,22 +1364,26 @@ def refresh_guide(destination):
     return dict(status='guide_updated', path=str(path), input_dispatched=False)
 
 
-def _recorded_targets(recipe, source_task):
+def _recorded_targets(recipe, source_task, *, first_trial=False):
     has_conditional = any(s['action']=='conditional-open' for s in recipe['steps'])
-    if source_task is None or not all(
+    if source_task is None:
+        return False
+    deferred = first_trial and any(s['action'] in input_policy.VALUE_OBSERVATIONS for s in recipe['steps'])
+    if not deferred and not all(
             step['action'] in ('visual-click', 'row-action', 'conditional-open') or
             (step['action']=='row-open' and 'row_target' in step)
             or (step['action'] == 'row-launch' and ('row_hint' in step or has_conditional))
             for step in recipe['steps']):
         return False
     import recorded_plan
-    compiled = (recorded_plan.compile_saved(source_task, app.task_directory())
-                if has_conditional or any(s['action']=='row-open' for s in recipe['steps']) else recorded_plan.compile_plan(source_task))
+    compiled = (recorded_plan.compile_saved(source_task, app.task_directory()) if
+                deferred or has_conditional or any(s['action']=='row-open' for s in recipe['steps'])
+                else recorded_plan.compile_plan(source_task))
     need(compiled.get('envelope', {}).get('recipe') == recipe, 'recorded_workflow_mismatch')
     return True
 
 
-def register(recipe, destination, hwnd=None, *, source_task=None):
+def register(recipe, destination, hwnd=None, *, source_task=None, first_trial=False):
     """Register demonstrated targets offline, or resolve other selectors read-only."""
     recipe = deepcopy(validate(recipe))
     if source_task is not None:
@@ -1145,21 +1391,29 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
     destination = Path(destination).resolve()
     need(not destination.exists(), 'workflow_destination_exists')
     need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', destination.name), 'workflow_folder_name_required')
-    recorded = _recorded_targets(recipe, source_task)
+    recorded = _recorded_targets(recipe, source_task, first_trial=first_trial)
     observed = dict(status='observed', steps=[]) if recorded else run(recipe, read_only=True, hwnd=hwnd)
     if observed['status'] != 'observed':
         return observed
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     rows = {row['number']: row for row in observed['steps']}
     for number, step in enumerate(recipe['steps'], 1):
-        if step['action'] in ('wait', 'context-menu', 'result-menu', 'verify-file', 'row-action', 'row-launch','row-open', 'visual-click','conditional-open'):
+        if recorded:
+            # The exact compiled source already supplies the selector. One
+            # fresh lookup in the real run will validate its current location.
+            if step['action'] == 'set-value' and step['selector']['role'] == 'combobox':
+                step['allow_option_select'] = True
+            continue
+        if step['action'] in ('wait', 'context-menu', 'result-menu', 'verify-file', 'row-action', 'row-launch','row-open',
+                              'visual-click', 'conditional-open', 'double-click-result') or 'result_column' in step:
             continue
         row = rows[number]
         if row['receipt']['status'] == 'deferred':
-            need('popup' in step or 'window_context' in step, 'invalid_deferred_scope')
+            need('popup' in step or 'window_context' in step or step['action'] == 'verify-value'
+                 and row['receipt'].get('diagnostic') == 'validate_result_on_execution', 'invalid_deferred_scope')
             continue
         capabilities = {'set-value': {'SetValue'}, 'invoke': {'Click'}, 'submit': {'SetFocus'},
-                        'choose-item': {'Select'}}[step['action']]
+                        'choose-item': {'Select'}}.get(step['action'])
         if (step['action'] == 'set-value' and step['selector']['role'] == 'combobox'
                 and (source_task is not None or step.get('allow_option_select'))):
             # A list-only combo exposes Expand on the field and Select on a
@@ -1167,7 +1421,8 @@ def register(recipe, destination, hwnd=None, *, source_task=None):
             capabilities.add('Expand')
             if 'SetValue' not in row['receipt']['actions'] and 'Expand' in row['receipt']['actions']:
                 step['allow_option_select'] = True
-        need(not capabilities.isdisjoint(row['receipt']['actions']), 'workflow_pattern_unavailable')
+        if capabilities is not None:
+            need(not capabilities.isdisjoint(row['receipt']['actions']), 'workflow_pattern_unavailable')
         if row['receipt'].get('resolved_selector'):
             step['selector'] = row['receipt']['resolved_selector']
             step.pop('grounding_text', None)
@@ -1314,12 +1569,14 @@ def summarize_execution(report, entries):
     outputs = []
     for row, (_, step) in zip(rows, entries):
         receipt = row['receipt']
-        if receipt.get('status') not in ('verified', 'waited', 'delivered_unverified'):
+        if receipt.get('status') not in ('verified', 'waited', 'delivered_unverified', 'observed'):
             return report
         item = {k: row[k] for k in ('number', 'label', 'elapsed_seconds') if k in row}
         item.update(action=step['action'])
         item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items', 'menu_recovery',
                                              'verified_path') if k in receipt})
+        if step['action'] in input_policy.VALUE_OBSERVATIONS:
+            item.update({k: receipt[k] for k in ('value', 'value_evidence') if k in receipt})
         summary['steps'].append(item)
         if (receipt['status'] == 'verified' and receipt.get('diagnostic') == 'export_workbook_verified'
                 and (receipt.get('file_verified') is True or receipt.get('workbook_verified') is True)
@@ -1342,7 +1599,7 @@ def _cli_receipt(argv):
     return receipt
 
 
-def register_first_run(recipe, args):
+def register_first_run(recipe, args, source_task=None):
     """Register once, then enter the normal supervised runner at most once."""
     destination = args.out.resolve()
     if destination.exists():
@@ -1364,11 +1621,14 @@ def register_first_run(recipe, args):
                     approval_flag='--allow-physical', input_dispatched=False)
     if missing:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
-    register_args = ['register', '--out', str(destination)]
-    register_args += ['--task', args.task] if args.task else ['--recipe', str(args.recipe.resolve())]
-    if args.hwnd is not None:
-        register_args += ['--hwnd', str(args.hwnd)]
-    registration = _cli_receipt(register_args)
+    if source_task and any(s['action'] in input_policy.VALUE_OBSERVATIONS for s in recipe['steps']):
+        registration = register(recipe, destination, args.hwnd, source_task=source_task, first_trial=True)
+    else:
+        register_args = ['register', '--out', str(destination)]
+        register_args += ['--task', args.task] if args.task else ['--recipe', str(args.recipe.resolve())]
+        if args.hwnd is not None:
+            register_args += ['--hwnd', str(args.hwnd)]
+        registration = _cli_receipt(register_args)
     if registration['status'] != 'registered':
         return registration
     run_args = ['run', '--recipe', str(destination / 'workflow.json')]
@@ -1477,7 +1737,7 @@ def main(argv=None):
             else:
                 recipe = load(args.recipe)
         if args.command == 'register' and args.run:
-            result = register_first_run(recipe, args)
+            result = register_first_run(recipe, args, source_task)
             print(json.dumps(result, ensure_ascii=False))
             return (0 if result['status'] in ('registered', 'observed', 'verified')
                     or (args.summary and result.get('outcome') == 'workbook_verified') else

@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 11
+COMPILER = 12
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 DEFAULT_QUERY_SETTLE_SECONDS = 5
 
@@ -43,6 +43,31 @@ def _query_before_result_menu(button, following):
     return caption.strip().casefold() in {'조회', '검색', 'search', 'query', 'find', 'refresh', '새로고침'}
 
 
+def _expected_binding(step, earlier):
+    """A column check uses the input's declared variable or constant, not the captured cell's old text."""
+    if 'value' in step:
+        return {'value': step['value']}
+    requested = step['parameter']
+    if '{' + requested + '}' in step.get('description', ''):
+        return {'parameter': requested}
+    key = ''.join(requested.split()).casefold()
+    bindings = []
+    for prior in earlier:
+        if prior['action'] not in (*tasks.VALUE_ACTIONS, 'field-input') or prior.get('window_context') != step.get('window_context'):
+            continue
+        directive = prior.get('instruction', {}) or prior
+        names = (prior.get('label'), prior.get('target'), prior.get('alias'), directive.get('parameter'))
+        if any(isinstance(name, str) and ''.join(name.split()).casefold() == key for name in names):
+            for field in ('parameter', 'value'):
+                if field in directive:
+                    bindings.append((field, directive[field]))
+                    break
+    if len(set(bindings)) != 1:
+        return None
+    field, value = bindings[0]
+    return {field: value}
+
+
 def compile_plan(task, *, replacements=None):
     """Return a complete compatible recipe or no recipe at all.
 
@@ -67,6 +92,13 @@ def compile_plan(task, *, replacements=None):
             steps[number - 1] = step
     if len(steps) > 100:
         return _result('not_compatible', diagnostic='execution_plan_step_limit')
+    for i in range(1, len(steps)):
+        if tasks.same_result_double(steps[i], steps[i - 1]):
+            source = steps[i]
+            steps[i] = dict(action='double-click-result', label=source.get('instruction_draft') or
+                            source.get('description') or source['label'])
+            if 'window_context' in source:
+                steps[i]['window_context'] = source['window_context']
     # Establish whole-task compatibility before deriving any executable steps.
     for number, step in enumerate(steps, 1):
         reason = None
@@ -77,6 +109,7 @@ def compile_plan(task, *, replacements=None):
         elif step['action'] == 'manual' and step.get('instruction_draft'):
             reason = step['reason']
         elif step['action'] in ('row-action', 'row-launch', 'row-open', 'visual-click', 'conditional-open', 'result-menu',
+                                'double-click-result', 'close-popup', *tasks.OBSERVE_ACTIONS,
                                 *tasks.CAPTURE_COMMANDS):
             continue
         elif step.get('action') not in (*tasks.VALUE_ACTIONS, 'open'):
@@ -96,6 +129,23 @@ def compile_plan(task, *, replacements=None):
         context = deepcopy(step.get('window_context'))
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
+        if step['action'] in (*tasks.OBSERVE_ACTIONS, 'close-popup', 'double-click-result'):
+            current = {k: deepcopy(step[k]) for k in ('action', 'label', 'selector', 'result_column') if k in step}
+            if context is not None:
+                current['window_context'] = context
+            if step['action'] == 'verify-value':
+                binding = _expected_binding(step, steps[:number - 1])
+                if not binding:
+                    return _result('not_compatible', diagnostic='expected_input_required', step=number,
+                                   field=step['label'])
+                current.update(binding)
+            elif step['action'] == 'close-popup':
+                if not context:
+                    return _result('not_compatible', diagnostic='popup_scope_required', step=number)
+                current.update(action='invoke', verify_closed=True)
+            converted.append(current)
+            source_steps.append(number)
+            continue
         if step['action'] in tasks.CAPTURE_COMMANDS:
             current = dict(action='set-value' if step['action'] == 'field-input' else step['action'],
                            selector=deepcopy(step['selector']), label=step['label'])
@@ -149,6 +199,9 @@ def compile_plan(task, *, replacements=None):
                 # The runner compares the result target before and after the query.
                 notes.append(dict(step=number, diagnostic='wait_for_double_click_target',
                                   business_result='not_verified'))
+            elif (next_step['action'] == 'verify-value' and current_scope == next_scope
+                  and tasks.is_query_button(step)):
+                pass  # The next read waits for the requested current result value.
             elif not independent and not dialog_sequence:
                 return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])
