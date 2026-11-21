@@ -94,6 +94,70 @@ def raw_row_step(label, spec):
     return {'id': uuid.uuid4().hex, 'action': 'row-action', 'label': label, 'row': spec}
 
 
+def _dialog_shell(win, title, *, width=780, height=720):
+    """Keep actions visible while long teaching forms scroll on small displays."""
+    import tkinter as tk
+    from tkinter import ttk
+    from recorder_theme import configure
+
+    theme = configure(win)
+    scale = win.winfo_fpixels('1i') / 96.0
+    px = lambda value: round(value * scale)
+    available_width = max(1, win.winfo_screenwidth() - px(48))
+    available_height = max(1, win.winfo_screenheight() - px(70))
+    dialog_width = min(px(width), available_width)
+    dialog_height = min(px(height), available_height)
+    win.geometry(f'{dialog_width}x{dialog_height}')
+    win.minsize(min(px(520), dialog_width), min(px(360), dialog_height))
+    win.maxsize(available_width, available_height)
+
+    shell = ttk.Frame(win, padding=px(20))
+    shell.pack(fill='both', expand=True)
+    shell.columnconfigure(0, weight=1)
+    shell.rowconfigure(1, weight=1)
+    header = ttk.Frame(shell)
+    header.grid(row=0, column=0, sticky='ew', pady=(0, px(14)))
+    ttk.Label(header, text='Desktop Select', style='Brand.TLabel').pack(anchor='w')
+    heading = ttk.Label(header, text=title, style='Title.TLabel', justify='left')
+    heading.pack(anchor='w', pady=(px(4), 0))
+    viewport = ttk.Frame(shell)
+    viewport.grid(row=1, column=0, sticky='nsew')
+    viewport.columnconfigure(0, weight=1)
+    viewport.rowconfigure(0, weight=1)
+    scroll = tk.Canvas(viewport, background=theme['bg'], highlightthickness=0,
+                       borderwidth=0, height=px(120))
+    scrollbar = ttk.Scrollbar(viewport, orient='vertical', command=scroll.yview)
+    scroll.configure(yscrollcommand=scrollbar.set)
+    scroll.grid(row=0, column=0, sticky='nsew')
+    scrollbar.grid(row=0, column=1, sticky='ns', padx=(px(8), 0))
+    body = ttk.Frame(scroll)
+    content = scroll.create_window(0, 0, anchor='nw', window=body)
+    footer = ttk.Frame(shell)
+    footer.grid(row=2, column=0, sticky='ew', pady=(px(14), 0))
+    wrapping = [(heading, px(40))]
+
+    def wrap(label, inset=0):
+        wrapping.append((label, px(inset)))
+        label.configure(wraplength=max(px(100), dialog_width - px(70) - px(inset)))
+        return label
+
+    def fit(event):
+        scroll.itemconfigure(content, width=event.width)
+        for label, inset in wrapping:
+            label.configure(wraplength=max(px(100), event.width - inset))
+
+    scroll.bind('<Configure>', fit)
+    body.bind('<Configure>', lambda event: scroll.configure(scrollregion=scroll.bbox('all')))
+
+    def wheel(event):
+        # Native editors retain their own wheel behavior.
+        if event.widget.winfo_class() not in ('Text', 'TCombobox'):
+            scroll.yview_scroll(-int(event.delta / 120), 'units')
+
+    win.bind('<MouseWheel>', wheel, add='+')
+    return theme, px, body, footer, header, wrap
+
+
 def teach_row_dialog(parent, binding, previous=None):
     """Return a reviewed step and its reusable example, or None."""
     import tkinter as tk
@@ -102,13 +166,17 @@ def teach_row_dialog(parent, binding, previous=None):
 
     win = tk.Toplevel(parent)
     win.title('같은 행의 버튼과 완료 상태')
-    frm = ttk.Frame(win, padding=12)
-    frm.pack(fill='both', expand=True)
+    theme, px, body, bar, header, wrap = _dialog_shell(win, '같은 행의 버튼과 완료 상태')
     message = tk.StringVar(win, '업무 창에 목록을 띄운 뒤 ‘행 가져오기’를 누르세요. 3초 동안 원하는 행 위에 마우스를 올려 두세요.')
-    ttk.Label(frm, textvariable=message, wraplength=690, justify='left').pack(anchor='w', pady=(0, 8))
-    group = ttk.Frame(frm)
+    wrap(ttk.Label(header, textvariable=message, style='Muted.TLabel', justify='left')).pack(
+        anchor='w', pady=(px(8), 0))
+    frm = ttk.Frame(body, style='Card.TFrame', padding=px(16))
+    frm.pack(fill='x')
+    ttk.Label(frm, text='1. 행의 세 영역 선택', style='Card.Section.TLabel').pack(anchor='w', pady=(0, px(10)))
+    group = ttk.Frame(frm, style='Card.TFrame')
     group.pack(fill='both', expand=True)
-    canvas = tk.Canvas(group, width=660, height=85, bg='#303030', highlightthickness=0)
+    canvas = tk.Canvas(group, width=px(660), height=px(85), bg=theme['surface'],
+                       highlightbackground='#DCE1EC', highlightthickness=1)
     horizontal = ttk.Scrollbar(group, orient='horizontal', command=canvas.xview)
     vertical = ttk.Scrollbar(group, orient='vertical', command=canvas.yview)
     canvas.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
@@ -119,19 +187,33 @@ def teach_row_dialog(parent, binding, previous=None):
     group.rowconfigure(0, weight=1)
 
     choice = tk.IntVar(win, 0)
-    choices = ttk.Frame(frm)
-    choices.pack(fill='x', pady=6)
+    choices = ttk.Frame(frm, style='Card.TFrame')
+    choices.pack(fill='x', pady=(px(10), 0))
+    style = ttk.Style(win)
+    style.configure('Card.TRadiobutton', background=theme['surface'], foreground=theme['ink'],
+                    font='TkDefaultFont', padding=(0, px(3)))
+    style.map('Card.TRadiobutton', background=[('active', theme['surface'])])
     for i, title in enumerate(PARTS):
-        ttk.Radiobutton(choices, text=title, variable=choice, value=i).pack(side='left', padx=(0, 8))
+        ttk.Radiobutton(choices, text=title, variable=choice, value=i, style='Card.TRadiobutton').pack(
+            anchor='w', pady=px(1))
+
+    capture = ttk.Frame(body, style='Card.TFrame', padding=px(16))
+    capture.pack(fill='x', pady=(px(12), 0))
+    ttk.Label(capture, text='2. 실행 전후 상태 확인', style='Card.Section.TLabel').pack(anchor='w', pady=(0, px(10)))
+    capture_bar = ttk.Frame(capture, style='Card.TFrame')
+    capture_bar.pack(fill='x')
+    capture_bar.columnconfigure(0, weight=1)
+    capture_bar.columnconfigure(1, weight=1)
+    evidence = ttk.Frame(capture, style='Card.TFrame')
+    evidence.pack(fill='x', pady=(px(10), 0))
 
     label = tk.StringVar(win)
-    ttk.Label(frm, text='이 행에서 실행할 동작').pack(anchor='w')
-    ttk.Entry(frm, textvariable=label, width=62).pack(anchor='w', fill='x')
-    ttk.Label(frm, text='예: 장비 1의 시작 버튼을 누르고 실행 중 표시 확인').pack(anchor='w')
-    evidence = ttk.Frame(frm)
-    evidence.pack(fill='x', pady=4)
-    bar = ttk.Frame(frm)
-    bar.pack(fill='x', pady=(8, 0))
+    details = ttk.Frame(body, style='Card.TFrame', padding=px(16))
+    details.pack(fill='x', pady=(px(12), 0))
+    ttk.Label(details, text='3. 이 행에서 실행할 동작', style='Card.Section.TLabel').pack(anchor='w', pady=(0, px(8)))
+    ttk.Entry(details, textvariable=label, width=40).pack(fill='x')
+    wrap(ttk.Label(details, text='예: 장비 1의 시작 버튼을 누르고 실행 중 표시 확인',
+                   style='Card.Muted.TLabel'), 32).pack(anchor='w', pady=(px(6), 0))
 
     preview = point = draft = spec = result = None
     boxes = [None, None, None]
@@ -219,8 +301,9 @@ def teach_row_dialog(parent, binding, previous=None):
         thumbnails.clear()
         canvas.delete('all')
         canvas.create_image(0, 0, anchor='nw', image=image)
-        canvas.configure(scrollregion=(0, 0, *rect[2:]), width=min(rect[2], max(450, win.winfo_screenwidth()-120)),
-                         height=min(rect[3], max(70, win.winfo_screenheight()//3)))
+        canvas.configure(scrollregion=(0, 0, *rect[2:]),
+                         width=min(rect[2], max(px(240), win.winfo_width() - px(110))),
+                         height=min(rect[3], px(180), max(px(70), win.winfo_screenheight()//3)))
         canvas.xview_moveto(0)
         canvas.yview_moveto(0)
         choice.set(0)
@@ -271,14 +354,20 @@ def teach_row_dialog(parent, binding, previous=None):
         for child in evidence.winfo_children():
             child.destroy()
         thumbnails.clear()
-        for title, key in (('실행 전', 'before'), ('기대하는 완료 상태', 'after')):
+        for column, (title, key) in enumerate((('실행 전', 'before'), ('기대하는 완료 상태', 'after'))):
             patch = row_vision.template_preview(observed_spec, key)
             thumb = tk.PhotoImage(master=win, data=patch, format='PPM')
+            limit = max(px(80), (win.winfo_width() - px(120)) // 2)
+            factor = max(1, (thumb.width() + limit - 1) // limit)
+            if factor > 1:
+                thumb = thumb.subsample(factor, factor)
             thumbnails.append(thumb)
-            ttk.Label(evidence, text=title, image=thumb, compound='top').pack(side='left', padx=8)
+            evidence.columnconfigure(column, weight=1)
+            ttk.Label(evidence, text=title, image=thumb, compound='top', style='Card.TLabel').grid(
+                row=0, column=column, sticky='n', padx=px(4))
         spec, ready = observed_spec, 'complete'
         decorate_status()
-        message.set('저장할 두 상태의 흑백 표시입니다. 의도한 변화가 맞으면 동작을 적고 ‘단계에 추가’를 누르세요.')
+        message.set('저장할 두 상태의 흑백 표시입니다. 의도한 변화가 맞으면 동작을 적고 ‘적용’을 누르세요.')
 
     def reuse_after():
         try:
@@ -301,17 +390,20 @@ def teach_row_dialog(parent, binding, previous=None):
     canvas.bind('<ButtonPress-1>', mark)
     canvas.bind('<B1-Motion>', trace_drag)
     canvas.bind('<ButtonRelease-1>', marked)
-    point_btn = ttk.Button(bar, text='행 가져오기 (3초)', command=lambda: sample_off_window(
+    point_btn = ttk.Button(frm, text='행 가져오기 (3초)', command=lambda: sample_off_window(
         'preview', lambda: (win.winfo_pointerxy(),), capture_row, 3000))
-    point_btn.pack(side='left')
-    before_btn = ttk.Button(bar, text='실행 전 상태 기록', command=lambda: sample_off_window(
+    point_btn.pack(fill='x', pady=(px(10), 0))
+    before_btn = ttk.Button(capture_bar, text='실행 전 상태 기록', command=lambda: sample_off_window(
         'before', lambda: (point, boxes, preview), capture_before, 650))
-    after_btn = ttk.Button(bar, text='완료 상태 가져오기 (3초)',
+    after_btn = ttk.Button(capture_bar, text='완료 상태 가져오기 (3초)',
                            command=lambda: sample_off_window('after', lambda: (draft,), show_outcome, 3000))
-    reuse_btn = ttk.Button(bar, text='이전 행의 완료 표시 사용', command=reuse_after)
-    use_btn = ttk.Button(bar, text='단계에 추가', command=accept)
-    for btn in (before_btn, after_btn, reuse_btn, use_btn, ttk.Button(bar, text='취소', command=close)):
-        btn.pack(side='left', padx=(4, 0))
+    reuse_btn = ttk.Button(capture_bar, text='이전 행의 완료 표시 사용', command=reuse_after)
+    before_btn.grid(row=0, column=0, sticky='ew', padx=(0, px(4)))
+    after_btn.grid(row=0, column=1, sticky='ew', padx=(px(4), 0))
+    reuse_btn.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(px(8), 0))
+    use_btn = ttk.Button(bar, text='적용', command=accept, style='Primary.TButton')
+    use_btn.pack(side='right')
+    ttk.Button(bar, text='취소', command=close, style='Quiet.TButton').pack(side='right', padx=(0, px(8)))
     decorate_status()
     parent.withdraw()
     win.protocol('WM_DELETE_WINDOW', close)

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/desktop-select/scripts'))
 import desktop_select  # Loads and checks the shared bridge without creating UIA.
 import recorder_targets as targets
+import recorder_theme
 
 
 def row(hwnd, title, exe='Example.exe', pid=7):
@@ -159,6 +160,12 @@ class PickerHarness:
     def __init__(self):
         self.root = Mock()
         self.root.winfo_viewable.return_value = False
+        self.root.winfo_fpixels.return_value = 96
+        self.root.winfo_screenwidth.return_value = 1280
+        self.root.winfo_screenheight.return_value = 800
+        self.font = Mock()
+        self.font.metrics.return_value = 20
+        self.font.measure.side_effect = lambda value: len(value) * 10
         self.root_callbacks, self.tree_callbacks, self.buttons = {}, {}, {}
         self.values, self.selected, self.variables = {}, (), []
         self.root.bind.side_effect = lambda event, fn, **kw: self.root_callbacks.update({event: fn})
@@ -193,7 +200,8 @@ class PickerHarness:
                                   TclError=self.TclError, ttk=self.ttk)
 
     def choose(self, hint, rows, ready=None):
-        with patch.dict(sys.modules, {'tkinter': self.tk, 'tkinter.ttk': self.ttk}):
+        with patch.dict(sys.modules, {'tkinter': self.tk, 'tkinter.ttk': self.ttk}), \
+                patch.object(recorder_theme, 'configure', return_value={'font': self.font}):
             return targets.choose_window(hint, rows, ready)
 
 
@@ -216,6 +224,8 @@ class RecorderPickerTests(unittest.TestCase):
             ui.selected = ('1',)
             ui.tree_callbacks['<<TreeviewSelect>>']()
             self.assertEqual(ui.buttons['이 창에서 녹화'].state, 'normal')
+            self.assertEqual(ui.variables[3].get(), rows[1]['title'])
+            self.assertIn('창 번호: 43', ui.variables[2].get())
             ui.buttons['이 창에서 녹화'].command()
 
         ui.root.mainloop.side_effect = interact

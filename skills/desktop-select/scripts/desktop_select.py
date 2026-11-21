@@ -738,7 +738,7 @@ def edit_recording(owner, storage, *, report_ready=False):
     except ImportError as error:
         raise SelectionError('recorder_tk_unavailable') from error
     from teach_capture import capture
-    focus = storage.previous.get('step_number') if storage.previous else None
+    focus = (storage.previous or storage.source or {}).get('step_number')
 
     def ready():
         # Escaped JSON also round-trips through Windows PowerShell's legacy output code page.
@@ -869,7 +869,7 @@ def recorder_request(path):
 
     fields = {
         'record': ({'command', 'task', 'exe'}, {'window': None, 'hwnd': None}),
-        'review': ({'command', 'task'}, {'edit': False}),
+        'review': ({'command', 'task'}, {'edit': False, 'restart': False}),
         'continue-recording': ({'command', 'task'}, {'from_step': None, 'supplement': None, 'save_as': None}),
     }
     if not isinstance(request, dict) or not isinstance(request.get('command'), str) or request['command'] not in fields:
@@ -878,7 +878,7 @@ def recorder_request(path):
     if not required <= request.keys() <= required.union(defaults):
         raise SelectionError('invalid_recorder_request')
     for key, value in request.items():
-        if key == 'edit':
+        if key in ('edit', 'restart'):
             if type(value) is not bool:
                 raise SelectionError('invalid_recorder_request')
         elif key in ('hwnd', 'from_step'):
@@ -886,6 +886,8 @@ def recorder_request(path):
                 raise SelectionError('invalid_recorder_request')
         elif not tasks._text(value):
             raise SelectionError('invalid_recorder_request')
+    if request.get('edit') and request.get('restart'):
+        raise SelectionError('invalid_recorder_request')
     return argparse.Namespace(**{**defaults, **request}, report_ready=True)
 
 
@@ -900,7 +902,11 @@ def run(args):
         import result_trial
         return result_trial.resume(sys.modules[__name__], args)
     if args.command == '_record_app':
-        return record_application(args.app, args.task)
+        result = record_application(args.app, args.task)
+        if result.get('status') == 'recorded' and getattr(args, 'session', None):
+            from recorder_launch import after_save
+            return after_save(sys.modules[__name__], args.session, result)
+        return result
     if args.command == 'recorder':
         if getattr(args, 'app', None) is not None or getattr(args, 'session', None) is not None:
             from recorder_launch import launch, status
@@ -919,21 +925,31 @@ def run(args):
     if args.command == 'review':
         directory = task_directory()
         doc = tasks.read_document(args.task, directory)
-        if doc.get('kind') != review_drafts.KIND:
+        draft = doc.get('kind') == review_drafts.KIND
+        edit, restart = getattr(args, 'edit', False), getattr(args, 'restart', False)
+        if draft:
+            review_drafts.validate(doc)
+        else:
             tasks._validate(doc)
-            if not getattr(args, 'edit', False):
+            if not edit and not restart:
                 return dict(status='observed', task=tasks.summary(doc), diagnostic='task_already_saved',
                             edit_args=['review', '--task', args.task, '--edit'],
+                            restart_args=['review', '--task', args.task, '--restart'],
                             continue_args=['continue-recording', '--task', args.task],
                             recover_args=['recover', '--task', args.task], input_dispatched=False)
-            from continue_recording import _new_name
-            name = _new_name(doc['name'], '수정본', directory)
-            storage = review_drafts.ReviewStorage(name, doc['exe'], doc['window'], directory, source=doc)
-        else:
-            review_drafts.validate(doc)
-            storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
         bridge.set_dpi_awareness()
-        result = edit_recording(None, storage, report_ready=getattr(args, 'report_ready', False))
+        owner = None
+        if edit or restart:
+            from continue_recording import _new_name
+            name = _new_name(doc['name'], '다시 녹화' if restart else '수정본', directory)
+            storage = review_drafts.ReviewStorage(name, doc['exe'], doc['window'], directory,
+                                                  source=None if restart else doc, new_only=True)
+            if restart:
+                owner = bridge.Binding(pick_window(windows(doc['exe']), doc['window'], None))
+                guard(owner, owner, doc['window'])
+        else:
+            storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
+        result = edit_recording(owner, storage, report_ready=getattr(args, 'report_ready', False))
         if result.get('status') == 'recorded' and (result.get('draft') or
                 result.get('execution_plan', {}).get('status') == 'not_compatible'):
             return attach_recovery(result, storage.name, prepare=True)
@@ -1204,7 +1220,9 @@ def parser():
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
     review = commands.add_parser('review', help='reopen a recording for review')
     review.add_argument('--task', required=True)
-    review.add_argument('--edit', action='store_true', help='edit a copy when the source is already saved')
+    revision = review.add_mutually_exclusive_group()
+    revision.add_argument('--edit', action='store_true', help='edit a copy of the saved recording or draft')
+    revision.add_argument('--restart', action='store_true', help='start a fresh copy in the same application window')
     repair = commands.add_parser('recover', help='inspect the live task windows or bind interpreted steps into a new task')
     repair.add_argument('--task', required=True)
     repair.add_argument('--only', type=int, help='observe one original step')

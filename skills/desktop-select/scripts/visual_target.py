@@ -15,7 +15,8 @@ import win_bridge as bridge
 
 
 SIDE = 41
-_CANVAS = {50000, 50006, 50020, 50025, 50026, 50032, 50033}
+NOTEPAD_FIND_NEXT = {'surface': 'notepad-find-next'}
+_CANVAS = {50000, 50006, 50020, 50021, 50025, 50026, 50032, 50033}
 _INPUT = {50003, 50004, 50008, 50009, 50010, 50011, 50028, 50029, 50036}
 _DATA = {50007, 50008, 50028, 50029, 50036}  # ListItem, List, DataGrid, DataItem, Table
 
@@ -59,6 +60,12 @@ def _texture(pixels):
 
 
 def validate_spec(spec):
+    if spec == NOTEPAD_FIND_NEXT:
+        return spec
+    if isinstance(spec,dict) and spec.get('surface')=='win32-toolbar-glyph':
+        from toolbar_button import decoded
+        decoded(spec)
+        return spec
     _require(_texture(_decoded(spec)), 'visual_target_lacks_detail')
     return spec
 
@@ -71,7 +78,33 @@ def _box(window, point):
             for i in range(2)] + [SIDE, SIDE]
 
 
-def _anchors(rgb):
+def _icon_model(rgb):
+    """Identify a solid glyph on a uniform background. Photos, borders and text blocks keep strict RGB matching."""
+    bg = tuple(rgb[:3])
+    # Require an empty rim so a crop touching an adjacent widget cannot claim a background change.
+    rim = (*range(SIDE), *range(SIDE*(SIDE-1), SIDE*SIDE), *range(0, SIDE*SIDE, SIDE),
+           *range(SIDE-1, SIDE*SIDE, SIDE))
+    if any(rgb[i*3:i*3+3] != rgb[:3] for i in rim):
+        return None
+    colors = list(zip(rgb[::3], rgb[1::3], rgb[2::3]))
+    if colors.count(bg) < len(colors)*.55:
+        return None
+    fg = max(colors, key=lambda p: max(abs(a-b) for a, b in zip(bg, p)))
+    ch = max(range(3), key=lambda i: abs(fg[i]-bg[i]))
+    span = fg[ch]-bg[ch]
+    if abs(span) < 72:
+        return None
+    # Alpha is the ink coverage of each antialiased pixel, independent of a hover fill.
+    alpha = [round(255*(p[ch]-bg[ch])/span) for p in colors]
+    if sum(a >= 192 for a in alpha) < 16:
+        return None
+    for p, a in zip(colors, alpha):
+        if not 0 <= a <= 255 or any(abs(p[i]-bg[i]-(fg[i]-bg[i])*a/255) > 6 for i in range(3)):
+            return None
+    return bg, bytes(alpha)
+
+
+def _anchors(rgb, icon=None):
     # A short pattern along the most distinctive scanline lets Python's C
     # regexp engine screen the whole window. Confirm candidates using all RGB pixels.
     best = None
@@ -92,14 +125,32 @@ def _anchors(rgb):
         if x-last > 1:
             pieces.append(b'.{%d}' % (x-last-1))
         value = row[x]
-        pieces.append(b'[\\x%02x-\\x%02x]' % (max(0, value-12), min(255, value+12)))
+        # Hover may tint the fill. Fully opaque ink remains a narrow search anchor.
+        margin = 12 if icon is None else 12 + 40*(255-icon[1][y*SIDE+x])//255
+        pieces.append(b'[\\x%02x-\\x%02x]' % (max(0, value-margin), min(255, value+margin)))
         last = x
     return channel, y, re.compile(b'(?=' + b''.join(pieces) + b')', re.DOTALL)
 
 
-def _distance(reference, actual):
+def _distance(reference, actual, icon=None):
     # Limit both overall drift and large pixel differences. A changed glyph
     # cannot win solely because its surrounding margins still match.
+    if reference == actual:
+        return 0
+    if icon is not None:
+        bg, alpha = icon
+        shift = [actual[i]-bg[i] for i in range(3)]
+        if max(map(abs, shift)) > 40:
+            return None
+        total = 0
+        for i, ink in enumerate(alpha):
+            # Only a uniform background tint is explained; a moved stroke or a different glyph is not.
+            for c in range(3):
+                diff = abs(actual[i*3+c] - reference[i*3+c] - round(shift[c]*(255-ink)/255))
+                if diff > 12:
+                    return None
+                total += diff
+        return total
     total = changed = 0
     for i in range(0, len(reference), 3):
         diff = max(abs(reference[i+c]-actual[i+c]) for c in range(3))
@@ -115,7 +166,8 @@ def _locate(window, pixels, spec):
     _require(_texture(rgb), 'visual_target_lacks_detail')
     x0, y0, width, height = window
     _require(width > 0 and height > 0 and len(pixels) == width*height*4, 'visual_frame_unavailable')
-    channel, row, pattern = _anchors(rgb)
+    icon = _icon_model(rgb)
+    channel, row, pattern = _anchors(rgb, icon)
     plane = pixels[2-channel::4]  # PrintWindow produces BGRA.
     best, first, candidates = None, None, 0
     for found in pattern.finditer(plane):
@@ -127,7 +179,7 @@ def _locate(window, pixels, spec):
         _require(candidates <= 1024, 'visual_target_too_common')
         box = [x0+x, y0+y, SIDE, SIDE]
         candidate = vision._rgb((window, (), pixels), box)
-        distance = 0 if rgb == candidate else _distance(rgb, candidate)
+        distance = _distance(rgb, candidate, icon)
         if distance is None:
             continue
         if first is None:
@@ -140,9 +192,9 @@ def _locate(window, pixels, spec):
     return box, [box[i]+spec['offset'][i] for i in range(2)]
 
 
-def from_frame(window, pixels, screen_point):
+def from_frame(window, pixels, screen_point, *, client=None):
     """Build a target from the exact full-resolution BGRA image viewed by the host."""
-    box = _box(window, screen_point)
+    box = _box(window if client is None else client, screen_point)
     rgb = vision._rgb((window, (), pixels), box)
     spec = dict(size=[SIDE,SIDE], offset=[screen_point[i]-box[i] for i in range(2)],
                 rgb=base64.b64encode(rgb).decode('ascii'))
@@ -199,16 +251,22 @@ def _enabled_canvas(binding, uia, painted, hit):
             and not any(receiver.property(k) is True for k in (30040,30043,30149)))
 
 
-def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface=None):
-    """Check control metadata only on branches intersecting the intended image."""
-    binding.check()
+def _client_rect(binding):
     client = bridge.RECT()
     origin = W.POINT()
     user = bridge.user32
     get_client = bridge._sig(user, 'GetClientRect', W.BOOL, W.HWND, C.POINTER(bridge.RECT))
     to_screen = bridge._sig(user, 'ClientToScreen', W.BOOL, W.HWND, C.POINTER(W.POINT))
-    _require(get_client(binding.hwnd, C.byref(client)) and to_screen(binding.hwnd, C.byref(origin))
-             and vision._inside(box, [origin.x, origin.y, client.right, client.bottom]), 'visual_target_outside_client')
+    _require(get_client(binding.hwnd, C.byref(client)) and to_screen(binding.hwnd, C.byref(origin)),
+             'visual_target_outside_client')
+    return [origin.x, origin.y, client.right, client.bottom]
+
+
+def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface=None, client=None):
+    """Check control metadata only on branches intersecting the intended image."""
+    binding.check()
+    _require(vision._inside(box, _client_rect(binding) if client is None else client), 'visual_target_outside_client')
+    user = bridge.user32
     root = uia.from_handle(binding.hwnd)
     _require(root is not None, 'visual_window_unavailable')
     affinity = W.DWORD()
@@ -222,7 +280,8 @@ def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface
                  'visual_point_not_exposed')
         element = uia.from_point(*point)
         _require(element is not None and safe_provider(binding, uia, element)
-                 and (element.property(30003) in _CANVAS or allow_data and element.property(30003) in _DATA)
+                 and (element.property(30003) in _CANVAS or _read_only_document(element)
+                      or allow_data and element.property(30003) in _DATA)
                  and uia.within(element, root)
                  and _enabled_canvas(binding,uia,element,hit), 'visual_hit_not_actionable')
         if bridge.hwnd_pid(hit) != binding.pid:
@@ -243,11 +302,12 @@ def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface
         elif element.property(30022) is True:
             continue
         role = element.property(30003)
+        doc = _read_only_document(element)
         data = allow_data and (role in _DATA or in_data and role == 50020)
         _require(safe_provider(binding,uia,element) and (role not in _INPUT or data)
-                 and (element.property(30040) is not True or data) and element.property(30149) is not True
+                 and (element.property(30040) is not True or data or doc) and element.property(30149) is not True
                  and (element.property(30043) is not True or role in (50026,50032,50033)
-                      or data and element.property(30046) is True),
+                      or doc or data and element.property(30046) is True),
                  'visual_target_protected_or_editable')
         if data and data_surface is not None:
             data_surface.add(role)
@@ -255,8 +315,20 @@ def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface
     return hit
 
 
+def _read_only_document(element):
+    # UIA's ValueIsReadOnly is meaningful only when the Value pattern is available.
+    return (element.property(30003) == 50030 and element.property(30043) is True
+            and element.property(30046) is True and element.property(30149) is not True)
+
+
 def observe(binding, spec):
     """Resolve from pixels belonging to this HWND without activating it."""
+    if spec == NOTEPAD_FIND_NEXT:
+        from notepad_find import locate
+        return locate(binding)
+    if isinstance(spec,dict) and spec.get('surface')=='win32-toolbar-glyph':
+        from toolbar_button import observe as observe_button
+        return observe_button(binding,spec)
     window = vision._window_rect(binding)
     validate_spec(spec)
     pixels = vision._frame(binding, window)
@@ -269,10 +341,11 @@ def observe(binding, spec):
 
 def teach(binding, screen_point):
     window = vision._window_rect(binding)
-    box = _box(window, screen_point)
+    client = _client_rect(binding)
+    box = _box(client, screen_point)
     with bridge.UIA() as uia:
-        _safe_patch(binding, uia, box, screen_point, exposed=False)
-    spec = from_frame(window, vision._frame(binding, window), screen_point)
+        _safe_patch(binding, uia, box, screen_point, exposed=False, client=client)
+    spec = from_frame(window, vision._frame(binding, window), screen_point, client=client)
     _require(observe(binding, spec)['point'] == list(screen_point), 'visual_target_changed')
     return spec
 
@@ -308,19 +381,37 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
             point, box = current['point'], current['box']
             _require(found['window'] == current['window'] and found['point'] == point,
                      'visual_target_changed_before_input')
-            with bridge.UIA() as uia:
-                shown = _safe_patch(binding, uia, box, point, exposed=True, gesture=spec.get('gesture'))
+            if spec != NOTEPAD_FIND_NEXT:
+                with bridge.UIA() as uia:
+                    shown = _safe_patch(binding, uia, box, point, exposed=True, gesture=spec.get('gesture'))
+                    if 'toolbar' in current:
+                        from toolbar_button import exposed
+                        _require(exposed(binding,uia,current),'visual_hit_not_actionable')
             if before_input is not None:
                 before_input(point)
             guard()
             bridge._combo_surface(binding)
-            raw = vision._frame(binding, current['window'], crop=box)
-            candidate = vision._rgb((box, (), raw), box)
-            _require(_distance(_decoded(spec), candidate) is not None, 'visual_target_changed_before_input')
-            hit = bridge.window_from_point(*point)
-            _require(hit == shown and _hit_belongs(binding, hit)
-                     and bridge.root_window(bridge.foreground()) == binding.hwnd
-                     and vision._window_rect(binding) == current['window'], 'visual_point_not_exposed')
+            if spec == NOTEPAD_FIND_NEXT:
+                from notepad_find import locate
+                exposed = locate(binding, exposed=True)
+                _require(all(exposed[key] == current[key] for key in ('point', 'window', 'overlay')),
+                         'visual_target_changed_before_input')
+            else:
+                raw = vision._frame(binding, current['window'], crop=box)
+                candidate = vision._rgb((box, (), raw), box)
+                if 'toolbar' in current:
+                    from toolbar_button import decoded, matches, exposed
+                    with bridge.UIA() as uia:
+                        _require(exposed(binding,uia,current) and matches(decoded(spec),candidate),
+                                 'visual_target_changed_before_input')
+                else:
+                    reference = _decoded(spec)
+                    _require(_distance(reference, candidate, _icon_model(reference)) is not None,
+                             'visual_target_changed_before_input')
+                hit = bridge.window_from_point(*point)
+                _require(hit == shown and _hit_belongs(binding, hit)
+                         and bridge.root_window(bridge.foreground()) == binding.hwnd
+                         and vision._window_rect(binding) == current['window'], 'visual_point_not_exposed')
             _require(row_action._input_tick() == tick, 'foreground_or_input_changed')
             try:
                 gesture = spec.get('gesture', 'click')
@@ -355,9 +446,18 @@ class HoverTracker(threading.Thread):
             return None
         point = tuple(bridge.cursor())
         window = vision._window_rect(binding)
-        box = _box(window, point)
+        hit = bridge.window_from_point(*point)
+        if hit and bridge.window_class(hit).casefold()=='toolbarwindow32':
+            from toolbar_button import native_toolbar, sample
+            if native_toolbar(binding,hit):
+                button = sample(binding,uia,window,point,hit)
+                if button is not None:
+                    return button
+        client = _client_rect(binding)
+        box = _box(client, point)
         data_surface = set()
-        hit = _safe_patch(binding, uia, box, point, exposed=True, gesture='double-click', data_surface=data_surface)
+        hit = _safe_patch(binding, uia, box, point, exposed=True, gesture='double-click', data_surface=data_surface,
+                          client=client)
         start = time.monotonic()
         pixels = vision._frame(binding, window, crop=box)
         rgb = vision._rgb((box, (), pixels), box)
@@ -377,16 +477,43 @@ class HoverTracker(threading.Thread):
         try:
             with bridge.UIA() as uia:
                 while not self.stopping.is_set():
+                    previous = None
                     try:
+                        active = bridge.root_window(bridge.foreground()) == self.binding.hwnd
+                        if not active:
+                            self.latest = None
+                            self.stopping.wait(.18)
+                            continue
+                        previous = tuple(bridge.cursor())
                         sample = self._sample(uia)
                     except (bridge.BridgeError, OSError, ValueError):
                         sample = None
                     self.latest = sample if sample and sample[0] > self.cutoff else None
-                    self.stopping.wait(.35 if sample else .18)
+                    self._wait_for_hover(previous, .35 if sample else .18)
         except (bridge.BridgeError, OSError):
             pass  # Semantic recording can still run on this window.
         finally:
             self.latest = None
+
+    def _wait_for_hover(self, previous, interval):
+        # A settled pointer at a new position should not wait for the old icon's
+        # refresh timer. Poll only the cursor here; do not paint or traverse UIA while moving.
+        if previous is None:
+            self.stopping.wait(interval)
+            return
+        deadline = time.monotonic() + interval
+        last = previous
+        while not self.stopping.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0 or self.stopping.wait(min(.03, left)):
+                return
+            try:
+                point = tuple(bridge.cursor())
+            except (bridge.BridgeError, OSError):
+                return
+            if point != previous and point == last:
+                return
+            last = point
 
     def pin_down(self, event):
         sample = self.latest
@@ -398,7 +525,7 @@ class HoverTracker(threading.Thread):
         x, y = event['x'], event['y']
         box, point = sample[3:5]
         if (max(abs(x-point[0]), abs(y-point[1])) <= 8 and
-                box[0] <= x < box[0]+SIDE and box[1] <= y < box[1]+SIDE):
+                box[0] <= x < box[0]+box[2] and box[1] <= y < box[1]+box[3]):
             self.pinned.append((event['token'], event['at'], sample[5], [x-box[0], y-box[1]]))
             return True
         return False
@@ -406,6 +533,8 @@ class HoverTracker(threading.Thread):
     def before(self, event):
         for token, when, spec, offset in reversed(tuple(self.pinned)):
             if token == event.get('token') and when == event.get('at'):
+                if spec.get('surface')=='win32-toolbar-glyph':
+                    return dict(spec)
                 return dict(spec, offset=offset)
         return None
 

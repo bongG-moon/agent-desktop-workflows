@@ -340,6 +340,28 @@ class LiveActionTests(unittest.TestCase):
         self.assertEqual((result['status'], result['input_dispatched']), ('uncertain', None))
         self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N')])
 
+    def test_verified_existing_selection_sends_no_setter(self):
+        self.combo.props.update({30045: '', 30037: True})
+        current = self.option(self.combo, 'N')
+        current.props[30079] = True
+        self.combo.selected_items = lambda: [current]
+        result = self.run_action(value='N')
+        self.assertEqual((result['diagnostic'], result['input_dispatched']), ('value_already_selected', False))
+        self.assertEqual(self.calls, [])
+
+    def test_synchronous_write_never_sleeps_and_delayed_write_waits_only_once(self):
+        self.after = lambda item, op, arg: item.props.update({30045: arg})
+        with patch.object(live, 'VALUE_SETTLE_SECONDS', .35), patch.object(live.time, 'sleep') as wait:
+            result = self.run_action(value='N')
+            self.assertEqual(result['status'], 'verified')
+            wait.assert_not_called()
+            self.after = lambda *args: None
+            wait.side_effect = lambda delay: self.combo.props.update({30045: 'P'})
+            result = self.run_action(value='P')
+            self.assertEqual(result['status'], 'verified')
+            wait.assert_called_once()
+        self.assertEqual(self.calls, [(self.combo, 'SetValue', 'N'), (self.combo, 'SetValue', 'P')])
+
     def test_readback_error_after_returned_write_keeps_delivered_without_retry(self):
         with patch.object(live, 'combo_readback', side_effect=OSError('reader failed')):
             result = self.run_action(value='N')

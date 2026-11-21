@@ -139,8 +139,46 @@ def _failure(error, token=None):
     return _receipt(result, token) if token else result
 
 
+def _publish_saved(folder, result, *, editing=False):
+    # Publish the durable result before the recorder child exits.
+    temporary = 'save-' + secrets.token_hex(8) + '.tmp'
+    try:
+        _write(folder, temporary, dict(receipt=result, editing=editing))
+        os.replace(_path(folder, temporary), _path(folder, 'saved.json'))
+    finally:
+        _path(folder, temporary).unlink(missing_ok=True)
+
+
+def after_save(app, token, result):
+    """Finish after publishing; later edits and retakes are explicit receipt commands."""
+    from recording_followup import followup
+
+    folder = _folder(token)
+    saved = followup(result)
+    try:
+        _publish_saved(folder, saved)
+    except OSError:
+        pass  # The task is already durable; the normal terminal receipt remains usable.
+    return saved
+
+
 def _observe(folder, token, *, initial=False, exited=False):
     request = _request(folder)
+    saved = _read(folder, 'saved.json', MAX_EVENT_BYTES, optional=True)
+    if saved:
+        checkpoint = json.loads(saved)
+        result = checkpoint.get('receipt') if isinstance(checkpoint, dict) else None
+        if (not isinstance(result, dict) or result.get('status') != 'recorded'
+                or not isinstance(result.get('task'), dict) or not isinstance(result['task'].get('name'), str)
+                or type(checkpoint.get('editing')) is not bool):
+            raise ValueError('recorder_session_file_invalid')
+        if checkpoint['editing']:
+            if _running(folder):
+                return _receipt(dict(status='recording', saved_task=result['task']['name'],
+                                     input_dispatched=False), token)
+            # A later task save can succeed even when its UI checkpoint fails.
+            result = next((e for e in reversed(_events(folder)) if e['status'] == 'recorded'), result)
+        return _receipt(result, token)
     events = _events(folder)
     terminal = [event for event in events if event['status'] not in LIVE_EVENTS]
     if terminal:
@@ -236,7 +274,8 @@ def _child(token):
         try:
             request = _request(folder)
             import desktop_select as app
-            code = app.worker(argparse.Namespace(command='_record_app', app=request['app'], task=request['task']))
+            code = app.worker(argparse.Namespace(command='_record_app', app=request['app'],
+                                                 task=request['task'], session=token))
             sys.stdout.flush()
         except BaseException as error:
             traceback.print_exc(file=sys.stderr)

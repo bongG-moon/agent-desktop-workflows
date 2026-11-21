@@ -41,6 +41,8 @@ def _property_condition(uia, property_id, value):
             string = win._sig(win.oleaut32, 'SysAllocString', C.c_void_p, C.c_wchar_p)(value)
             _need(bool(string), 'target_condition_allocation_failed')
             variant.vt, variant.pointer = 8, string
+        elif isinstance(value, bool):
+            variant.vt, variant.i4 = 11, -1 if value else 0
         else:
             variant.vt, variant.i4 = 3, value
         # UIAutomationClient.idl, IUIAutomation vtable slot 23.
@@ -102,7 +104,7 @@ def ancestry(uia, element, root, *, pid=None):
     raise win.BridgeError('target_ancestry_incomplete')
 
 
-def find_all(uia, root, *, automation_id=None, name=None, roles=(), limit=128):
+def find_all(uia, root, *, automation_id=None, name=None, roles=(), limit=128, grid_group=False, cell_text=None):
     """Native descendant search, retaining all usable matches to detect duplicates.
 
     The provider still searches its subtree internally. This removes Python's
@@ -113,9 +115,10 @@ def find_all(uia, root, *, automation_id=None, name=None, roles=(), limit=128):
     _need(type(limit) is int and 1 <= limit <= _MAX_CANDIDATES, 'invalid_target_limit')
     _need(automation_id is None or _text(automation_id), 'invalid_target_identifier')
     _need(name is None or _text(name), 'invalid_target_name')
-    _need(automation_id is None or name is None, 'invalid_target_selector')
+    _need(cell_text is None or _text(cell_text), 'invalid_target_value')
+    _need(sum(v is not None for v in (automation_id, name, cell_text)) <= 1, 'invalid_target_selector')
     role_numbers = _roles(roles)
-    _need(automation_id is not None or name is not None or bool(role_numbers), 'target_query_required')
+    _need(automation_id is not None or name is not None or cell_text is not None or bool(role_numbers), 'target_query_required')
     pid = uia.pid(root)
     _need(type(pid) is int and pid > 0, 'target_owner_mismatch')
     _need(not uia.secure(root), 'target_protected')
@@ -137,6 +140,29 @@ def find_all(uia, root, *, automation_id=None, name=None, roles=(), limit=128):
                 part = _join(uia, condition, part)
                 resources.append(part)
             condition = part
+        if cell_text is not None:
+            # A cell can expose its displayed data via Name, ValuePattern, or MSAA.
+            values = None
+            for property_id in (30005, 30045, 30093):
+                part = _property_condition(uia, property_id, cell_text)
+                resources.append(part)
+                if values is not None:
+                    part = _join(uia, values, part, either=True)
+                    resources.append(part)
+                values = part
+            if condition is not None:
+                values = _join(uia, condition, values)
+                resources.append(values)
+            condition = values
+        if grid_group:
+            grid = _property_condition(uia, 30030, True)
+            resources.append(grid)
+            table = _property_condition(uia, 30038, True)
+            resources.append(table)
+            pattern = _join(uia, grid, table, either=True)
+            resources.append(pattern)
+            condition = _join(uia, condition, pattern)
+            resources.append(condition)
         pointer = C.c_void_p()
         # IUIAutomationElement::FindAll: slot 6, TreeScope_Descendants.
         root.call(6, (C.c_int32, C.c_void_p, C.POINTER(C.c_void_p)),

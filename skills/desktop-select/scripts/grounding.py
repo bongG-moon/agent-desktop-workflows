@@ -56,7 +56,7 @@ def _pixels(data):
     return [0,0,width,height], bytes(bgra)
 
 
-def _protected(uia, binding, window):
+def _protected(uia, binding, window, group_boxes=None):
     root = uia.from_handle(binding.hwnd)
     if root is None:
         raise tasks.TaskError('grounding_window_unavailable')
@@ -67,6 +67,11 @@ def _protected(uia, binding, window):
         if count > 2500:
             raise tasks.TaskError('grounding_protection_unknown')
         if visual_target.safe_provider(binding,uia,node):
+            if group_boxes is not None and node.property(30003) == 50026:
+                identifier = node.property(30011)
+                key = ('automation_id', identifier) if isinstance(identifier, str) and identifier and not identifier.isdecimal() else ('name', node.property(30005))
+                if isinstance(key[1], str) and key[1]:
+                    group_boxes[key] = None if key in group_boxes else uia.bounds(node)
             pending.extend(uia.children(node))
             continue
         if node.property(30022) is True:
@@ -79,7 +84,7 @@ def _protected(uia, binding, window):
     return blocked
 
 
-def _capture(app, binding, check):
+def _capture(app, binding, check, *, group_boxes=None):
     check()
     window = row_vision._window_rect(binding)
     affinity = W.DWORD()
@@ -89,7 +94,12 @@ def _capture(app, binding, check):
     with app.bridge.UIA() as uia:
         protected = _protected(uia,binding,window)
         pixels = bytearray(row_vision._frame(binding,window))
-        protected |= _protected(uia,binding,window)
+        if group_boxes is None:
+            protected |= _protected(uia,binding,window)
+        else:
+            # Record geometry while walking this captured window for privacy masking.
+            # These candidates are never selected or persisted by size or position.
+            protected |= _protected(uia,binding,window,group_boxes)
     for left,top,right,bottom in protected:
         if right > left and bottom > top:
             mask = bytes((right-left)*4)

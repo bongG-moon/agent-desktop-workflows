@@ -6,6 +6,10 @@ def followup(result):
     """Decorate a saved receipt; never turn an uncertain dispatch into a retry."""
     if result.get('status') not in ('recorded', 'needs_grounding') or result.get('input_dispatched') is not False:
         return result
+    original = result.get('task')
+    if result['status'] == 'recorded' and isinstance(original, dict) and isinstance(original.get('name'), str):
+        review = ['review', '--task', original['name']]
+        result.update(edit_args=[*review, '--edit'], restart_args=[*review, '--restart'])
     scripts = Path(__file__).absolute().parent
     recovered = result.get('live_recovery')
     nested = isinstance(recovered, dict)

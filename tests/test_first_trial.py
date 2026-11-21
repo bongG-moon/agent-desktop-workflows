@@ -98,6 +98,20 @@ class FirstTrial(unittest.TestCase):
         inventory['targets'] = [observed,observed]
         self.assertIsNone(recovery._suggest_binding(1,row,inventory))
 
+    def test_readable_column_without_exact_match_stops_without_image(self):
+        tasks.save_task(self.task, self.directory)
+        receipt = dict(status='blocked', diagnostic='result_value_not_found', input_dispatched=False,
+                       result_window=dict(hwnd=7))
+        self.worker.return_value = dict(status='blocked', diagnostic='result_value_not_found', stopped_at=2,
+            input_dispatched=True, steps=[dict(number=1, receipt=dict(status='delivered_unverified', input_dispatched=True)),
+                                         dict(number=2, receipt=receipt)])
+        recipe = dict(steps=[dict(action='invoke'), dict(action='verify-value', result_column='Region', value='LAB-42')])
+        with patch.object(first_trial, '_compiled', return_value=dict(envelope=dict(recipe=recipe, source_steps=[1, 2]))):
+            report = self.trial('--task', self.task['name'])
+        self.assertEqual(report['host_action'], 'report_unmatched_result')
+        self.assertNotIn('result_inspection', report)
+        self.worker.assert_called_once()
+
     def test_opaque_result_offers_bound_read_only_inspection_and_never_repeats_query(self):
         import grounding
         tasks.save_task(self.task, self.directory)
@@ -160,7 +174,8 @@ class FirstTrial(unittest.TestCase):
         identity = dict(hwnd=7,pid=19,exe_name='A.exe',title='업무 창',process_started_utc_ticks=111)
         self.worker.return_value = dict(status='blocked',stopped_at=2,input_dispatched=True,
             steps=[dict(number=1,receipt=dict(status='delivered_unverified',input_dispatched=True)),
-                   dict(number=2,receipt=dict(status='blocked',input_dispatched=False,result_window=identity))])
+                   dict(number=2,receipt=dict(status='blocked',diagnostic='result_cell_unreadable',
+                                              input_dispatched=False,result_window=identity))])
         with (patch.object(first_trial, '_compiled', return_value=dict(envelope=dict(recipe=recipe,source_steps=[1,2,3,4,5]))),
               patch.object(grounding,'_directory',return_value=self.directory),patch.object(app,'worker_receipt',self.worker)):
             original = self.trial('--task', self.task['name'], '--allow-physical')

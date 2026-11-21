@@ -10,7 +10,7 @@ import desktop_select  # Load the pinned recorder and bridge from the source che
 import learned_tasks as tasks
 import teach_capture as capture
 from capture_trail import finalize_contexts
-from visual_target import HoverTracker, SIDE
+from visual_target import HoverTracker, NOTEPAD_FIND_NEXT, SIDE, validate_spec
 
 
 class VisualRecordingTests(TestCase):
@@ -59,6 +59,17 @@ class VisualRecordingTests(TestCase):
         self.assertFalse(self.worker._use_visual(dict(self.event,window=303),None))
         self.assertFalse(self.worker._use_visual(dict(self.event,scope_proven=False),None))
         self.assertFalse(self.worker._use_visual(dict(self.event,action='right-click'),None))
+
+    def test_named_container_does_not_replace_its_unexposed_button_with_a_relative_point(self):
+        for role in ('toolbar','pane','document'):
+            notes = capture.CaptureNotes()
+            self.worker.model = notes
+            node = dict(self.observed['node'], role=role, locator=dict(role=role, name='Drawing area'),
+                        available_actions=['SetFocus'])
+            with self.subTest(role=role):
+                self.worker.capture_action(dict(self.event,visual=self.proof), dict(self.observed,node=node))
+                step, = notes.snapshot()
+                self.assertEqual((step['action'],step['visual']), ('visual-click',self.proof))
 
     def test_pair_replaces_only_first_click_using_its_pre_press_sample(self):
         first = dict(self.proof, gesture='double-click')
@@ -173,3 +184,23 @@ class VisualRecordingTests(TestCase):
         step,=self.notes.snapshot()
         self.assertEqual(step['action'],'manual')
         self.assertNotIn('visual',step)
+
+    def test_notepad_find_next_keeps_observed_action_and_korean_instruction(self):
+        self.binding.exe = 'Notepad.exe'
+        self.worker.visual_tracker.before.return_value = None
+        document_hit = dict(self.observed, node=dict(self.observed['node'], role='document'))
+        with (mock.patch.object(capture.recorder.CaptureWorker, 'observe_down', return_value=document_hit),
+              mock.patch('notepad_find.locate', return_value=dict(hit=600)) as locate,
+              mock.patch('notepad_find.contains_click', return_value=True)):
+            observed = self.worker.observe_down(self.event)
+        locate.assert_called_once_with(self.binding, exposed=True)
+        self.worker.capture_action(self.event, observed)
+        row, = self.notes.snapshot()
+        sentence = '메모장에서 다음 찾기 버튼을 눌러줘'
+        edits = capture.StepEdits()
+        edits.store(row, '', sentence)
+        saved = tasks.recorded_step(edits.apply([row])[0])
+        self.assertEqual((saved['action'], saved['label'], saved['visual']),
+                         ('visual-click', sentence, NOTEPAD_FIND_NEXT))
+        self.assertEqual(tasks.compile_instruction(row, '이전 찾기 버튼을 눌러줘')['mode'], 'draft')
+        self.assertRaises(capture.bridge.BridgeError, validate_spec, dict(NOTEPAD_FIND_NEXT, gesture='double-click'))

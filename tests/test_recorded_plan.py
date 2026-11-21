@@ -82,6 +82,8 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual(verify['selector'], {'role':'table'})
         natural = tasks.compile_instruction(raw, '조회 결과 표에서 Batch 값이 입력한 값과 같은지 확인해줘')
         self.assertEqual((natural['result_column'], natural['parameter']), ('Batch', 'Batch'))
+        named = tasks.compile_instruction(raw, '결과 표에서 Equip ID가 입력한 장비 ID와 같은지 확인해줘')
+        self.assertEqual((named['result_column'], named['parameter']), ('Equip ID', '장비 ID'))
         stated_input = tasks.compile_instruction(raw, 'Batch 입력란이 {조회값}과 일치하는지 확인해줘')
         self.assertEqual(stated_input['selector'], {'role':'textfield', 'query':'Batch'})
         self.assertNotIn('result_column', stated_input)

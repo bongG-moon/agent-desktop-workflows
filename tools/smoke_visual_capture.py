@@ -51,7 +51,7 @@ def exercise_legacy_draft(command, check, fixture, binding, folder, exe, title):
           and fixture.command('state')['detailHwnd'] != 0)
 
 
-def exercise(source, work, double_click=False, list_row=False):
+def exercise(source, work, double_click=False, list_row=False, toolbar=False):
     installed = work/'skills/desktop-select'
     install_skill(source, installed)
     sys.path.insert(0, str(installed/'scripts'))
@@ -67,7 +67,8 @@ def exercise(source, work, double_click=False, list_row=False):
     subprocess.run([str(compiler), '/nologo', '/out:' + str(exe), '/r:System.Windows.Forms.dll',
                     '/r:System.Drawing.dll', '/r:System.Web.Extensions.dll',
                     str(ROOT/'tests/fixtures/PaintedIconFixture.cs')], check=True, capture_output=True)
-    fixture = Fixture(exe, *(['--details'] if double_click else []), *(['--list'] if list_row else []))
+    fixture = Fixture(exe, *(['--details'] if double_click else []), *(['--list'] if list_row else []),
+                      *(['--toolbar'] if toolbar else []))
     checks = []
     def check(name, ok):
         checks.append(dict(case=name, passed=bool(ok)))
@@ -84,6 +85,10 @@ def exercise(source, work, double_click=False, list_row=False):
         session.start()
         observed = fixture.command('state')
         x, y = observed['x'], observed['y']
+        if toolbar:
+            with app.bridge.UIA() as uia:
+                hit = uia.from_point(x, y)
+                check('provider_exposes_toolbar_instead_of_button', hit is not None and hit.property(30003) == 50021)
         old_cursor = app.bridge.cursor()
         if app.bridge.root_window(app.bridge.window_from_point(x, y)) != binding.hwnd:
             raise RuntimeError('fixture_point_not_exposed')
@@ -137,6 +142,13 @@ def exercise(source, work, double_click=False, list_row=False):
         state = fixture.command('state')
         check('replay_clicked_relocated_icon_once', result['input_dispatched'] is True
               and state[counter]==2 and state['missed']==0)
+        if toolbar:
+            fixture.command('duplicate-icon')
+            result = command(*replay)
+            after = fixture.command('state')
+            check('two_matching_icons_stop_without_input', result.get('input_dispatched') is False
+                  and 'visual_target_ambiguous' in json.dumps(result)
+                  and (after[counter], after['missed']) == (2, 0))
         if double_click:
             popups = app.owned_popups(binding)
             check('double_click_opened_owned_detail', state['detailHwnd'] in [p['hwnd'] for p in popups])
@@ -166,7 +178,10 @@ if __name__ == '__main__':
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--double-click', action='store_true', help='open, read and close details in the owned fixture window')
     parser.add_argument('--list-row', action='store_true', help='exercise a double-click on a native list row')
+    parser.add_argument('--toolbar', action='store_true', help='test an unnamed painted toolbar button and its duplicate')
     args=parser.parse_args()
+    if args.toolbar and (args.double_click or args.list_row):
+        parser.error('--toolbar tests a single click on the painted button')
     work = args.work_dir.resolve()
     work.mkdir(parents=True,exist_ok=False)
-    exercise(args.skill_dir.resolve(),work,args.double_click or args.list_row,args.list_row)
+    exercise(args.skill_dir.resolve(),work,args.double_click or args.list_row,args.list_row,args.toolbar)

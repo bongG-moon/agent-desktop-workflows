@@ -29,6 +29,39 @@ def image(*icons, delta=0, width=170, height=120):
 class VisualTargets(unittest.TestCase):
     window = [200, 120, 170, 120]
 
+    @staticmethod
+    def toolbar(*buttons):
+        w, h = 170, 120
+        data = bytearray(bytes([241,241,241,0])*(w*h))
+        for x, y, fill, flip in buttons:
+            for dy in range(-21,22):
+                for dx in range(-21,22):
+                    stroke = abs(dx) <= 1 and abs(dy) <= 8 or abs(dx) <= 6 and abs(dy-(7-abs(dx))*(-1 if flip else 1)) <= 1
+                    color = 57 if stroke else fill
+                    i = 4*((y+dy)*w+x+dx)
+                    data[i:i+3] = bytes([color]*3)
+        return data
+
+    def test_relocated_toolbar_icon_allows_hover_fill_but_not_another_glyph_or_second_match(self):
+        spec = visual.from_frame(self.window, self.toolbar((35,42,213,False)), (235,162))
+        self.assertIn('rgb', spec)
+        wanted = (106,72,241,False)
+        wrong = (35,42,213,True)
+        self.assertEqual(visual._locate(self.window, self.toolbar(wrong, wanted), spec)[1], [306,192])
+        for incorrect, error in (([wrong], 'not_found'), ([(35,42,213,False), wanted], 'ambiguous'),
+                                 ([(106,72,120,False)], 'not_found')):
+            with self.assertRaisesRegex(visual.bridge.BridgeError, error):
+                visual._locate(self.window, self.toolbar(*incorrect), spec)
+
+    def test_pointer_relocation_wakes_sampler_after_settling_without_ui_lookups(self):
+        tracker = visual.HoverTracker(SimpleNamespace(hwnd=2))
+        tracker.stopping = mock.Mock()
+        tracker.stopping.is_set.return_value = tracker.stopping.wait.return_value = False
+        with mock.patch.object(visual.bridge,'cursor',side_effect=[(4,4),(10,10),(10,10)]):
+            tracker._wait_for_hover((1,1), .35)
+        self.assertEqual(tracker.stopping.wait.call_count,3)
+        self.assertTrue(all(call.args == (.03,) for call in tracker.stopping.wait.call_args_list))
+
     def test_moved_icon_matches_at_its_new_window_position_with_small_color_drift(self):
         spec = visual.from_frame(self.window, image((35,42)), (236,162))
         self.assertEqual(set(spec), {'size','offset','rgb'})
@@ -205,6 +238,31 @@ class VisualTargets(unittest.TestCase):
             uia.secure.return_value = True
             with self.assertRaises(visual.bridge.BridgeError):
                 visual._safe_patch(*args, exposed=True, gesture='double-click')
+
+    def test_one_click_on_toolbar_and_explicitly_read_only_document_rechecks_protection(self):
+        binding = SimpleNamespace(hwnd=1,pid=2,check=lambda:None)
+        props = {30003:50021,30010:True}
+        el = SimpleNamespace(property=props.get)
+        uia = mock.Mock()
+        uia.from_point.return_value = uia.from_handle.return_value = el
+        uia.pid.return_value, uia.within.return_value, uia.secure.return_value = 2, True, False
+        uia.children.return_value = []
+        def client(_hwnd, rect):
+            rect._obj.right = rect._obj.bottom = 150
+            return True
+        with (mock.patch.object(visual.bridge, '_sig', side_effect=lambda u,n,*args: client if n=='GetClientRect' else lambda *args:True),
+              mock.patch.object(visual.bridge,'root_window',return_value=1),
+              mock.patch.object(visual.bridge,'foreground',return_value=1),
+              mock.patch.object(visual.bridge,'hwnd_pid',return_value=2),
+              mock.patch.object(visual.bridge,'window_from_point',return_value=1),
+              mock.patch.object(visual.vision,'_bounds',return_value=[0,0,140,140])):
+            args = (binding,uia,[10,10,41,41],(30,30))
+            self.assertEqual(visual._safe_patch(*args,exposed=True),1)
+            props.update({30003:50030,30040:True,30043:True,30046:True})
+            self.assertEqual(visual._safe_patch(*args,exposed=True),1)
+            for invalid in ({30046:False},{30046:None},{30043:False},{30149:True}):
+                with mock.patch.dict(props,invalid), self.assertRaises(visual.bridge.BridgeError):
+                    visual._safe_patch(*args,exposed=True)
 
     def test_disabled_renderer_must_have_the_actual_enabled_input_parent(self):
         binding = SimpleNamespace(hwnd=1,pid=2)

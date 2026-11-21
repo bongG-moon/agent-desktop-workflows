@@ -221,16 +221,19 @@ def run(app, args):
             step = recipe['steps'][number - 1]
             if (last['number'] == number and step['action'] == 'verify-value' and step.get('result_column')
                     and receipt.get('input_dispatched') is False and window):
-                import result_trial
-                expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
-                report.update(host_action='inspect_current_result_without_replaying',
-                              result_inspection=dict(source_step=report['source_stopped_at'], column=step['result_column'],
-                                  observed_at=time.time(), window=window, capture_requires_consent=True,
-                                  args=['inspect-trial', '--receipt', key]))
-                if result_trial.supported(recipe, number) and receipt.get('diagnostic') not in (
-                        'result_table_missing', 'result_table_ambiguous', 'target_missing', 'target_ambiguous'):
-                    report['result_inspection'].update(resume_supported=True, recipe_hash=recovery._fingerprint(recipe),
-                        expected_hash=recovery._fingerprint([key, expected]), source_hash=source_key, source_task=doc['name'])
+                diagnostic = receipt.get('diagnostic') or report.get('diagnostic')
+                if diagnostic not in python_workflow.RESULT_IMAGE_ERRORS:
+                    report['host_action'] = 'report_unmatched_result'
+                else:
+                    import result_trial
+                    expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
+                    report.update(host_action='inspect_current_result_without_replaying',
+                                  result_inspection=dict(source_step=report['source_stopped_at'], column=step['result_column'],
+                                      observed_at=time.time(), window=window, capture_requires_consent=True,
+                                      args=['inspect-trial', '--receipt', key]))
+                    if result_trial.supported(recipe, number) and diagnostic not in ('result_table_missing', 'target_missing'):
+                        report['result_inspection'].update(resume_supported=True, recipe_hash=recovery._fingerprint(recipe),
+                            expected_hash=recovery._fingerprint([key, expected]), source_hash=source_key, source_task=doc['name'])
         elif report.get('status') in ('verified', 'completed_unverified'):
             report['host_action'] = 'report_completed_trial'
         report.update(effective_task=name, trial_receipt=key, preparation_seconds=round(prepared_at-started, 3),

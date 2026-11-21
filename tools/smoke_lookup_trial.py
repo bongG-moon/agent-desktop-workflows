@@ -15,6 +15,17 @@ INSTRUCTIONS = ['입력받은 변수를 Equip ID 입력란에 입력해줘', 'VI
                 '해당 결과 행을 더블클릭해 상세 창을 열어줘', 'Comment 값을 읽어줘', 'Exit 버튼을 눌러 상세 창을 닫아줘']
 
 
+def build_lookup_fixture(work):
+    net = Path(os.environ['WINDIR']) / 'Microsoft.NET/Framework64/v4.0.30319'
+    exe = work / 'LookupDetailsFixture.exe'
+    libs = [net / 'WPF' / (name + '.dll') for name in
+            ('PresentationFramework', 'PresentationCore', 'WindowsBase', 'UIAutomationTypes', 'UIAutomationProvider')]
+    subprocess.run([str(net/'csc.exe'), '/nologo', '/target:exe', '/out:'+str(exe),
+                    *['/r:'+str(lib) for lib in libs], '/r:System.Xaml.dll', '/r:System.Web.Extensions.dll',
+                    str(ROOT/'tests/fixtures/LookupDetailsFixture.cs'), str(ROOT/'tests/fixtures/ProviderResultGrid.cs')], check=True)
+    return exe
+
+
 def exercise(package, work, painted=False, external_host=False):
     work.mkdir(parents=True, exist_ok=False)
     with ZipFile(package) as archive:
@@ -29,13 +40,7 @@ def exercise(package, work, painted=False, external_host=False):
     from teach_capture import StepEdits
     from row_action import foreground
 
-    net = Path(os.environ['WINDIR']) / 'Microsoft.NET/Framework64/v4.0.30319'
-    exe = work / 'LookupDetailsFixture.exe'
-    libs = [net / 'WPF' / (name + '.dll') for name in
-            ('PresentationFramework', 'PresentationCore', 'WindowsBase', 'UIAutomationTypes', 'UIAutomationProvider')]
-    subprocess.run([str(net/'csc.exe'), '/nologo', '/target:exe', '/out:'+str(exe),
-                    *['/r:'+str(lib) for lib in libs], '/r:System.Xaml.dll', '/r:System.Web.Extensions.dll',
-                    str(ROOT/'tests/fixtures/LookupDetailsFixture.cs')], check=True)
+    exe = build_lookup_fixture(work)
     win = app.bridge
     win.set_dpi_awareness()
     fixture = Fixture(exe, *(['--painted'] if painted else []))
@@ -61,7 +66,9 @@ def exercise(package, work, painted=False, external_host=False):
         assert win.user32.SetCursorPos(x, y)
         settle(.5)
         check()
-        assert win.cursor() == (x,y) and win._send_point(x, y, gesture)['ok']
+        assert win.cursor() == (x,y), 'pointer_moved_before_demonstration'
+        delivered = win._send_point(x, y, gesture)
+        assert delivered['ok'], delivered
         settle(.75)
 
     try:

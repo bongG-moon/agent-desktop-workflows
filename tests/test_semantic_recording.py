@@ -5,7 +5,8 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/desktop-select/scripts'))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / 'skills/desktop-select/scripts'), str(ROOT / 'scripts')]
 import learned_tasks as tasks
 
 

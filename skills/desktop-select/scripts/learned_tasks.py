@@ -299,6 +299,43 @@ def _recorded_selector(raw):
     return selector
 
 
+def recorded_result_surface(locator):
+    """Keep a table and its surrounding controls, leaving out the demonstrated row/value."""
+    if not isinstance(locator, dict):
+        return None
+    parents = locator.get('ancestors', [])
+    if not isinstance(parents, list) or len(parents) > 16:
+        return None
+    chain = [locator, *parents]
+    if any(not isinstance(item, dict) or item.get('role') == 'password' or any(
+            item.get(k) is True for k in ('secure', 'protected', 'is_password', 'password', 'is_protected'))
+            for item in chain):
+        return None
+    for index, item in enumerate(chain):
+        if item.get('role') not in {'list', 'table'}:
+            continue
+        surface = _selector(item)
+        if surface:
+            break
+    else:
+        # Some result providers expose a group containing data rows instead of a table.
+        saw_row = False
+        for index, item in enumerate(chain):
+            if item.get('role') in {'row', 'listitem'}:
+                saw_row = True
+            if (index == 0 or saw_row) and item.get('role') == 'group' and (surface := _selector(item)):
+                break
+        else:
+            return None
+    owners = []
+    for item in chain[index + 1:]:
+        if item.get('role') in {'row', 'listitem'}:
+            break  # An outer data row's caption may itself be a business value.
+        if owner := _selector(item):
+            owners.append(owner)
+    return dict(surface, ancestors=owners) if owners else surface
+
+
 def _observed_intent(raw, sentence):
     """Compile one explicit observation or scoped close, independently of the demonstrated click."""
     if not sentence or not re.search(r'읽|가져|알려|일치|같은지|동일한지|\bread\b|\b(?:exit|close)\b|닫|종료', sentence, re.I):
@@ -346,7 +383,8 @@ def _observed_intent(raw, sentence):
     if not read:
         read = re.fullmatch(r'read\s+' + field + r'(?:\s+value)?', text, re.I)
     comparison = (r'(?:(?:(\{[^{}]+\}|[\x22\x27‘“][^\x22\x27’”]+[\x22\x27’”])|'
-                  r'입력(?:\s*받은|한|했던)?\s*값|조회\s*조건)(?:와|과)\s*)?')
+                  r'입력(?:\s*받은|한|했던)?\s*값|조회\s*조건|'
+                  r'입력(?:\s*받은|한|했던)\s+([\w][\w ._-]{0,59}?))(?:와|과)\s*)?')
     match = re.fullmatch(r'(?:(?:조회\s*)?결과(?:\s*(?:표|행|목록))?(?:에서|의|에)?\s+)?' + field
                          + r'\s*(?:값)?(?:이|가)?\s*' + comparison +
                          r'(?:일치(?:하는지|\s*여부)?|같은지|동일한지)\s*확인(?:해)?(?:\s*(?:줘|주세요))?', text)
@@ -370,10 +408,10 @@ def _observed_intent(raw, sentence):
             return dict(mode='read-value', text=sentence, selector=selector, label=name)
     # A result check is a cell lookup inside a grid, never a read of the search input.
     elif not selector or selector['role'] not in {'table', 'list', 'group'}:
-        selector = next((item for item in (selector or {}).get('ancestors', []) if item.get('role') in {'table', 'list'}),
-                        {'role': 'table'})
+        locator = target.get('locator') if isinstance(target, dict) else selector
+        selector = recorded_result_surface(locator) or {'role': 'table'}
     expected = match[2]
-    binding = {'parameter': name} if not expected else (
+    binding = {'parameter': (match[3] or name).strip()} if not expected else (
         {'parameter': expected[1:-1]} if expected.startswith('{') else {'value': _quoted_literal(expected)})
     return dict(mode='verify-value', text=sentence, selector=selector, label=name, **binding,
                 **({} if field_check else {'result_column': name}))
@@ -882,6 +920,13 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         return {'mode': 'visual-click', 'text': sentence}
     if raw_step.get('action') == 'visual-click':
         if all(value is None for value in (mode, argument, target, role, within)):
+            from visual_target import NOTEPAD_FIND_NEXT
+            if raw_step.get('visual') == NOTEPAD_FIND_NEXT:
+                if sentence == raw_step.get('label') or re.fullmatch(
+                        r'(?:메모장에서?\s*)?다음\s*찾기(?:\s*(?:버튼|아이콘))?(?:을|를)?\s*'
+                        r'(?:클릭해|눌러|선택해)\s*(?:줘|주세요)?[.!]?', sentence):
+                    return {'mode': 'visual-click', 'text': sentence}
+                return {'mode': 'draft', 'text': sentence}
             if sentence == raw_step.get('label') or click_request(sentence):
                 return {'mode': 'visual-click', 'text': sentence}
         raw_step = {**_manual('capture_target_unavailable'), **_annotations(raw_step)}

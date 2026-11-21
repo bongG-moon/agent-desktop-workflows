@@ -37,11 +37,14 @@ import workflow_repair
 
 CHILD_VISUAL_TIMEOUT = 30
 RESULT_VISUAL_TIMEOUT = 5
-RESULT_SURFACES = {'table', 'list', 'group'}
+RESULT_SURFACES = {'table', 'list', 'group', 'custom'}
 OBSERVABLE_FIELDS = {'textfield', 'combobox', 'statictext', 'row', 'listitem'}
-RESULT_INSPECTION_ERRORS = {
-    'result_table_missing', 'result_table_ambiguous', 'result_cell_missing', 'result_cell_ambiguous',
-    'result_column_unavailable', 'result_column_ambiguous', 'target_missing', 'target_ambiguous',
+RESULT_IMAGE_ERRORS = {
+    'target_missing', 'result_table_missing', 'result_column_unavailable', 'result_cell_missing', 'result_cell_unreadable',
+}
+RESULT_INSPECTION_ERRORS = RESULT_IMAGE_ERRORS | {
+    'result_table_ambiguous', 'result_cell_ambiguous', 'result_column_ambiguous', 'target_ambiguous',
+    'result_value_not_found', 'result_column_not_found', 'result_grid_scan_limit', 'result_grid_incomplete',
 }
 
 
@@ -353,25 +356,194 @@ def result_surface(binding, uia, selector):
                 item.close()
 
 
-def observe_result(binding, uia, step, expected, guard, *, wait_seconds):
+def _stable_result_selector(binding, uia, table):
+    role = app.bridge.ROLES.get(table.property(30003))
+    if role not in RESULT_SURFACES:
+        return None
+    identifier = table.property(30011)
+    if lookup._text(identifier) and not identifier.isdecimal():
+        selector = dict(role=role, automation_id=identifier)
+    else:
+        name = table.property(30005)
+        if not lookup._text(name):
+            return None
+        selector = dict(role=role, name=name)
+    try:
+        same = lookup.resolve(binding, uia, selector)
+    except app.bridge.BridgeError as error:
+        if error.code in ('target_missing', 'target_ambiguous'):
+            return None
+        raise
+    return selector if uia.same(same, table) else None
+
+
+def _group_for_column(binding, uia, column, *, native=()):
+    """Find a provider-backed result group even if it has no native table role."""
+    window = uia.from_handle(binding.hwnd)
+    groups = [g for g in lookup.find_all(uia, window, roles=('group','custom'), grid_group=True)
+              if live._visible(uia, g, binding, window)]
+    def matching(surfaces):
+        import result_cell
+        need(len(surfaces) <= 24, 'result_grid_scan_limit')
+        matches = []
+        for surface in surfaces:
+            header = result_cell._column(binding, uia, surface, window, column, None)
+            if header.get('element') is not None and uia.same(header['grid'], surface):
+                matches.append(surface)
+        return matches
+    if groups and not native:
+        if len(groups) == 1:
+            return groups[0]
+        matches = matching(groups)
+        if matches:
+            need(len(matches) == 1, 'result_table_ambiguous')
+            return matches[0]
+    if not groups or native:
+        # Without a grid pattern, a column header and actual data rows must
+        # belong to the same immediate group. A form's matching caption is insufficient.
+        def owner(node):
+            chain = lookup.ancestry(uia, node, window, pid=binding.pid)
+            return next((e for e in chain[1:-1] if app.bridge.ROLES.get(e.property(30003)) == 'group'), None)
+        headers = lookup.find_all(uia, window, name=column, roles=('headeritem',))
+        if not headers:
+            headers = [item for item in lookup.find_all(uia, window, roles=('headeritem',))
+                       if (item.property(30005) or '').strip().casefold() == column.strip().casefold()]
+        for header in headers:
+            if not live._visible(uia, header, binding, window):
+                continue
+            group = owner(header)
+            if group is None or any(uia.same(g, group) for g in groups):
+                continue
+            rows = lookup.find_all(uia, group, roles=('row','listitem'), limit=4096)
+            if any((parent := owner(row)) is not None and uia.same(parent, group) for row in rows):
+                groups.append(group)
+    if native:
+        groups = matching([*native, *groups])
+    need(len(groups) == 1, 'result_table_ambiguous' if groups else 'result_table_missing')
+    return groups[0]
+
+
+def _result_target(binding, uia, selector, reviewed_group, *, column=None, element_hint=False):
+    if selector == {'role': 'table'} and reviewed_group and (element_hint or reviewed_group['role'] in ('table','list')):
+        try:
+            return result_surface(binding, uia, reviewed_group), reviewed_group
+        except app.bridge.BridgeError as error:
+            if error.code != 'target_missing':
+                raise
+        reviewed_group = None
+    # A visually witnessed opaque group must not hide a newly appeared native table.
+    try:
+        return result_surface(binding, uia, selector), selector
+    except WorkflowError as error:
+        if selector == {'role': 'table'} and error.code == 'result_table_ambiguous' and column:
+            window = uia.from_handle(binding.hwnd)
+            native = [item for item in lookup.find_all(uia, window, roles=('table','list'))
+                      if live._visible(uia, item, binding, window)]
+            try:
+                target = _group_for_column(binding, uia, column, native=native)
+            except WorkflowError as scoped_error:
+                if scoped_error.code == 'result_table_missing':
+                    raise error
+                raise
+            return target, _stable_result_selector(binding, uia, target) or selector
+        if error.code != 'result_table_missing' or selector != {'role': 'table'}:
+            raise
+        if not reviewed_group:
+            if column:
+                group = _group_for_column(binding, uia, column)
+                return group, _stable_result_selector(binding, uia, group) or selector
+            raise
+    try:
+        return result_surface(binding, uia, reviewed_group), reviewed_group
+    except app.bridge.BridgeError as error:
+        if error.code not in ('target_missing', 'target_ambiguous'):
+            raise
+        if column and error.code == 'target_missing':
+            group = _group_for_column(binding, uia, column)
+            return group, _stable_result_selector(binding, uia, group) or selector
+        # A stale hint cannot change the original recording's scope or
+        # prevent the registered runner from offering a fresh local review.
+        raise WorkflowError('result_table_missing') from error
+
+
+def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewed_group=None, on_match=None,
+                   column_hint=None, element_hint=False, remember=False):
     """Wait only for the explicitly requested result. Never submit the query again."""
     import result_cell
-    deadline = time.monotonic() + wait_seconds
+    started = time.monotonic()
+    deadline = started + wait_seconds
+    attempts, provider_seconds, waited = 0, 0., 0.
     while True:
         guard()
+        attempts += 1
+        began = time.monotonic()
+        table, selector = None, step['selector']
+        evidence = {}
         try:
-            table = result_surface(binding, uia, step['selector'])
-            result_cell.find(binding, uia, table, expected, column=step['result_column'])
-            return dict(status='verified', input_dispatched=False, diagnostic='result_value_matched',
-                        value=expected, value_evidence=dict(status='observed', source='result_column'))
+            table, selector = _result_target(binding, uia, selector, reviewed_group,
+                                              column=step['result_column'], element_hint=element_hint)
+            try:
+                result_cell.find(binding, uia, table, expected, column=step['result_column'],
+                                 column_hint=column_hint, evidence=evidence)
+            except app.bridge.BridgeError as original:
+                # A form can expose an unrelated list beside its custom result grid.
+                # Disambiguate by the recorded column only if the first table lacks it.
+                if (original.code not in ('result_column_unavailable','result_column_not_found')
+                        or selector != {'role':'table'} or step['selector'] != selector):
+                    raise
+                try:
+                    other = _group_for_column(binding, uia, step['result_column'], native=(table,))
+                except WorkflowError as scoped_error:
+                    if scoped_error.code == 'result_table_missing':
+                        raise original
+                    raise
+                if uia.same(table, other):
+                    raise original
+                table = other
+                selector = _stable_result_selector(binding, uia, table) or selector
+                evidence.clear()
+                result_cell.find(binding, uia, table, expected, column=step['result_column'], evidence=evidence)
         except (ValueError, app.bridge.BridgeError) as error:
-            if getattr(error, 'code', None) not in {'target_missing', 'result_cell_missing',
-                                                      'result_table_missing', 'result_column_unavailable'}:
+            diagnostic = getattr(error, 'code', None)
+            if diagnostic not in RESULT_INSPECTION_ERRORS:
                 raise
+            retry = diagnostic in RESULT_IMAGE_ERRORS or diagnostic in ('result_value_not_found','result_column_not_found')
+            # Empty once is not evidence that delayed headers/rows will never
+            # appear. Only short-circuit for a previously visually verified
+            # group, still unambiguously live and still exposing no table data.
+            painted = (diagnostic == 'result_column_unavailable' and reviewed_group == selector
+                       and table is not None and result_cell.bare_group(uia, table))
+            provider_seconds += time.monotonic() - began
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise
-            time.sleep(min(.2, remaining))
+            if retry and not painted and remaining > 0:
+                before = time.monotonic()
+                time.sleep(min(.2, remaining))
+                waited += time.monotonic() - before
+                continue
+            strategy = 'reviewed_group_pixels' if painted else 'uia_timeout' if retry else 'uia_inconclusive'
+            receipt = dict(status='blocked', input_dispatched=False, diagnostic=diagnostic)
+            if painted:
+                receipt['result_surface_selector'] = selector
+        else:
+            strategy = 'uia_matched'
+            if on_match is not None:
+                on_match(table)
+            receipt = dict(status='verified', input_dispatched=False, diagnostic='result_value_matched',
+                           value=expected, value_evidence=dict(status='observed', source=evidence.get('source','result_column')))
+            if remember or selector != step['selector']:
+                stable = _stable_result_selector(binding, uia, table) if selector == {'role':'table'} else selector
+                if stable and ('automation_id' in stable or 'name' in stable) and (
+                        'name' not in stable or expected.casefold() not in stable['name'].casefold()):
+                    receipt['result_element'] = dict(selector=stable, source='element')
+                    if evidence.get('column_hint'):
+                        receipt['result_element']['column_hint'] = evidence['column_hint']
+            provider_seconds += time.monotonic() - began
+        route = ('remembered_element' if reviewed_group and selector == reviewed_group
+                 else 'discovery' if step['selector'] == {'role':'table'} else 'recorded_element')
+        receipt['result_observation'] = dict(strategy=strategy, attempts=attempts, wait_seconds=round(waited, 4),
+            provider_seconds=round(provider_seconds, 4), elapsed_seconds=round(time.monotonic() - started, 4),
+            table_lookup=route)
+        return receipt
 
 
 def observe_field(binding, uia, element, role, action, expected=None):
@@ -611,6 +783,7 @@ def check_result_point(binding, uia, selector, point):
     need(all(item.property(30003) in data_roles and item.property(30149) is not True
              and (item.property(30043) is not True or item.property(30046) is True) for item in chain),
          'result_point_not_data')
+    return box
 
 
 def check_result_frame(binding, confirmation, point, guard):
@@ -620,15 +793,53 @@ def check_result_frame(binding, confirmation, point, guard):
     _, witnessed = grounding.read_frame(grounding._directory(), scope, confirmation['frame'])
     rect, current = grounding._capture(app, binding, guard)
     relative_point = [point[0] - rect[0], point[1] - rect[1]]
-    need(current == witnessed and relative_point == confirmation['point'], 'result_frame_changed')
+    need(relative_point == confirmation['point'], 'result_frame_changed')
+    if 'table_box' in confirmation:
+        import result_trial
+        need(list(rect) == list(confirmation['window_rect']) and
+             result_trial.same_table_pixels(witnessed, current, rect, confirmation['table_box']),
+             'result_frame_changed')
+    else:
+        need(current == witnessed, 'result_frame_changed')
     with app.bridge.UIA() as uia:
-        check_result_point(binding, uia, confirmation['selector'], point)
+        if confirmation.get('original_selector'):
+            _, selector = _result_target(binding, uia, confirmation['original_selector'], confirmation['selector'])
+            need(selector == confirmation['selector'], 'result_table_changed')
+        box = check_result_point(binding, uia, confirmation['selector'], point)
+        if 'table_box' in confirmation:
+            need(box == confirmation['table_box'], 'result_table_changed')
+
+
+def checked_result_hints(recipe, saved):
+    result_hints = {}
+    if saved is None:
+        return result_hints
+    if not isinstance(saved, list):
+        saved = [saved]
+    for hint in saved:
+        import result_cell
+        need(isinstance(hint, dict), 'invalid_result_surface_hint')
+        number = hint.get('number')
+        selector = hint.get('selector')
+        need(type(number) is int and 1 <= number <= len(recipe['steps'])
+             and 'result_column' in recipe['steps'][number-1] and isinstance(selector, dict)
+             and number not in result_hints and isinstance(selector.get('role'), str) and selector['role'] in RESULT_SURFACES
+             and ('name' in selector or 'automation_id' in selector)
+             and recipe['steps'][number-1]['selector'] in ({'role': 'table'}, selector)
+             and ('source' not in hint or hint['source'] == 'element')
+             and ('column_hint' not in hint or result_cell.valid_column_hint(hint['column_hint'])),
+             'invalid_result_surface_hint')
+        lookup._selector(selector)
+        result_hints[number] = hint
+    return result_hints
 
 
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
         background_only=False, only=None, scene_session=None, resume=None, track_menu=False,
-        registered_session=None, result_confirmation=None):
+        registered_session=None, result_confirmation=None, result_surface_hint=None,
+        remember_result_elements=False, result_owner=None):
     recipe = validate(recipe)
+    result_hints = checked_result_hints(recipe, result_surface_hint)
     if result_confirmation is not None:
         first = recipe['steps'][0]
         need(not read_only and only is None and resume is None and registered_session is None and
@@ -685,6 +896,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                   input_policy='background_only' if background_only else 'auto')
     started = time.monotonic()
     result_baselines = {}
+    verified_tables = []
     number, dispatching = 0, False
     anchor_proof = None
     reservations = ExitStack()
@@ -692,8 +904,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     stage_started = started
     try:
         owner = bind(recipe['exe'], recipe['window'], hwnd)
-        if result_confirmation:
-            identity = result_confirmation['owner']
+        if result_confirmation or result_owner:
+            identity = result_confirmation['owner'] if result_confirmation else result_owner
             need(workflow_repair.identity(owner) == [identity['hwnd'], identity['pid'], identity['process_started_utc_ticks']]
                  and recipe['window'] == identity['title'] and recipe['exe'].casefold() == identity['exe_name'].casefold(),
                  'result_window_changed')
@@ -861,18 +1073,18 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         surface = popup_surface(binding, title, popup) if popup else binding
                         reserve_surface(surface)
                         expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
-                        try:
-                            receipt = observe_result(surface, uia, step, expected, lambda: check_target(surface, popup),
-                                                     wait_seconds=RESULT_VISUAL_TIMEOUT)
-                        except (ValueError, app.bridge.BridgeError) as error:
-                            diagnostic = getattr(error, 'code', None)
-                            if diagnostic not in RESULT_INSPECTION_ERRORS:
-                                raise
+                        hint = result_hints.get(number, {})
+                        verified_tables.clear()
+                        receipt = observe_result(surface, uia, step, expected, lambda: check_target(surface, popup),
+                                                 wait_seconds=RESULT_VISUAL_TIMEOUT, reviewed_group=hint.get('selector'),
+                                                 column_hint=hint.get('column_hint'), element_hint=hint.get('source')=='element',
+                                                 on_match=verified_tables.append, remember=remember_result_elements)
+                        if receipt.get('result_element'):
+                            result_hints[number] = receipt['result_element']
+                        if receipt['status'] == 'blocked':
                             check_target(surface, popup)
-                            identity = dict(hwnd=surface.hwnd, pid=surface.pid, exe_name=surface.exe,
-                                            title=popup['title'] if popup else title, process_started_utc_ticks=surface.created)
-                            receipt = dict(status='blocked', input_dispatched=False, diagnostic=diagnostic,
-                                           result_window=identity)
+                            receipt['result_window'] = dict(hwnd=surface.hwnd, pid=surface.pid, exe_name=surface.exe,
+                                title=popup['title'] if popup else title, process_started_utc_ticks=surface.created)
                 elif step['action'] == 'double-click-result':
                     if read_only:
                         receipt = dict(status='deferred', input_dispatched=False, verification='pending_execution',
@@ -882,13 +1094,20 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         prior = recipe['steps'][number - 2]
                         expected = (values[prior['parameter'].casefold()] if 'parameter' in prior else prior['value'])
                         check_target(binding, mutate=True)
-                        table = result_surface(binding, uia, prior['selector'])
+                        hint = result_hints.get(number - 1, {})
+                        def current_table():
+                            return _result_target(binding, uia, prior['selector'], hint.get('selector'),
+                                                  column=prior['result_column'], element_hint=hint.get('source')=='element')[0]
+                        table = current_table()
+                        need(verified_tables and uia.same(verified_tables.pop(), table),
+                             'result_table_changed')
                         def result_guard():
                             check_target(binding, mutate=True)
-                            need(uia.same(result_surface(binding, uia, prior['selector']), table), 'result_table_changed')
+                            need(uia.same(current_table(), table), 'result_table_changed')
                         # execute() reports all attempted input as a receipt.
                         # Its lookup/foreground guards can raise before input.
-                        receipt = result_cell.execute(binding, uia, table, expected, result_guard, column=prior['result_column'])
+                        receipt = result_cell.execute(binding, uia, table, expected, result_guard,
+                                                      column=prior['result_column'], column_hint=hint.get('column_hint'))
                 elif step['action'] == 'conditional-open':
                     if read_only:
                         receipt = dict(status='observed',input_dispatched=False,condition='pending_execution')
@@ -1283,6 +1502,15 @@ def run_instructions(recipe, skill_name):
         repair = '이번 실행에서 표 위치 보정용 화면 확인까지 승인받았으면 `--auto-repair-frame`과 `--allow-physical`을 함께 준다. '
         repair += ('표 보정 승인이 없으면 이 옵션을 생략한다.\n\n' if scene_windows else
                    '저장된 반복 승인은 보정 이미지를 볼 권한을 포함하지 않는다.\n\n')
+    if any(step['action'] == 'double-click-result' for step in recipe['steps']):
+        import result_trial
+        if any(result_trial.supported(recipe, n) for n in range(1, len(recipe['steps']) + 1)):
+            repair += ('기록된 표와 열에서 이번 요청값을 먼저 읽어 비교한다. 읽을 수 있는 표는 자동으로 진행하고, '
+                       '값이 없거나 여러 행에 있으면 그 결과를 보고한다. 글자를 읽을 수 없는 표를 PC에서 확인하도록 허용받으면 '
+                       '실행 명령에 `--local-result-review --allow-physical`을 붙인다. '
+                       '이미 `result_review`가 반환됐으면 같은 창에서 `resume_args`로 이어간다. '
+                       '처음 받은 `--set` 인자도 함께 전달해 현재 행을 다시 읽는다. '
+                       '열과 셀을 확인하는 동안 표 새로 보기로 방금 조회한 표만 갱신할 수 있다.\n\n')
     return (GUIDE_BEGIN
             + f'Claude Code에서 사용자가 `/{skill_name}`으로 직접 호출했고 Company Agent가 이번 턴의 기본 Skill 도구 호출을 '
             f'요구하며 이 업무의 Skill 호출이 아직 성공하지 않은 경우에만 `Skill(skill="{skill_name}")`을 한 번 먼저 호출한다.\n\n'
@@ -1576,7 +1804,7 @@ def summarize_execution(report, entries):
         item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items', 'menu_recovery',
                                              'verified_path') if k in receipt})
         if step['action'] in input_policy.VALUE_OBSERVATIONS:
-            item.update({k: receipt[k] for k in ('value', 'value_evidence') if k in receipt})
+            item.update({k: receipt[k] for k in ('value', 'value_evidence', 'result_observation') if k in receipt})
         summary['steps'].append(item)
         if (receipt['status'] == 'verified' and receipt.get('diagnostic') == 'export_workbook_verified'
                 and (receipt.get('file_verified') is True or receipt.get('workbook_verified') is True)
@@ -1690,6 +1918,9 @@ def main(argv=None):
             repair.add_argument('--repair-frame', metavar='TICKET', help='inspect the failed result area without input')
             repair.add_argument('--resume-menu', metavar='TICKET', help='resume a before-click failure from the approved frame')
             repair.add_argument('--resume-input', metavar='TICKET', help='after the user pauses, continue at the unsent menu')
+            repair.add_argument('--confirm-result-locally', metavar='TICKET', help='review the current result cell on this PC and continue from it')
+            p.add_argument('--local-result-review', action='store_true',
+                           help='if needed, open a local confirmation window for an unreadable result cell during this run')
             p.add_argument('--forget-physical', action='store_true', help='remove the repeat permission for this registration')
             p.add_argument('--frame', metavar='TOKEN')
             p.add_argument('--point', nargs=2, type=int, metavar=('X', 'Y'))
@@ -1747,12 +1978,13 @@ def main(argv=None):
             registered = workflow_repair.registered(args.recipe)
             if args.forget_physical:
                 need(registered and not any((args.only, args.hwnd, args.resume_input, args.resume_menu, args.repair_frame,
+                     args.confirm_result_locally, args.local_result_review,
                      args.set, args.remember_physical, args.allow_physical, args.background_only, args.frame, args.point,
                      args.input_plan, args.read_only, args.auto_repair_frame)), 'invalid_forget_physical_arguments')
                 workflow_repair.forget_approval(args.recipe)
                 print(json.dumps(dict(status='forgotten', input_dispatched=False)))
                 return 0
-            repairing = bool(args.repair_frame or args.resume_menu or args.resume_input)
+            repairing = bool(args.repair_frame or args.resume_menu or args.resume_input or args.confirm_result_locally)
             need(not repairing or (registered and not args.read_only and not args.input_plan and
                                    not args.background_only and args.only is None and args.hwnd is None),
                  'invalid_registered_repair_arguments')
@@ -1760,6 +1992,11 @@ def main(argv=None):
                  (args.point is not None) == bool(args.resume_menu), 'menu_repair_frame_and_point_required')
             entries = selected_steps(recipe, args.only)
             active = dict(recipe, steps=[step for _, step in entries])
+            if args.local_result_review or args.confirm_result_locally:
+                import result_trial
+                need(registered and not args.background_only and not args.input_plan and not args.read_only
+                     and args.only is None and not (args.local_result_review and repairing)
+                     and any(result_trial.supported(recipe,n) for n, _ in entries), 'invalid_registered_result_review')
             requirements = input_policy.profile(active['steps'], [n for n, _ in entries])
             eligible = (registered and args.only is None and args.hwnd is None and not args.background_only
                         and not args.read_only and not args.input_plan and requirements['physical_input_required']
@@ -1775,7 +2012,7 @@ def main(argv=None):
                 if refusal:
                     print(json.dumps(refusal, ensure_ascii=False))
                     return 2
-            args.repeat_approval_used = (eligible and not args.allow_physical and not repairing
+            args.repeat_approval_used = (eligible and not args.allow_physical and not repairing and not args.local_result_review
                                          and not args.auto_repair_frame and workflow_repair.approved(args.recipe, recipe))
             overrides = app.tasks.parse_overrides(args.set)
             _, missing = values_for(active, overrides)
@@ -1798,11 +2035,13 @@ def main(argv=None):
                 result = export_evidence.discover_directories(owner)
             elif args.command == 'register':
                 result = register(recipe, args.out, args.hwnd, source_task=source_task)
-            elif registered and not args.read_only and (repairing or any(workflow_repair.menu(s) for _, s in entries)):
+            elif registered and not args.read_only and (repairing or any(workflow_repair.menu(s) for _, s in entries)
+                                                       or (args.only is None and any('result_column' in s for _, s in entries))):
                 executing = mutating
                 if not args.repair_frame and any(s['action'] == 'conditional-open' for _, s in entries):
                     from scene_session import start
                     session_args = {k: getattr(args, k) for k in ('repair_frame', 'resume_menu', 'resume_input', 'frame',
+                                                                  'confirm_result_locally', 'local_result_review',
                                                                   'point', 'only', 'hwnd', 'auto_repair_frame',
                                                                   'allow_physical', 'background_only', 'set')}
                     session_args['recipe'] = str(args.recipe.absolute())
@@ -1825,6 +2064,8 @@ def main(argv=None):
                         workflow_repair.remember_test(args.recipe, recipe, result, approval_before)
         else:
             timeout = worker_timeout(active if args.command == 'run' else recipe) if recipe else 90
+            if getattr(args, 'local_result_review', False) or getattr(args, 'confirm_result_locally', None):
+                timeout += 600
             launched = True
             supervise = coordination.run_worker if mutating or getattr(args, 'repair_frame', None) else subprocess.run
             child = supervise([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),

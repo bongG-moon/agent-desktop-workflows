@@ -106,8 +106,14 @@ def exercise(skill, exe, work):
         check("already_selected_by_id_sends_no_second_input", reply.get("status") == "verified" and
               reply.get("input_dispatched") is False and signature(state()) == before, reply)
         reply = cli("select", "--target", "MES Setup", "--value", "Hybrid")
-        check("option_from_other_combo_is_rejected", reply.get("status") == "blocked" and
-              reply.get("input_dispatched") is False and signature(state()) == before, reply)
+        # This provider advertises writable arbitrary strings. Only it knows
+        # that "Hybrid" is invalid: it throws *inside* SetValue. Confirm the
+        # single attempted write and the absence of any side effect or retry.
+        expected = list(before)
+        expected[1] += 1
+        check("writable_combo_rejected_literal_is_not_retried",
+              reply.get("status") == "uncertain" and reply.get("method") == "SetValue" and
+              reply.get("input_dispatched") is None and signature(state()) == tuple(expected), reply)
         reply = cli("select", "--target", "Family", "--value", "Hybrid", "--within", "workPanel")
         actual = state()
         check("second_combo_changes_only_its_selection", reply.get("status") == "verified" and
@@ -144,6 +150,13 @@ def exercise(skill, exe, work):
             reply = discovery
         check("fresh_leaf_invocation_reaches_only_active_sheet", reply.get("status") == "delivered_unverified"
               and state()["sheet_commands"] == 1, reply)
+
+        # "N" belongs to MES Setup. The noneditable Family list may be
+        # expanded to inspect it, but must never select another field's row.
+        before = signature(state())
+        reply = cli("select", "--target", "Family", "--value", "N", "--within", "workPanel")
+        check("closed_list_rejects_option_from_other_combo", reply.get("status") == "blocked"
+              and reply.get("method") in (None, "Expand") and signature(state()) == before, reply)
     finally:
         fixture.close()
     return results

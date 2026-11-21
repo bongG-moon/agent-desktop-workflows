@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/desktop-select/scripts'))
 import recorder_launch as launcher
@@ -90,6 +90,27 @@ return 0''') as spawn:
         self.assertEqual(last['recover_args'], ['recover', '--task', task])
         self.assertEqual(last['session'], first['session'])
         self.assertEqual(launcher._folder(first['session']).parent, self.store.parent / 'recording-sessions')
+
+    def test_terminal_revision_survives_failed_ui_checkpoint(self):
+        final = dict(status='recorded', task={'name': '수정본'}, input_dispatched=False)
+        folder = self.session(events=(json.dumps(final) + '\n').encode())
+        launcher._publish_saved(folder, dict(final, task={'name': '원본'}), editing=True)
+        self.assertEqual(launcher.status(self.token)['task'], final['task'])
+        (folder / 'events.jsonl').write_bytes(b'')
+        self.assertEqual(launcher.status(self.token)['task'], {'name': '원본'})
+
+    def test_checkpoint_failure_returns_saved_receipt_without_starting_another_action(self):
+        self.session()
+        saved = dict(status='recorded', task={'name': '저장된 업무'}, input_dispatched=False)
+        app = Mock()
+        with patch.object(launcher, '_publish_saved', side_effect=OSError('disk busy')) as publish:
+            result = launcher.after_save(app, self.token, saved)
+        publish.assert_called_once()
+        self.assertEqual(result['status'], 'recorded')
+        self.assertEqual(result['edit_args'], ['review', '--task', '저장된 업무', '--edit'])
+        self.assertEqual(result['restart_args'], ['review', '--task', '저장된 업무', '--restart'])
+        self.assertFalse(result['input_dispatched'])
+        self.assertEqual(app.mock_calls, [])
 
     def test_timeout_returns_starting_without_terminating_the_child(self):
         with patch.object(launcher, 'STARTUP_WAIT_SECONDS', 0.08), self.fake_child('''time.sleep(0.3)

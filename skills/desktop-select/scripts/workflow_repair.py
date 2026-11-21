@@ -222,7 +222,12 @@ class RepairSession:
         need(remaining > 0, 'menu_repair_expired')
         with self.pending.open('x', encoding='utf8') as stream:
             json.dump(record, stream)
+        return self.describe(record)
+
+    @staticmethod
+    def describe(record):
         ticket = record['ticket']
+        remaining = record['expires'] - time.time()
         if record.get('pause'):
             return dict(ticket=ticket, step=record['number'], expires_seconds=int(remaining),
                         host_action='wait_for_user_idle_then_resume', resume_args=['--resume-input', ticket, '--summary'])
@@ -233,7 +238,7 @@ class RepairSession:
         import secrets
         need(self.pending.is_file() and self.pending.stat().st_size < tasks.MAX_FILE_BYTES, 'menu_repair_expired')
         record = json.loads(self.pending.read_text(encoding='utf8'))
-        need(secrets.compare_digest(record['ticket'], ticket) and time.time() < record['expires'],
+        need((ticket is None or secrets.compare_digest(record['ticket'], ticket)) and time.time() < record['expires'],
              'menu_repair_expired')
         need(record['recipe'] == digest(recipe), 'workflow_changed_during_repair')
         return record
@@ -409,6 +414,8 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
             return dict(status='blocked', diagnostic='registered_workflow_busy', input_dispatched=False)
         resume = None
         replacements = {}
+        result_review = None
+        surface_options = {'background_only': True} if getattr(args, 'background_only', False) else {}
         try:
             current = flow.load(args.recipe)
             if current != recipe:
@@ -426,8 +433,43 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                 need(original == recipe, 'workflow_changed_during_repair')
             if getattr(args, 'repeat_approval_used', False):
                 need(approved(args.recipe, current), 'registered_physical_consent_required')
+            if surface_options.get('background_only'):
+                refusal = input_policy.blocked(input_policy.profile([s for _, s in flow.selected_steps(current, args.only)]))
+                if refusal:
+                    # A read-only reminder can reuse an outstanding ticket without consuming it.
+                    if session.pending.is_file():
+                        try:
+                            prior = session.read(None, current)
+                            if (not prior.get('pause') and prior['variables'] == digest(overrides)
+                                    and prior['only'] == args.only and args.hwnd in (None, prior['scope'][0][0])):
+                                refusal['menu_repair'] = session.describe(prior)
+                        except (OSError, ValueError, KeyError, IndexError, TypeError):
+                            pass
+                    return refusal
             approval_before = approval_state(args.recipe) if remember else None
             recipe = run_recipe = current
+            result_ticket = getattr(args, 'confirm_result_locally', None)
+            local_review = getattr(args, 'local_result_review', False)
+            if (not args.only and not args.repair_frame and not args.resume_menu and not resume_input
+                    and any('result_column' in s for s in recipe['steps'])):
+                import registered_result
+                result_review = registered_result.ResultReview(session, recipe, args.recipe)
+                if registered_result.eligible(recipe):
+                    existing = result_review.existing(overrides, result_ticket, args.hwnd)
+                    if existing:
+                        if (local_review or result_ticket) and not existing.get('claimed'):
+                            return result_review.confirm(flow, existing, args.recipe, overrides, try_elements=True)
+                        return result_review.feedback(existing, overrides=overrides)
+                hint = result_review.hint()
+                if hint:
+                    try:
+                        flow.checked_result_hints(recipe, hint)
+                    except (ValueError, flow.app.bridge.BridgeError):
+                        pass  # An obsolete cache can always be rebuilt from the recording.
+                    else:
+                        surface_options['result_surface_hint'] = hint
+                surface_options['remember_result_elements'] = True
+            need(not result_ticket, 'result_review_expired')
             if args.repair_frame or args.resume_menu or resume_input:
                 resume = session.read(args.repair_frame or args.resume_menu or resume_input, recipe)
                 need(bool(resume.get('pause')) == bool(resume_input), 'wrong_continuation_type')
@@ -453,9 +495,52 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
         except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
             return dict(status='blocked', diagnostic=getattr(error, 'code', 'menu_repair_unavailable'),
                         input_dispatched=False)
+        started = time.monotonic()
         report = flow.run(run_recipe, overrides, hwnd=resume['scope'][0][0] if resume else args.hwnd,
                           only=resume['only'] if resume else args.only, track_menu=True, resume=resume,
-                          scene_session=scene_session)
+                          scene_session=scene_session, **surface_options)
+        if result_review and not resume:
+            learned = [dict(row['receipt']['result_element'], number=row['number']) for row in report.get('steps',[])
+                       if row.get('receipt',{}).get('result_element') and row['receipt']['status'] == 'verified']
+            try:
+                result_review.remember_elements(learned)
+            except (OSError, ValueError, flow.app.tasks.TaskError):
+                report['result_surface_hint_saved'] = False
+            try:
+                record = result_review.offer(flow, report, overrides, remember=remember, approval_before=approval_before)
+                if record:
+                    follow = result_review.feedback(record, overrides=overrides)
+                    report.update(host_action=follow['host_action'], result_review=follow['result_review'])
+                    if local_review:
+                        continuation = result_review.confirm(flow, record, args.recipe, overrides)
+                        continuation['elapsed_seconds'] = round(time.monotonic() - started, 4)
+                        if continuation.get('resumed_at'):
+                            prefix = report['steps'][:-1]
+                            if continuation.get('result_match_source') == 'local_visual_confirmation':
+                                observed = report['steps'][-1]['receipt']
+                                observed.update(status='verified', provider_diagnostic=observed['diagnostic'],
+                                                diagnostic='result_confirmed_on_local_screen',
+                                                value_evidence=dict(source='local_visual_confirmation'))
+                                prefix = report['steps']
+                            continuation['steps'] = prefix + continuation['steps']
+                            continuation['original_elapsed_seconds'] = report.get('elapsed_seconds')
+                            continuation['input_dispatched'] = flow.combine(report['input_dispatched'], continuation['input_dispatched'])
+                            continuation.pop('resumed_at')
+                            if continuation['status'] == 'verified' and any(
+                                    row['receipt']['status'] == 'delivered_unverified' for row in report['steps']):
+                                continuation['status'] = 'completed_unverified'
+                            return continuation
+                        if continuation.get('input_dispatched') is None:
+                            continuation['steps'] = report['steps']
+                            continuation['previous_input_dispatched'] = report['input_dispatched']
+                            return continuation
+                        report['review_diagnostic'] = continuation.get('diagnostic')
+                        report['original_elapsed_seconds'] = report.get('elapsed_seconds')
+                        report['elapsed_seconds'] = continuation['elapsed_seconds']
+                    return report
+            except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
+                report['review_diagnostic'] = getattr(error, 'code', 'result_review_unavailable')
+                return report
         if resume:
             report['resumed_at'] = resume['number']
         scope = report.pop('menu_repair_scope', None)

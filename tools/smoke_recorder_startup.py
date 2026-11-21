@@ -310,6 +310,12 @@ def editor_child(skill, work, app_exe, candidate):
         actions = iter(['시작', '마치고 검토', '저장'])
         def tick():
             try:
+                close = next((w for w in descendants(root)
+                              if isinstance(w, ttk.Button) and w.cget('text') == '처음부터 다시 녹화'), None)
+                if close is not None:
+                    next(w for w in descendants(root) if isinstance(w, ttk.Button)
+                         and w.cget('text') == '닫기').invoke()
+                    return
                 label = next(actions)
                 next(w for w in descendants(root) if isinstance(w, ttk.Button) and w.cget('text') == label).invoke()
                 if label != '저장':

@@ -107,29 +107,40 @@ def _display(locator):
 def teach_context_dialog(parent, binding):
     import tkinter as tk
     from tkinter import ttk, filedialog
-    from row_teach import SampleJob, selection_box
+    from row_teach import SampleJob, selection_box, _dialog_shell
 
     win = tk.Toplevel(parent)
-    win.title('조회 결과의 우클릭 메뉴 가르치기')
-    form = ttk.Frame(win, padding=12)
-    form.pack(fill='both', expand=True)
-    form.columnconfigure(1, weight=1)
-    target_text = tk.StringVar(win, '등록 전')
+    win.title('우클릭 메뉴 지정')
+    theme, px, body, buttons, header, wrap = _dialog_shell(
+        win, '조회 결과의 우클릭 메뉴', width=760, height=780)
+    target_text = tk.StringVar(win, '아직 지정하지 않음')
     trigger_text = tk.StringVar(win, '버튼 없이 현재 결과 사용')
-    ready_text = tk.StringVar(win, '등록 전')
+    ready_text = tk.StringVar(win, '아직 지정하지 않음')
     expected = tk.StringVar(win)
     name = tk.StringVar(win)
     output_kind = tk.StringVar(win, '메뉴 전달만 확인')
     output_path = tk.StringVar(win)
     message = tk.StringVar(win, '조회 버튼을 가리킨 다음 업무 화면에서 조회를 한 번 시연하세요. 결과가 보이면 우클릭할 지점을 지정하세요.')
+    wrap(ttk.Label(header, textvariable=message, style='Muted.TLabel', justify='left')).pack(
+        anchor='w', pady=(px(8), 0))
     trigger = menu = readiness = result = None
     job = pending = None
 
-    def text(text, row, col=0, **kw):
-        ttk.Label(form, text=text, **kw).grid(row=row, column=col, sticky='w', pady=3, padx=(0, 6))
+    def card(title):
+        frame = ttk.Frame(body, style='Card.TFrame', padding=px(16))
+        frame.pack(fill='x', pady=(0, px(12)))
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text=title, style='Card.Section.TLabel').grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=(0, px(10)))
+        return frame
 
-    def value(textvar, row, col=1):
-        ttk.Label(form, textvariable=textvar, wraplength=440).grid(row=row, column=col, sticky='w', pady=3)
+    def text(caption, frame, row):
+        ttk.Label(frame, text=caption, style='Card.TLabel').grid(
+            row=row, column=0, sticky='nw', pady=px(4), padx=(0, px(12)))
+
+    def value(textvar, frame, row):
+        wrap(ttk.Label(frame, textvariable=textvar, style='Card.Muted.TLabel', justify='left'), 170).grid(
+            row=row, column=1, sticky='w', pady=px(4))
 
     def close():
         if pending:
@@ -175,7 +186,7 @@ def teach_context_dialog(parent, binding):
         nonlocal trigger, readiness
         trigger = readiness = None
         trigger_text.set('버튼 없이 현재 결과 사용')
-        ready_text.set('등록 전')
+        ready_text.set('아직 지정하지 않음')
         expected.set('')
 
     def set_trigger(answer):
@@ -213,26 +224,45 @@ def teach_context_dialog(parent, binding):
         rect, ppm = answer
         view = tk.Toplevel(win)
         view.title('조회 완료 표시를 드래그하세요')
+        view_theme, view_px, view_body, view_footer, view_header, view_wrap = _dialog_shell(
+            view, '조회 완료 표시 선택', width=920, height=680)
+        view_wrap(ttk.Label(view_header, text='조회 완료 후 고정된 작은 표시 하나를 드래그하세요.',
+                            style='Muted.TLabel')).pack(anchor='w', pady=(view_px(8), 0))
         original = tk.PhotoImage(master=view, data=ppm, format='PPM')
-        scale = max(1, (rect[2] + 899)//900, (rect[3] + 479)//480)
+        max_width = max(view_px(180), min(view_px(840), view.winfo_screenwidth() - view_px(120)))
+        max_height = max(view_px(100), min(view_px(420), view.winfo_screenheight() - view_px(260)))
+        scale = max(1, (rect[2] + max_width - 1)//max_width, (rect[3] + max_height - 1)//max_height)
         scaled = original.subsample(scale, scale)
-        ttk.Label(view, text='조회 완료 후 고정된 작은 표시 하나를 드래그하세요.').pack(anchor='w')
-        canvas = tk.Canvas(view, width=scaled.width(), height=scaled.height(), highlightthickness=0)
-        canvas.pack()
+        image_card = ttk.Frame(view_body, style='Card.TFrame', padding=view_px(12))
+        image_card.pack(fill='both', expand=True)
+        image_card.columnconfigure(0, weight=1)
+        image_card.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(image_card, width=min(scaled.width(), max_width),
+                           height=min(scaled.height(), max_height), background=view_theme['surface'],
+                           highlightbackground='#DCE1EC', highlightthickness=1,
+                           scrollregion=(0, 0, scaled.width(), scaled.height()))
+        horizontal = ttk.Scrollbar(image_card, orient='horizontal', command=canvas.xview)
+        vertical = ttk.Scrollbar(image_card, orient='vertical', command=canvas.yview)
+        canvas.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        horizontal.grid(row=1, column=0, sticky='ew')
+        vertical.grid(row=0, column=1, sticky='ns')
         canvas.create_image(0, 0, image=scaled, anchor='nw')
         start = None
+        def position(e):
+            return int(canvas.canvasx(e.x)), int(canvas.canvasy(e.y))
         def mark(e):
             nonlocal start
-            start = e.x, e.y
+            start = position(e)
         def draw(e):
             if start:
                 canvas.delete('box')
-                canvas.create_rectangle(*start, e.x, e.y, outline='red', width=2, tags='box')
+                canvas.create_rectangle(*start, *position(e), outline=view_theme['accent'], width=2, tags='box')
         def complete(e):
             if not start:
                 return
             try:
-                box = selection_box(tuple(x*scale for x in start), (e.x*scale, e.y*scale), rect[2:])
+                box = selection_box(tuple(x*scale for x in start), tuple(x*scale for x in position(e)), rect[2:])
             except ValueError:
                 return
             view.destroy()
@@ -240,7 +270,7 @@ def teach_context_dialog(parent, binding):
         canvas.bind('<Button-1>', mark)
         canvas.bind('<B1-Motion>', draw)
         canvas.bind('<ButtonRelease-1>', complete)
-        ttk.Button(view, text='취소', command=view.destroy).pack()
+        ttk.Button(view_footer, text='취소', command=view.destroy, style='Quiet.TButton').pack(side='right')
         view.transient(win)
         view.grab_set()
         win.wait_window(view)
@@ -252,19 +282,32 @@ def teach_context_dialog(parent, binding):
         expected.set('')
         message.set('실행 전 상태에서 완료 모양이 이미 보이면 조회 갱신을 구분할 수 없습니다. 실제 완료 표식을 지정하세요.')
 
-    text('조회 버튼', 0)
-    value(trigger_text, 0)
-    bar = ttk.Frame(form)
-    bar.grid(row=1, column=1, sticky='w')
+    query_card = card('1. 조회 시작')
+    text('조회 버튼', query_card, 1)
+    value(trigger_text, query_card, 1)
+    bar = ttk.Frame(query_card, style='Card.TFrame')
+    bar.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(px(6), 0))
+    bar.columnconfigure(0, weight=1)
     def point():
         return win.winfo_pointerxy()
     ttk.Button(bar, text='조회 버튼 가리키기 (3초)', command=lambda: sample(
-        'trigger', lambda: (point(),), set_trigger, 3000)).pack(side='left')
-    ttk.Button(bar, text='조회 버튼 생략', command=clear_trigger).pack(side='left', padx=4)
-    text('메뉴 경로', 2)
-    names = tk.Text(form, height=3, width=45, wrap='none')
-    names.grid(row=2, column=1, sticky='ew', pady=3)
-    text('상위 메뉴부터 한 줄씩 입력하세요. 예: 첫 줄 EXPORT, 다음 줄 EXPORT TO EXCEL', 3, 1)
+        'trigger', lambda: (point(),), set_trigger, 3000)).grid(row=0, column=0, sticky='ew')
+    ttk.Button(bar, text='조회 버튼 생략', command=clear_trigger).grid(
+        row=0, column=1, padx=(px(8), 0))
+    menu_card = card('2. 결과 위치와 메뉴 경로')
+    text('메뉴 경로', menu_card, 1)
+    names = tk.Text(menu_card, height=3, width=1, wrap='none', font='TkTextFont',
+                    background=theme['surface'], foreground=theme['ink'], insertbackground=theme['ink'],
+                    selectbackground='#ECEBFA', selectforeground=theme['ink'], borderwidth=0,
+                    highlightthickness=1, highlightbackground='#DCE1EC', highlightcolor=theme['accent'],
+                    padx=px(9), pady=px(7))
+    names.grid(row=1, column=1, sticky='ew', pady=px(4))
+    name_scroll = ttk.Scrollbar(menu_card, orient='horizontal', command=names.xview)
+    names.configure(xscrollcommand=name_scroll.set)
+    name_scroll.grid(row=2, column=1, sticky='ew')
+    wrap(ttk.Label(menu_card, text='상위 메뉴부터 한 줄씩 입력하세요. 예: 첫 줄 EXPORT, 다음 줄 EXPORT TO EXCEL',
+                   style='Card.Muted.TLabel', justify='left'), 170).grid(
+                       row=3, column=1, sticky='w', pady=(px(6), px(10)))
     def teach_point():
         try:
             path = menu_path(names.get('1.0', 'end-1c'))
@@ -272,23 +315,30 @@ def teach_context_dialog(parent, binding):
             message.set(str(exc))
             return
         sample('menu', lambda: (point(), path), set_menu, 3000)
-    text('우클릭할 표 위치', 4)
-    value(target_text, 4)
-    ttk.Button(form, text='데이터가 있는 지점 가리키기 (3초)', command=teach_point).grid(row=5, column=1, sticky='w')
-    text('조회 완료 표시', 6)
-    value(ready_text, 6)
-    ready_bar = ttk.Frame(form)
-    ready_bar.grid(row=7, column=1, sticky='w')
+    text('우클릭할 표 위치', menu_card, 4)
+    value(target_text, menu_card, 4)
+    ttk.Button(menu_card, text='데이터가 있는 지점 가리키기 (3초)', command=teach_point).grid(
+        row=5, column=0, columnspan=2, sticky='ew', pady=(px(6), 0))
+    ready_card = card('3. 조회 완료 확인')
+    text('조회 완료 표시', ready_card, 1)
+    value(ready_text, ready_card, 1)
+    ready_bar = ttk.Frame(ready_card, style='Card.TFrame')
+    ready_bar.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(px(6), px(10)))
+    ready_bar.columnconfigure(0, weight=1)
     ttk.Button(ready_bar, text='상태 글자 가리키기 (3초)', command=lambda: sample(
-        'ready', lambda: (point(),), set_text_ready, 3000) if trigger else message.set('먼저 조회 버튼을 지정하세요.')).pack(side='left')
-    ttk.Button(ready_bar, text='표 안의 완료 모양 고르기', command=open_visual).pack(side='left', padx=4)
-    text('기대하는 상태 글자', 8)
-    ttk.Entry(form, textvariable=expected).grid(row=8, column=1, sticky='ew')
-    text('내보내기 결과', 9)
+        'ready', lambda: (point(),), set_text_ready, 3000) if trigger else message.set('먼저 조회 버튼을 지정하세요.')).grid(
+            row=0, column=0, sticky='ew')
+    ttk.Button(ready_bar, text='표 안의 완료 모양 고르기', command=open_visual).grid(
+        row=1, column=0, sticky='ew', pady=(px(8), 0))
+    text('기대하는 상태 글자', ready_card, 3)
+    ttk.Entry(ready_card, textvariable=expected).grid(row=3, column=1, sticky='ew')
+    output_card = card('4. 내보내기 결과와 단계 이름')
+    text('내보내기 결과', output_card, 1)
     kinds = ('메뉴 전달만 확인', '지정 파일', '폴더의 새 Excel 파일')
-    ttk.Combobox(form, values=kinds, textvariable=output_kind, state='readonly').grid(row=9, column=1, sticky='ew')
-    file_bar = ttk.Frame(form)
-    file_bar.grid(row=10, column=1, sticky='ew')
+    ttk.Combobox(output_card, values=kinds, textvariable=output_kind, state='readonly').grid(
+        row=1, column=1, sticky='ew')
+    file_bar = ttk.Frame(output_card, style='Card.TFrame')
+    file_bar.grid(row=2, column=0, columnspan=2, sticky='ew', pady=px(8))
     def browse():
         if output_kind.get() == kinds[0]:
             output_kind.set(kinds[2])
@@ -297,11 +347,10 @@ def teach_context_dialog(parent, binding):
                                              filetypes=[('Excel 통합 문서', '*.xlsx')]))
         if path:
             output_path.set(path)
-    ttk.Entry(file_bar, textvariable=output_path).pack(side='left', fill='x', expand=True)
-    ttk.Button(file_bar, text='경로 선택', command=browse).pack(side='left', padx=(4, 0))
-    text('이 단계의 이름', 11)
-    ttk.Entry(form, textvariable=name).grid(row=11, column=1, sticky='ew')
-    ttk.Label(form, textvariable=message, wraplength=540).grid(row=12, column=0, columnspan=2, sticky='w', pady=8)
+    ttk.Entry(file_bar, textvariable=output_path, width=1).pack(side='left', fill='x', expand=True)
+    ttk.Button(file_bar, text='경로 선택', command=browse).pack(side='left', padx=(px(8), 0))
+    text('이 단계의 이름', output_card, 3)
+    ttk.Entry(output_card, textvariable=name).grid(row=3, column=1, sticky='ew')
 
     def accept():
         nonlocal result
@@ -323,10 +372,9 @@ def teach_context_dialog(parent, binding):
             message.set('단계를 추가하기 전에 다음 내용을 확인하세요. ' + str(exc))
             return
         close()
-    buttons = ttk.Frame(form)
-    buttons.grid(row=13, column=1, sticky='e')
-    ttk.Button(buttons, text='단계에 추가', command=accept).pack(side='left')
-    ttk.Button(buttons, text='취소', command=close).pack(side='left', padx=4)
+    ttk.Button(buttons, text='적용', command=accept, style='Primary.TButton').pack(side='right')
+    ttk.Button(buttons, text='취소', command=close, style='Quiet.TButton').pack(
+        side='right', padx=(0, px(8)))
     parent.withdraw()
     win.protocol('WM_DELETE_WINDOW', close)
     try:

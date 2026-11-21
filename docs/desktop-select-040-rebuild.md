@@ -60,7 +60,7 @@
 |---|---|
 | `provider_visibility.py` | IsOffscreen 미제공 시 현재 창 표시, 유효 좌표와 포함 관계로 판단. 최소화된 창은 실제 조작 전에 복원 |
 | `provider_values.py` | 동일한 편집 피어 값은 일치 근거로 사용. 값 충돌과 여러 선택 항목은 확인 실패로 유지 |
-| `live_action.py` | 쓰기 가능한 부모 콤보에 SetValue 1회, 0.35초 후 현재 대상과 값 재확인. 그 뒤 Expand/Select로 재시도하지 않음 |
+| `live_action.py` | 같은 값을 확인하면 쓰기를 생략한다. 변경이 필요하면 SetValue 1회 후 즉시 확인하고, 늦게 반영되는 경우에만 최대 0.35초 기다려 다시 읽는다. |
 | `desktop_select.py` | 직접 명령의 최초 라벨 해석 뒤 확인은 ID와 부모 범위로 수행. 주변 라벨 읽기는 해당 폼으로 제한 |
 | `runtime-manifest.json` | 원본 브리지와 녹화기의 검증 정보를 코드 밖에 분리. 호환 보정은 원본을 수정하지 않고 적용 |
 | `teach_capture.py`, `learned_tasks.py` | 위치만 지정한 콤보도 지시 편집 가능. 임시 정보 변경 시 지시 유지. 다음 단계 이동, 삭제, 명시적 이름 연결 |

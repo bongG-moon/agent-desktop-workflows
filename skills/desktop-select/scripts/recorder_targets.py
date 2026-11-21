@@ -142,8 +142,12 @@ def choose_window(hint, rows, on_ready=None):
 
 
 def _choose_window(tk, ttk, hint, rows, on_ready):
+    import recorder_theme
+
     root = tk.Tk()
     root.title('Desktop Select 녹화 대상 선택')
+    theme = recorder_theme.configure(root)
+    font = theme['font']
 
     def pixels(value, fallback):
         try:
@@ -151,59 +155,76 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
         except (TypeError, ValueError):
             return fallback
 
-    # Tk scales its default font with Windows DPI, but its default Treeview row
-    # height stays at 20 pixels. Derive both row height and initial sizing from
-    # the actual font so enlarged text never overlaps the next row.
-    line_height = pixels(root.tk.call('font', 'metrics', 'TkDefaultFont', '-linespace'), 20)
-    row_height = line_height + max(8, line_height // 2)
-    label_width = pixels(root.tk.call('font', 'measure', 'TkDefaultFont', '가' * 44), 720)
+    scale = root.winfo_fpixels('1i') / 96.0
+
+    def px(value):
+        return max(1, round(value * scale))
+
+    # The shared theme measures the same Korean font used by the table. Keep
+    # physical dimensions within the screen even when Windows doubles its DPI.
+    line_height = pixels(font.metrics('linespace'), px(20))
+    row_height = line_height + px(14)
+    label_width = pixels(font.measure('가' * 44), px(620))
     screen_width = pixels(root.winfo_screenwidth(), 1280)
     screen_height = pixels(root.winfo_screenheight(), 800)
-    width = min(max(760, label_width + 100), max(320, screen_width - 80))
-    height = min(max(460, row_height * 7 + line_height * 7 + 90), max(240, screen_height - 120))
+    width = min(max(px(780), label_width + px(100)), max(320, screen_width - 80))
+    height = min(max(px(580), row_height * 6 + line_height * 8 + px(100)),
+                 max(240, screen_height - 120))
     root.geometry(f'{width}x{height}')
-    root.minsize(min(width, 640), min(height, max(340, line_height * 12)))
-    root.tk.call('ttk::style', 'configure', 'RecorderPicker.Treeview',
-                 '-font', 'TkDefaultFont', '-rowheight', row_height)
-    root.tk.call('ttk::style', 'configure', 'RecorderPicker.Treeview.Heading',
-                 '-font', 'TkDefaultFont', '-padding', (8, max(4, line_height // 6)))
+    root.minsize(min(width, px(640)), min(height, px(500)))
+    # Keep useful rows visible on a smaller display at high DPI. Font and
+    # control sizes stay with the shared theme; only surrounding whitespace
+    # becomes more compact when the screen cannot hold the preferred height.
+    scale = min(scale, height / 580)
     selected = None
     failed = False
     current = {}
-    frame = ttk.Frame(root, padding=16)
+    frame = ttk.Frame(root, padding=(px(24), px(20)))
     frame.pack(fill='both', expand=True)
-    ttk.Label(frame, text='녹화할 창을 선택하세요.').pack(anchor='w')
-    search = ttk.Frame(frame)
-    search.pack(fill='x', pady=(10, 8))
+    actions = ttk.Frame(frame)
+    # Reserve the footer first: long titles and high DPI must never move the
+    # recording/cancel buttons below the window's client area.
+    actions.pack(side='bottom', fill='x', pady=(px(16), 0))
+    detail_card = ttk.Frame(frame, padding=(px(16), px(8)), style='Card.TFrame')
+    detail_card.pack(side='bottom', fill='x', pady=(px(12), 0))
+    ttk.Label(frame, text='Desktop Select', style='Brand.TLabel').pack(anchor='w', pady=(0, px(3)))
+    ttk.Label(frame, text='녹화할 창 선택', style='Title.TLabel').pack(anchor='w')
+    search = ttk.Frame(frame, padding=(px(16), px(12)), style='Card.TFrame')
+    search.pack(fill='x', pady=(px(18), px(10)))
     query = tk.StringVar(value=hint)
-    ttk.Label(search, text='프로그램 또는 창 제목').pack(side='left', padx=(0, 8))
+    ttk.Label(search, text='프로그램 또는 창 제목', style='Card.Muted.TLabel').pack(
+        side='left', padx=(0, px(12)))
     entry = ttk.Entry(search, textvariable=query)
     entry.pack(side='left', fill='x', expand=True)
     message = tk.StringVar()
-    notice = ttk.Label(frame, textvariable=message, wraplength=width - 40, justify='left')
-    notice.pack(anchor='w', pady=(0, 8))
-    table = ttk.Frame(frame)
+    notice = ttk.Label(frame, textvariable=message, wraplength=width - px(48), justify='left',
+                       style='Muted.TLabel')
+    notice.pack(anchor='w', pady=(0, px(10)))
+    table = ttk.Frame(frame, style='Card.TFrame', padding=1)
     listing = ttk.Treeview(table, columns=('title', 'exe', 'pid', 'hwnd'), show='headings',
                            displaycolumns=('title', 'exe'), selectmode='browse', height=7,
-                           style='RecorderPicker.Treeview')
-    for key, title, column_width in [('title', '창 제목', int((width - 60) * .58)),
-                                     ('exe', '프로그램', int((width - 60) * .42))]:
-        listing.heading(key, text=title)
-        minimum = pixels(root.tk.call('font', 'measure', 'TkDefaultFont', title), 80) + 32
-        listing.column(key, width=column_width, minwidth=minimum, stretch=True)
+                           style='Steps.Treeview')
+    for key, title, column_width in [('title', '창 제목', int((width - px(60)) * .64)),
+                                     ('exe', '프로그램', int((width - px(60)) * .36))]:
+        listing.heading(key, text=title, anchor='w')
+        minimum = pixels(font.measure(title), px(60)) + px(24)
+        listing.column(key, width=column_width, minwidth=minimum, stretch=True, anchor='w')
     scroll = ttk.Scrollbar(table, orient='vertical', command=listing.yview)
     horizontal = ttk.Scrollbar(table, orient='horizontal', command=listing.xview)
     listing.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
     horizontal.pack(side='bottom', fill='x')
     scroll.pack(side='right', fill='y')
     listing.pack(side='left', fill='both', expand=True)
-    detail = tk.StringVar(value='목록에서 창을 선택하면 전체 제목과 프로그램을 확인할 수 있습니다.')
-    detail_label = ttk.Label(frame, textvariable=detail, wraplength=width - 40, justify='left')
-    actions = ttk.Frame(frame)
-    # Reserve the footer before giving remaining space to the scrollable list.
-    # Larger fonts or a multi-line caption must not push the buttons off screen.
-    actions.pack(side='bottom', fill='x', pady=(12, 0))
-    detail_label.pack(side='bottom', fill='x', pady=(10, 0))
+    detail = tk.StringVar(value='목록에서 녹화할 창을 선택하세요.')
+    caption = tk.StringVar()
+    ttk.Label(detail_card, text='선택한 창', style='Card.Section.TLabel').pack(anchor='w')
+    # A read-only field retains the entire literal caption and lets the user
+    # scroll/copy it without a long title expanding the footer beyond the screen.
+    caption_field = ttk.Entry(detail_card, textvariable=caption, state='readonly')
+    caption_field.pack(fill='x', pady=(px(8), px(7)))
+    detail_label = ttk.Label(detail_card, textvariable=detail, wraplength=width - px(80),
+                             justify='left', style='Card.Muted.TLabel')
+    detail_label.pack(anchor='w')
     table.pack(fill='both', expand=True)
 
     def cancel():
@@ -216,9 +237,11 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
             selected = current[keys[0]]
             root.destroy()
 
-    confirm = ttk.Button(actions, text='이 창에서 녹화', command=choose, state='disabled')
+    confirm = ttk.Button(actions, text='이 창에서 녹화', command=choose, state='disabled',
+                         style='Primary.TButton')
     confirm.pack(side='right')
-    ttk.Button(actions, text='취소', command=cancel).pack(side='right', padx=(0, 8))
+    ttk.Button(actions, text='취소', command=cancel, style='Quiet.TButton').pack(
+        side='right', padx=(0, px(8)))
 
     def show(*_):
         nonlocal current
@@ -230,7 +253,8 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
         for key, row in current.items():
             listing.insert('', 'end', iid=key, values=(row['title'], row['exe_name'], row['pid'], row['hwnd']))
         confirm.configure(state='disabled')
-        detail.set('목록에서 창을 선택하면 전체 제목과 프로그램을 확인할 수 있습니다.')
+        caption.set('')
+        detail.set('목록에서 녹화할 창을 선택하세요.')
         if not rows:
             message.set('선택할 창이 없습니다. 프로그램을 연 뒤 새로 고침을 누르세요.')
         elif matches:
@@ -256,19 +280,21 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
         chosen = current.get(keys[0]) if len(keys) == 1 else None
         confirm.configure(state='normal' if chosen is not None else 'disabled')
         if chosen is None:
-            detail.set('목록에서 창을 선택하면 전체 제목과 프로그램을 확인할 수 있습니다.')
+            caption.set('')
+            detail.set('목록에서 녹화할 창을 선택하세요.')
             return
-        text = f"창 제목: {chosen['title']}\n프로그램: {chosen['exe_name']}"
+        caption.set(chosen['title'])
+        caption_field.xview_moveto(0)
+        text = f"프로그램: {chosen['exe_name']}"
         if sum(row['title'] == chosen['title'] and row['exe_name'].casefold() == chosen['exe_name'].casefold()
                for row in rows) > 1:
-            text += f"\n창 번호: {chosen['hwnd']}  /  프로세스: {chosen['pid']}"
+            text += f"    창 번호: {chosen['hwnd']}  /  프로세스: {chosen['pid']}"
         detail.set(text)
 
     def resize(event):
         if event.widget is root:
-            wraplength = max(200, event.width - 40)
-            notice.configure(wraplength=wraplength)
-            detail_label.configure(wraplength=wraplength)
+            notice.configure(wraplength=max(px(160), event.width - px(48)))
+            detail_label.configure(wraplength=max(px(160), event.width - px(80)))
 
     def report_ready(event=None):
         nonlocal on_ready
@@ -283,7 +309,7 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
         failed = True
         root.destroy()
 
-    ttk.Button(actions, text='새로 고침', command=refresh).pack(side='left')
+    ttk.Button(actions, text='새로 고침', command=refresh, style='Quiet.TButton').pack(side='left')
     entry.bind('<KeyRelease>', show)
     listing.bind('<<TreeviewSelect>>', changed)
     listing.bind('<Double-1>', choose)

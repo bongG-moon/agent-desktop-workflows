@@ -365,6 +365,24 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid, jus
             return result['value'] == selected_value
         return None
 
+    def verify_write(read_matches):
+        # Most Windows providers update synchronously. Give a lagging provider
+        # one last read after the original settle interval, never another write.
+        deadline = time.monotonic() + VALUE_SETTLE_SECONDS
+        check_target()
+        matched = read_matches()
+        remaining = deadline - time.monotonic()
+        if matched is not True and VALUE_SETTLE_SECONDS > 0:
+            if remaining > 0:
+                time.sleep(remaining)
+            check_target()
+            matched = read_matches()
+        if matched is True:
+            return receipt('verified', 'current_state_matched', 'matched')
+        if matched is False:
+            return receipt('mismatch', 'current_state_mismatch', 'mismatch')
+        return receipt('delivered_unverified', 'current_state_unavailable')
+
     try:
         # The workflow already found this exact ID and checked its recorded label.
         # Every pattern call still re-resolves immediately before its mutation.
@@ -385,14 +403,12 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid, jus
                          and 'SetValue' in uia.actions(element), 'text_value_not_writable')
             send(element, 'SetValue', text_write_guard, value)
             verifying = True
-            time.sleep(VALUE_SETTLE_SECONDS)
-            check_target()
-            result = text_readback(binding, uia, element)
-            if result.get('value_evidence', {}).get('status') != 'observed':
-                return receipt('delivered_unverified', 'current_state_unavailable')
-            if result['value'] != value:
-                return receipt('mismatch', 'current_state_mismatch', 'mismatch')
-            return receipt('verified', 'current_state_matched', 'matched')
+            def text_matches():
+                result = text_readback(binding, uia, element)
+                if result.get('value_evidence', {}).get('status') == 'observed':
+                    return result['value'] == value
+                return None
+            return verify_write(text_matches)
         elif action in ('select', 'set-value'):
             _require(role == 'combobox', 'combo_required')
             _require(isinstance(value, str) and value.strip() and '\0' not in value
@@ -401,19 +417,18 @@ def execute(binding, uia, element, node, action, value=None, *, still_valid, jus
                 # Writable custom combos need neither visible option peers nor
                 # a truthful ExpandCollapse state. The caller supplies a literal
                 # value; a single write is followed by independent readback.
+                # A parent value or SelectionPattern can identify a no-op
+                # without collecting the option inventory.
+                if element.property(30045) == value or element.property(30037) is True:
+                    check_target()
+                    if read_value() is True:
+                        return receipt('verified', 'value_already_selected', 'matched')
                 def direct_write_guard():
                     check_target()
                     _require('SetValue' in uia.actions(element), 'combo_value_not_writable')
                 send(element, 'SetValue', direct_write_guard, value)
                 verifying = True
-                time.sleep(VALUE_SETTLE_SECONDS)
-                check_target()
-                matched = read_value()
-                if matched is True:
-                    return receipt('verified', 'current_state_matched', 'matched')
-                if matched is False:
-                    return receipt('mismatch', 'current_state_mismatch', 'mismatch')
-                return receipt('delivered_unverified', 'current_state_unavailable')
+                return verify_write(read_value)
             try:
                 code, matches = _options(binding, uia, element, value)
             except win.BridgeError as error:

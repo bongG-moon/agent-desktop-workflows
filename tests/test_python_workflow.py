@@ -159,6 +159,128 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(flow.WorkflowError, 'verified_result_required'):
             flow.validate(dict(data, steps=[data['steps'][2]]))
 
+    def test_confirmed_painted_group_hands_off_after_first_read_without_another_query(self):
+        import result_cell
+        table = dict(role='table')
+        group = dict(role='group', automation_id='PaintedSurface')
+        step = dict(action='verify-value', selector=table, result_column='Code', value='LAB-42')
+        data = dict(recipe(), steps=[dict(action='invoke',selector=dict(role='button',name='VIEW')),step])
+        with (patch.object(flow, 'result_surface', side_effect=[flow.WorkflowError('result_table_missing'),self.element]) as surface,
+              patch.object(result_cell,'find',side_effect=flow.app.bridge.BridgeError('result_column_unavailable')),
+              patch.object(result_cell,'bare_group',return_value=True),
+              patch.object(flow.live,'execute',side_effect=self.execute) as invoke,
+              patch.object(flow.time,'sleep') as sleep):
+            result = flow.run(data, result_surface_hint=dict(number=2,selector=group))
+            receipt = result['steps'][-1]['receipt']
+            self.assertEqual(receipt['result_observation']['strategy'],'reviewed_group_pixels')
+            self.assertEqual(receipt['result_observation']['attempts'],1)
+            self.assertEqual(receipt['result_observation']['wait_seconds'],0)
+            self.assertEqual(receipt['result_surface_selector'],group)
+            self.assertFalse(receipt['input_dispatched'])
+            self.assertEqual([call.args[-1] for call in surface.call_args_list],[table,group])
+            invoke.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_temporary_header_and_cell_absence_still_waits_until_uia_succeeds(self):
+        import result_cell
+        step = dict(action='verify-value', selector=dict(role='group',name='Loading results'),
+                    result_column='Code', value='LAB-42')
+        now = [200.]
+        def sleep(seconds):
+            now[0] += seconds
+        missing_header = flow.app.bridge.BridgeError('result_column_unavailable')
+        missing_cell = flow.app.bridge.BridgeError('result_cell_missing')
+        with (patch.object(flow,'result_surface',return_value=self.element),
+              patch.object(result_cell,'find',side_effect=[missing_header]*8+[missing_cell,self.element]),
+              patch.object(result_cell,'bare_group') as structure,
+              patch.object(flow.time,'monotonic',side_effect=lambda: now[0]),
+              patch.object(flow.time,'sleep',side_effect=sleep)):
+            receipt = flow.observe_result(self.binding,self.uia,step,'LAB-42',lambda: None,wait_seconds=5)
+        self.assertEqual(receipt['status'],'verified')
+        self.assertEqual(receipt['result_observation']['attempts'],10)
+        self.assertAlmostEqual(receipt['result_observation']['wait_seconds'],1.8)
+        structure.assert_not_called()
+
+    def test_generic_surface_keeps_native_resolution_and_ambiguity_ahead_of_history(self):
+        group = dict(role='group', automation_id='PaintedSurface')
+        table = dict(role='table')
+        with patch.object(flow,'result_surface',return_value=self.element) as surface:
+            self.assertEqual(flow._result_target(self.binding,self.uia,table,group),(self.element,table))
+            surface.assert_called_once_with(self.binding,self.uia,table)
+            surface.side_effect = flow.WorkflowError('result_table_ambiguous')
+            with self.assertRaisesRegex(flow.WorkflowError,'result_table_ambiguous'):
+                flow._result_target(self.binding,self.uia,table,group)
+            self.assertEqual(surface.call_count,2)
+            surface.side_effect = [flow.WorkflowError('result_table_missing'),flow.app.bridge.BridgeError('target_missing')]
+            with self.assertRaisesRegex(flow.WorkflowError,'result_table_missing'):
+                flow._result_target(self.binding,self.uia,table,group)
+
+    def test_proven_table_locator_uses_direct_lookup_and_recovers_only_on_absence(self):
+        generic = dict(role='table')
+        saved = dict(role='group', automation_id='CurrentGrid')
+        with patch.object(flow,'result_surface', return_value=self.element) as get:
+            actual = flow._result_target(self.binding, self.uia, generic, saved, column='Key', element_hint=True)
+            self.assertEqual(actual,(self.element,saved))
+            self.assertEqual([c.args[-1] for c in get.call_args_list], [saved])
+            get.reset_mock()
+            get.side_effect = [flow.app.bridge.BridgeError('target_missing'), self.element]
+            self.assertEqual(flow._result_target(self.binding,self.uia,generic,saved,column='Key',element_hint=True),
+                             (self.element,generic))
+            self.assertEqual([c.args[-1] for c in get.call_args_list], [saved, generic])
+            get.reset_mock()
+            get.side_effect = flow.app.bridge.BridgeError('target_ambiguous')
+            with self.assertRaisesRegex(flow.app.bridge.BridgeError,'target_ambiguous'):
+                flow._result_target(self.binding,self.uia,generic,saved,column='Key',element_hint=True)
+            self.assertEqual(get.call_count,1)
+
+    def test_generic_selection_finds_only_groups_with_grid_pattern_or_header_and_rows(self):
+        import result_cell
+        self.uia.same.side_effect = lambda a,b: a is b
+        with (patch.object(flow.lookup,'find_all', return_value=[self.element]) as find,
+              patch.object(flow.live,'_visible',return_value=True),
+              patch.object(result_cell,'_column',side_effect=lambda b,u,s,*rest: dict(element=object(),grid=s))):
+            self.assertIs(flow._group_for_column(self.binding,self.uia,'Key'), self.element)
+            self.assertTrue(find.call_args.kwargs['grid_group'])
+            self.assertEqual(find.call_count,1)
+            find.return_value = [self.element,MagicMock()]
+            with self.assertRaisesRegex(flow.WorkflowError,'result_table_ambiguous'):
+                flow._group_for_column(self.binding,self.uia,'Key')
+
+    def test_generic_list_without_requested_column_finds_result_group_once(self):
+        import result_cell
+        unrelated, group = MagicMock(), MagicMock()
+        self.uia.same.side_effect = lambda a,b: a is b
+        selector = dict(role='group',automation_id='CurrentResult')
+        step = dict(action='verify-value',selector=dict(role='table'),result_column='Part',value='P-3')
+        def find(binding,uia,table,expected,**options):
+            if table is unrelated:
+                raise flow.app.bridge.BridgeError('result_column_not_found')
+            self.assertIs(table,group)
+            self.assertEqual(expected,'P-3')
+        with (patch.object(flow,'result_surface',return_value=unrelated),
+              patch.object(result_cell,'find',side_effect=find) as cells,
+              patch.object(flow.lookup,'find_all',side_effect=lambda *a,**k: [group] if k.get('grid_group') else []),
+              patch.object(flow.live,'_visible',return_value=True),
+              patch.object(result_cell,'_column',side_effect=lambda b,u,s,*a: dict(element=object(),grid=s) if s is group else {}),
+              patch.object(flow,'_stable_result_selector',return_value=selector)):
+            report = flow.observe_result(self.binding,self.uia,step,'P-3',lambda: None,wait_seconds=0,remember=True)
+        self.assertEqual(report['status'],'verified')
+        self.assertEqual([c.args[2] for c in cells.call_args_list],[unrelated,group])
+        self.assertEqual(report['result_element']['selector'],selector)
+
+    def test_changed_result_table_after_same_value_was_verified_blocks_double_click(self):
+        import result_cell
+        data = dict(recipe(), steps=[
+            dict(action='verify-value', selector=dict(role='table'), result_column='Part', value='A1'),
+            dict(action='double-click-result', label='Open matching row')])
+        self.uia.same.side_effect = lambda first, second: first is second
+        with (patch.object(flow,'result_surface',side_effect=[self.element,MagicMock()]),
+              patch.object(result_cell,'find',return_value=self.element), patch.object(result_cell,'execute') as click):
+            result = flow.run(data)
+        self.assertEqual((result['status'],result['diagnostic']),('blocked','result_table_changed'),result)
+        self.assertFalse(result['input_dispatched'])
+        click.assert_not_called()
+
     def test_read_and_verify_observe_only_and_keep_literal_in_summary(self):
         selector = dict(role='textfield', automation_id='Details')
         data = dict(recipe(), steps=[dict(action='read-value', selector=selector, label='Details'),

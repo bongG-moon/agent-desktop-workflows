@@ -21,6 +21,8 @@ class RecordingFollowupTests(unittest.TestCase):
         evidence = deepcopy(source['live_recovery'])
         result = followup(source)
         self.assertEqual(result['effective_task'], '보정 사본')
+        self.assertEqual(result['edit_args'], ['review', '--task', '원본', '--edit'])
+        self.assertEqual(result['restart_args'], ['review', '--task', '원본', '--restart'])
         self.assertEqual(result['next_action']['args'], [
             'try-recording', '--task', '보정 사본'])
         self.assertEqual(result['next_action']['required_parameters'], ['Family'])

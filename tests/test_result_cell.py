@@ -35,6 +35,51 @@ class ResultCellTests(unittest.TestCase):
     def find(self):
         return result_cell.find(self.binding, self.uia, self.grid, 'Q42', column='Order')
 
+    def prepare_painted_group(self):
+        self.grid.values[30022] = True
+        group = self.node(self.uia.root, 50026, 'Painted results', 20, 200)
+        group.values[30011] = 'ResultSurface'
+        self.uia.children = lambda parent: (e for e in self.uia.nodes.values() if e.parent_node is parent)
+        self.uia.from_point = lambda x, y: group
+        for name, value in [('window_from_point', 41), ('root_window', self.binding.hwnd), ('hwnd_pid', self.binding.pid)]:
+            self.patches.enter_context(patch.object(win, name, return_value=value))
+        return group
+
+    def bind_painted(self):
+        return result_cell.bound_group(self.binding, self.uia, (100, 21), (90, 32))
+
+    def test_two_distinct_visual_points_bind_a_unique_group_by_identity(self):
+        group = self.prepare_painted_group()
+        self.assertEqual(self.bind_painted(), ({'role':'group','automation_id':'ResultSurface'}, group.box))
+        group.values[30011] = ''
+        self.assertEqual(self.bind_painted()[0], {'role':'group','name':'Painted results'})
+        self.node(self.uia.root, 50026, 'Painted results', 250, 200)
+        with self.assertRaisesRegex(win.BridgeError, 'target_ambiguous'):
+            self.bind_painted()
+
+    def test_binding_rejects_protected_or_form_groups_and_another_visible_table(self):
+        group = self.prepare_painted_group()
+        self.grid.values[30022] = False
+        with self.assertRaisesRegex(win.BridgeError, 'result_table_ambiguous'):
+            self.bind_painted()
+        self.grid.values[30022] = True
+        group.values[30019] = True
+        with self.assertRaisesRegex(win.BridgeError, 'target_protected'):
+            self.bind_painted()
+        group.values[30019] = False
+        self.node(group, 50004, 'Filter', 25, 70)
+        with self.assertRaisesRegex(win.BridgeError, 'result_group_not_proven'):
+            self.bind_painted()
+
+    def test_both_points_must_directly_hit_same_group_below_the_reviewed_header(self):
+        group = self.prepare_painted_group()
+        with self.assertRaisesRegex(win.BridgeError, 'result_group_not_proven'):
+            result_cell.bound_group(self.binding, self.uia, (90, 32), (100, 21))
+        another = self.node(self.uia.root,50026,'Other',80,200)
+        self.uia.from_point = lambda x, y: group if y < 25 else another
+        with self.assertRaisesRegex(win.BridgeError, 'result_group_not_proven'):
+            self.bind_painted()
+
     def prepare_pointer(self):
         for module, name, result in (
                 (result_cell.coordination, 'desktop_input', nullcontext()),
@@ -53,7 +98,7 @@ class ResultCellTests(unittest.TestCase):
         self.node(self.row, 50020, 'Q42', 134, 30)
         self.assertIs(self.find(), self.cell)
         self.cell.values[30005] = 'different'
-        with self.assertRaisesRegex(win.BridgeError, 'result_cell_missing'):
+        with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
             self.find()
 
     def test_nested_grid_same_x_coordinate_is_not_a_match(self):
@@ -79,9 +124,121 @@ class ResultCellTests(unittest.TestCase):
         self.node(edit, 50020, 'Q42', 8, 36)
         private = self.node(self.row, 50026, 'protected', 0, 120, secure=True)
         secret = self.node(private, 50020, 'Q42', 8, 36)
-        with self.assertRaisesRegex(win.BridgeError, 'result_cell_missing'):
+        with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
             self.find()
         self.assertNotIn(30005, secret.reads)
+
+    def test_cell_with_descriptive_name_uses_actual_value_and_rejects_conflict(self):
+        self.cell.values.update({30005: 'Description', 30045: 'Q42'})
+        self.assertIs(self.find(), self.cell)
+        self.cell.values.update({30045: None, 30093: 'Q42'})
+        self.assertIs(self.find(), self.cell)
+        self.cell.values.update({30005: 'Q42', 30045: 'other'})
+        with self.assertRaisesRegex(win.BridgeError, 'result_cell_missing'):
+            self.find()
+
+    def test_value_only_cell_duplicates_in_same_column_are_ambiguous(self):
+        row = self.node(self.grid, 50007, 'row 2', 0, 240)
+        self.node(row, 50025, '', 8, 36).values[30045] = 'Q42'
+        with self.assertRaisesRegex(win.BridgeError, 'result_cell_ambiguous'):
+            self.find()
+
+    def test_cell_relationship_identifies_logical_column_without_header_in_the_tree(self):
+        self.header.values.update({30003: 50025, 30011: 'OrderHeading', 30022: True})
+        self.cell.values.update({30039: True, 30005: '', 30093: 'Q42'})
+        evidence = {}
+        with patch.object(result_cell.grid_provider, 'headers', return_value=[self.header]) as read:
+            match = result_cell.find(self.binding,self.uia,self.grid,'Q42',column='Order',evidence=evidence)
+            self.assertIs(match, self.cell)
+            self.assertEqual(evidence['column_hint'], {'role':'custom','automation_id':'OrderHeading'})
+            read.assert_called_once_with(self.cell, cell=True)
+        with patch.object(result_cell.grid_provider,'headers',return_value=[self.other_header]):
+            with self.assertRaisesRegex(win.BridgeError, 'result_column_unavailable'):
+                self.find()
+
+    def test_grid_getitem_revalidates_cached_header_index_and_current_value_after_reorder(self):
+        self.grid.values.update({30030: True, 30038: True, 30062: 1, 30063: 2})
+        self.header.values[30011] = 'OrderHead'
+        self.cell.values.update({30005: '', 30045: 'Q42', 30065: 0})
+        headers = [self.header, self.other_header]
+        with patch.object(result_cell.grid_provider, 'headers', return_value=headers), \
+                patch.object(result_cell.grid_provider,'column_cells',side_effect=lambda *a:[self.cell]) as read:
+            evidence = {}
+            self.assertIs(result_cell.find(self.binding,self.uia,self.grid,'Q42',column='Order',evidence=evidence),self.cell)
+            hint = evidence['column_hint']
+            self.assertEqual(hint['index'],0)
+            self.assertEqual(evidence['source'],'grid_pattern')
+            headers.reverse()
+            self.cell.values[30065] = 1
+            self.assertIs(result_cell.find(self.binding,self.uia,self.grid,'Q42',column='Order',column_hint=hint,
+                                           evidence=evidence),self.cell)
+            read.assert_called_with(self.grid,1,1)
+            self.assertEqual(evidence['column_hint']['index'],1)
+            self.cell.values[30045] = 'Q43'
+            with self.assertRaisesRegex(win.BridgeError,'result_value_not_found'):
+                self.find()
+
+    def test_nonvisual_griditem_column_verifies_data_but_zero_rect_cannot_receive_input(self):
+        self.grid.values.update({30030:True, 30038:True, 30062:1, 30063:2})
+        self.header.box.update(width=0, height=0)
+        self.header.values[30065] = 0
+        self.cell.box.update(width=0, height=0)
+        self.cell.values.update({30005:'', 30045:'Q42', 30065:0, 30064:0})
+        with patch.object(result_cell.grid_provider, 'headers', return_value=[self.header, self.other_header]), \
+                patch.object(result_cell.grid_provider, 'column_cells', return_value=[self.cell]):
+            self.assertIs(self.find(), self.cell)
+            pointer = self.prepare_pointer()
+            with self.assertRaisesRegex(win.BridgeError, 'result_cell_not_clickable'):
+                self.execute()
+            pointer.assert_not_called()
+
+    def test_gridview_cell_wrapper_and_textblock_with_empty_legacy_value(self):
+        self.grid.values.update({30030: True, 30038: True, 30062: 1, 30063: 2})
+        wrapper = self.node(self.row, 50025, '', 0, 120)
+        wrapper.values.update({30093:'', 30064:0, 30065:0})
+        self.cell.parent_node = wrapper
+        self.cell.values[30093] = ''
+        with patch.object(result_cell.grid_provider,'headers',return_value=[self.header,self.other_header]), \
+                patch.object(result_cell.grid_provider,'column_cells',return_value=[wrapper]):
+            self.assertIs(self.find(), self.cell)
+            self.cell.values[30005] = 'new value'
+            with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
+                self.find()
+            wrapper.values[30005] = 'Q42'
+            with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
+                self.find()
+            self.cell.values[30005] = 'Q42'
+            wrapper.values[30005] = 'Cell'
+            self.assertIs(self.find(), self.cell)
+            wrapper.values[30045] = ''
+            with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
+                self.find()
+
+    def test_partial_column_cannot_prove_a_readable_match_is_unique(self):
+        self.grid.values.update({30030:True,30038:True,30062:2,30063:2})
+        other = self.node(self.grid, 50029, '', 4, 36)
+        with patch.object(result_cell.grid_provider,'headers',return_value=[self.header,self.other_header]), \
+                patch.object(result_cell.grid_provider,'column_cells',return_value=[self.cell,other]):
+            with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+                self.find()
+
+    def test_oversized_partially_materialized_grid_does_not_scan_every_row_or_click(self):
+        self.grid.values.update({30030:True,30038:True,30062:65,30063:2})
+        with patch.object(result_cell.grid_provider,'headers',return_value=[self.header,self.other_header]), \
+                patch.object(result_cell.grid_provider,'column_cells') as read:
+            with self.assertRaisesRegex(win.BridgeError,'result_grid_scan_limit'):
+                self.find()
+            read.assert_not_called()
+
+    def test_empty_or_known_other_columns_report_mismatch_without_visual_fallback(self):
+        self.grid.values.update({30030:True,30038:True,30062:0,30063:2})
+        with patch.object(result_cell.grid_provider, 'headers', return_value=[self.header,self.other_header]):
+            with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
+                self.find()
+            self.grid.values[30062] = 2
+            self.header.values[30005] = 'Not the requested column'
+            with self.assertRaisesRegex(win.BridgeError, 'result_column_not_found'):
+                self.find()
 
     def test_double_click_dispatches_once(self):
         pointer = self.prepare_pointer()

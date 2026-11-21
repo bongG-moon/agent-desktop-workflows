@@ -17,6 +17,10 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" recorder --app
 
 `recorder_ready`면 **시작**을 눌러 시연하도록 안내하고 응답의 `session`을 기억한다. `recorder_selection_required`면 열린 선택창에서 대상을 고른다. 저장 여부만 물으면 `status_args`로 확인한다. 저장 후 테스트까지 요청하면 바로 아래 명령을 사용한다.
 
+“지금까지 녹화한 내용 보여줘”는 `tasks`로 저장된 작업을 확인하고 `show --task "<작업명>"`으로 단계를 읽는다. 편집창을 요청하면 `review --task "<작업명>" --edit`를 사용한다. 녹화 대상 선택창은 새로 시연할 업무 창을 고르는 화면이다.
+
+저장하면 녹화창이 닫히고 같은 세션의 마지막 저장본을 사용할 수 있다. “저장한 녹화 수정”은 `edit_args`, “처음부터 다시 녹화”는 `restart_args`로 연다. 두 경우 모두 새 사본으로 저장한다. 검토 화면에서는 동작 문장을 입력하고 버튼 또는 Ctrl+Enter로 다음 단계에 적용한다. 일반 Enter는 한글 입력을 확정할 때 사용할 수 있다.
+
 ## 저장한 녹화 시험과 보정
 
 “녹화했어. 테스트해줘. 장비 ID는 LAB-42야”처럼 저장 후 시험을 요청하면 **첫 도구 호출에서** 해당 세션과 이번 입력값을 넘긴다. 정확한 변수 이름은 녹화에서 받은 이름을 쓴다. 아래는 `Equip ID`라는 변수의 예다. 세션 대신 작업명만 알면 `--task "<작업명>"`을 쓴다.
@@ -27,7 +31,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 
 실제 마우스로 시연한 동작을 시험하도록 허용받았으면 같은 호출에 `--allow-physical`을 붙인다. 이 명령이 저장 상태, 필요한 보정, 시험 결과를 한 번에 처리한다. 별도 상태 조회, 필드별 시험 입력, 등록, 소스 조사와 설치 파일 수정은 생략한다. 응답이 끊겼으면 같은 명령으로 기존 시험 결과를 받는다. 사용자가 의도적으로 **새 시험**을 요청할 때만 새 `--trial-id`를 준다.
 
-`report_completed_trial`이면 관찰된 값과 완료 상태를 보고하고 끝낸다. `inspect_current_result_without_replaying`이면 화면 확인 허용 범위에서 `result_inspection.args`를 실행하고 반환된 이미지를 읽는다. 요청한 열에서 해당 값이 한 행에만 보이고 `resume_args`가 있으면 그 셀의 글자와 이미지 좌표를 넣어 상세창 단계부터 이어간다. 이미 전달한 조회와 더블클릭은 반복하지 않는다.
+`report_completed_trial`이면 읽은 값과 완료 상태를 보고한다. 표 검증은 실행기가 지정한 열의 현재 셀을 먼저 읽어 비교한다. `report_unmatched_result`이면 값이 없거나 대상을 하나로 정할 수 없다는 결과를 보고한다. `inspect_current_result_without_replaying`일 때만 화면 확인 허용 범위에서 `result_inspection.args`를 실행한다. 요청한 열에 정확히 한 건이 보이고 `resume_args`가 있으면 그 셀의 글자와 이미지 좌표를 넣어 상세창 단계부터 이어간다.
 
 업무 스킬로 저장해 달라는 요청이 있을 때 `python_workflow.py register --task "<실행용 작업명>" --out "<프로젝트>/.claude/skills/<업무 이름>"`으로 등록한다. 성공한 시험을 등록 때문에 재실행할 필요는 없다.
 
@@ -36,6 +40,8 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 ## 등록된 업무 실행
 
 업무 이름이 주어지면 그 업무 스킬의 실행기를 첫 명령으로 호출한다. 예를 들어 프로젝트 루트에서 `python -X utf8 -B ".claude/skills/<업무 이름>/scripts/run.py" --summary`에 요청받은 `--set "이름=값"`을 붙인다. 독립된 여러 업무는 각각 별도 프로세스로 실행하고 각 결과를 확인한다. 앞선 업무의 성공이나 산출물이 다음 업무의 조건이면 순서대로 진행한다.
+
+결과 행을 확인하고 더블클릭하는 등록 업무에서 이번 화면 확인과 마우스 사용까지 허용받으면 `--local-result-review --allow-physical`을 붙인다. 이미 `result_review`를 받았으면 같은 실행기에 `result_review.resume_args`를 전달해 방금 조회한 결과에서 이어간다.
 
 ## 입력과 결과
 

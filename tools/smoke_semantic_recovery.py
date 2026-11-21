@@ -41,7 +41,9 @@ for number, text in enumerate(phrases, 1):
         raw['wait_after'] = .1
     steps.append(raw)
 args = app.parser().parse_args(['record','--task','Recovered query','--exe',sys.argv[2],'--window',sys.argv[3]])
-with patch('teach_capture.capture', return_value={'status':'recorded','steps':steps,'input_dispatched':False}):
+def save_demonstration(owner, *, save_recording, **kwargs):
+    return save_recording(steps)
+with patch('teach_capture.capture', side_effect=save_demonstration):
     result = app.run(args)
 print(json.dumps({'raw':steps,'task':tasks.load_task('Recovered query',sys.argv[4]),
                   'record_result':result}, ensure_ascii=False))

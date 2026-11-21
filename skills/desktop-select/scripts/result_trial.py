@@ -9,9 +9,12 @@ import recovery
 
 
 def supported(recipe, check_number):
+    if type(check_number) is not int or not 1 <= check_number <= len(recipe['steps']):
+        return False
     check = recipe['steps'][check_number - 1]
     suffix = recipe['steps'][check_number:]
-    if (check.get('window_context') or check.get('popup') or len(suffix) < 2
+    if (check.get('action') != 'verify-value' or not check.get('result_column')
+            or check.get('window_context') or check.get('popup') or len(suffix) < 2
             or suffix[0]['action'] != 'double-click-result' or suffix[0].get('window_context')):
         return False
     scope = suffix[1].get('window_context') or {}
@@ -20,6 +23,39 @@ def supported(recipe, check_number):
             and all(step['action'] == 'read-value' for step in suffix[1:-1])
             and (suffix[-1]['action'] == 'read-value' or
                  suffix[-1]['action'] == 'invoke' and suffix[-1].get('verify_closed') is True))
+
+
+def visual_suffix(recipe, offset, image, point):
+    """Build only the already-requested double-click and its dependent detail operations."""
+    import visual_target
+    if not supported(recipe, offset):
+        raise tasks.TaskError('result_resume_unavailable')
+    rect, pixels = grounding._pixels(image)
+    spec = visual_target.from_frame(rect, pixels, tuple(point))
+    spec['gesture'] = 'double-click'
+    remaining = deepcopy(recipe['steps'][offset:])
+    remaining[0] = dict(action='visual-click', label=remaining[0]['label'], visual=spec)
+    for step in remaining[1:]:
+        step['window_context']['after_step'] = 1
+    return dict(recipe, steps=remaining)
+
+
+def same_table_pixels(first, second, rect, box):
+    """Compare every pixel in the witnessed grid, including all headers and other rows."""
+    left, top = box['x'] - rect[0], box['y'] - rect[1]
+    width, height = box['width'], box['height']
+    if not (0 <= left < left + width <= rect[2] and 0 <= top < top + height <= rect[3]):
+        return False
+    if first == second:
+        return True
+    before, a = grounding._pixels(first)
+    after, b = grounding._pixels(second)
+    if before != after or before[2:] != list(rect[2:]):
+        return False
+    stride, size = rect[2] * 4, width * 4
+    offset = (rect[2] * top + left) * 4
+    a, b = memoryview(a), memoryview(b)
+    return all(a[i:i+size] == b[i:i+size] for i in range(offset, offset+height*stride, stride))
 
 
 def _path(directory, key):
@@ -41,7 +77,6 @@ def prior(directory, key):
 def resume(app, args):
     import coordination
     import python_workflow
-    import visual_target
     directory, report, inspection = first_trial._inspection(app, args.receipt)
     if not inspection.get('resume_supported'):
         raise tasks.TaskError('result_resume_unavailable')
@@ -72,14 +107,8 @@ def resume(app, args):
                 or not supported(recipe, offset)):
             raise tasks.TaskError('prepared_recording_changed')
         _, png = grounding.read_frame(grounding._directory(), receipt_id.encode('ascii'), args.frame)
-        rect, pixels = grounding._pixels(png)
-        spec = visual_target.from_frame(rect, pixels, tuple(args.point))
-        spec['gesture'] = 'double-click'
-        remaining = deepcopy(recipe['steps'][offset:])
-        remaining[0] = dict(action='visual-click', label=remaining[0]['label'], visual=spec)
-        for step in remaining[1:]:
-            step['window_context']['after_step'] = 1
-        suffix = dict(recipe, steps=remaining)
+        suffix = visual_suffix(recipe, offset, png, args.point)
+        remaining = suffix['steps']
         python_workflow.validate(suffix)
         confirmation = dict(owner=inspection['window'], frame=args.frame, receipt=receipt_id, point=args.point,
                             selector=deepcopy(recipe['steps'][offset-1]['selector']))

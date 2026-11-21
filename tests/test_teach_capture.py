@@ -22,6 +22,42 @@ def combo(name='Mode', value='N'):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_recorded_verification_keeps_hit_table_even_when_cell_has_no_identifier(self):
+        notes = capture.CaptureNotes()
+        worker = capture._Worker(Mock(hwnd=7), Mock(), notes, queue.Queue(), queue.Queue())
+        row = capture.manual('stable_locator_unavailable')
+        notes.add(row)
+        table = dict(role='table', automation_id='results')
+        owner = dict(role='group', automation_id='detailPane')
+        locator = dict(role='statictext', ancestors=[dict(role='row', name='OLD-VALUE'), table, owner])
+        node = dict(role='statictext', secure=False, locator=locator)
+        worker.recent_click = dict(step_id=row['id'], observation=dict(window=7, node=node))
+        worker._remember_double_target(dict(scope_proven=True, window=7))
+        captured, = notes.snapshot()
+        spec = learned_tasks.compile_instruction(captured, '조회 결과 표에서 Part 값이 입력한 값과 같은지 확인해줘')
+        step = learned_tasks.instructed_step(captured, spec)
+        self.assertEqual(step['selector'], dict(table, ancestors=[owner]))
+        self.assertEqual(step['result_column'], 'Part')
+        self.assertNotIn('OLD-VALUE', json.dumps([captured, step]))
+        self.assertNotIn('visual', step)
+
+    def test_unnamed_cell_and_nested_tables_keep_only_the_inner_result_surface(self):
+        outer = dict(role='row', name='OLD-ROW')
+        inner = dict(role='table', automation_id='parts')
+        raw = dict(action='click', target=dict(kind='element', locator=dict(
+            role='statictext', ancestors=[inner, outer, dict(role='table', automation_id='orders')])))
+        spec = learned_tasks.compile_instruction(raw, 'Part 일치 확인')
+        self.assertEqual(spec['selector'], inner)
+        raw['target']['locator']['ancestors'][1] = dict(outer, secure=True)
+        with self.assertRaises(learned_tasks.TaskError):
+            learned_tasks.instructed_step(raw, spec)
+
+    def test_group_containing_a_row_is_remembered_without_saving_cell_data(self):
+        group = dict(role='group', automation_id='results')
+        cell = dict(role='statictext', ancestors=[dict(role='row', name='OLD-ROW'), group])
+        self.assertEqual(learned_tasks.recorded_result_surface(cell), group)
+        self.assertIsNone(learned_tasks.recorded_result_surface(dict(role='statictext', ancestors=[group])))
+
     def test_protected_inputs_and_unscoped_coordinates_do_not_survive_review(self):
         notes = capture.CaptureNotes()
         for i, (role, action) in enumerate((('textfield', 'set-value'), ('table', 'right-click'))):

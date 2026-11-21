@@ -14,6 +14,7 @@ sealed class PaintedIconFixture : Form {
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     int left = 64, pressed, missed, opened;
+    bool duplicateIcon;
     Form detail;
     ListView list;
     ListViewItem targetRow;
@@ -33,25 +34,28 @@ sealed class PaintedIconFixture : Form {
         detail.Show(this);
     }
 
-    PaintedIconFixture(bool showDetails, bool useList) {
+    void PaintIcon(Graphics g, Rectangle box) {
+        g.FillRectangle(Brushes.Indigo, box);
+        g.FillEllipse(Brushes.Orange, box.X + 9, box.Y + 7, 46, 48);
+        g.FillPolygon(Brushes.Navy, new Point[] {
+            new Point(box.X + 14, box.Y + 23), new Point(box.X + 45, box.Y + 12),
+            new Point(box.X + 44, box.Y + 44), new Point(box.X + 24, box.Y + 50) });
+        g.FillEllipse(Brushes.White, box.X + 24, box.Y + 24, 11, 11);
+        g.DrawString("Pocket", Font, Brushes.White, box.X + 11, box.Y + 51);
+    }
+
+    PaintedIconFixture(bool showDetails, bool useList, bool toolbar) {
         Text = "Desktop Select painted icon fixture";
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
         AutoScaleMode = AutoScaleMode.None;
         ClientSize = new Size(420, 240);
         canvas.Dock = DockStyle.Fill;
+        if (toolbar) { canvas.AccessibleRole = AccessibleRole.ToolBar; canvas.AccessibleName = "Drawing toolbar"; }
         canvas.BackColor = Color.FromArgb(33, 42, 50);
         canvas.Paint += delegate(object sender, PaintEventArgs paint) {
-            var g = paint.Graphics;
-            var box = Icon;
-            g.FillRectangle(Brushes.Indigo, box);
-            // A single non-repeating multicolour glyph on a plain canvas.
-            g.FillEllipse(Brushes.Orange, box.X + 9, box.Y + 7, 46, 48);
-            g.FillPolygon(Brushes.Navy, new Point[] {
-                new Point(box.X + 14, box.Y + 23), new Point(box.X + 45, box.Y + 12),
-                new Point(box.X + 44, box.Y + 44), new Point(box.X + 24, box.Y + 50) });
-            g.FillEllipse(Brushes.White, box.X + 24, box.Y + 24, 11, 11);
-            g.DrawString("Pocket", Font, Brushes.White, box.X + 11, box.Y + 51);
+            PaintIcon(paint.Graphics, Icon);
+            if (duplicateIcon) PaintIcon(paint.Graphics, new Rectangle(64, 65, 72, 68));
         };
         canvas.MouseClick += delegate(object sender, MouseEventArgs mouse) {
             if (mouse.Button == MouseButtons.Left && Icon.Contains(mouse.Location)) pressed++;
@@ -93,6 +97,7 @@ sealed class PaintedIconFixture : Form {
             Invoke(new Action(delegate {
                 if (command == "quit") { Close(); return; }
                 if (command == "dismiss" && detail != null) { detail.Close(); }
+                if (command == "duplicate-icon") { duplicateIcon = true; canvas.Refresh(); }
                 if (command == "move-icon") {
                     if (list == null) { left = 246; canvas.Refresh(); }
                     else { list.Items.Insert(0, "Alpha"); targetRow.Selected = false; targetRow.Focused = false; list.Refresh(); }
@@ -105,6 +110,7 @@ sealed class PaintedIconFixture : Form {
     [STAThread] static void Main(string[] args) {
         SetProcessDpiAwarenessContext(new IntPtr(-4));
         Application.EnableVisualStyles();
-        Application.Run(new PaintedIconFixture(Array.IndexOf(args, "--details") >= 0, Array.IndexOf(args, "--list") >= 0));
+        Application.Run(new PaintedIconFixture(Array.IndexOf(args, "--details") >= 0,
+            Array.IndexOf(args, "--list") >= 0, Array.IndexOf(args, "--toolbar") >= 0));
     }
 }

@@ -157,7 +157,7 @@ def _edit_lock(directory):
 
 
 class ReviewStorage:
-    def __init__(self, name, exe, title, directory, *, existing=None, source=None):
+    def __init__(self, name, exe, title, directory, *, existing=None, source=None, new_only=False):
         self.name, self.exe, self.title, self.directory = name, exe, title, directory
         current = existing
         if current is None:
@@ -167,7 +167,7 @@ class ReviewStorage:
                 if error.code != 'task_not_found':
                     raise
         if current is not None:
-            if source is not None or current.get('kind') != KIND:
+            if new_only or source is not None or current.get('kind') != KIND:
                 raise tasks.TaskError('task_already_exists')
             validate(current)
             if current['exe'].casefold() != exe.casefold() or current['window'] != title:
@@ -189,6 +189,8 @@ class ReviewStorage:
 
     def initial_rows(self):
         if self.source is not None:
+            if self.source.get('kind') == KIND:
+                return deepcopy(self.source['rows'])
             return rows_from_task(self.source)
         return deepcopy(self.previous['rows']) if self.previous is not None else None
 
