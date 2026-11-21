@@ -4,7 +4,7 @@ Windows에서 Desktop Select ZIP을 프로젝트별로 새로 설치하고, 실�
 
 이 PC의 최종 검증 ZIP은 **desktop-select-0.4.26-windows-x64.zip**이다. SHA-256은 `d3c364174616894854f7dad6076c1a2e83254de7cce901fdbdf57c6a8f2b39ba`다. 아래 링크는 이 작업 폴더에 보관한 설치본과 측정 기록을 연다. [검증한 ZIP](../.build/visual-multi-verified-20261122/package/desktop-select-0.4.26-windows-x64.zip) [체크섬](../.build/visual-multi-verified-20261122/package/desktop-select-0.4.26-windows-x64.zip.sha256)
 
-게시용 패키지는 같은 버전 0.4.26으로 다시 묶었다. 사용가이드의 예전 Enter 안내 한 곳을 실제 동작인 Ctrl+Enter로 맞췄으며, 위 실기 검증본과 실행 코드 및 나머지 파일의 내용은 같다. 게시 ZIP의 SHA-256은 `926c88cded2bd8d2b663cd541187aaf491c3793b9fa3652cfbb5752c66bbf503`이다. [게시 ZIP](../.build/release-0426-20261122/desktop-select-0.4.26-windows-x64.zip) [게시 체크섬](../.build/release-0426-20261122/SHA256SUMS.txt)
+게시용 패키지는 같은 버전 0.4.26으로 다시 묶었다. 사용가이드의 예전 Enter 안내 한 곳을 실제 동작인 Ctrl+Enter로 맞추고, GitHub Windows 검사에서 확인된 작은 화면의 녹화 대상 창 선택 배치도 보완했다. 1024×768 화면의 200% 배율에서도 목록의 첫 행 전체와 하단 버튼이 표시되는지 확인했다. 위 실기 검증본과 자동화 동작을 처리하는 실행 코드는 같으며, ZIP에서 달라진 파일은 사용가이드와 녹화 대상 창 선택 모듈뿐이다. 게시 ZIP의 SHA-256은 `846e2904adc986fe5de34c7788e5e1627a4dcf5481433e49bd5b87150841c99a`다. [게시 ZIP](../.build/release-0426-20261122/desktop-select-0.4.26-windows-x64.zip) [게시 체크섬](../.build/release-0426-20261122/SHA256SUMS.txt)
 
 ## 위치가 바뀌는 버튼
 

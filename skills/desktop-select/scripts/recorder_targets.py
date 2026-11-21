@@ -172,6 +172,7 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
                  max(240, screen_height - 120))
     root.geometry(f'{width}x{height}')
     root.minsize(min(width, px(640)), min(height, px(500)))
+    compact = height < px(480)
     # Keep useful rows visible on a smaller display at high DPI. Font and
     # control sizes stay with the shared theme; only surrounding whitespace
     # becomes more compact when the screen cannot hold the preferred height.
@@ -179,18 +180,21 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
     selected = None
     failed = False
     current = {}
-    frame = ttk.Frame(root, padding=(px(24), px(20)))
+    frame = ttk.Frame(root, padding=(px(16), px(8)) if compact else (px(24), px(20)))
     frame.pack(fill='both', expand=True)
     actions = ttk.Frame(frame)
     # Reserve the footer first: long titles and high DPI must never move the
     # recording/cancel buttons below the window's client area.
-    actions.pack(side='bottom', fill='x', pady=(px(16), 0))
-    detail_card = ttk.Frame(frame, padding=(px(16), px(8)), style='Card.TFrame')
-    detail_card.pack(side='bottom', fill='x', pady=(px(12), 0))
-    ttk.Label(frame, text='Desktop Select', style='Brand.TLabel').pack(anchor='w', pady=(0, px(3)))
+    actions.pack(side='bottom', fill='x', pady=(px(8 if compact else 16), 0))
+    detail_card = ttk.Frame(frame, padding=(px(12), px(6)) if compact else (px(16), px(8)),
+                            style='Card.TFrame')
+    detail_card.pack(side='bottom', fill='x', pady=(px(8 if compact else 12), 0))
+    if not compact:
+        ttk.Label(frame, text='Desktop Select', style='Brand.TLabel').pack(anchor='w', pady=(0, px(3)))
     ttk.Label(frame, text='녹화할 창 선택', style='Title.TLabel').pack(anchor='w')
-    search = ttk.Frame(frame, padding=(px(16), px(12)), style='Card.TFrame')
-    search.pack(fill='x', pady=(px(18), px(10)))
+    search = ttk.Frame(frame, padding=(px(12), px(6)) if compact else (px(16), px(12)),
+                       style='Card.TFrame')
+    search.pack(fill='x', pady=(px(8), px(6)) if compact else (px(18), px(10)))
     query = tk.StringVar(value=hint)
     ttk.Label(search, text='프로그램 또는 창 제목', style='Card.Muted.TLabel').pack(
         side='left', padx=(0, px(12)))
@@ -199,7 +203,7 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
     message = tk.StringVar()
     notice = ttk.Label(frame, textvariable=message, wraplength=width - px(48), justify='left',
                        style='Muted.TLabel')
-    notice.pack(anchor='w', pady=(0, px(10)))
+    notice.pack(anchor='w', pady=(0, px(6 if compact else 10)))
     table = ttk.Frame(frame, style='Card.TFrame', padding=1)
     listing = ttk.Treeview(table, columns=('title', 'exe', 'pid', 'hwnd'), show='headings',
                            displaycolumns=('title', 'exe'), selectmode='browse', height=7,
@@ -217,11 +221,12 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
     listing.pack(side='left', fill='both', expand=True)
     detail = tk.StringVar(value='목록에서 녹화할 창을 선택하세요.')
     caption = tk.StringVar()
-    ttk.Label(detail_card, text='선택한 창', style='Card.Section.TLabel').pack(anchor='w')
+    if not compact:
+        ttk.Label(detail_card, text='선택한 창', style='Card.Section.TLabel').pack(anchor='w')
     # A read-only field retains the entire literal caption and lets the user
     # scroll/copy it without a long title expanding the footer beyond the screen.
     caption_field = ttk.Entry(detail_card, textvariable=caption, state='readonly')
-    caption_field.pack(fill='x', pady=(px(8), px(7)))
+    caption_field.pack(fill='x', pady=(0, px(4)) if compact else (px(8), px(7)))
     detail_label = ttk.Label(detail_card, textvariable=detail, wraplength=width - px(80),
                              justify='left', style='Card.Muted.TLabel')
     detail_label.pack(anchor='w')

@@ -1,5 +1,6 @@
 """Large Windows fonts must not hide the picker actions or overlap rows."""
 from pathlib import Path
+from contextlib import ExitStack
 import sys
 import unittest
 from unittest.mock import patch
@@ -24,11 +25,11 @@ class RecorderPickerLayoutTests(unittest.TestCase):
                 yield child
                 yield from children(child)
 
-        for scale in (1, 2):
-            with self.subTest(scale=scale):
-                self.check_layout(tk, ttk, font, rows, children, scale)
+        for scale, screen in ((1, None), (2, None), (2, (1024, 768))):
+            with self.subTest(scale=scale, screen=screen):
+                self.check_layout(tk, ttk, font, rows, children, scale, screen)
 
-    def check_layout(self, tk, ttk, font, rows, children, scale):
+    def check_layout(self, tk, ttk, font, rows, children, scale, screen=None):
         try:
             root = tk.Tk()
         except tk.TclError as error:
@@ -67,6 +68,11 @@ class RecorderPickerLayoutTests(unittest.TestCase):
                     self.assertEqual(str(button.cget('style')), 'Primary.TButton'
                                      if label == '이 창에서 녹화' else 'Quiet.TButton')
                 self.assertGreater(listing.winfo_height(), row_height)
+                first = listing.bbox(listing.get_children()[0])
+                self.assertTrue(first, 'the first row must be available for selection')
+                self.assertEqual(first[3], row_height)
+                self.assertLessEqual(first[1] + first[3], listing.winfo_height(),
+                                     'the header and a complete first row must fit')
                 checked.append(True)
             except BaseException as error:
                 errors.append(error)
@@ -76,7 +82,11 @@ class RecorderPickerLayoutTests(unittest.TestCase):
 
         root.after(30, check)
         deadline = root.after(3000, root.destroy)
-        with patch.object(tk, 'Tk', return_value=root):
+        with ExitStack() as patches:
+            patches.enter_context(patch.object(tk, 'Tk', return_value=root))
+            if screen is not None:
+                patches.enter_context(patch.object(root, 'winfo_screenwidth', return_value=screen[0]))
+                patches.enter_context(patch.object(root, 'winfo_screenheight', return_value=screen[1]))
             targets.choose_window('Fixture', rows)
         if errors:
             raise errors[0]
