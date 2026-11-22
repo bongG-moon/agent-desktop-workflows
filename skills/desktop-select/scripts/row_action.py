@@ -102,6 +102,13 @@ def execute(binding, spec, guard, *, timeout=90, required_bounds=None):
 def _click_row(binding, spec, guard, required_bounds):
     from row_vision import confirm_pixels, confirm_point, observe_row
     guard()
+    click_only = spec.get('version') == 2
+    if click_only:
+        # No state evidence to poll. Resolve after activation, then recheck the
+        # row hit and both small marks just before sending a single click.
+        foreground(binding)
+        tick = _input_tick()
+        guard()
     observed = observe_row(binding, spec)
     state = observed['kind']
     if required_bounds is not None and observed['row_bounds'] != required_bounds:
@@ -110,17 +117,19 @@ def _click_row(binding, spec, guard, required_bounds):
         return _result('blocked', False, state, diagnostic='row_' + state)
     # The independent second sample avoids treating transient rendering as a
     # confirmed state and binds the input to the same current physical surface.
-    if state == 'after':
-        time.sleep(.15)
-    else:
-        foreground(binding)
-        tick = _input_tick()
-    guard()
-    current = observe_row(binding, spec)
-    if current['kind'] != state or current['row_bounds'] != observed['row_bounds']:
-        return _result('blocked', False, current['kind'], diagnostic='row_changed_before_action')
-    if state == 'after':
-        return _result('verified', False, state, before='after')
+    current = observed
+    if not click_only:
+        if state == 'after':
+            time.sleep(.15)
+        else:
+            foreground(binding)
+            tick = _input_tick()
+        guard()
+        current = observe_row(binding, spec)
+        if current['kind'] != state or current['row_bounds'] != observed['row_bounds']:
+            return _result('blocked', False, current['kind'], diagnostic='row_changed_before_action')
+        if state == 'after':
+            return _result('verified', False, state, before='after')
     if current.get('point') != observed.get('point') or not current.get('point'):
         return _result('blocked', False, state, diagnostic='row_button_changed')
     guard()
@@ -133,10 +142,18 @@ def _click_row(binding, spec, guard, required_bounds):
         return _result('blocked', False, state, diagnostic='row_point_not_exposed')
     if _input_tick() != tick:
         return _result('blocked', False, state, diagnostic='foreground_or_input_changed')
-    sent = bridge._send_point(*current['point'], 'click')
+    try:
+        sent = bridge._send_point(*current['point'], 'click')
+    except (bridge.BridgeError, OSError) as error:
+        return _result('uncertain', getattr(error, 'input_dispatched', None), 'unknown',
+                       diagnostic=getattr(error, 'code', 'row_delivery_uncertain'))
     if sent.get('input_dispatched') is not True or not sent.get('ok'):
         return _result('uncertain', sent.get('input_dispatched'), 'unknown',
                        diagnostic=sent.get('diagnostic', 'row_delivery_uncertain'), before='before')
+    if click_only:
+        receipt = _result('delivered_unverified', True, 'unknown', diagnostic='row_click_dispatched')
+        receipt['verification_scope'] = 'click_delivery'
+        return receipt
 
 
 def teach_rows(binding, title, args, directory):

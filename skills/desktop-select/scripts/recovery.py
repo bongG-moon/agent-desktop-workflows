@@ -103,6 +103,8 @@ def _summary(number, row, doc):
                 'menu_window_point', 'wait_after'):
         if key in step:
             item[key] = step[key]
+    if location := tasks.row_location(step):
+        item['row_location'] = location
     if row['mode'] is not None:
         item.update(mode=row['mode'], argument=row['argument'])
     if row['context']:

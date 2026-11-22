@@ -1,4 +1,4 @@
-"""Ordinary painted-row clicks need an identity, a button and a settled effect."""
+"""Record a row-local click and promote it when the same row also proves an effect."""
 from unittest import TestCase, mock
 from types import SimpleNamespace
 from queue import Queue
@@ -31,10 +31,43 @@ class OrdinaryRowTests(TestCase):
         self.assertIsNone(rows.infer(self.press,sample(list(reversed(changed)),11)))
 
     def test_duplicate_rows_unchanged_state_and_post_event_baseline_do_not_teach_an_action(self):
-        self.assertIsNone(rows.prepare(sample([self.base[0]]*2,10),[157,205],10.1))
+        cue = dict(role='listitem', scope=['Items'], ordinal=1, size=[68, 15], point=[57, 5])
+        self.assertIsNone(rows.prepare(sample([self.base[0]]*2,10), [157, 205], 10.1, cue=cue))
+        vision.validate_cue(cue)
+        self.assertIn('button', cue)
+        with self.assertRaises(vision.bridge.BridgeError):
+            vision.validate_cue(dict(cue, point=[0, 0]))
         self.assertIsNone(rows.prepare(self.before,[157,205],10.01))
         self.assertIsNone(rows.infer(self.press,sample([('a','stopped','stop'),self.base[1]],11)))
         self.assertIsNone(rows.infer(self.press,sample([self.base[0],('b','running','stop')],11)))
+
+    def test_click_only_marks_follow_a_unique_row_without_inventing_an_effect(self):
+        model = teach_capture.CaptureNotes()
+        model.row_step('first', self.press.number, None, press=self.press)
+        recorded, = model.snapshot()
+        spec = recorded['row']
+        self.assertEqual((recorded['action'], spec['version'], spec['ordinal']), ('row-action', 2, 1))
+        self.assertEqual(set(spec['boxes']), {'key', 'button'})
+        self.assertFalse({'pixels', 'before', 'after'} & spec.keys())
+        # Translate and reorder the two rows; the same sampled button in the
+        # originally demonstrated row moves with its owner.
+        moved = frame(list(reversed(self.base)), pos=(150, 300))
+        seen = vision.observe_row(None, spec, snapshot=moved)
+        self.assertEqual((seen['kind'], seen['point']), ('before', [207, 320]))
+        for states, expected in (([self.base[0]]*2, 'ambiguous'),
+                                 ([('a', 'stopped', 'stop'), self.base[1]], 'unknown')):
+            with self.subTest(states=states):
+                obs = vision.observe_row(None, spec, snapshot=frame(states))
+                self.assertEqual((obs['kind'], obs['point']), (expected, None))
+
+        tracker = rows.Tracker(None, model)
+        tracker.follow('first', self.press)
+        changed = [('a', 'running', 'stop'), self.base[1]]
+        for at in (11, 12):
+            tracker.observe(sample(changed, at))
+        self.assertEqual(model.snapshot()[0]['row']['version'], 1)
+        tracker.observe(sample([('a', 'loading', 'stop'), self.base[1]], 13))
+        self.assertEqual(model.snapshot()[0], recorded)
 
     def test_two_quick_clicks_settle_independently_in_order_and_save_without_private_frames(self):
         second = rows.prepare(self.before,[157,220],10.15)
@@ -141,6 +174,9 @@ class OrdinaryRowTests(TestCase):
         step = model.snapshot()[1]
         self.assertEqual(step['action'], 'manual')
         self.assertEqual(teach_capture.default_text(step), '1번째 행 버튼을 눌러줘')
+        self.assertEqual(vision.validate_cue(step['row_cue']), dict(
+            ordinal=1, role='listitem', scope=['Items'], size=[68, 15], point=[57, 5]))
+        self.assertNotIn('row', step)
 
     def test_unique_native_selection_is_preferred_over_an_available_row_image(self):
         model = teach_capture.CaptureNotes()

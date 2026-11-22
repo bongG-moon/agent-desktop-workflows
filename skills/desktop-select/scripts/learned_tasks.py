@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+from copy import deepcopy
 import json
 import ntpath
 import os
@@ -265,6 +266,48 @@ def click_request(sentence):
     if not _text(name, 200) or name in {'이', '그', '해당', '여기', '거기'}:
         return None
     return name, role
+
+
+def recorded_button_ordinal(text):
+    """Read an ordinary row-button request without inferring what the button does."""
+    if not isinstance(text, str):
+        return None
+    text = ' '.join(text.strip().casefold().rstrip('.!。').split())
+    verb = r'(?:눌러|누르기|누른다|클릭(?:해|하기)?)(?:\s*(?:줘|주세요))?'
+    match = re.fullmatch(r'(?:목록(?:에서|의)\s*)?(\d{1,4}|첫|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*'
+                         r'(?:번\s*째|째|번)?\s*(?:행|줄|항목)(?:의|에\s*있는)?\s*버튼(?:을|를)?\s*' + verb, text)
+    names = ('첫', '두', '세', '네', '다섯', '여섯', '일곱', '여덟', '아홉', '열')
+    if not match:
+        match = re.fullmatch(r'(?:please )?(?:click|press|tap) (?:the )?button (?:in|on) (?:the )?'
+                             r'(\d{1,4}(?:st|nd|rd|th)?|first|second|third|fourth|fifth) (?:row|item)', text)
+        if not match:
+            return None
+        names = ('first', 'second', 'third', 'fourth', 'fifth')
+    term = match[1]
+    ordinal = names.index(term) + 1 if term in names else int(re.match(r'\d+', term)[0])
+    return ordinal if 1 <= ordinal <= 2500 else None
+
+
+def legacy_row_button_ordinal(step):
+    """Identify the exact caption query emitted for an ungrounded row by older recorders."""
+    if (step.get('action') != 'open' or step.get('match') != 'query' or step.get('role') != 'button'
+            or step.get('expand') is not False or set(step) - {
+                'action', 'match', 'role', 'target', 'expand', 'instruction', 'window_context'}):
+        return None
+    target = step.get('target')
+    match = re.fullmatch(r'([1-9]\d{0,3})번째 행', target) if isinstance(target, str) else None
+    if not match or step.get('instruction') != {'mode': 'recorded', 'text': f"{match[0]} 버튼을 눌러줘"}:
+        return None
+    return int(match[1]) if int(match[1]) <= 2500 else None
+
+
+def _recorded_row(step):
+    if step.get('action') == 'row-action':
+        return {'label': step['label'], 'row': step['row']}
+    if step.get('action') == 'row-launch' and 'row_hint' in step:
+        # A spoken ordinal may differ from the row originally demonstrated.
+        return {'label': '녹화한 행 버튼', 'row': step['row_hint']}
+    return step.get('recorded_row')
 
 
 def click_menu_path(sentence):
@@ -930,6 +973,20 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
             if sentence == raw_step.get('label') or click_request(sentence):
                 return {'mode': 'visual-click', 'text': sentence}
         raw_step = {**_manual('capture_target_unavailable'), **_annotations(raw_step)}
+    row = _recorded_row(raw_step)
+    row_review = (raw_step.get('action') == 'manual'
+                  and raw_step.get('reason', raw_step.get('recognition', {}).get('reason')) == 'row_capture_requires_review'
+                  and is_recoverable(raw_step))
+    if (row or row_review) and all(v is None for v in (mode, argument, target, role, within)):
+        ordinal = recorded_button_ordinal(sentence)
+        same_button = re.fullmatch(r'(?:이|그|해당|녹화한|시연한)\s*버튼(?:을|를)?\s*'
+                                   r'(?:눌러|누르기|클릭(?:해|하기)?)(?:\s*(?:줘|주세요))?[.!。]?'
+                                   r'|(?:click|press|tap) (?:this|that|the recorded) button[.!]?', sentence, re.I)
+        if ordinal or same_button:
+            if row and (same_button or ordinal == (
+                    row['row'].get('ordinal') or recorded_button_ordinal(row['label']))):
+                return {'mode': 'row-action', 'text': sentence}
+            return {'mode': 'draft', 'text': sentence}
     if raw_step.get('action') in ('row-action', 'row-launch'):
         # A taught gesture is the default. An explicit edit supplies a new
         # intent rather than authorizing the old gesture under another label.
@@ -984,6 +1041,26 @@ def instructed_step(raw_step, spec):
     """
     if not isinstance(raw_step, dict) or not isinstance(spec, dict):
         raise TaskError('invalid_step_instruction')
+    if spec.get('mode') == 'row-action':
+        if compile_instruction(raw_step, spec.get('text')) != spec:
+            raise TaskError('invalid_step_instruction')
+        row = _recorded_row(raw_step)
+        result = dict(action='row-action', **deepcopy(row), **_annotations(raw_step))
+        result['description'] = spec['text']
+        _validate_row(result)
+        return result
+    result = _apply_instruction(raw_step, spec)
+    # Keep capture evidence outside the executable selector. A changed sentence may
+    # name a different target, then later be edited back to the demonstrated gesture.
+    row = _recorded_row(raw_step)
+    if row and 'row_hint' not in result:
+        result['recorded_row'] = deepcopy(row)
+    if 'row_cue' in raw_step:
+        result['row_cue'] = deepcopy(raw_step['row_cue'])
+    return result
+
+
+def _apply_instruction(raw_step, spec):
     if spec.get('mode') in (*OBSERVE_ACTIONS, 'close-popup'):
         if compile_instruction(raw_step, spec.get('text')) != spec:
             raise TaskError('invalid_step_instruction')
@@ -1033,9 +1110,9 @@ def instructed_step(raw_step, spec):
             step = instructed_step({**_manual(reason), **_annotations(raw_step)}, spec)
             return dict(step, visual_hint=marker)
         raw_step = {**_manual('capture_target_unavailable'), **_annotations(raw_step)}
-    row_hint = None
+    row = _recorded_row(raw_step)
+    row_hint = row['row'] if row else raw_step.get('row_hint')
     if raw_step.get('action') in ('row-action', 'row-launch'):
-        row_hint = raw_step.get('row') if raw_step['action'] == 'row-action' else raw_step.get('row_hint')
         raw_step = {**_manual('row_capture_requires_review'), **_annotations(raw_step)}
     if spec.get('mode') == 'row-launch':
         text = spec.get('text')
@@ -1043,8 +1120,9 @@ def instructed_step(raw_step, spec):
                 or compile_instruction(raw_step, text) != spec):
             raise TaskError('invalid_step_instruction')
         step = {'action': 'row-launch', 'ordinal': spec['ordinal'], 'label': text, **_annotations(raw_step)}
-        if row_hint is not None:
-            from copy import deepcopy
+        if 'description' in step:
+            step['description'] = text
+        if row_hint is not None and row_hint.get('version') == 1:
             _validate_row({'action': 'row-action', 'label': 'row', 'row': row_hint})
             step['row_hint'] = deepcopy(row_hint)
         return step
@@ -1139,6 +1217,8 @@ def recorded_step(raw):
         return special
     step = _convert(raw)
     step.update(_annotations(raw))
+    if 'row_cue' in raw and step.get('reason') == 'row_capture_requires_review':
+        step['row_cue'] = deepcopy(raw['row_cue'])
     if 'menu_anchor' in raw:
         step['menu_anchor'] = _menu_anchor(raw['menu_anchor'], step.get('reason'))
     if 'menu_window_point' in raw:
@@ -1218,9 +1298,35 @@ def _validate_context(step):
     result_menu.validate_spec(step.get('context'))
 
 
+def row_location(step):
+    """Expose small row-relative hints while keeping local pixel masks out of host responses."""
+    if 'row_cue' in step:
+        cue = {key: deepcopy(value) for key, value in step['row_cue'].items() if key != 'button'}
+        if 'button' in step['row_cue']:
+            cue['has_button_marker'] = True
+        return cue
+    recorded = _recorded_row(step)
+    if not recorded:
+        return None
+    row = recorded['row']
+    if not isinstance(row, dict) or not {'size', 'role', 'scope', 'boxes'} <= row.keys() or 'button' not in row['boxes']:
+        return None
+    x, y, width, height = row['boxes']['button']
+    location = {'point': [x + width // 2, y + height // 2], 'size': list(row['size']),
+                'button_box': list(row['boxes']['button']), 'has_button_marker': True,
+                'role': row['role'], 'scope': list(row['scope'])}
+    if 'row_id' in row:
+        location['row_id'] = row['row_id']
+    ordinal = row.get('ordinal') or recorded_button_ordinal(recorded['label'])
+    if ordinal:
+        location['ordinal'] = ordinal
+    return location
+
+
 def summary(plan):
     """The local row patches are used by the player and stay out of CLI responses."""
-    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'row_hint', 'context', 'visual', 'visual_hint')},
+    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'row_hint', 'recorded_row', 'row_cue', 'context', 'visual', 'visual_hint')},
+                              **({'row_location': location} if (location := row_location(step)) else {}),
                               **({'has_visual_hint': True} if 'visual_hint' in step else {}),
                               **({'menu_path': step['context']['menu']['path']} if 'context' in step else {})}
                              for step in plan['steps']])
@@ -1267,6 +1373,8 @@ def grounding_request(number, step):
     result = dict(number=number, instruction=sentence or '', reason=step.get('reason', 'target_unavailable'))
     if 'window_context' in step:
         result['window_context'] = dict(step['window_context'])
+    if location := row_location(step):
+        result['row_location'] = location
     query = step.get('selector', {}).get('query') or (step.get('target') if step.get('match') == 'query' else None)
     if query:
         result['query'] = query
@@ -1308,6 +1416,26 @@ def _validate_observation(step):
 def _validate_step(s, parameters):
     if not isinstance(s, dict) or not isinstance(s.get('action'), str):
         raise TaskError('invalid_task_step')
+    if 'row_cue' in s or 'recorded_row' in s:
+        # These fields are editorial evidence only; the recipe compiler selects
+        # executable fields explicitly for each of the allowed action types.
+        if (s['action'] not in ('row-launch', 'manual', 'open', *VALUE_ACTIONS, *OBSERVE_ACTIONS, 'close-popup')
+                or (s['action'] == 'manual' and s.get('reason') != 'row_capture_requires_review')
+                or ('row_cue' in s and 'recorded_row' in s) or 'row_hint' in s):
+            raise TaskError('invalid_row_step')
+        s = dict(s)
+        if 'row_cue' in s:
+            from row_vision import validate_cue
+            from win_bridge import BridgeError
+            try:
+                validate_cue(s.pop('row_cue'))
+            except BridgeError as error:
+                raise TaskError(error.code) from error
+        else:
+            recorded = s.pop('recorded_row')
+            if not isinstance(recorded, dict) or set(recorded) != {'label', 'row'}:
+                raise TaskError('invalid_row_step')
+            _validate_row(dict(action='row-action', **recorded))
     annotation = _annotations(s)
     if any(s[key] != annotation.get(key) for key in ('alias', 'description') if key in s):
         raise TaskError('invalid_step_annotation')
@@ -1332,6 +1460,8 @@ def _validate_step(s, parameters):
             raise TaskError('invalid_row_step')
         if 'row_hint' in s:
             _validate_row({'action': 'row-action', 'label': 'row', 'row': s['row_hint']})
+            if s['row_hint']['version'] != 1:
+                raise TaskError('invalid_row_step')
         return
     if s.get('action') == 'result-menu':
         _validate_context(s)

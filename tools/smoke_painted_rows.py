@@ -35,7 +35,7 @@ def write_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf8')
 
 
-def exercise(skill, work, exe, include_legacy, include_workflow):
+def exercise(skill, work, exe, include_legacy, include_workflow, unchanged_buttons=False):
     installed = work / 'skills/desktop-select'
     install_skill(skill, installed)
     sys.path.insert(0, str(installed / 'scripts'))
@@ -99,6 +99,8 @@ def exercise(skill, work, exe, include_legacy, include_workflow):
 
     try:
         binding = app.bridge.Binding(app.pick_window(app.windows(exe.name), title, hwnd))
+        if unchanged_buttons:
+            fixture.command('unchanged-buttons')
         fixture.command('activate')
         deadline = time.monotonic() + 5
         while app.bridge.root_window(app.bridge.foreground()) != hwnd and time.monotonic() < deadline:
@@ -115,7 +117,8 @@ def exercise(skill, work, exe, include_legacy, include_workflow):
         while time.monotonic() < deadline:
             session.poll()
             steps = session.notes.snapshot()
-            if len(steps) == 2 and all(s['action'] == 'row-action' for s in steps):
+            version = 2 if unchanged_buttons else 1
+            if len(steps) == 2 and all(s.get('row', {}).get('version') == version for s in steps):
                 break
             time.sleep(.1)
         recorded = session.finish()
@@ -125,7 +128,11 @@ def exercise(skill, work, exe, include_legacy, include_workflow):
               [(s['action'], s.get('recognition', {}).get('reason')) for s in steps])
         expected = dict(Atlas=1, Birch=1, Cobalt=0)
         check('demonstrated_exact_rows', fixture.command('state')['calls'] == expected)
-        edited = recorder.StepEdits().apply(steps)
+        editor = recorder.StepEdits()
+        if unchanged_buttons:
+            for number, step in enumerate(steps, 1):
+                editor.store(step, '', f'{number}번째 줄의 버튼을 클릭해 주세요')
+        edited = editor.apply(steps)
         plan = tasks.from_recording(TASK, exe.name, title, edited)
         tasks.save_task(plan, directory)
         check('saved_and_loaded_two_visual_row_actions',
@@ -138,8 +145,23 @@ def exercise(skill, work, exe, include_legacy, include_workflow):
         status = replay('row-status')
         check('row_status_found_both_stopped_rows_after_move', status.get('status') == 'observed'
               and [s['observed_state'] for s in status['steps']] == ['before'] * 2, status)
+        started = time.perf_counter()
         first = replay('replay')
+        replay_seconds = time.perf_counter() - started
         write_json(work / 'replay.json', first)
+        if unchanged_buttons:
+            checks_after_click = fixture.command('state')
+            check('wording_edits_preserved_both_observed_marks',
+                  [s['row'] for s in tasks.load_task(TASK, directory)['steps']] == [s['row'] for s in steps]
+                  and all(s['row']['version'] == 2 for s in steps))
+            check('clicked_same_plus_buttons_after_rows_moved',
+                  checks_after_click['calls'] == expected and checks_after_click['otherButtonCalls'] == 0,
+                  checks_after_click)
+            check('two_click_receipts_without_claiming_a_state_change',
+                  len(first['steps']) == 2 and all(s['receipt'].get('diagnostic') == 'row_click_dispatched'
+                  and s['receipt']['input_dispatched'] is True for s in first['steps']), first)
+            write_json(work / 'timings.json', dict(two_click_replay_seconds=round(replay_seconds, 3)))
+            return
         check('replay_verified_same_two_rows_individually', first.get('status') == 'verified'
               and len(first['steps']) == 2 and all(s['receipt'].get('input_dispatched') is True
               and s['receipt'].get('observed_state') == 'after' for s in first['steps']), first)
@@ -218,10 +240,11 @@ if __name__ == '__main__':
     parser.add_argument('--compile-only', action='store_true')
     parser.add_argument('--include-legacy', action='store_true', help='Also replay old recordings with row instructions')
     parser.add_argument('--include-workflow', action='store_true', help='Register and run the generated Python skill')
+    parser.add_argument('--unchanged-buttons', action='store_true', help='Exercise edits and reordering of two fixed glyphs')
     args = parser.parse_args()
     if os.name != 'nt' or not args.work_dir.is_absolute() or args.work_dir.exists():
         parser.error('Requires Windows and a new absolute work directory')
     args.work_dir.mkdir(parents=True)
     target = compile_fixture(args.work_dir)
     if not args.compile_only:
-        exercise(args.skill_dir.resolve(), args.work_dir, target, args.include_legacy, args.include_workflow)
+        exercise(args.skill_dir.resolve(), args.work_dir, target, args.include_legacy, args.include_workflow, args.unchanged_buttons)

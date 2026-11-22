@@ -163,6 +163,7 @@ def validate(recipe):
                      'invalid_row_step')
                 if 'row_hint' in step:
                     row_vision.validate_spec(step['row_hint'])
+                    need(step['row_hint']['version'] == 1, 'invalid_row_step')
             continue
         if step.get('action') == 'wait':
             need(set(step) == {'action', 'seconds'} and type(step.get('seconds')) in (int, float)
@@ -699,6 +700,7 @@ def confirm_opened_window(report, routes, number):
     receipt = routes.outcomes.get(number)
     if (receipt and (routes.steps[number-1]['action'],receipt.get('diagnostic')) in (
             ('invoke','business_result_not_verified'),('row-open','row_open_dispatched'),
+            ('row-action','row_click_dispatched'),
             ('double-click-result','visual_double_click_dispatched'),
             ('visual-click','visual_double_click_dispatched'),
             ('result-menu','menu_delivered_no_output_condition'))
@@ -1308,10 +1310,14 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     return _grounding_report(report, [_grounding_step(recipe, number, step, receipt['diagnostic'])])
                 row_opened = (step['action']=='row-open' and (receipt['status']=='verified' or
                               (receipt.get('diagnostic')=='row_open_dispatched' and receipt['input_dispatched'] is True)))
+                delivered_row_click = (step['action'] == 'row-action' and step['row']['version'] == 2
+                                       and receipt['status'] == 'delivered_unverified'
+                                       and receipt.get('diagnostic') == 'row_click_dispatched'
+                                       and receipt['input_dispatched'] is True)
                 double_sent = ((app.tasks.is_double_click_step(step) or step['action'] == 'double-click-result') and receipt['status']=='delivered_unverified'
                                and receipt.get('diagnostic')=='visual_double_click_dispatched'
                                and receipt['input_dispatched'] is True)
-                if not read_only and (row_opened or double_sent) and routes.origins.get(number):
+                if not read_only and (row_opened or delivered_row_click or double_sent) and routes.origins.get(number):
                     for expected in routes.origins[number].values():
                         routes.resolve(expected)
                     confirm_opened_window(report,routes,number)
@@ -1357,7 +1363,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 delivered_conditional = (step['action'] == 'conditional-open' and receipt['status'] == 'delivered_unverified'
                                          and receipt.get('diagnostic') == 'conditional_open_dispatched'
                                          and receipt['input_dispatched'] is True)
-                if delivered or delivered_menu or delivered_submit or delivered_visual or delivered_conditional or double_sent:
+                if (delivered or delivered_menu or delivered_submit or delivered_visual or delivered_conditional
+                        or delivered_row_click or double_sent):
                     report['status'] = 'completed_unverified'
                     if delivered and routes.origins.get(number):
                         pending_opener = number

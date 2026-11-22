@@ -37,6 +37,9 @@ class RowIntentTests(TestCase):
     def test_host_can_normalize_loose_wording_but_cannot_invert_an_explicit_action(self):
         self.assertEqual(row_intent.parse('첫번째 요소 실행버튼 누르기'),1)
         self.assertEqual(row_intent.parse('두 번째 행을 실행해 줘'),2)
+        self.assertEqual(row_intent.parse('1번째 행의 ▶ 버튼을 눌러줘'), 1)
+        self.assertEqual(row_intent.parse('두 번째 줄 ▶를 눌러줘'), 2)
+        self.assertIsNone(row_intent.parse('1번째 행 버튼을 눌러줘'))
         self.assertIsNone(row_intent.parse('첫 행 말고 둘째만 켜줘'))
         self.assertFalse(row_intent.conflicts_with_launch('거기 맨 위에 거 켜줘'))
         for sentence in ('두 번째 행 실행하지 마세요','첫 번째 행 종료해줘','do not start the first item'):

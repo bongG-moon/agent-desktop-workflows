@@ -22,6 +22,8 @@ sealed class PaintedRowsFixture : Form {
     readonly Dictionary<string,int> calls = new Dictionary<string,int>();
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     readonly string[] names = { "Atlas", "Birch", "Cobalt" };
+    bool unchangedButtons;
+    int otherButtonCalls;
 
     readonly Dictionary<string,int> childCalls = new Dictionary<string,int>();
 
@@ -41,6 +43,8 @@ sealed class PaintedRowsFixture : Form {
         list.DrawItem += PaintRow;
         list.MouseUp += delegate(object sender, MouseEventArgs e) {
             int i = list.IndexFromPoint(e.Location);
+            if (unchangedButtons && i >= 0 && e.Button == MouseButtons.Left
+                && OtherButtonBox(list.GetItemRectangle(i)).Contains(e.Location)) otherButtonCalls++;
             if (i >= 0 && e.Button == MouseButtons.Left && ButtonBox(list.GetItemRectangle(i)).Contains(e.Location)) {
                 string name = ((Device)list.Items[i]).Name;
                 calls[name]++;
@@ -64,6 +68,7 @@ sealed class PaintedRowsFixture : Form {
     }
 
     static Rectangle ButtonBox(Rectangle r) { return new Rectangle(r.Right-80, r.Y+10, 46, 38); }
+    static Rectangle OtherButtonBox(Rectangle r) { return new Rectangle(r.Right-138, r.Y+10, 46, 38); }
 
     void PaintRow(object sender, DrawItemEventArgs e) {
         if (e.Index < 0) return;
@@ -74,10 +79,17 @@ sealed class PaintedRowsFixture : Form {
             e.Graphics.FillRectangle(Brushes.WhiteSmoke, r);
             e.Graphics.DrawLine(Pens.LightGray, r.X, r.Bottom-1, r.Right, r.Bottom-1);
             e.Graphics.DrawString(name, font, Brushes.Black, r.X + 30, r.Y + 15);
-            e.Graphics.DrawString(calls[name] > 0 ? "Running" : "Ready", font,
+            e.Graphics.DrawString(!unchangedButtons && calls[name] > 0 ? "Running" : "Ready", font,
                                   Brushes.Black, r.X + 310, r.Y + 15);
             e.Graphics.DrawRectangle(Pens.SlateGray, b);
-            if (calls[name] > 0) {
+            if (unchangedButtons) {
+                // Two non-launch actions, with no visible result inside the row.
+                var other = OtherButtonBox(r);
+                e.Graphics.DrawRectangle(Pens.SlateGray, other);
+                e.Graphics.FillEllipse(Brushes.DarkBlue, other.X+17, other.Y+12, 12, 12);
+                e.Graphics.FillRectangle(Brushes.DarkBlue, b.X+13, b.Y+17, 20, 5);
+                e.Graphics.FillRectangle(Brushes.DarkBlue, b.X+21, b.Y+9, 5, 20);
+            } else if (calls[name] > 0) {
                 e.Graphics.FillRectangle(Brushes.DarkGreen, b.X+15, b.Y+10, 17, 18);
             } else {
                 e.Graphics.FillPolygon(Brushes.DarkGreen, new [] {
@@ -96,7 +108,8 @@ sealed class PaintedRowsFixture : Form {
             points.Add(new int[] {p.X,p.Y});
         }
         Console.WriteLine(json.Serialize(new {kind=kind, title=Text, pid=Process.GetCurrentProcess().Id,
-            hwnd=Handle.ToInt64(), calls=calls, childCalls=childCalls, points=points, order=order}));
+            hwnd=Handle.ToInt64(), calls=calls, childCalls=childCalls, otherButtonCalls=otherButtonCalls,
+            points=points, order=order}));
         Console.Out.Flush();
     }
 
@@ -107,6 +120,7 @@ sealed class PaintedRowsFixture : Form {
             try { Invoke(new Action(delegate {
                 if (op=="quit") { Close(); return; }
                 if (op=="activate") { Activate(); }
+                if (op=="unchanged-buttons") { unchangedButtons=true; list.Invalidate(); }
                 if (op=="reset-reorder") {
                     foreach(string name in names) calls[name]=0;
                     list.Items.Clear();

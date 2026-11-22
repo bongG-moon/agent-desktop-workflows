@@ -30,6 +30,11 @@ def _bounds(uia, element):
     return [r[k] for k in ('x', 'y', 'width', 'height')]
 
 
+def _may_be_visible(element):
+    state = element.property(30022)
+    return state is False or state is None
+
+
 def _window_rect(binding):
     binding.check()
     if bridge.user32.IsIconic(binding.hwnd) or not bridge.user32.IsWindowVisible(binding.hwnd):
@@ -70,8 +75,10 @@ def _row_layout(binding, *, include_viewport=False):
             if stable_id:
                 scope = [*scope[-3:], aid]
             if control in (50008, 50028, 50036):  # List, DataGrid, Table
-                viewport = _bounds(uia, e)
-            if control in (50007, 50029) and viewport and e.property(30022) is False and e.property(30010) is True:
+                viewport = _bounds(uia, e) if _may_be_visible(e) else None
+            # With no IsOffscreen value, use the same already-collected geometry:
+            # a full row inside its list and the checked, visible owner HWND.
+            if control in (50007, 50029) and viewport and _may_be_visible(e) and e.property(30010) is True:
                 rect = _bounds(uia, e)
                 if (_inside(rect, viewport) and _inside(rect, window) and
                         rect[2] <= 5000 and rect[3] <= 512):
@@ -256,14 +263,44 @@ def _match_distance(reference, current, width):
     return distance
 
 
-def _validate_layout(size, boxes):
-    if (not isinstance(size,list) or len(size)!=2 or any(type(v) is not int for v in size)
-            or not 1<=size[0]<=5000 or not 1<=size[1]<=512):
+def _valid_size(size):
+    return (isinstance(size, list) and len(size) == 2 and all(type(v) is int for v in size)
+            and 1 <= size[0] <= 5000 and 1 <= size[1] <= 512)
+
+
+def _valid_identity(spec):
+    return (spec.get('role') in ('listitem', 'row') and isinstance(spec.get('scope'), list)
+            and len(spec['scope']) <= 4 and all(isinstance(s, str) and 1 <= len(s) <= 160 for s in spec['scope'])
+            and ('row_id' not in spec or isinstance(spec['row_id'], str) and 1 <= len(spec['row_id']) <= 160))
+
+
+def validate_cue(cue):
+    """A witnessed row-local hit is a location hint; it cannot dispatch a click."""
+    if (not isinstance(cue, dict) or set(cue) - {'row_id', 'button', 'button_box'} != {'ordinal', 'size', 'point', 'role', 'scope'}
+            or not _valid_identity(cue) or not _valid_size(cue['size'])
+            or type(cue['ordinal']) is not int or not 1 <= cue['ordinal'] <= 2500
+            or not isinstance(cue['point'], list) or len(cue['point']) != 2
+            or not all(type(p) is int and 0 <= p < size for p, size in zip(cue['point'], cue['size']))):
+        _reject('invalid_row_cue')
+    if 'button' in cue or 'button_box' in cue:
+        if 'button' not in cue or 'button_box' not in cue:
+            _reject('invalid_row_cue')
+        box = cue['button_box']
+        _validate_layout(cue['size'], {'button': box}, ('button',))
+        x, y, w, h = box
+        if cue['point'] != [x + w//2, y + h//2]:
+            _reject('invalid_row_cue')
+        _unpack(cue['button'], w*h)
+    return cue
+
+
+def _validate_layout(size, boxes, fields=('key', 'button', 'state')):
+    if not _valid_size(size):
         _reject('invalid_row_size')
-    if not isinstance(boxes,dict) or set(boxes) != {'key','button','state'}:
+    if not isinstance(boxes,dict) or set(boxes) != set(fields):
         _reject('invalid_row_boxes')
     seen = []
-    for key in ('key','button','state'):
+    for key in fields:
         box = boxes[key]
         if (not isinstance(box,list) or len(box)!=4 or any(type(v) is not int for v in box)
                 or not _inside(box,[0,0,*size]) or not 3<=box[2]<=512 or not 3<=box[3]<=128
@@ -273,29 +310,30 @@ def _validate_layout(size, boxes):
 
 
 def validate_spec(spec, *, draft=False):
-    fields = {'version','size','role','scope','boxes','key','button','before'}
-    if not draft:
-        fields.add('after')
-    if isinstance(spec, dict) and 'row_id' in spec:
-        if not isinstance(spec['row_id'], str) or not 1 <= len(spec['row_id']) <= 160:
-            _reject('invalid_row_template')
-        fields.add('row_id')
-    if (not isinstance(spec,dict) or set(spec)!=fields or type(spec['version']) is not int or spec['version']!=1
-            or spec['role'] not in ('listitem','row') or not isinstance(spec['scope'],list)
-            or len(spec['scope'])>4 or any(not isinstance(s,str) or not 1<=len(s)<=160 for s in spec['scope'])):
+    if (not isinstance(spec, dict) or type(spec.get('version')) is not int
+            or spec['version'] not in (1, 2) or not _valid_identity(spec)):
         _reject('invalid_row_template')
-    _validate_layout(spec['size'],spec['boxes'])
-    masks = {}
-    for field in ('key','button','before') if draft else ('key','button','before','after'):
+    click_only = spec['version'] == 2
+    masks = ('key', 'button') if click_only else ('key', 'button', 'before') if draft else ('key', 'button', 'before', 'after')
+    fields = {'version', 'size', 'role', 'scope', 'boxes', *masks}
+    if click_only:
+        if draft or type(spec.get('ordinal')) is not int or not 1 <= spec['ordinal'] <= 2500:
+            _reject('invalid_row_template')
+        fields.add('ordinal')
+    if set(spec) - {'row_id'} != fields:
+        _reject('invalid_row_template')
+    _validate_layout(spec['size'], spec['boxes'], ('key', 'button') if click_only else ('key', 'button', 'state'))
+    bits = {}
+    for field in masks:
         box = spec['boxes']['state' if field in ('before','after') else field]
-        masks[field] = _unpack(spec[field],box[2]*box[3])
-    if not draft and _difference(masks['before'],masks['after']) < .30:
+        bits[field] = _unpack(spec[field],box[2]*box[3])
+    if 'after' in bits and _difference(bits['before'],bits['after']) < .30:
         _reject('row_state_change_unproven')
 
 
 def template_preview(spec, field):
     """Render only the stored foreground mask for review in the recorder."""
-    validate_spec(spec, draft='after' not in spec)
+    validate_spec(spec, draft=spec.get('version') == 1 and 'after' not in spec)
     if field not in ('key', 'button', 'before', 'after') or field not in spec:
         _reject('invalid_row_template')
     size = spec['boxes']['state' if field in ('before', 'after') else field][2:]
@@ -405,9 +443,10 @@ def observe_row(binding,spec, *, snapshot=None):
     kind,rect,offset = _match(snapshot,spec)
     point = None
     if kind=='found':
-        if _evidence(snapshot,rect,spec,'after',offset) <= .14:
+        if 'after' in spec and _evidence(snapshot,rect,spec,'after',offset) <= .14:
             kind = 'after'
-        elif _evidence(snapshot,rect,spec,'before',offset) <= .14 and _evidence(snapshot,rect,spec,'button',offset) <= .14:
+        elif (('before' not in spec or _evidence(snapshot,rect,spec,'before',offset) <= .14)
+              and _evidence(snapshot,rect,spec,'button',offset) <= .14):
             kind = 'before'
             x,y,w,h = _patch(rect,spec['boxes']['button'],offset)
             point = [x+w//2,y+h//2]
@@ -426,7 +465,7 @@ def _list_hit_row(uia, element, pid, point, rect):
     for _ in range(12):
         hits = []
         for child in uia.children(element):
-            if child.property(30022) is True:
+            if not _may_be_visible(child):
                 continue
             bounds = _bounds(uia, child)
             if _inside([*point, 1, 1], bounds):
@@ -501,13 +540,14 @@ def confirm_pixels(binding, spec, obs):
     window = _window_rect(binding)
     if not _inside(rect, window):
         _reject('row_window_moved')
-    snapshot = window, (), _frame(binding, window)
+    snapshot = (rect, (), _frame(binding, window, crop=rect)) if spec['version'] == 2 else (window, (), _frame(binding, window))
     offset = obs.get('paint_offset', (0, 0))
     if (not isinstance(offset, (list, tuple)) or len(offset) != 2
             or any(type(v) is not int or abs(v)>1 for v in offset)
             or any(not _inside(_patch(rect,b,offset), rect) for b in spec['boxes'].values())):
         _reject('row_pixels_changed')
-    if any(_evidence(snapshot, rect, spec, field, offset) > .14 for field in ('key', 'button', 'before')):
+    fields = ('key', 'button') if spec['version'] == 2 else ('key', 'button', 'before')
+    if any(_evidence(snapshot, rect, spec, field, offset) > .14 for field in fields):
         _reject('row_pixels_changed')
     x, y, w, h = _patch(rect, spec['boxes']['button'], offset)
     point = [x + w//2, y + h//2]

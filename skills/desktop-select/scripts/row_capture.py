@@ -90,10 +90,17 @@ class Press:
     keys: list
     button: list
     at: float
+    button_mask: str
+
+    def click_spec(self):
+        """Keep the two small witnessed marks, even if no result appears in this row."""
+        key = self.keys[0]
+        return dict(version=2, size=self.rect[2:], ordinal=self.number, boxes=dict(key=key, button=self.button),
+                    key=visual._pattern(_crop(self.pixels, self.rect[2], key)), button=self.button_mask, **self.meta)
 
 
-def prepare(frame, point, at):
-    """Require a completed pre-down sample and a distinct row identity."""
+def prepare(frame, point, at, *, cue=None):
+    """Match the pre-down row; retain the smaller button mark even if rows look alike."""
     if frame is None or not 0 <= at - frame.end <= 2.5:
         return None
     rect, meta = visual._point_row(frame.rows, point)
@@ -106,7 +113,7 @@ def prepare(frame, point, at):
         return None
     pixels = frame.pixels[index]
     w, h = rect[2:]
-    visual._pattern(_crop(pixels,w,button))
+    button_mask = visual._pattern(_crop(pixels,w,button))
     keys = []
     for box in _regions(w,h,visual._glyph(pixels)):
         if visual._overlaps(box, button):
@@ -118,8 +125,10 @@ def prepare(frame, point, at):
                for i in peers):
             keys.append(box)
     if not keys:
+        if cue is not None:
+            cue.update(button_box=button, button=button_mask)
         return None
-    return Press(rect, meta, number, frame.window, pixels, keys, button, at)
+    return Press(rect, meta, number, frame.window, pixels, keys, button, at, button_mask)
 
 
 def infer(press, frame):
@@ -159,7 +168,7 @@ def infer(press, frame):
         return None
     state = scores[0]
     spec = dict(version=1, size=[w,h], boxes=dict(key=key,button=press.button,state=state),
-                key=visual._pattern(_crop(previous,w,key)), button=visual._pattern(_crop(previous,w,press.button)),
+                key=visual._pattern(_crop(previous,w,key)), button=press.button_mask,
                 before=visual._pattern(_crop(previous,w,state)), after=visual._pattern(_crop(current,w,state)),
                 **press.meta)
     visual.validate_spec(spec)

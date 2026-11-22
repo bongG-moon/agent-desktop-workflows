@@ -134,7 +134,7 @@ class CaptureNotes:
         self.times = {}
         self.event_at = None
         self.completed_double_down = 0
-        self.row_selections = {}
+        self.row_fallbacks = {}
         self.lock = threading.RLock()
         self.state = 'ready'
         self.partial = False
@@ -178,7 +178,7 @@ class CaptureNotes:
                     and previous.get('recognition', {}).get('reason') == 'right_click_requires_menu_teaching'):
                 self.steps[step['id']] = step
 
-    def row_step(self, step_id, number, spec, selection=None):
+    def row_step(self, step_id, number, spec, selection=None, *, cue=None, press=None):
         """Keep the click's original order while the observed row state settles."""
         with self.lock:
             if self.closed or self.limit:
@@ -188,18 +188,27 @@ class CaptureNotes:
                 return
             # A queued double click or deleted/invalidated event owns its ID.
             existing = self.steps.get(step_id)
-            if existing and existing != self.row_selections.get(step_id) and existing.get('action') != 'row-action' and (
+            if existing and existing != self.row_fallbacks.get(step_id) and existing.get('action') != 'row-action' and (
                     existing.get('recognition', {}).get('reason') != 'row_capture_requires_review'):
                 return
             label = f'{number}번째 행 버튼' if number else '선택한 행 버튼'
-            if selection is not None:
-                self.row_selections[step_id] = capture_step(selection)
+            if existing is None:
+                if selection is not None:
+                    fallback = capture_step(selection)
+                elif press is not None:
+                    fallback = dict(id=step_id, action='row-action', row=press.click_spec(), label=label + ' 누르기')
+                else:
+                    fallback = dict(manual('row_capture_requires_review', step_id), label=label)
+                    if cue is not None:
+                        fallback['row_cue'] = cue
+                self.row_fallbacks[step_id] = fallback
             self.times.setdefault(step_id, self.event_at or time.monotonic())
             if spec is None:
-                self.steps[step_id] = (self.row_selections.get(step_id) or
-                                       dict(manual('row_capture_requires_review', step_id), label=label))
+                self.steps[step_id] = self.row_fallbacks[step_id]
             else:
                 self.steps[step_id] = dict(id=step_id, action='row-action', row=spec, label=label + ' 누르기')
+            if self.steps[step_id]['action'] == 'row-action':
+                self.steps[step_id]['_ordinary_row_press'] = True
 
     def snapshot(self):
         with self.lock:
@@ -307,6 +316,10 @@ class StepEdits:
             return 'observed_context_surface', anchor['target'], anchor['point']
         if step['action'] == 'visual-click':
             return step['action'], step['visual']
+        if (step.get('_ordinary_row_press') or step.get('recognition', {}).get('reason') == 'row_capture_requires_review'):
+            # The same press may be upgraded from position to button or state
+            # evidence while the user types. Its event ID stays constant.
+            return 'recorded_row_press', step['id']
         if step['action'] == 'row-action':
             return step['action'], step['row'], step['label']
         if step['action'] == 'result-menu':
@@ -910,7 +923,7 @@ class _Worker(recorder.CaptureWorker):
         import row_capture
         import row_vision
         point = [event['x'],event['y']]
-        press, number = None,None
+        press, number, cue = None, None, None
         if frame is not None or role in ('row', 'listitem', 'list', 'table'):
             try:
                 # A first click may precede the first usable pixel sample. Its
@@ -923,14 +936,15 @@ class _Worker(recorder.CaptureWorker):
                     return observation
                 peers = [r for r,m in layout if m['scope'] == meta['scope'] and m['role'] == meta['role']]
                 number = sorted(peers,key=lambda r:(r[1],r[0])).index(rect)+1
+                cue = dict(ordinal=number, size=rect[2:], point=[point[0]-rect[0], point[1]-rect[1]], **meta)
                 if frame is not None:
-                    press = row_capture.prepare(frame, point, event['at'])
+                    press = row_capture.prepare(frame, point, event['at'], cue=cue)
             except bridge.BridgeError:
                 pass
-        if not press and (_semantic_list_selection(node) or self._unique_list_selection(observation)):
+        if not press and _semantic_list_selection(node):
             return observation
         if press or number or role in ('row','listitem'):
-            return dict(observation, painted_row=(number,press))
+            return dict(observation, painted_row=(number,press), row_cue=cue)
         return observation
 
     def handle(self, event):
@@ -1466,7 +1480,7 @@ class _Worker(recorder.CaptureWorker):
                 if _semantic_list_selection(node):
                     selection = self.step('select', observation)
                 step_id = selection['id'] if selection else uuid.uuid4().hex
-                self.model.row_step(step_id, number, None, selection)
+                self.model.row_step(step_id, number, None, selection, cue=observation.get('row_cue'), press=press)
                 if press:
                     self.row_tracker.follow(step_id,press)
                 return step_id
@@ -1683,7 +1697,7 @@ class CaptureSession:
         with self.notes.lock:
             self.notes.closed = True
             self.notes.steps.clear()
-            self.notes.row_selections.clear()
+            self.notes.row_fallbacks.clear()
             self.notes.hover_target = None
         return {'status': 'cancelled', 'steps': [], 'input_dispatched': False}
 

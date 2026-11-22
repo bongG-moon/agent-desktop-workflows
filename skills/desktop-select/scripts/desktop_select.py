@@ -460,18 +460,31 @@ def save_instruction(args):
         step['alias'] = args.alias
     ordinal = getattr(args, 'row', None)
     if ordinal is not None:
-        from row_intent import conflicts_with_launch, parse
+        from row_intent import confirmed_launch_hint, conflicts_with_launch, parse
         interpreted = parse(args.text)
+        legacy_ordinal = tasks.legacy_row_button_ordinal(source['steps'][number - 1])
         if conflicts_with_launch(args.text) or (interpreted is not None and interpreted != ordinal):
+            raise tasks.TaskError('instruction_binding_conflict')
+        if legacy_ordinal is not None and (legacy_ordinal != ordinal or interpreted != ordinal):
             raise tasks.TaskError('instruction_binding_conflict')
         if (not 1 <= ordinal <= 64 or not tasks._text(args.text, 1000)
                 or any(v is not None for v in (args.mode, args.argument, args.target, args.role, args.within, args.wait_after))
-                or not (tasks.is_recoverable(step) or step.get('action') in ('row-action','row-launch'))):
+                or not (legacy_ordinal or tasks.is_recoverable(step) or step.get('action') in ('row-action','row-launch'))):
             raise tasks.TaskError('invalid_row_instruction')
-        hint = step.get('row', step.get('row_hint'))
+        evidence = tasks._recorded_row(step)
+        hint = evidence['row'] if evidence and evidence['row']['version'] == 1 else None
+        if legacy_ordinal:
+            context = step.get('window_context')
+            exe, title = (context['exe'], context['title']) if context else (source['exe'], source['window'])
+            hint = confirmed_launch_hint(exe, title, ordinal, task_directory())
+        original = step
         step = dict(action='row-launch', ordinal=ordinal, label=f'{ordinal}번째 행 실행',
-                    **tasks._annotations(step))
+                    **tasks._annotations(original))
         step['description'] = args.text.strip()
+        if 'row_cue' in original:
+            step['row_cue'] = deepcopy(original['row_cue'])
+        if evidence and evidence['row']['version'] == 2:
+            step['recorded_row'] = deepcopy(evidence)
         if hint is not None:
             step['row_hint'] = hint
     else:

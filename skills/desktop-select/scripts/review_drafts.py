@@ -96,6 +96,11 @@ def validate(doc):
             ancestors = step['target'].get('locator', {}).get('ancestors', [])
             require(isinstance(ancestors, list) and all(isinstance(node, dict) for node in ancestors))
         require(isinstance(step.get('recognition', {}), dict))
+        if 'row_cue' in step:
+            from row_vision import validate_cue
+            require(step['action'] == 'manual' and tasks.is_recoverable(step)
+                    and step['recognition'].get('reason') == 'row_capture_requires_review')
+            validate_cue(step['row_cue'])
         if 'ordinary_menu' in step:
             require(step['action'] == 'result-menu' and step['ordinary_menu'] is True)
         if 'menu_anchor' in step:
@@ -126,8 +131,11 @@ def summary(doc):
     for number, row in enumerate(doc['rows'], 1):
         step = row['step']
         scope = step.get('_capture_window', {})
-        steps.append(dict(number=number, id=step['id'], label=step['label'],
-                          window=scope.get('title', doc['window']), **row['form']))
+        item = dict(number=number, id=step['id'], label=step['label'],
+                    window=scope.get('title', doc['window']), **row['form'])
+        if location := tasks.row_location(step.get('saved', step)):
+            item['row_location'] = location
+        steps.append(item)
     return dict(name=doc['name'], exe=doc['exe'], window=doc['window'], steps=steps)
 
 

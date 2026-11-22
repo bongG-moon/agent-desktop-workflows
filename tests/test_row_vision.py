@@ -173,6 +173,34 @@ class RowRecognitionTests(unittest.TestCase):
         self.assertFalse(vision._list_hit_row(uia, outer,100,[80,30],row.rect))
         self.assertFalse(vision._list_hit_row(uia, outer.descendants[-1],100,[80,30],row.rect))
 
+    def test_missing_visibility_accepts_only_a_complete_row_in_the_list_and_shown_window(self):
+        def node(role, rect, visibility=None, children=(), enabled=True):
+            element = MagicMock()
+            element.rect, element.peers = rect, children
+            element.property.side_effect = {30003: role, 30022: visibility, 30010: enabled}.get
+            return element
+        rect = [10, 20, 100, 15]
+        row = node(50007, rect)
+        hidden = node(50007, rect, True)
+        unexpected = node(50007, rect, 'unknown')
+        clipped = node(50007, [10, 85, 100, 20])
+        outside = node(50007, [10, 45, 201, 15])
+        zero = node(50007, [10, 20, 0, 15])
+        disabled = node(50007, rect, enabled=False)
+        hidden_list = node(50008, [0, 0, 240, 100], True, [node(50007, rect)])
+        viewport = node(50008, [0, 0, 240, 100], children=[row, hidden, unexpected, clipped, outside, zero, disabled])
+        root = node(50032, [0, 0, 200, 110], children=[hidden_list, viewport])
+        uia = MagicMock()
+        uia.from_handle.return_value = root
+        uia.children.side_effect = lambda e: e.peers
+        uia.bounds.side_effect = lambda e: dict(zip(('x', 'y', 'width', 'height'), e.rect))
+        uia.secure.return_value, uia.pid.return_value = False, 7
+        with (patch.object(vision, '_window_rect', return_value=root.rect),
+              patch.object(vision.bridge, 'UIA') as factory):
+            factory.return_value.__enter__.return_value = uia
+            _, visible = vision._row_layout(MagicMock(hwnd=8, pid=7))
+        self.assertEqual(visible, [(rect, dict(role='listitem', scope=[]))])
+
     def test_changed_suffix_cannot_hide_in_an_otherwise_identical_long_row_or_status(self):
         width, height = 288, 24
         old = bytearray(width * height)

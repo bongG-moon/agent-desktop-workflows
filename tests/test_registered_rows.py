@@ -90,6 +90,44 @@ class RegisteredRowTests(TestCase):
         click.assert_called_once()
         launch.assert_not_called()
 
+    def test_delivery_without_a_recorded_effect_continues_only_after_one_confirmed_click(self):
+        self.runtime()
+        base = [('a', 'stopped', 'start'), ('b', 'stopped', 'start')]
+        before = sample(base, 1)
+        self.task['steps'] = [dict(action='row-action', label=f'{n}번째 행 버튼',
+                                   row=row_capture.prepare(before, [157, y], 1.2).click_spec())
+                              for n, y in enumerate((205, 220), 1)]
+        recipe = self.compile()
+        receipt = dict(status='delivered_unverified', diagnostic='row_click_dispatched', input_dispatched=True)
+        with mock.patch.object(workflow.row_action, 'execute', side_effect=lambda *a: dict(receipt)) as send:
+            report = workflow.run(recipe)
+            self.assertEqual((report['status'], send.call_count), ('completed_unverified', 2))
+            send.reset_mock()
+            receipt.update(status='uncertain', diagnostic='row_delivery_uncertain', input_dispatched=None)
+            report = workflow.run(recipe)
+            self.assertEqual((report['status'], report['stopped_at'], send.call_count), ('uncertain', 1, 1))
+
+    def test_correct_only_the_legacy_default_query_with_explicit_launch_intent(self):
+        app = workflow.app
+        self.task['steps'] = [dict(action='open', role='button', match='query', target='1번째 행', expand=False,
+                                   instruction=dict(mode='recorded', text='1번째 행 버튼을 눌러줘'))]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(app, 'task_directory', return_value=Path(tmp)):
+            tasks.save_task(self.task, Path(tmp))
+            def args(text, ordinal):
+                return app.parser().parse_args(['instruct', '--task', self.task['name'], '--only', '1',
+                                                '--row', str(ordinal), '--text', text, '--alias', '첫 실행', '--save-as', '수정한 녹화'])
+            with self.assertRaisesRegex(tasks.TaskError, 'instruction_binding_conflict'):
+                app.save_instruction(args('1번째 행 버튼을 눌러줘', 1))
+            with self.assertRaisesRegex(tasks.TaskError, 'instruction_binding_conflict'):
+                app.save_instruction(args('2번째 행 실행', 2))
+            with mock.patch.object(workflow.row_intent, 'confirmed_launch_hint', return_value=self.spec) as prior:
+                saved = app.save_instruction(args('1번째 행 실행 버튼을 눌러줘', 1))
+            prior.assert_called_once_with(self.task['exe'], self.task['window'], 1, Path(tmp))
+            self.assertEqual(saved['execution_plan']['status'], 'saved')
+            corrected = tasks.load_task('수정한 녹화', Path(tmp))['steps'][0]
+            self.assertEqual((corrected['ordinal'], corrected['row_hint']), (1, self.spec))
+            self.assertEqual(tasks.load_task(self.task['name'], Path(tmp)), self.task)
+
     def test_mixed_plan_filters_required_inputs_for_only_and_blocks_background_before_binding(self):
         first = recording()['steps'][1]
         self.task['steps'].insert(0, first)

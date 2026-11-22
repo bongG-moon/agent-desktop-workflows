@@ -51,6 +51,67 @@ class RecoveryDraftTests(unittest.TestCase):
         self.assertEqual(draft['action'], 'manual')
         self.assertEqual(draft['instruction_draft'], '이번에 필요한 항목을 검토해줘')
 
+    def test_point_only_row_survives_draft_save_reopen_and_late_glyph_evidence(self):
+        import review_drafts
+        import recorded_plan
+        model = capture.CaptureNotes()
+        model.row_step('press', 1, None)
+        point, = model.snapshot()
+        cue = dict(ordinal=1, point=[14, 4], size=[28, 12], role='row', scope=['controls'])
+        point['row_cue'] = cue
+        edits = capture.StepEdits()
+        task = tasks.from_recording('work', 'Example.exe', 'Work', edits.apply([point]))
+        partial, = task['steps']
+        self.assertEqual(partial, dict(action='manual', reason='row_capture_requires_review',
+                                       row_cue=cue, instruction_draft='1번째 행 버튼을 눌러줘'))
+        self.assertEqual(tasks.summary(task)['steps'][0]['row_location'], cue)
+        self.assertEqual(tasks.resolve_saved_intents(task), task)
+        rows = review_drafts.rows_from_task(task)
+        source, = edits.restore_rows(rows)
+        edits.store(source, '', '첫 번째 행의 버튼을 클릭해줘')
+        again = tasks.from_recording('work', 'Example.exe', 'Work', edits.apply([source]))
+        self.assertEqual(again['steps'][0]['row_cue'], cue)
+        self.assertEqual(again['steps'][0]['action'], 'manual')
+
+        # The original editor can receive fresh proof for this same event
+        # while the user is already entering an instruction.
+        edits.store(point, '작업', '첫 번째 행의 버튼을 클릭해줘')
+        spec = dict(version=2, role='row', scope=['controls'], size=[28, 12], ordinal=1,
+                    boxes=dict(key=[0, 0, 4, 4], button=[12, 2, 4, 4]), key='qlU=', button='Vao=')
+        model.row_step('press', 1, spec)
+        final, = model.snapshot()
+        task = tasks.from_recording('work', 'Example.exe', 'Work', edits.apply([final]))
+        recorded, = task['steps']
+        self.assertEqual((recorded['action'], recorded['row'], recorded['description'], recorded['alias']),
+                         ('row-action', spec, '첫 번째 행의 버튼을 클릭해줘', '작업'))
+        location = tasks.summary(task)['steps'][0]['row_location']
+        self.assertEqual((location['ordinal'], location['scope'], location['point'], location['button_box']),
+                         (1, ['controls'], [14, 4], [12, 2, 4, 4]))
+        self.assertIs(location['has_button_marker'], True)
+        self.assertNotIn('button', location)
+        action, = recorded_plan.compile_plan(task)['envelope']['recipe']['steps']
+        self.assertEqual((action['action'], action['row']), ('row-action', spec))
+
+        for sentence, expected in [('두 번째 행의 버튼을 클릭해줘', 'manual'),
+                                   ('삭제 버튼을 눌러줘', 'open'), ('두 번째 요소 실행', 'row-launch')]:
+            with self.subTest(sentence=sentence):
+                edited = tasks.instructed_step(recorded, tasks.compile_instruction(recorded, sentence))
+                tasks._validate_step(edited, set())
+                self.assertEqual(edited['action'], expected)
+                self.assertEqual(edited['recorded_row']['row'], spec)
+                self.assertNotIn('row_hint', edited)
+                restored = tasks.instructed_step(edited, tasks.compile_instruction(edited, '이 버튼을 눌러줘'))
+                self.assertEqual(restored['row'], spec)
+                self.assertEqual(restored['description'], '이 버튼을 눌러줘')
+
+    def test_only_exact_legacy_row_caption_can_be_repaired_by_ordinal(self):
+        step = dict(action='open', match='query', role='button', expand=False, target='2번째 행',
+                    instruction=dict(mode='recorded', text='2번째 행 버튼을 눌러줘'))
+        self.assertEqual(tasks.legacy_row_button_ordinal(step), 2)
+        for override in (dict(within='other panel'), dict(target='1번째 행'), dict(expand=True),
+                         dict(instruction=dict(mode='recorded', text='2번째 행 삭제 버튼을 눌러줘'))):
+            self.assertIsNone(tasks.legacy_row_button_ordinal(dict(step, **override)))
+
     def test_known_value_draft_names_the_actual_field(self):
         step = capture.capture_step(combo('Family', 'Hybrid'))
         self.assertEqual(capture.default_text(step), 'Family 조건을 Hybrid로 설정해줘')

@@ -31,7 +31,7 @@ def parse(text):
         r'(?:(\d{1,2})\s*(?:번째|번(?:째)?)?|'
         r'(첫|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*(?:번째|째)?)\s*'
         r'(?:행|줄|항목|요소|기기|인스턴스|플레이어)(?:의|에서|에 있는|에|을|를)?\s*'
-        r'(?:실행|시작|재생|켜기)(?:\s*버튼(?:을|를)?)?\s*'
+        r'(?:실행|시작|재생|켜기|▶\ufe0f?(?:을|를)?)(?:\s*버튼(?:을|를)?)?\s*'
         r'(?:(?:눌러(?:서)?|클릭해(?:서)?)\s+\d{1,3}\s*(?:번\s*)?'
         r'(?:기기|인스턴스|플레이어)(?:를|을)?\s*(?:열어|실행해|시작해|켜)\s*(?:줘|주세요)?'
         r'|(?:클릭|선택|눌러|누르기|누른다|누름|하기|시켜|해|하|켜)?\s*'
@@ -228,11 +228,33 @@ def _row_index(frame, rect):
     return matches[0]
 
 
-def _memory(binding, title, ordinal, directory):
+def _cache_location(exe, title, ordinal, directory):
     from hashlib import sha256
     import learned_tasks as tasks
-    key = '\n'.join((binding.exe.casefold(), title, str(ordinal))).encode('utf-8')
+    key = '\n'.join((exe.casefold(), title, str(ordinal))).encode('utf-8')
     return tasks._directory(directory) / 'row-launches', sha256(key).hexdigest()
+
+
+def _memory(binding, title, ordinal, directory):
+    return _cache_location(binding.exe, title, ordinal, directory)
+
+
+def confirmed_launch_hint(exe, title, ordinal, directory):
+    """Embed a previously verified play button when repairing an explicitly named ordinal."""
+    import learned_tasks as tasks
+    store, key = _cache_location(exe, title, ordinal, directory)
+    try:
+        plan = tasks.load_task(key, store)
+    except tasks.TaskError as error:
+        if error.code == 'task_not_found':
+            return None
+        raise
+    tasks.check_binding(plan, exe, title)
+    if len(plan['steps']) == 1 and plan['steps'][0]['action'] == 'row-action':
+        row = plan['steps'][0]['row']
+        if row['version'] == 1 and _recorded_play(row):
+            return row
+    return None
 
 
 def _remember(store, plan):
@@ -267,7 +289,7 @@ def execute(binding, title, ordinal, guard, directory=None, *, preview=False, ti
     examples = []
     if hint is not None:
         visual.validate_spec(hint)
-        if _recorded_play(hint):
+        if hint['version'] == 1 and _recorded_play(hint):
             examples.append((hint, 'recorded_row_hint'))
     try:
         saved = tasks.load_task(key,store)
@@ -277,7 +299,7 @@ def execute(binding, title, ordinal, guard, directory=None, *, preview=False, ti
     else:
         tasks.check_binding(saved,binding.exe,title)
         prior = saved['steps'][0]
-        if prior['action'] == 'row-action' and prior['row'] != hint:
+        if prior['action'] == 'row-action' and prior['row'].get('version') == 1 and prior['row'] != hint:
             examples.append((prior['row'], 'previously_observed_row'))
     if examples:
         snapshot = visual._snapshot(binding, include_viewport=True)

@@ -48,6 +48,25 @@ class RowActionTests(unittest.TestCase):
         self.assertEqual(6, self.vision.observe_row.call_count)
         self.send.assert_called_once_with(40, 60, 'click')
 
+    def test_click_only_capture_rechecks_the_point_once_without_result_polling(self):
+        self.spec = {'version': 2}
+        receipt = self.execute(sample('before'))
+        self.assertEqual((receipt['status'], receipt['diagnostic'], receipt['verification_scope']),
+                         ('delivered_unverified', 'row_click_dispatched', 'click_delivery'))
+        self.vision.observe_row.assert_called_once()
+        self.vision.confirm_point.assert_called_once()
+        self.vision.confirm_pixels.assert_called_once()
+        self.send.assert_called_once_with(40, 60, 'click')
+
+    def test_click_only_unavailable_or_changed_button_never_dispatches(self):
+        self.spec = {'version': 2}
+        blocked = self.execute(sample('ambiguous'))
+        self.assertEqual((blocked['status'], blocked['input_dispatched']), ('blocked', False))
+        self.vision.confirm_pixels.side_effect = app.bridge.BridgeError('row_pixels_changed')
+        with self.assertRaisesRegex(app.bridge.BridgeError, 'row_pixels_changed'):
+            self.execute(sample('before'))
+        self.send.assert_not_called()
+
     def test_already_running_does_not_click(self):
         result = self.execute(sample('after'), sample('after'))
         self.assertEqual(('verified', False, 'after'),
