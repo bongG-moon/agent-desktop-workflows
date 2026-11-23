@@ -27,6 +27,13 @@ sealed class ProviderCompatibilityFixture : Form {
     internal string HiddenKey, WorkbookPath, ResultState, ResultFamily;
     internal string EntryValue="", EntryMode="normal", ResultEntry="";
     internal int EntryWrites;
+    internal bool TrackFocus;
+    internal RawPeer FocusedPeer;
+    internal readonly List<object> InputEvents = new List<object>();
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    internal void RecordInput(string action) {
+        InputEvents.Add(new { action=action, foreground=GetForegroundWindow().ToInt64() });
+    }
     internal ProviderCompatibilityFixture() {
         Text = "Synthetic provider compatibility"; ClientSize = new System.Drawing.Size(660, 250);
         StartPosition = FormStartPosition.Manual; Location = new System.Drawing.Point(45, 45);
@@ -148,6 +155,7 @@ sealed class ProviderCompatibilityFixture : Form {
             Brushes.DarkSlateGray, 20, ClientSize.Height-30);
     }
     protected override void WndProc(ref Message m) {
+        if(TrackFocus && m.Msg==0x0100 && m.WParam.ToInt32()==13)RecordInput("Enter");
         if (m.Msg == 0x003D && m.LParam.ToInt64() == AutomationInteropProvider.RootObjectId && Root != null) {
             m.Result = AutomationInteropProvider.ReturnRawElementProvider(Handle, m.WParam, m.LParam, Root); return;
         }
@@ -163,7 +171,7 @@ sealed class ProviderCompatibilityFixture : Form {
         Console.WriteLine(json.Serialize(new { kind=kind, title=Text, pid=Process.GetCurrentProcess().Id,
             hwnd=Handle.ToInt64(), minimized=Minimized, opens=Opens, exports=Exports, controls=values,
             result_state=ResultState, result_family=ResultFamily, result_entry=ResultEntry,
-            text_value=EntryValue, text_writes=EntryWrites, text_mode=EntryMode,
+            text_value=EntryValue, text_writes=EntryWrites, text_mode=EntryMode, input_events=InputEvents,
             query_caption=Root.Children.Find(delegate(RawPeer peer) { return peer.Key=="QueryCommand"; }).Name }));
         Console.Out.Flush();
     }
@@ -183,6 +191,8 @@ sealed class ProviderCompatibilityFixture : Form {
                 else if(command=="restore") { WindowState=FormWindowState.Normal; Activate(); }
                 else if(command=="point-front") { TopMost=true; BringToFront(); Activate(); }
                 else if(command=="point-done")TopMost=false;
+                else if(command=="track-focus") { TrackFocus=true; InputEvents.Clear(); }
+                else if(command=="reset-input-events")InputEvents.Clear();
                 else if(command.StartsWith("title|"))Text=command.Substring(6);
                 else if(command=="label-wrappers")SetWrappedLabels(true);
                 else if(command=="label-direct")SetWrappedLabels(false);
@@ -198,6 +208,15 @@ sealed class ProviderCompatibilityFixture : Form {
                     }
                 }
                 else if(command.StartsWith("text-mode|"))EntryMode=command.Substring(10);
+                else if(command=="text-wrap") {
+                    var field=Root.Children.Find(delegate(RawPeer p) { return p.Key=="searchText"; });
+                    if(field!=null) {
+                        var group=new RawPeer(this,Root,72,"entryPanel","Entry panel",50026,new Rectangle(170,200,280,52));
+                        Root.Children.Remove(field);
+                        var nested=new RawPeer(this,group,71,"searchText","",50004,field.Relative);
+                        nested.Label=field.Label; group.Children.Add(nested); Root.Children.Add(group);
+                    }
+                }
                 else if(command=="text-reset") { EntryValue=ResultEntry=""; EntryWrites=0; EntryMode="normal"; }
                 else if(command.StartsWith("automation-id|")) {
                     var parts=command.Split('|');
@@ -303,7 +322,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
             case 30005:
                 if(Role==50003 && Combo.Mode=="name-is-value")return Combo.Current;
                 return Role==50007 && Combo.Mode=="unsupported-option" ? Choice : Name;
-            case 30008: return false;
+            case 30008: return Host.TrackFocus && Host.FocusedPeer==this;
             case 30009: return Role==50003 || Role==50004 || Role==50000;
             case 30010: return !(TextEntry && Host.EntryMode=="disabled");
             case 30011: return AutomationKey ?? Key;
@@ -363,13 +382,16 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
         }
     }
     public IRawElementProviderSimple[] GetEmbeddedFragmentRoots() { return null; }
-    public void SetFocus() {}
+    public void SetFocus() {
+        Host.RecordInput("SetFocus:"+Key);
+        if(Host.TrackFocus)Host.FocusedPeer=this;
+    }
     public IRawElementProviderFragmentRoot FragmentRoot { get { return Host.Root; } }
     public IRawElementProviderFragment ElementProviderFromPoint(double x,double y) {
         foreach(var child in Children)if(child.BoundingRectangle.Contains(x,y))return child.ElementProviderFromPoint(x,y);
         return this;
     }
-    public IRawElementProviderFragment GetFocus() { return Host.Root; }
+    public IRawElementProviderFragment GetFocus() { return Host.TrackFocus && Host.FocusedPeer!=null ? Host.FocusedPeer : Host.Root; }
     string IValueProvider.Value {
         get {
             if(TextEntry && Host.EntryMode=="unreadable")
@@ -387,6 +409,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     }
     bool IValueProvider.IsReadOnly { get { return TextEntry ? Host.EntryMode=="readonly" : Role!=50003 || SelectOnly; } }
     void IValueProvider.SetValue(string value) {
+        Host.RecordInput("SetValue:"+Key);
         if(TextEntry) {
             if(((IValueProvider)this).IsReadOnly || Host.EntryMode=="password" || Host.EntryMode=="disabled")
                 throw new InvalidOperationException("fixture_text_not_writable");
@@ -427,7 +450,7 @@ sealed class RawPeer : IRawElementProviderFragmentRoot, IValueProvider, IExpandC
     }
     void ISelectionItemProvider.AddToSelection() { ((ISelectionItemProvider)this).Select(); }
     void ISelectionItemProvider.RemoveFromSelection() { throw new InvalidOperationException(); }
-    void IInvokeProvider.Invoke() { if(Key=="ExportCommand")Host.Export(); else Host.Query(); }
+    void IInvokeProvider.Invoke() { Host.RecordInput("Invoke:"+Key); if(Key=="ExportCommand")Host.Export(); else Host.Query(); }
     void IFixtureLegacyProvider.Select(int flags) { throw new InvalidOperationException("legacy_readonly"); }
     void IFixtureLegacyProvider.DoDefaultAction() { throw new InvalidOperationException("legacy_readonly"); }
     void IFixtureLegacyProvider.SetValue(string value) { throw new InvalidOperationException("legacy_readonly"); }

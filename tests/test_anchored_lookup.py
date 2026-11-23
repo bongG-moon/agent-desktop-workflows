@@ -20,7 +20,9 @@ class AnchoredLookupTests(unittest.TestCase):
         }
         for node in self.boxes:
             node.values[30022] = False
-        self.uia.bounds = Mock(side_effect=lambda node: dict(self.boxes[node]))
+        self.uia.bounds = Mock(side_effect=lambda node: dict(self.boxes.get(node, dict(x=0,y=0,width=0,height=0))))
+        self.uia.children = Mock(side_effect=lambda node: (child for child in self.uia.nodes.values()
+                                                         if child.parent_node is node))
         self.uia.from_point = Mock(return_value=self.field)
         self.uia.point_descendant = Mock(return_value=self.field)
         def within(node, parent):
@@ -49,14 +51,14 @@ class AnchoredLookupTests(unittest.TestCase):
 
     def test_fresh_anchor_geometry_resolves_unnamed_editor_without_persisted_handle(self):
         self.assertIs(self.resolve(), self.field)
-        self.uia.from_point.assert_called_once_with(350, 220)
+        self.uia.from_point.assert_not_called()
         self.uia.point_descendant.assert_not_called()
         self.assertNotIn('83489', str(self.selector))
         # A moved but stable form changes the current point, not the recipe.
         self.boxes[self.anchor]['x'] += 60
         self.boxes[self.field]['x'] += 60
         self.assertIs(self.resolve(), self.field)
-        self.uia.from_point.assert_called_with(410, 220)
+        self.uia.from_point.assert_not_called()
 
     def test_wrong_role_or_class_is_not_same_target(self):
         for key, value in ((30003, 50000), (30012, 'OtherEditor')):
@@ -78,15 +80,28 @@ class AnchoredLookupTests(unittest.TestCase):
                 self.assertNotIn(30012, self.field.reads)
                 self.field.values[key] = old
 
-    def test_other_window_over_point_stops_before_uia_hit(self):
-        with patch.object(win, 'root_window', return_value=999), \
-             self.assertRaisesRegex(win.BridgeError, 'anchored_target_occluded'):
-            self.resolve()
+    def test_other_window_over_point_does_not_change_owned_uia_target(self):
+        with patch.object(win, 'window_from_point', side_effect=AssertionError('desktop hit')), \
+             patch.object(win, 'root_window', return_value=999):
+            self.assertIs(self.resolve(), self.field)
         self.uia.from_point.assert_not_called()
+
+    def test_missing_offscreen_uses_owned_geometry_without_foreground(self):
+        self.field.values[30022] = None
+        with patch('provider_visibility._shown', return_value=True), \
+             patch.object(win, 'window_from_point', side_effect=AssertionError('desktop hit')):
+            self.assertIs(self.resolve(), self.field)
+
+    def test_minimized_window_rejects_stale_visible_geometry_before_lookup(self):
+        with patch.object(win.user32, 'IsIconic', return_value=True), \
+             self.assertRaisesRegex(win.BridgeError, 'target_window_minimized'):
+            self.resolve()
+        self.uia.children.assert_not_called()
+        self.assertEqual([], self.uia.queries)
 
     def test_same_process_field_outside_demonstrated_anchor_is_rejected(self):
         self.field.parent_node = self.root
-        with self.assertRaisesRegex(win.BridgeError, 'anchored_target_outside_anchor'):
+        with self.assertRaisesRegex(win.BridgeError, 'anchored_target_not_visible'):
             self.resolve()
 
     def test_duplicate_anchor_is_ambiguous_before_point_is_used(self):
@@ -109,13 +124,39 @@ class AnchoredLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(win.BridgeError, 'anchored_target_changed'):
             self.resolve()
 
-    def test_parent_hit_is_refined_then_full_ancestry_checked(self):
-        self.uia.from_point.return_value = self.anchor
+    def test_local_geometry_path_is_owned_before_target_metadata_is_read(self):
         self.assertIs(self.resolve(), self.field)
-        self.uia.point_descendant.assert_called_once_with(self.anchor, 350, 220, 7)
+        self.uia.children.assert_called_with(self.anchor)
+        self.uia.point_descendant.assert_not_called()
         self.field.values[30019] = True
         with self.assertRaisesRegex(win.BridgeError, 'target_protected'):
             self.resolve()
+
+    def test_overlapping_children_fail_before_any_target_is_chosen(self):
+        other = Node(self.uia, '', 50004, parent=self.anchor)
+        other.values.update({30012: 'RichEdit20W', 30022: False})
+        self.boxes[other] = dict(self.boxes[self.field])
+        with self.assertRaisesRegex(win.BridgeError, 'anchored_target_ambiguous'):
+            self.resolve()
+        self.uia.from_point.assert_not_called()
+
+    def test_sibling_scan_is_bounded_even_when_point_has_one_match(self):
+        for _ in range(151):
+            Node(self.uia, '', 50020, parent=self.anchor)
+        with self.assertRaisesRegex(win.BridgeError, 'anchored_target_incomplete'):
+            self.resolve()
+        self.assertLess(self.uia.bounds.call_count, 160)
+
+    def test_pane_table_and_custom_wrappers_remain_supported(self):
+        for role in (50033, 50036, 50025):
+            with self.subTest(role=role):
+                wrapper = Node(self.uia, '', role, parent=self.anchor)
+                wrapper.values[30022] = False
+                self.boxes[wrapper] = dict(self.boxes[self.anchor])
+                self.field.parent_node = wrapper
+                self.assertIs(self.resolve(), self.field)
+                wrapper.parent_node = None
+                self.field.parent_node = self.anchor
 
     def test_explicit_offscreen_or_point_outside_control_stops(self):
         self.field.values[30022] = True
@@ -153,8 +194,9 @@ class BoundAnchorTests(unittest.TestCase):
     def test_new_same_class_field_at_the_point_never_retargets_bound_action(self):
         proof = self.bind()
         replacement = Node(self.uia, '', 50004, parent=self.anchor)
-        replacement.values[30012] = self.field.values[30012]
-        self.uia.from_point.return_value = replacement
+        replacement.values.update({30012: self.field.values[30012], 30022: False})
+        self.boxes[replacement] = dict(self.boxes[self.field])
+        self.uia.children.side_effect = lambda node: [replacement] if node is self.anchor else []
         with self.assertRaisesRegex(win.BridgeError, 'anchored_target_changed'):
             proof.revalidate()
 
@@ -210,11 +252,10 @@ class BoundAnchorTests(unittest.TestCase):
         with self.assertRaisesRegex(win.BridgeError, 'root_changed'):
             proof.revalidate()
 
-    def test_occlusion_hidden_state_and_closed_session_are_rejected(self):
+    def test_external_occlusion_is_ignored_but_hidden_state_and_closed_session_fail(self):
         proof = self.bind()
-        with patch.object(win, 'window_from_point', return_value=222), \
-             self.assertRaisesRegex(win.BridgeError, 'anchored_target_occluded'):
-            proof.revalidate()
+        with patch.object(win, 'window_from_point', side_effect=AssertionError('desktop hit')):
+            self.assertIs(proof.revalidate(), self.field)
         self.field.values[30022] = True
         with self.assertRaisesRegex(win.BridgeError, 'anchored_target_not_visible'):
             proof.revalidate()
@@ -223,14 +264,23 @@ class BoundAnchorTests(unittest.TestCase):
         with self.assertRaisesRegex(win.BridgeError, 'anchored_binding_expired'):
             proof.revalidate()
 
-    def test_recorded_selector_is_copied_and_parent_hit_still_proves_same_field(self):
+    def test_minimized_after_binding_rejects_cached_visible_target_before_dispatch(self):
+        proof = self.bind()
+        self.uia.children.reset_mock()
+        with patch.object(win.user32, 'IsIconic', return_value=True), \
+             self.assertRaisesRegex(win.BridgeError, 'target_window_minimized'):
+            proof.revalidate()
+        self.uia.children.assert_not_called()
+
+    def test_recorded_selector_is_copied_and_new_overlapping_field_invalidates_proof(self):
         proof = self.bind()
         self.selector['anchor']['name'] = 'Changed recipe'
         self.uia.from_point.return_value = self.anchor
         self.assertIs(proof.revalidate(), self.field)
         replacement = Node(self.uia, '', 50004, parent=self.anchor)
-        self.uia.point_descendant.return_value = replacement
-        with self.assertRaisesRegex(win.BridgeError, 'anchored_target_changed'):
+        replacement.values.update({30012: 'RichEdit20W', 30022: False})
+        self.boxes[replacement] = dict(self.boxes[self.field])
+        with self.assertRaisesRegex(win.BridgeError, 'anchored_target_ambiguous'):
             proof.revalidate()
 
     def test_recorded_anchor_ancestor_identity_must_remain_current(self):

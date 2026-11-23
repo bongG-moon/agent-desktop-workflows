@@ -902,7 +902,6 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     number, dispatching = 0, False
     anchor_proof = None
     reservations = ExitStack()
-    anchor_input = ExitStack()
     stage_started = started
     try:
         owner = bind(recipe['exe'], recipe['window'], hwnd)
@@ -962,7 +961,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
-            elif mutates_window and requirements['background_eligible']:
+            elif mutates_window and any(row['input_mode'] == 'accessibility' for row in requirements['steps']):
                 input_policy.prefer_background(uia)
             if mutates_window:
                 first = active[0]
@@ -1210,13 +1209,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     else:
                         root = uia.from_handle(surface.hwnd)
                     if not observation and not read_only and 'anchor' in selector:
-                        # Point-based identity needs the actual target surface
-                        # exposed. Ordinary UIA actions remain background-capable.
-                        from row_action import foreground
-                        anchor_input.enter_context(coordination.desktop_input())
-                        foreground(surface)
-                        report['foreground_requested'] = True
-                        check_target(surface, popup, mutate=True)
+                        # Resolve the relative position in this window's UIA
+                        # subtree. A covering application need not lose focus.
                         anchor_proof = lookup.bind_anchored(surface, uia, selector, root=root)
                         element, stable, resolution = anchor_proof.element, None, None
                     elif not observation:
@@ -1273,7 +1267,6 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             if anchor_proof is not None:
                                 anchor_proof.close()
                                 anchor_proof = None
-                            anchor_input.close()
                         dispatching = False
                         if (step.get('verify_closed') and receipt['status'] == 'delivered_unverified'
                                 and receipt.get('input_dispatched') is True):
@@ -1395,7 +1388,6 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             if anchor_proof is not None:
                 anchor_proof.close()
         finally:
-            anchor_input.close()
             reservations.close()
     report['elapsed_seconds'] = round(time.monotonic() - started, 4)
     return report
@@ -1786,10 +1778,10 @@ def workflow_notes(recipe, source_task, pending_popup):
         guide += ('\n실제 마우스로 표를 우클릭하는 단계는 대상 창을 앞으로 가져온 뒤 녹화한 영역을 확인하고 지정된 메뉴 경로를 순서대로 선택한다. '
                   '해당 단계가 끝날 때까지 마우스와 키보드를 사용하지 않는다.\n')
     if any('anchor' in step.get('selector', {}) for step in active):
-        guide += ('\n상위 영역과 상대 위치로 찾는 입력란은 실행할 때 대상 창을 앞으로 가져와 확인한다. '
-                  '대상을 찾는 동안 마우스와 키보드를 사용하지 않는다. '
+        guide += ('\n상위 영역과 상대 위치로 찾는 입력란은 대상 창의 접근성 구조 안에서 확인한다. '
+                  '다른 창에 가려져 있어도 유일한 입력란을 찾으면 전면화 없이 실행한다. '
                   '같은 종류 입력란의 배치가 바뀌면 역할과 클래스 검사만으로 구별할 수 없으므로 지정 위치를 다시 확인한다. '
-                  '등록과 --read-only는 창을 앞으로 가져오지 않으므로 사용자가 해당 영역을 보이게 해 두어야 한다.\n')
+                  '영역 안에서 대상이 겹치거나 구조를 읽을 수 없으면 입력 전에 멈춘다.\n')
     return guide
 
 

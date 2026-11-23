@@ -59,15 +59,15 @@ class InputPolicyTests(unittest.TestCase):
         self.assertTrue(requirements['physical_input_required'])
         self.assertFalse(requirements['background_eligible'])
 
-    def test_anchored_accessibility_needs_foreground_without_pointer_input(self):
+    def test_anchored_accessibility_uses_owned_subtree_without_foreground(self):
         for action in ('set-value', 'invoke', 'select', 'fill', 'open'):
             with self.subTest(action=action):
                 requirements = policy.profile([dict(action=action, selector={'anchor': {'name': 'Panel'}})])
                 self.assertEqual('accessibility', requirements['steps'][0]['input_mode'])
-                self.assertTrue(requirements['foreground_required'])
+                self.assertFalse(requirements['foreground_required'])
                 self.assertFalse(requirements['physical_input_required'])
-                self.assertFalse(requirements['background_eligible'])
-                self.assertIsNotNone(policy.blocked(requirements))
+                self.assertTrue(requirements['background_eligible'])
+                self.assertIsNone(policy.blocked(requirements))
 
     def test_unknown_manual_and_malformed_actions_fail_closed(self):
         for step in ({'action': 'manual'}, {'action': 'teach-target'}, {'action': 'future-command'},

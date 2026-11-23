@@ -113,6 +113,19 @@ class DirectRevalidationTests(unittest.TestCase):
         self.assertEqual(self.action()['status'], 'verified')
         app.observe.assert_called_once()
 
+    def test_learned_region_suppresses_automatic_focus_before_observation(self):
+        events = []
+        with patch.object(app.input_policy, 'prefer_background', side_effect=lambda uia: events.append('background')), \
+             patch.object(app, 'near_region', side_effect=lambda nodes, anchor: (nodes, list(range(len(nodes))), 1)), \
+             patch.object(app, 'add_display_properties'):
+            app.observe.side_effect = lambda *a, **kw: (events.append('observe') or (deepcopy(self.nodes), self.elements))
+            args = argparse.Namespace(command='select', role=None, target='state', within=None,
+                                      window='Business', value='N', popup=None, expand=False)
+            result = app.action(args, self.owner, anchor={'target': 'conditions'})
+        self.assertTrue(result['input_dispatched'])
+        self.assertEqual('background', events[0])
+        self.assertEqual(1, events.count('background'))
+
 
 if __name__ == '__main__':
     unittest.main()

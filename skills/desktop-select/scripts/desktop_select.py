@@ -308,7 +308,7 @@ def action(args, owner, *, learned=None, anchor=None):
         if mutate:
             if background:
                 input_policy.configure_uia(uia)
-            elif anchor is None:
+            else:
                 input_policy.prefer_background(uia)
         def read_view():
             nodes, elements = observe(surface, uia, identities_only=learned is not None or anchor is not None)

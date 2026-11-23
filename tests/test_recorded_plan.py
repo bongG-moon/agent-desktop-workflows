@@ -38,6 +38,88 @@ def recording():
 
 
 class CompilationTests(unittest.TestCase):
+    def test_old_visual_value_check_compiles_to_current_input_without_recorded_pixels(self):
+        from test_visual_target import image, visual, VisualTargets
+        marker = visual.from_frame(VisualTargets.window, image((35, 42)), (235, 162))
+        source = recording()
+        source['steps'] = [
+            dict(action='fill', target='partInput', role='textfield', match='automation_id', label='Part ID',
+                 recorded_effect='unobserved', instruction=dict(mode='required', parameter='품목', text='Part ID 입력')),
+            dict(action='visual-click', visual=marker, label='기록한 셀',
+                 description='조회 결과 표에서 Part ID 값이 입력한 값과 같은지 확인해줘'),
+            dict(action='visual-click', visual=dict(marker, gesture='double-click'), label='기록한 행',
+                 description='확인한 결과 행을 더블클릭해줘')]
+        before = deepcopy(source)
+        plan = plans.compile_plan(source)
+        self.assertEqual(plan['status'], 'compiled', plan)
+        steps = plan['envelope']['recipe']['steps']
+        self.assertEqual([s['action'] for s in steps], ['set-value', 'verify-value', 'double-click-result'])
+        self.assertEqual(steps[1]['parameter'], '품목')
+        self.assertEqual(steps[1]['result_column'], 'Part ID')
+        self.assertNotIn('visual', json.dumps(steps))
+        self.assertEqual(source, before)
+        for value in ('LAB-42', 'PART-A'):
+            self.assertEqual(workflow.values_for(plan['envelope']['recipe'], {'품목': value}), ({'품목': value}, []))
+
+    def test_latest_assignment_uses_control_identity_and_keeps_distinct_fields_ambiguous(self):
+        check = dict(action='verify-value', parameter='Part ID', label='Part ID')
+        old = dict(action='fill', target='part', match='automation_id', role='textfield', label='Part ID',
+                   instruction=dict(mode='fixed', value='old'))
+        current = dict(old, instruction=dict(mode='required', parameter='품목'))
+        self.assertEqual(plans._expected_binding(check, [old, current]), {'parameter':'품목'})
+        different = dict(current, target='anotherPart', instruction=dict(mode='fixed', value='different'))
+        self.assertIsNone(plans._expected_binding(check, [old, current, different]))
+        scoped = dict(current, ancestors=[dict(role='group', automation_id='otherPanel')],
+                      instruction=dict(mode='fixed', value='different'))
+        self.assertIsNone(plans._expected_binding(check, [current, scoped]))
+
+    def test_child_comparison_inherits_only_its_openers_input_at_open_time(self):
+        prior = dict(action='fill', target='part', match='automation_id', role='textfield', label='Part ID',
+                     instruction=dict(mode='required', parameter='품목'))
+        opener = dict(action='open')
+        child = dict(exe='Example.exe', title='Results', after_step=2, related=True)
+        check = dict(action='verify-value', parameter='Part ID', label='Part ID', window_context=child)
+        changed = dict(prior, instruction=dict(mode='fixed', value='later'))
+        self.assertEqual(plans._expected_binding(check, [prior, opener, changed]), {'parameter':'품목'})
+        unrelated = dict(check, window_context=dict(exe='Other.exe', title='Other', mode='existing'))
+        self.assertIsNone(plans._expected_binding(unrelated, [prior, opener]))
+        self.assertEqual(plans._expected_binding(check, [prior, opener,
+                         dict(changed, window_context=child)]), {'value':'later'})
+        self.assertEqual(plans._expected_binding(dict(check, value='explicit'), [prior]), {'value':'explicit'})
+
+    def test_unparsed_comparison_hands_off_with_its_location_instead_of_clicking_old_pixels(self):
+        from test_visual_target import image, visual, VisualTargets
+        marker = visual.from_frame(VisualTargets.window, image((35, 42)), (235, 162))
+        for sentence in ('Compare Code with the entered part, then open the matching row',
+                         '입력한 값과 맞는지 확인하고 맞으면 결과 행을 더블클릭해줘',
+                         'Batch 일치 확인 후 결과 행 열기', '조회 결과 값 일치 확인 후 계속',
+                         'Batch를 입력한 값과 비교 후 확인한 행 열기'):
+            old = dict(action='visual-click', visual=marker, label=sentence)
+            spec = tasks.compile_instruction(old, sentence)
+            self.assertEqual(spec, dict(mode='draft', text=sentence))
+            source = dict(recording(), steps=[old])
+            resolved = tasks.resolve_saved_intents(source)['steps'][0]
+            self.assertEqual(resolved['visual_hint'], marker)
+            self.assertEqual(resolved['instruction_draft'], sentence)
+            plan = plans.compile_plan(source)
+            self.assertEqual(plan['diagnostic'], 'instruction_requires_structure')
+            self.assertEqual(plan['grounding_steps'][0]['instruction'], sentence)
+            self.assertNotIn('envelope', plan)
+        icon = dict(action='visual-click', visual=marker, label='Compare button')
+        self.assertEqual(tasks.resolve_saved_intents(dict(recording(), steps=[icon]))['steps'], [icon])
+        for sentence in ('비교하기 버튼을 눌러줘', 'click Compare button'):
+            self.assertEqual(tasks.compile_instruction(icon, sentence)['mode'], 'visual-click')
+
+    def test_saved_recorded_instruction_text_can_express_a_result_observation(self):
+        prior = recording()['steps'][0]
+        old = dict(action='open', target='cell', role='button', match='automation_id', expand=False,
+                   instruction=dict(mode='recorded', text='MES Setup 일치 확인'))
+        source = dict(recording(), steps=[prior, old])
+        plan = plans.compile_plan(source)
+        self.assertEqual(plan['status'], 'compiled', plan)
+        self.assertEqual(plan['envelope']['recipe']['steps'][1]['action'], 'verify-value')
+        self.assertEqual(plan['envelope']['recipe']['steps'][1]['value'], 'N')
+
     def test_new_recording_compiles_result_check_double_click_read_and_business_close(self):
         import teach_capture as capture
         from capture_trail import finalize_contexts
@@ -84,6 +166,11 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual((natural['result_column'], natural['parameter']), ('Batch', 'Batch'))
         named = tasks.compile_instruction(raw, '결과 표에서 Equip ID가 입력한 장비 ID와 같은지 확인해줘')
         self.assertEqual((named['result_column'], named['parameter']), ('Equip ID', '장비 ID'))
+        for sentence in ('결과 표에서 Batch 값이 입력한 값과 맞는지 확인해줘',
+                         '결과 표에서 Batch 값을 입력한 값과 비교해줘',
+                         '결과 표에서 Batch가 입력값이랑 같은지 확인해줘'):
+            natural = tasks.compile_instruction(raw, sentence)
+            self.assertEqual((natural['result_column'], natural['parameter']), ('Batch', 'Batch'))
         stated_input = tasks.compile_instruction(raw, 'Batch 입력란이 {조회값}과 일치하는지 확인해줘')
         self.assertEqual(stated_input['selector'], {'role':'textfield', 'query':'Batch'})
         self.assertNotIn('result_column', stated_input)

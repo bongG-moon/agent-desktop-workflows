@@ -379,9 +379,20 @@ def recorded_result_surface(locator):
     return dict(surface, ancestors=owners) if owners else surface
 
 
+def _comparison_request(sentence):
+    """Recognize a comparison intent without guessing its subject or expected value."""
+    if (isinstance(sentence, str) and click_request(sentence)
+            and re.search(r'버튼|아이콘|\b(?:button|icon)\b', sentence, re.I)):
+        return False
+    return isinstance(sentence, str) and bool(re.search(
+        r'일치(?:하는지|\s*여부|\s*확인)|같은지|동일한지|맞는지|비교(?:해|하|\s+(?:후|뒤))|'
+        r'\bcompare\b(?!\s+(?:button|icon)\b).+\b(?:with|to|against)\b|'
+        r'\b(?:check|verify|ensure)\b.+\b(?:matches?|equals?|same)\b', sentence, re.I))
+
+
 def _observed_intent(raw, sentence):
     """Compile one explicit observation or scoped close, independently of the demonstrated click."""
-    if not sentence or not re.search(r'읽|가져|알려|일치|같은지|동일한지|\bread\b|\b(?:exit|close)\b|닫|종료', sentence, re.I):
+    if not sentence or not re.search(r'읽|가져|알려|일치|같은지|동일한지|맞는지|비교|\bread\b|\b(?:exit|close)\b|닫|종료', sentence, re.I):
         return None
     if _conditional_sentence(sentence):
         return None
@@ -427,10 +438,11 @@ def _observed_intent(raw, sentence):
         read = re.fullmatch(r'read\s+' + field + r'(?:\s+value)?', text, re.I)
     comparison = (r'(?:(?:(\{[^{}]+\}|[\x22\x27‘“][^\x22\x27’”]+[\x22\x27’”])|'
                   r'입력(?:\s*받은|한|했던)?\s*값|조회\s*조건|'
-                  r'입력(?:\s*받은|한|했던)\s+([\w][\w ._-]{0,59}?))(?:와|과)\s*)?')
+                  r'입력(?:\s*받은|한|했던)\s+([\w][\w ._-]{0,59}?))(?:와|과|이랑|랑)\s*)?')
     match = re.fullmatch(r'(?:(?:조회\s*)?결과(?:\s*(?:표|행|목록))?(?:에서|의|에)?\s+)?' + field
-                         + r'\s*(?:값)?(?:이|가)?\s*' + comparison +
-                         r'(?:일치(?:하는지|\s*여부)?|같은지|동일한지)\s*확인(?:해)?(?:\s*(?:줘|주세요))?', text)
+                         + r'\s*(?:값)?(?:이|가|을|를)?\s*' + comparison +
+                         r'(?:(?:일치(?:하는지|\s*여부)?|같은지|동일한지|맞는지)\s*확인(?:해)?|비교(?:해)?)'
+                         r'(?:\s*(?:줘|주세요))?', text)
     if not (read or match):
         return None
     name = (read or match)[1].strip()
@@ -942,6 +954,10 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         observation = _observed_intent(raw_step, sentence)
         if observation is not None:
             return observation
+        if _comparison_request(sentence):
+            # A location hint must not turn an unsupported comparison sentence
+            # into a click on recording-time pixels. The host receives the prose.
+            return {'mode': 'draft', 'text': sentence}
     special = _capture_command(raw_step)
     if special is not None:
         if any(value is not None for value in (target, role, within)):
@@ -1339,11 +1355,20 @@ def resolve_saved_intents(plan):
     for step in plan['steps']:
         # A single click could be the user's location hint for a read. Older
         # recordings kept that explanation on an otherwise recognized button.
-        if step.get('instruction_draft') and (step.get('action') in ('open', *VALUE_ACTIONS)
+        directive = step.get('instruction', {})
+        sentence = step.get('instruction_draft') or (
+            directive.get('text') if directive.get('mode') == 'recorded' else None)
+        if step.get('action') == 'visual-click':
+            # Older plans treated even explicit value checks as an image click.
+            # Reinterpret the explanation, never the recorded business pixels.
+            sentence = sentence or step.get('description') or step.get('label')
+        if sentence and (step.get('action') in ('open', 'visual-click', *VALUE_ACTIONS)
                 or (step.get('reason') == 'popup_needs_live_binding' and step.get('window_context'))):
-            observation = _observed_intent(step, step['instruction_draft'])
+            observation = _observed_intent(step, sentence)
             if observation is not None:
                 step = instructed_step(step, observation)
+            elif _comparison_request(sentence):
+                step = instructed_step(step, {'mode': 'draft', 'text': sentence})
         if step.get('action') == 'manual' and (is_recoverable(step) or is_double_click_step(step)):
             text = step.get('instruction_draft', '')
             is_user_text = bool(text and text != LEGACY_INSTRUCTION_HINT)

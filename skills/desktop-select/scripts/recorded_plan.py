@@ -15,7 +15,7 @@ import learned_tasks as tasks
 
 
 SCHEMA = 1
-COMPILER = 12
+COMPILER = 13
 MAX_BYTES = tasks.MAX_FILE_BYTES * 2
 DEFAULT_QUERY_SETTLE_SECONDS = 5
 
@@ -51,21 +51,38 @@ def _expected_binding(step, earlier):
     if '{' + requested + '}' in step.get('description', ''):
         return {'parameter': requested}
     key = ''.join(requested.split()).casefold()
-    bindings = []
-    for prior in earlier:
-        if prior['action'] not in (*tasks.VALUE_ACTIONS, 'field-input') or prior.get('window_context') != step.get('window_context'):
-            continue
-        directive = prior.get('instruction', {}) or prior
-        names = (prior.get('label'), prior.get('target'), prior.get('alias'), directive.get('parameter'))
-        if any(isinstance(name, str) and ''.join(name.split()).casefold() == key for name in names):
-            for field in ('parameter', 'value'):
-                if field in directive:
-                    bindings.append((field, directive[field]))
-                    break
-    if len(set(bindings)) != 1:
-        return None
-    field, value = bindings[0]
-    return {field: value}
+    scope, limit = step.get('window_context'), len(earlier)
+    while True:
+        # Reassigning the same identified input supersedes its previous value.
+        # Equal labels on distinct controls still remain ambiguous.
+        inputs = {}
+        for number, prior in enumerate(earlier[:limit]):
+            if (prior['action'] not in (*tasks.VALUE_ACTIONS, 'field-input')
+                    or prior.get('window_context') != scope):
+                continue
+            selector = tasks._recorded_selector(prior)
+            identity = _canonical(selector) if selector else number
+            inputs[identity] = prior
+        bindings = []
+        for prior in inputs.values():
+            directive = prior.get('instruction', {}) or prior
+            names = (prior.get('label'), prior.get('target'), prior.get('alias'), directive.get('parameter'))
+            if any(isinstance(name, str) and ''.join(name.split()).casefold() == key for name in names):
+                for field in ('parameter', 'value'):
+                    if field in directive:
+                        bindings.append((field, directive[field]))
+                        break
+        if bindings:
+            if len(set(bindings)) != 1:
+                return None
+            field, value = bindings[0]
+            return {field: value}
+        # A result window can inherit an input from its own opener's scope,
+        # never an unrelated window or an assignment made after it was opened.
+        origin = scope.get('after_step') if scope else None
+        if type(origin) is not int or not 0 < origin <= limit:
+            return None
+        scope, limit = earlier[origin - 1].get('window_context'), origin - 1
 
 
 def compile_plan(task, *, replacements=None):

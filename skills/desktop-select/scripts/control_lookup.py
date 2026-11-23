@@ -267,14 +267,46 @@ def resolve(binding, uia, selector, root=None):
                 element.close()
 
 
+def _point_target(binding, uia, anchor, window, selector, x, y):
+    """Follow one owned UIA geometry path, independent of desktop occlusion.
+
+    Only children of the containing branch are inspected. Overlapping peers
+    and incomplete providers remain ambiguous; no desktop hit or input is used.
+    """
+    import provider_visibility as visibility
+    current, visited = anchor, 0
+    for _ in range(8):
+        ancestry(uia, current, window, pid=binding.pid)
+        if (win.ROLES.get(current.property(30003)) == selector['role']
+                and current.property(30012) == selector['class_name']):
+            return current
+        _need(current.property(30003) in (50008, 50009, 50010, 50023, 50025, 50026,
+                                         50028, 50029, 50032, 50033, 50036),
+              'anchored_target_type_changed')
+        inside = []
+        for child in uia.children(current):
+            visited += 1
+            _need(visited <= 150, 'anchored_target_incomplete')
+            box = uia.bounds(child)
+            if not (visibility.valid(box) and box['x'] <= x < box['x'] + box['width']
+                    and box['y'] <= y < box['y'] + box['height']):
+                continue
+            ancestry(uia, child, window, pid=binding.pid)
+            if visibility.visible(binding, uia, child, window):
+                inside.append(child)
+        _need(len(inside) == 1, 'anchored_target_ambiguous' if inside else 'anchored_target_not_visible')
+        current = inside[0]
+    raise win.BridgeError('anchored_target_incomplete')
+
+
 def _anchored(binding, uia, selector, root, *, _return_proof=False):
     """Locate an unnamed field near a demonstrated, currently unique anchor.
 
-    The point is used for UIA hit-testing only. No mouse event is sent and no
+    The point is used within the owned UIA subtree. No mouse event is sent and no
     transient HWND or accessibility ref is stored in the recipe.
     """
     import provider_visibility as visibility
-    binding.check()
+    visibility.require_observable(binding)
     window = uia.from_handle(binding.hwnd)
     _need(window is not None and uia.pid(window) == binding.pid, 'root_unavailable')
     root = window if root is None else root
@@ -286,24 +318,9 @@ def _anchored(binding, uia, selector, root, *, _return_proof=False):
     x = round(box['x'] + box['width'] * selector['point'][0])
     y = round(box['y'] + box['height'] * selector['point'][1])
 
-    def owned_hit():
-        handle = win.window_from_point(x, y)
-        _need(handle and win.root_window(handle) == binding.hwnd and win.hwnd_pid(handle) == binding.pid,
-              'anchored_target_occluded')
-        return handle
-
-    native_hit = owned_hit()
-    element = uia.from_point(x, y)
+    element = _point_target(binding, uia, anchor, window, selector, x, y)
     ancestry(uia, element, window, pid=binding.pid)
     _need(uia.within(element, anchor), 'anchored_target_outside_anchor')
-    if win.ROLES.get(element.property(30003)) != selector['role']:
-        # A provider may hit the containing group instead of its actual field.
-        # Never walk through an unrelated peer or descend into an input field.
-        _need(element.property(30003) in (50008, 50009, 50010, 50026, 50032),
-              'anchored_target_type_changed')
-        element = uia.point_descendant(element, x, y, binding.pid)
-        ancestry(uia, element, window, pid=binding.pid)
-        _need(uia.within(element, anchor), 'anchored_target_outside_anchor')
     _need(win.ROLES.get(element.property(30003)) == selector['role']
           and element.property(30012) == selector['class_name'], 'anchored_target_type_changed')
     target_box = dict(uia.bounds(element))
@@ -314,12 +331,12 @@ def _anchored(binding, uia, selector, root, *, _return_proof=False):
           'anchored_target_not_visible')
     current = resolve(binding, uia, selector['anchor'], root=root)
     _need(uia.same(current, anchor) and uia.bounds(current) == box
-          and uia.bounds(element) == target_box and owned_hit() == native_hit,
+          and uia.bounds(element) == target_box,
           'anchored_target_changed')
     binding.check()
     if _return_proof:
         return _AnchoredBinding(binding, uia, selector, root, window, anchor, element,
-                                box, target_box, (x, y), native_hit)
+                                box, target_box, (x, y))
     return element
 
 
@@ -337,12 +354,12 @@ def bind_anchored(binding, uia, selector, root=None):
 
 class _AnchoredBinding:
     """Ephemeral evidence; revalidation reads the same target, never searches another."""
-    def __init__(self, binding, uia, selector, root, window, anchor, element, box, target_box, point, native_hit):
+    def __init__(self, binding, uia, selector, root, window, anchor, element, box, target_box, point):
         self._binding, self._uia = binding, uia
         self._selector = deepcopy(selector)
         self._root, self._window, self._anchor, self._element = root, window, anchor, element
         self._box, self._target_box = dict(box), dict(target_box)
-        self._point, self._native_hit = point, native_hit
+        self._point = point
         self._thread, self._active = threading.get_ident(), True
 
     @property
@@ -357,7 +374,7 @@ class _AnchoredBinding:
         _need(self._active and not getattr(self._uia, 'closed', False), 'anchored_binding_expired')
         _need(threading.get_ident() == self._thread, 'accessibility_wrong_thread')
         binding, uia, selector = self._binding, self._uia, self._selector
-        binding.check()
+        visibility.require_observable(binding)
         window = uia.from_handle(binding.hwnd)
         _need(window is not None and uia.same(window, self._window) and uia.pid(window) == binding.pid,
               'root_changed')
@@ -380,18 +397,9 @@ class _AnchoredBinding:
         _need(uia.bounds(self._anchor) == self._box and uia.bounds(self._element) == self._target_box,
               'anchored_target_changed')
         x, y = self._point
-        hit = win.window_from_point(x, y)
-        _need(hit == self._native_hit and win.root_window(hit) == binding.hwnd
-              and win.hwnd_pid(hit) == binding.pid, 'anchored_target_occluded')
-        current = uia.from_point(x, y)
-        if not uia.same(current, self._element):
-            ancestry(uia, current, window, pid=binding.pid)
-            _need(uia.within(current, self._anchor)
-                  and current.property(30003) in (50008, 50009, 50010, 50026, 50032),
-                  'anchored_target_changed')
-            current = uia.point_descendant(current, x, y, binding.pid)
-            _need(uia.same(current, self._element), 'anchored_target_changed')
-        _need(uia.bounds(self._anchor) == self._box and uia.bounds(self._element) == self._target_box
-              and win.window_from_point(x, y) == hit, 'anchored_target_changed')
+        current = _point_target(binding, uia, self._anchor, window, selector, x, y)
+        _need(uia.same(current, self._element), 'anchored_target_changed')
+        _need(uia.bounds(self._anchor) == self._box and uia.bounds(self._element) == self._target_box,
+              'anchored_target_changed')
         binding.check()
         return self._element

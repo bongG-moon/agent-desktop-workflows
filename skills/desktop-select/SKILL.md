@@ -31,7 +31,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 
 실제 마우스로 시연한 동작을 시험하도록 허용받았으면 같은 호출에 `--allow-physical`을 붙인다. 이 명령이 저장 상태, 필요한 보정, 시험 결과를 한 번에 처리한다. 별도 상태 조회, 필드별 시험 입력, 등록, 소스 조사와 설치 파일 수정은 생략한다. 응답이 끊겼으면 같은 명령으로 기존 시험 결과를 받는다. 사용자가 의도적으로 **새 시험**을 요청할 때만 새 `--trial-id`를 준다.
 
-`report_completed_trial`이면 읽은 값과 완료 상태를 보고한다. 표 검증은 실행기가 지정한 열의 현재 셀을 먼저 읽어 비교한다. `report_unmatched_result`이면 값이 없거나 대상을 하나로 정할 수 없다는 결과를 보고한다. `inspect_current_result_without_replaying`일 때만 화면 확인 허용 범위에서 `result_inspection.args`를 실행한다. 요청한 열에 정확히 한 건이 보이고 `resume_args`가 있으면 그 셀의 글자와 이미지 좌표를 넣어 상세창 단계부터 이어간다.
+`report_completed_trial`이면 읽은 값과 완료 상태를 보고한다. 표 검증은 지정한 열의 현재 셀을 이번 실행에 넣은 값과 비교한다. 녹화 당시 값이나 그 값이 찍힌 이미지를 비교 기준으로 고정하지 않는다. `report_unmatched_result`이면 값이 없거나 대상을 하나로 정할 수 없다는 결과를 보고한다. `inspect_current_result_without_replaying`일 때만 화면 확인 허용 범위에서 `result_inspection.args`를 실행한다. 요청한 열에 정확히 한 건이 보이고 `resume_args`가 있으면 그 셀의 글자와 이미지 좌표를 넣어 상세창 단계부터 이어간다.
 
 업무 스킬로 저장해 달라는 요청이 있을 때 `python_workflow.py register --task "<실행용 작업명>" --out "<프로젝트>/.claude/skills/<업무 이름>"`으로 등록한다. 성공한 시험을 등록 때문에 재실행할 필요는 없다.
 
@@ -48,5 +48,6 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 - 등록 업무를 실행해 달라면 받은 변수로 실행기를 바로 호출한다. 필요한 값이나 실제 입력 허용 범위가 빠졌으면 한 번에 묻는다. 반복 허용을 저장한 업무는 같은 범위에서 바로 실행한다. 입력 충돌로 멈추면 사용자가 손을 뗀 뒤 영수증의 재개 지시를 따른다. 입력이 전혀 없을 때만 처음부터 다시 시작한다. 사용자가 자신의 마우스와 키보드를 계속 쓰려면 `--background-only`를 사용한다.
 - 영수증의 JSON을 읽고 검증한 범위만 보고한다. `verified`는 기대 상태 확인, `delivered_unverified`는 전달 확인이다. 파일 생성은 `verified_outputs`의 경로를 보고한다. 종료 코드 3 또는 `uncertain`이면 이미 전달한 단계와 현재 결과를 확인하고 불확실한 입력을 재전송하지 않는다.
 - 명령이 이미 창을 확인하므로 일반 실행 전후의 `--help`, `inspect`, `--read-only`, `plan`, 소스나 파일 검색은 생략한다. 녹화 문장은 현재 요청 범위 안에서 쓰고 업무 데이터와 화면은 로컬에서만 사용한다.
+- 기본 실행은 접근성 단계의 자동 포커스를 억제한다. 뒤에 우클릭이 있어도 앞선 입력 단계 때문에 미리 창을 앞으로 가져오지 않는다. 실제 마우스나 키보드가 필요한 단계에서만 전면화한다. 최소화 복원과 앱 자체의 창 전환은 별개다.
 
 등록 없는 직접 조작은 `desktop_select.py`의 `select`, `fill`, `open`에 `--exe`, `--window`, `--target`과 필요한 값을 준다. 대상이 모호하거나 입력란의 보호 여부를 확정할 수 없으면 입력하지 않는다. 해당 기능이 필요할 때만 [입력란과 메뉴 식별](references/host-details.md), [표 우클릭과 파일 검증](references/table-export.md), [반복 행과 여러 창](references/rows-and-windows.md)을 읽는다.

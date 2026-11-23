@@ -41,9 +41,7 @@ def profile(steps, numbers=None):
         elif action == 'submit':
             mode, foreground = 'physical_keyboard', True
         elif action in _ACCESSIBILITY_ACTIONS:
-            selector = step.get('selector')
-            foreground = isinstance(selector, Mapping) and 'anchor' in selector
-            mode, eligible = 'accessibility', not foreground
+            mode, eligible = 'accessibility', True
         elif action in _OBSERVATION_ACTIONS:
             mode, eligible = 'observation', True
         entries.append(dict(number=number, action=action, input_mode=mode,

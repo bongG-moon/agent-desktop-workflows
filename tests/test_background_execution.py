@@ -49,8 +49,8 @@ class BackgroundRuntimeTests(unittest.TestCase):
         self.addCleanup(configure.stop)
         return fixture
 
-    def test_later_submit_anchor_or_menu_rejects_entire_plan_before_binding(self):
-        for later in (submit(), anchored(), context_fixture.context()):
+    def test_later_submit_or_menu_rejects_entire_plan_before_binding(self):
+        for later in (submit(), context_fixture.context()):
             with self.subTest(action=later['action'], anchored='anchor' in later.get('selector', {})), \
                     patch.object(flow, 'bind') as bind, \
                     patch.object(app.bridge, 'UIA') as uia, \
@@ -142,6 +142,35 @@ class BackgroundRuntimeTests(unittest.TestCase):
         self.assertIs(result['physical_input'], True)
         self.assertIs(result['input_dispatched'], True)
         self.assertEqual('physical_pointer', result['steps'][0]['receipt']['input_mode'])
+
+    def test_mixed_recipe_disables_uia_focus_before_field_and_later_menu(self):
+        fixture = self.fixture()
+        flow.input_policy.configure_uia.side_effect = lambda uia: fixture.events.append('disable-autofocus')
+        result = flow.run(context_fixture.recipe(field(), context_fixture.context()))
+        self.assertEqual('completed_unverified', result['status'])
+        self.assertEqual('disable-autofocus', fixture.events[0])
+        self.assertIn(('fill', 100, 'value'), fixture.events)
+        flow.input_policy.configure_uia.assert_called_once_with(fixture.uia)
+        flow.context_menu.execute.assert_called_once()
+
+    def test_anchored_field_is_eligible_for_strict_background_without_activation(self):
+        fixture = self.fixture()
+        proof = Mock(element=fixture.element)
+        proof.revalidate.return_value = fixture.element
+        with patch.object(app.bridge.user32, 'IsIconic', return_value=False), \
+             patch('row_action.foreground') as activate, \
+             patch.object(flow.lookup, 'bind_anchored', return_value=proof):
+            result = flow.run(context_fixture.recipe(anchored()), background_only=True)
+        self.assertEqual('verified', result['status'])
+        self.assertEqual([('fill', 100, 'value')], fixture.events)
+        activate.assert_not_called()
+        app.visibility.restore_for_action.assert_not_called()
+        flow.input_policy.configure_uia.assert_called_once_with(fixture.uia)
+
+    def test_pure_pointer_plan_does_not_add_uia_configuration_work(self):
+        self.fixture()
+        flow.run(context_fixture.recipe(context_fixture.context()))
+        flow.input_policy.configure_uia.assert_not_called()
 
     def test_default_policy_falls_back_if_provider_cannot_disable_auto_focus(self):
         fixture = self.fixture()

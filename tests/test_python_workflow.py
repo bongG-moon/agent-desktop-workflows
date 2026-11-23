@@ -159,6 +159,41 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(flow.WorkflowError, 'verified_result_required'):
             flow.validate(dict(data, steps=[data['steps'][2]]))
 
+    def test_old_recording_pixels_never_choose_the_row_for_a_new_input(self):
+        import recorded_plan
+        import result_cell
+        from test_visual_target import image, visual, VisualTargets
+        marker = visual.from_frame(VisualTargets.window, image((35, 42)), (235, 162))
+        source = dict(schema=1, name='Saved lookup', exe='Example.exe', window='Example window', steps=[
+            dict(action='fill', target='code', role='textfield', match='automation_id', label='Code',
+                 recorded_effect='unobserved', instruction=dict(mode='required', parameter='검색어', text='Code 입력')),
+            dict(action='open', target='query', role='button', match='automation_id', expand=False,
+                 command_name='VIEW', instruction=dict(mode='recorded', text='VIEW 클릭')),
+            dict(action='visual-click', visual=marker, label='Code 일치 확인'),
+            dict(action='visual-click', visual=dict(marker, gesture='double-click'), label='결과 행을 더블클릭해줘')])
+        data = recorded_plan.compile_plan(source)['envelope']['recipe']
+        self.element.property.side_effect = lambda key: 'VIEW' if key == 30005 else ''
+        dispatch = dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched',
+                        input_dispatched=True, physical_input=True)
+        def execute(*args, **kwargs):
+            return dict(status='verified', input_dispatched=True) if args[4] == 'fill' else self.execute(*args, **kwargs)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(flow, 'RESULT_VISUAL_TIMEOUT', 0),
+              patch.object(result_cell, 'find') as find, patch.object(result_cell, 'execute', return_value=dispatch) as click,
+              patch.object(flow.live, 'execute', side_effect=execute) as inputs,
+              patch.object(visual, 'execute', side_effect=AssertionError('recorded pixels must not be used'))):
+            for number, value in enumerate(('LAB-42', 'PART-A'), 1):
+                report = flow.run(data, {'검색어': value})
+                self.assertEqual(report['status'], 'completed_unverified', report)
+                self.assertEqual(find.call_args.args[3], value)
+                self.assertEqual(click.call_args.args[3], value)
+                self.assertEqual(find.call_args.kwargs['column'], 'Code')
+                self.assertEqual(inputs.call_count, number * 2)
+            find.side_effect = flow.app.bridge.BridgeError('result_value_not_found')
+            report = flow.run(data, {'검색어': 'absent'})
+            self.assertEqual(report['status'], 'blocked', report)
+            self.assertEqual(click.call_count, 2)
+
     def test_confirmed_painted_group_hands_off_after_first_read_without_another_query(self):
         import result_cell
         table = dict(role='table')

@@ -239,7 +239,7 @@ class CompositionTests(unittest.TestCase):
         flow.app.visibility.restore_for_action.assert_not_called()
         flow.live.execute.assert_not_called()
 
-    def test_anchored_field_is_exposed_before_mutation_but_never_in_read_only(self):
+    def test_anchored_field_does_not_activate_window_for_mutation_or_read_only(self):
         step = dict(action='set-value', selector=dict(anchor=dict(name='Form', role='group'),
                     point=[.5, .3], role='textfield', class_name='Edit'), value='value')
         proof = MagicMock(element=self.element)
@@ -248,8 +248,8 @@ class CompositionTests(unittest.TestCase):
                 patch.object(flow.lookup, 'bind_anchored', return_value=proof, create=True) as bind_anchor:
             result = flow.run(recipe(step))
             self.assertEqual(result['status'], 'verified')
-            self.assertEqual(self.events, ['restore', 'foreground', ('fill', 100, 'value')])
-            expose.assert_called_once_with(self.owner)
+            self.assertEqual(self.events, ['restore', ('fill', 100, 'value')])
+            expose.assert_not_called()
             bind_anchor.assert_called_once()
             proof.revalidate.assert_called_once()
             proof.close.assert_called_once()
@@ -359,11 +359,12 @@ class CompositionTests(unittest.TestCase):
                 self.assertIn(expected, guide)
                 self.assertNotIn(excluded, guide)
                 self.assertNotIn('submit 단계', guide)
-                if name != 'normal':
+                if name == 'menu':
                     self.assertIn('마우스와 키보드를 사용하지 않는다', guide)
                 if name == 'anchor':
                     self.assertIn('같은 종류 입력란의 배치가 바뀌면', guide)
-                    self.assertIn('등록과 --read-only는 창을 앞으로 가져오지 않으므로', guide)
+                    self.assertIn('대상 창의 접근성 구조 안에서', guide)
+                    self.assertNotIn('마우스와 키보드를 사용하지 않는다', guide)
         flow.live.execute.assert_not_called()
         flow.context_menu.execute.assert_not_called()
         flow.app.visibility.restore_for_action.assert_not_called()
