@@ -1,5 +1,5 @@
 """An unsupported painted target can be demonstrated, moved, and clicked only once."""
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -78,6 +78,73 @@ class VisualTargets(unittest.TestCase):
             visual.from_frame(self.window, image(), (235,162))
         with self.assertRaisesRegex(visual.bridge.BridgeError, 'invalid_visual_target'):
             visual.validate_spec(dict(spec, rgb='a' * 100000))
+
+    def test_reviewed_result_can_use_selected_column_without_relaxing_stored_visual_uniqueness(self):
+        pixels = image((35,42), (113,70))
+        with self.assertRaisesRegex(visual.bridge.BridgeError, 'visual_target_ambiguous'):
+            visual.from_frame(self.window, pixels, (235,162))
+        spec = dict(visual._frame_patch(self.window, pixels, (235,162)), gesture='double-click')
+        binding = SimpleNamespace(hwnd=1,pid=2)
+        with ExitStack() as stack:
+            def patch(module, name, **kwargs):
+                return stack.enter_context(mock.patch.object(module,name,**kwargs))
+            window = patch(visual.vision,'_window_rect',return_value=self.window)
+            def capture(_, bounds, crop=None):
+                if crop is None:
+                    return pixels
+                x, y = crop[0]-bounds[0], crop[1]-bounds[1]
+                return b''.join(pixels[(i*bounds[2]+x)*4:(i*bounds[2]+x+crop[2])*4]
+                                for i in range(y,y+crop[3]))
+            frame = patch(visual.vision,'_frame',side_effect=capture)
+            safe = patch(visual,'_safe_patch',return_value=23)
+            patch(visual.bridge,'UIA')
+            activate = patch(row_action,'foreground')
+            patch(row_action,'_input_tick',return_value=10)
+            patch(visual.bridge,'_combo_surface')
+            patch(visual.bridge,'window_from_point',return_value=23)
+            patch(visual.bridge,'root_window',return_value=1)
+            patch(visual.bridge,'foreground',return_value=1)
+            patch(visual.bridge,'hwnd_pid',return_value=2)
+            lease = patch(visual.coordination,'desktop_input',side_effect=nullcontext)
+            send = patch(visual.bridge,'_send_point',return_value=dict(ok=True,input_dispatched=True))
+            locate = patch(visual,'_locate',side_effect=AssertionError('must not rediscover a reviewed column'))
+            proof = mock.Mock()
+            result = visual.execute(binding,spec,lambda:None,reviewed_point=[235,162],before_input=proof)
+            self.assertEqual(result['diagnostic'],'visual_double_click_dispatched')
+            proof.assert_called_once_with([235,162])
+            send.assert_called_once_with(235,162,'double-click')
+            activate.assert_called_once()
+            lease.assert_called_once()
+            self.assertTrue(any(call.kwargs.get('exposed') for call in safe.call_args_list))
+            locate.assert_not_called()
+
+            send.reset_mock()
+            for options in ({}, {'before_input':proof,'read_only':True}):
+                rejected = visual.execute(binding,spec,lambda:None,reviewed_point=[235,162],**options)
+                self.assertEqual(rejected['diagnostic'],'invalid_reviewed_result_point')
+            rejected = visual.execute(binding,{k:v for k,v in spec.items() if k!='gesture'},lambda:None,
+                                      reviewed_point=[235,162],before_input=proof)
+            self.assertEqual(rejected['diagnostic'],'invalid_reviewed_result_point')
+            send.assert_not_called()
+
+            for point in ([235,162], [313,190]):
+                # The real callback authenticates both the saved table frame and
+                # exact selected point. Its failure must propagate before SendInput.
+                proof.side_effect = visual.bridge.BridgeError('result_frame_changed')
+                rejected = visual.execute(binding,spec,lambda:None,reviewed_point=point,before_input=proof)
+                self.assertEqual(rejected['diagnostic'],'result_frame_changed')
+            send.assert_not_called()
+            proof.side_effect = None
+            frame.side_effect = None
+            frame.return_value = bytes(visual.SIDE*visual.SIDE*4)
+            rejected = visual.execute(binding,spec,lambda:None,reviewed_point=[235,162],before_input=proof)
+            self.assertEqual(rejected['diagnostic'],'visual_target_changed_before_input')
+            send.assert_not_called()
+            frame.side_effect = capture
+            window.side_effect = [self.window, [201,120,170,120]]
+            rejected = visual.execute(binding,spec,lambda:None,reviewed_point=[235,162],before_input=proof)
+            self.assertEqual(rejected['diagnostic'],'visual_target_changed_before_input')
+            send.assert_not_called()
 
     def test_click_pins_only_contemporary_pre_down_crop_and_respects_other_input(self):
         tracker = visual.HoverTracker(SimpleNamespace(hwnd=2))

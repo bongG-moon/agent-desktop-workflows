@@ -192,12 +192,18 @@ def _locate(window, pixels, spec):
     return box, [box[i]+spec['offset'][i] for i in range(2)]
 
 
-def from_frame(window, pixels, screen_point, *, client=None):
-    """Build a target from the exact full-resolution BGRA image viewed by the host."""
+def _frame_patch(window, pixels, screen_point, *, client=None):
+    """Encode the viewed patch; callers must independently prove its identity."""
     box = _box(window if client is None else client, screen_point)
     rgb = vision._rgb((window, (), pixels), box)
     spec = dict(size=[SIDE,SIDE], offset=[screen_point[i]-box[i] for i in range(2)],
                 rgb=base64.b64encode(rgb).decode('ascii'))
+    return validate_spec(spec)
+
+
+def from_frame(window, pixels, screen_point, *, client=None):
+    """Build a target from the exact full-resolution BGRA image viewed by the host."""
+    spec = _frame_patch(window, pixels, screen_point, client=client)
     _, matched = _locate(window, pixels, spec)
     _require(tuple(matched) == tuple(screen_point), 'visual_target_ambiguous')
     return spec
@@ -350,18 +356,41 @@ def teach(binding, screen_point):
     return spec
 
 
-def execute(binding, spec, guard, *, read_only=False, background_only=False, first_match_timeout=0, before_input=None):
+def execute(binding, spec, guard, *, read_only=False, background_only=False, first_match_timeout=0,
+            before_input=None, reviewed_point=None):
     """Deliver one gesture in a single SendInput batch after matching the current window."""
     def blocked(reason):
         return dict(status='blocked', input_dispatched=False, diagnostic=reason)
     if background_only and not read_only:
         return blocked('physical_input_requires_foreground')
     try:
+        if reviewed_point is not None:
+            _require(not read_only and callable(before_input) and isinstance(spec, dict)
+                     and spec.get('gesture') == 'double-click'
+                     and isinstance(reviewed_point, (list, tuple)) and len(reviewed_point) == 2
+                     and all(type(value) is int for value in reviewed_point), 'invalid_reviewed_result_point')
+            reviewed_point = tuple(reviewed_point)
+
+        def current_target():
+            if reviewed_point is None:
+                return observe(binding, spec)
+            # This is only an ephemeral current-frame result confirmation.
+            # Global image uniqueness cannot disambiguate equal text in another
+            # column. The mandatory callback authenticates the full table,
+            # original HWND/geometry and selected point before any input.
+            window = vision._window_rect(binding)
+            validate_spec(spec)
+            box = [reviewed_point[i] - spec['offset'][i] for i in range(2)] + list(spec['size'])
+            _require(vision._inside(box, window), 'visual_point_outside_window')
+            with bridge.UIA() as uia:
+                _safe_patch(binding, uia, box, reviewed_point, exposed=False, gesture='double-click')
+            return dict(point=list(reviewed_point), box=box, window=window)
+
         deadline = time.monotonic() + min(max(first_match_timeout, 0), 30)
         while True:
             guard()
             try:
-                found = observe(binding, spec)
+                found = current_target()
                 break
             except bridge.BridgeError as error:
                 remaining = deadline - time.monotonic()
@@ -377,7 +406,7 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
             guard()
             bridge._combo_surface(binding)
             tick = row_action._input_tick()
-            current = observe(binding, spec)
+            current = current_target()
             point, box = current['point'], current['box']
             _require(found['window'] == current['window'] and found['point'] == point,
                      'visual_target_changed_before_input')
@@ -406,7 +435,8 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
                                  'visual_target_changed_before_input')
                 else:
                     reference = _decoded(spec)
-                    _require(_distance(reference, candidate, _icon_model(reference)) is not None,
+                    _require((reference == candidate) if reviewed_point is not None else
+                             _distance(reference, candidate, _icon_model(reference)) is not None,
                              'visual_target_changed_before_input')
                 hit = bridge.window_from_point(*point)
                 _require(hit == shown and _hit_belongs(binding, hit)

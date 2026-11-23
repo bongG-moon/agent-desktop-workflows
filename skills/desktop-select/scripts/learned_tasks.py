@@ -1340,12 +1340,26 @@ def row_location(step):
 
 
 def summary(plan):
-    """The local row patches are used by the player and stay out of CLI responses."""
-    return dict(plan, steps=[{**{k: v for k, v in step.items() if k not in ('row', 'row_hint', 'recorded_row', 'row_cue', 'context', 'visual', 'visual_hint')},
-                              **({'row_location': location} if (location := row_location(step)) else {}),
-                              **({'has_visual_hint': True} if 'visual_hint' in step else {}),
-                              **({'menu_path': step['context']['menu']['path']} if 'context' in step else {})}
-                             for step in plan['steps']])
+    """Keep local pixel payloads out of host context, including nested markers."""
+    steps = []
+    for step in plan['steps']:
+        item = {k: v for k, v in step.items() if k not in (
+            'row', 'row_hint', 'recorded_row', 'row_cue', 'context', 'visual', 'visual_hint')}
+        if location := row_location(step):
+            item['row_location'] = location
+        if 'visual_hint' in step or 'visual' in step:
+            item['has_visual_hint'] = True
+        if 'context' in step:
+            item['menu_path'] = step['context']['menu']['path']
+        if 'row_target' in step:
+            item['row_target'] = {k: v for k, v in step['row_target'].items() if k != 'key'}
+            item['row_target']['has_visual_hint'] = True
+        for key in ('when_present', 'dismiss', 'always'):
+            if isinstance(step.get(key), dict) and 'visual' in step[key]:
+                item[key] = {k: v for k, v in step[key].items() if k != 'visual'}
+                item[key]['has_visual_hint'] = True
+        steps.append(item)
+    return dict(plan, steps=steps)
 
 
 def resolve_saved_intents(plan):

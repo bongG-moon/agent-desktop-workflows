@@ -159,6 +159,8 @@ class ResultReview:
                 flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
             current = self._read(self.pending)
             reply = self.feedback(current or record, getattr(error, 'code', 'result_review_unavailable'))
+            if getattr(error, 'result_geometry', None):
+                reply['result_geometry'] = error.result_geometry
         if overrides and reply.get('result_review'):
             reply['result_review'] = self.feedback(record, overrides=overrides)['result_review']
         reply['elapsed_seconds'] = round(time.monotonic() - started, 4)
@@ -184,6 +186,7 @@ class ResultReview:
         expected = values.get(step['parameter'].casefold()) if 'parameter' in step else step['value']
         path = None
         local_review_seconds = 0
+        geometry = {}
         try:
             while True:
                 repair.need(time.time() < record['expires'], 'result_review_expired')
@@ -193,8 +196,10 @@ class ResultReview:
                         return result
                 try_elements = True  # A refresh may expose data that was unavailable before.
                 table_box = None
+                recorded_box = None
                 selector = original_selector
                 group_boxes = None
+                geometry = {}
                 with flow.app.bridge.UIA() as uia:
                     try:
                         table, selector = flow._result_target(binding, uia, original_selector, hint,
@@ -204,13 +209,20 @@ class ResultReview:
                             raise
                         group_boxes = {}
                     else:
-                        box = uia.bounds(table)
+                        recorded_box = dict(uia.bounds(table))
                     rect, png = grounding._capture(flow.app, binding, guard, group_boxes=group_boxes)
+                    geometry['capture_rect'] = list(rect)
                     if group_boxes is None:
-                        table_box = [box['x'] - rect[0], box['y'] - rect[1], box['width'], box['height']]
+                        geometry['table_absolute'] = recorded_box
+                        geometry['table_relative'] = [recorded_box['x'] - rect[0], recorded_box['y'] - rect[1],
+                                                      recorded_box['width'], recorded_box['height']]
+                        visible = result_trial.visible_table_box(rect, recorded_box)
+                        table_box = [visible['x'] - rect[0], visible['y'] - rect[1], visible['width'], visible['height']]
+                        geometry['visible_relative'] = table_box
                 frame, path = grounding.store_frame(grounding._directory(), key.encode('ascii'), png)
                 opened = time.monotonic()
-                choice = local_result_review.choose(path, step['result_column'], table_box=table_box, expected=expected)
+                choice = local_result_review.choose(path, step['result_column'], table_box=table_box,
+                                                    expected=expected, frame_size=rect[2:])
                 local_review_seconds += time.monotonic() - opened
                 if not choice or not choice.get('refresh'):
                     break
@@ -224,28 +236,32 @@ class ResultReview:
             repair.need(0 <= left < right < rect[2] and left <= x <= right
                         and 0 <= head_y < y < rect[3], 'result_point_outside_column')
             repair.need(time.time() < record['expires'], 'result_review_expired')
-            now, current = grounding._capture(flow.app, binding, guard)
-            repair.need(now == rect, 'result_frame_changed')
             head = (rect[0] + (right + left)//2, rect[1] + head_y)
             point = (rect[0]+x, rect[1]+y)
-            with flow.app.bridge.UIA() as uia:
-                if table_box is None:
-                    selector, box = result_cell.bound_group(binding, uia, head, point)
-                    key_type = 'automation_id' if 'automation_id' in selector else 'name'
-                    repair.need(group_boxes.get((key_type, selector[key_type])) == box, 'result_table_changed')
-                else:
-                    table, current_selector = flow._result_target(binding, uia, original_selector, hint,
-                                                                 column=step['result_column'])
-                    repair.need(current_selector == selector, 'result_table_changed')
-                    box = uia.bounds(table)
-                    repair.need(table_box == [box['x']-rect[0], box['y']-rect[1], box['width'], box['height']],
-                                'result_table_changed')
-                    self._check_header(flow, binding, uia, table, step['result_column'], head, point)
-                repair.need(result_trial.same_table_pixels(png, current, rect, box), 'result_frame_changed')
-                repair.need(box['x'] <= rect[0]+left < rect[0]+right < box['x']+box['width']
-                            and box['y'] <= head[1] < point[1] < box['y']+box['height'], 'result_point_outside_table')
-                flow.check_result_point(binding, uia, selector, point)
-            suffix = result_trial.visual_suffix(self.recipe, number, png, [x, y])
+            # Reviewing the snapshot never reserves desktop input. Only this
+            # explicitly confirmed physical continuation needs the target exposed.
+            with flow.coordination.desktop_input():
+                guard()
+                flow.row_action.foreground(binding)
+                now, current = grounding._capture(flow.app, binding, guard)
+                repair.need(now == rect, 'result_frame_changed')
+                with flow.app.bridge.UIA() as uia:
+                    if table_box is None:
+                        selector, box = result_cell.bound_group(binding, uia, head, point)
+                        key_type = 'automation_id' if 'automation_id' in selector else 'name'
+                        repair.need(group_boxes.get((key_type, selector[key_type])) == box, 'result_table_changed')
+                    else:
+                        table, current_selector = flow._result_target(binding, uia, original_selector, hint,
+                                                                     column=step['result_column'])
+                        repair.need(current_selector == selector, 'result_table_changed')
+                        box = uia.bounds(table)
+                        repair.need(box == recorded_box, 'result_table_changed')
+                        self._check_header(flow, binding, uia, table, step['result_column'], head, point)
+                    repair.need(result_trial.same_table_pixels(png, current, rect, box), 'result_frame_changed')
+                    repair.need(box['x'] <= rect[0]+left < rect[0]+right < box['x']+box['width']
+                                and box['y'] <= head[1] < point[1] < box['y']+box['height'], 'result_point_outside_table')
+                    flow.check_result_point(binding, uia, selector, point, reviewed_frame=rect)
+            suffix = result_trial.visual_suffix(self.recipe, number, png, [x, y], reviewed=True)
             repair.need(flow.load(recipe_path) == self.recipe, 'workflow_changed_during_repair')
             confirmation = dict(owner=owner, frame=frame, receipt=key, point=[x,y], selector=selector,
                                 window_rect=rect, table_box=box)
@@ -256,6 +272,10 @@ class ResultReview:
             result['local_review_seconds'] = round(local_review_seconds,4)
             learned = dict(number=number, selector=selector) if selector.get('role') == 'group' else None
             return self._finish(result, record, recipe_path, number, 'local_visual_confirmation', learned)
+        except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
+            if geometry:
+                error.result_geometry = dict(geometry, **getattr(error, 'geometry', {}))
+            raise
         finally:
             if path is not None:
                 try:
@@ -321,6 +341,7 @@ class ResultReview:
         result.update(resumed_at=offset+1, prior_steps_replayed=False, previous_input_dispatched=record['prior_input'],
                       resumed_action_seconds=result.get('elapsed_seconds'), result_match_source=source)
         if result.get('status') in ('completed_unverified','verified') and not result.get('stopped_at'):
+            result.setdefault('host_action', 'report_execution_receipt')
             if record.get('remember'):
                 repair.remember_test(path, self.recipe, result, record['approval_before'], offset+1)
             self.pending.unlink(missing_ok=True)

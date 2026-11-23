@@ -1,5 +1,6 @@
 """Resume only a host-confirmed result row and its recorded detail dialog."""
 from copy import deepcopy
+import struct
 import time
 
 import first_trial
@@ -25,13 +26,16 @@ def supported(recipe, check_number):
                  suffix[-1]['action'] == 'invoke' and suffix[-1].get('verify_closed') is True))
 
 
-def visual_suffix(recipe, offset, image, point):
+def visual_suffix(recipe, offset, image, point, *, reviewed=False):
     """Build only the already-requested double-click and its dependent detail operations."""
     import visual_target
     if not supported(recipe, offset):
         raise tasks.TaskError('result_resume_unavailable')
     rect, pixels = grounding._pixels(image)
-    spec = visual_target.from_frame(rect, pixels, tuple(point))
+    # A registered local review already binds a column and cell in this exact
+    # transient frame. Its caller supplies full-table confirmation at dispatch.
+    builder = visual_target._frame_patch if reviewed else visual_target.from_frame
+    spec = builder(rect, pixels, tuple(point))
     spec['gesture'] = 'double-click'
     remaining = deepcopy(recipe['steps'][offset:])
     remaining[0] = dict(action='visual-click', label=remaining[0]['label'], visual=spec)
@@ -40,14 +44,40 @@ def visual_suffix(recipe, offset, image, point):
     return dict(recipe, steps=remaining)
 
 
+def visible_table_box(rect, box):
+    """Intersect an owned table's raw screen bounds with its exact captured frame.
+
+    Keep the raw bounds separately for identity/layout checks. This intersection
+    is only a visible pixel region, never a scale correction or a new selector.
+    """
+    if (not isinstance(rect, (list, tuple)) or len(rect) != 4
+            or not isinstance(box, dict)
+            or any(type(v) is not int for v in rect)
+            or any(type(box.get(k)) is not int for k in ('x', 'y', 'width', 'height'))
+            or rect[2] <= 0 or rect[3] <= 0 or box['width'] <= 0 or box['height'] <= 0):
+        raise tasks.TaskError('result_geometry_invalid')
+    left, top = max(rect[0], box['x']), max(rect[1], box['y'])
+    right = min(rect[0] + rect[2], box['x'] + box['width'])
+    bottom = min(rect[1] + rect[3], box['y'] + box['height'])
+    if left >= right or top >= bottom:
+        raise tasks.TaskError('result_table_outside_frame')
+    return dict(x=left, y=top, width=right-left, height=bottom-top)
+
+
 def same_table_pixels(first, second, rect, box):
-    """Compare every pixel in the witnessed grid, including all headers and other rows."""
-    left, top = box['x'] - rect[0], box['y'] - rect[1]
-    width, height = box['width'], box['height']
-    if not (0 <= left < left + width <= rect[2] and 0 <= top < top + height <= rect[3]):
+    """Compare the entire captured part of the grid, including all visible rows."""
+    try:
+        visible = visible_table_box(rect, box)
+        for png in (first, second):
+            if (len(png) < 41 or png[:8] != grounding.SIGNATURE or png[12:16] != b'IHDR'
+                    or struct.unpack_from('>II', png, 16) != tuple(rect[2:])):
+                return False
+    except (tasks.TaskError, TypeError, struct.error):
         return False
     if first == second:
         return True
+    left, top = visible['x'] - rect[0], visible['y'] - rect[1]
+    width, height = visible['width'], visible['height']
     before, a = grounding._pixels(first)
     after, b = grounding._pixels(second)
     if before != after or before[2:] != list(rect[2:]):

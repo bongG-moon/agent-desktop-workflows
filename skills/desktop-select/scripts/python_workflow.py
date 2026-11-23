@@ -341,13 +341,15 @@ def combine(previous, current):
 
 
 def result_surface(binding, uia, selector):
+    import result_cell
     root = uia.from_handle(binding.hwnd)
     if selector != {'role': 'table'}:
         return resolve_step(binding, uia, root, selector)[0]
     candidates = lookup.find_all(uia, root, roles=('table', 'list'))
     kept = None
     try:
-        visible = [item for item in candidates if live._visible(uia, item, binding, root)]
+        visible = [item for item in candidates if live._visible(uia, item, binding, root)
+                   or result_cell.readable_surface(binding, uia, item, root)]
         need(len(visible) == 1, 'result_table_ambiguous' if visible else 'result_table_missing')
         kept = visible[0]
         return kept
@@ -380,9 +382,10 @@ def _stable_result_selector(binding, uia, table):
 
 def _group_for_column(binding, uia, column, *, native=()):
     """Find a provider-backed result group even if it has no native table role."""
+    import result_cell
     window = uia.from_handle(binding.hwnd)
     groups = [g for g in lookup.find_all(uia, window, roles=('group','custom'), grid_group=True)
-              if live._visible(uia, g, binding, window)]
+              if live._visible(uia, g, binding, window) or result_cell.readable_surface(binding, uia, g, window)]
     def matching(surfaces):
         import result_cell
         need(len(surfaces) <= 24, 'result_grid_scan_limit')
@@ -438,8 +441,10 @@ def _result_target(binding, uia, selector, reviewed_group, *, column=None, eleme
     except WorkflowError as error:
         if selector == {'role': 'table'} and error.code == 'result_table_ambiguous' and column:
             window = uia.from_handle(binding.hwnd)
+            import result_cell
             native = [item for item in lookup.find_all(uia, window, roles=('table','list'))
-                      if live._visible(uia, item, binding, window)]
+                      if live._visible(uia, item, binding, window)
+                      or result_cell.readable_surface(binding, uia, item, window)]
             try:
                 target = _group_for_column(binding, uia, column, native=native)
             except WorkflowError as scoped_error:
@@ -770,12 +775,30 @@ def _missing_groundings(recipe, entries, owner, uia, prepare=None):
     return missing
 
 
-def check_result_point(binding, uia, selector, point):
+def check_result_point(binding, uia, selector, point, *, reviewed_frame=None):
     table = result_surface(binding, uia, selector)
     root = uia.from_handle(binding.hwnd)
-    need(live._visible(uia, table, binding, root), 'result_point_outside_table')
     box = uia.bounds(table)
     x, y = point
+    visible = live._visible(uia, table, binding, root)
+    if reviewed_frame is not None:
+        import result_trial
+        region = result_trial.visible_table_box(reviewed_frame, box)
+        need(region['x'] <= x < region['x'] + region['width']
+             and region['y'] <= y < region['y'] + region['height'], 'result_point_outside_frame')
+    if not visible and reviewed_frame is not None and table.property(30022) is None:
+        # The exact captured visible portion has just been reviewed and compared.
+        # A provider may expose its scrollable table larger than this HWND. Prove
+        # ownership and the actual pointed data surface instead of accepting the
+        # full off-window rectangle as a general visibility override.
+        app.visibility.require_observable(binding)
+        need(bool(app.bridge.user32.IsWindowVisible(binding.hwnd)), 'result_point_outside_table')
+        lookup.ancestry(uia, table, root, pid=binding.pid)
+        hit = app.bridge.window_from_point(x, y)
+        need(hit and app.bridge.root_window(hit) == binding.hwnd
+             and app.bridge.hwnd_pid(hit) == binding.pid, 'result_cell_occluded')
+        visible = True
+    need(visible, 'result_point_outside_table')
     need(box['x'] <= x < box['x'] + box['width'] and box['y'] <= y < box['y'] + box['height'],
          'result_point_outside_table')
     # Owner-drawn cells may expose only their group, image or pane. A sibling grid,
@@ -807,7 +830,8 @@ def check_result_frame(binding, confirmation, point, guard):
         if confirmation.get('original_selector'):
             _, selector = _result_target(binding, uia, confirmation['original_selector'], confirmation['selector'])
             need(selector == confirmation['selector'], 'result_table_changed')
-        box = check_result_point(binding, uia, confirmation['selector'], point)
+        box = check_result_point(binding, uia, confirmation['selector'], point,
+                                 reviewed_frame=rect if 'table_box' in confirmation else None)
         if 'table_box' in confirmation:
             need(box == confirmation['table_box'], 'result_table_changed')
 
@@ -1139,6 +1163,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         if result_confirmation and number == 1:
                             options['before_input'] = lambda point: check_result_frame(
                                 binding, result_confirmation, point, click_guard)
+                            if 'table_box' in result_confirmation and 'window_rect' in result_confirmation:
+                                options['reviewed_point'] = [result_confirmation['window_rect'][i]
+                                                             + result_confirmation['point'][i] for i in range(2)]
                         receipt = visual_target.execute(binding, step['visual'], click_guard,
                                                         read_only=read_only, background_only=background_only,
                                                         first_match_timeout=first_match_timeout, **options)
@@ -1522,6 +1549,10 @@ def run_instructions(recipe, skill_name):
             '현재 상태만 요청하면 실행 인자 대신 `--read-only`, 입력 방식만 요청하면 `--input-plan`을 쓴다. '
             '백그라운드 전용 요청은 실행 변수와 `--background-only`로 호출한다.\n\n'
             'JSON의 상태를 보고하고 workbook_verified이면 verified_outputs의 파일 경로를 전달한다. '
+            '`host_action=report_execution_receipt`이면 영수증에서 확인한 값과 결과를 보고한다. '
+            '이미 확인된 값, 창 닫힘과 파일을 화면으로 다시 검사하지 않는다. '
+            '이미지 확인이 필요한 중단 응답에서만 반환된 이미지를 읽고, 같은 창의 같은 판단에서 동일한 frame 또는 image_sha256은 다시 읽지 않는다. '
+            '로컬 확인창과 Python 내부 픽셀 검사는 모델에 이미지를 보내라는 지시가 아니다. '
             'input_pause이면 사용자에게 입력을 잠시 멈춰 달라고 안내한다. 사용자가 멈췄다고 하면 제공된 resume_args로 이어간다. '
             'retry_full_run_after_idle은 전체를 다시 시작할 수 있다. 그 밖에는 이미 보낸 입력의 결과부터 확인한다. '
             '녹화 순서 설명이나 중단 후 복구가 필요할 때만 '
@@ -1757,7 +1788,8 @@ def workflow_notes(recipe, source_task, pending_popup):
                   '새 영수증이 나오면 같은 절차를 계속하며, 실행 명령을 처음부터 다시 시작하지 않는다.\n')
     if any(step['action'] == 'visual-click' for step in active):
         guide += ('\n화면으로 녹화한 클릭은 지정한 창에서 녹화된 모양을 다시 찾고 실제 마우스로 한 번 누른다. '
-                  'delivered_unverified는 클릭 전달을 뜻한다. 앱 실행 등 결과는 해당 창에서 별도로 확인한다.\n')
+                  'delivered_unverified는 클릭 전달을 뜻한다. 후속 단계의 값 읽기나 창 확인 영수증이 있으면 그 근거를 사용한다. '
+                  '요청한 결과의 근거가 없을 때만 해당 요소를 읽고, 요소로 확인할 수 없을 때 해당 창 이미지를 사용한다.\n')
     if any('grounding_text' in step or step['action']=='row-open' for step in active):
         guide += ('\n설명 속 이름이 현재 창에서 보이지 않으면 grounding_steps의 단계와 원문으로 '
                   'desktop-select의 ground에서 같은 창을 확인한다. 여러 행에 같은 실행 버튼이 있으면 '
@@ -1813,6 +1845,7 @@ def summarize_execution(report, entries):
         summary['verified_outputs'] = outputs
         if outputs[-1]['number'] == entries[-1][0] and entries[-1][1]['action'] in ('verify-file', 'result-menu'):
             summary['outcome'] = 'workbook_verified'
+    summary.setdefault('host_action', 'report_execution_receipt')
     return summary
 
 

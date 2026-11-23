@@ -45,6 +45,33 @@ def bare_group(uia, element):
     return True
 
 
+def readable_surface(binding, uia, element, window):
+    """A clipped container may be read; this never establishes a clickable cell."""
+    role = win.ROLES.get(element.property(30003))
+    if role not in SURFACES and not (role == 'custom' and (
+            element.property(30030) is True or element.property(30038) is True)):
+        return False
+    if visibility.visible(binding, uia, element, window):
+        return True
+    if element.property(30022) is not None:
+        return False
+    box = uia.bounds(element)
+    if not visibility.valid(box):
+        return False
+    binding.check()
+    if not win.user32.IsWindowVisible(binding.hwnd) or win.user32.IsIconic(binding.hwnd):
+        return False
+    lookup.ancestry(uia, element, window, pid=binding.pid)
+    # UIA can expose the full scrollable surface beyond this HWND. Use actual
+    # window geometry only for this read permission; cell/header guards remain
+    # unchanged and local confirmation still compares the captured intersection.
+    from row_vision import _window_rect
+    x, y, width, height = _window_rect(binding)
+    return (width > 0 and height > 0
+            and max(x, box['x']) < min(x + width, box['x'] + box['width'])
+            and max(y, box['y']) < min(y + height, box['y'] + box['height']))
+
+
 def bound_group(binding, uia, header_point, cell_point):
     """Identify the owner-drawn group directly under both reviewed screen points."""
     binding.check()
@@ -350,7 +377,7 @@ def find(binding, uia, root_element, expected, *, column=None, column_hint=None,
     require(role in SURFACES or role == 'custom' and (
         root_element.property(30030) is True or root_element.property(30038) is True), 'result_container_required')
     require(isinstance(expected, str) and expected.strip(), 'result_value_required')
-    require(visibility.visible(binding, uia, root_element, window), 'result_container_not_visible')
+    require(readable_surface(binding, uia, root_element, window), 'result_container_not_visible')
     header = None
     oversized = None
     if column is not None:

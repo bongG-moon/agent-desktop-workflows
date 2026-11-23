@@ -1,5 +1,7 @@
 # 녹화 편집과 복구
 
+[관찰 순서](host-details.md#관찰-순서)에 따라 이번 영수증의 요소와 위치를 먼저 사용한다. 아래 이미지 보정은 그 증거만으로 미해결 단계를 연결할 수 없을 때 적용한다.
+
 ## 정확한 창 지정과 검토
 
 앱 이름으로 새 녹화를 열 때는 기본 `recorder --app`을 사용한다. 정확한 exe와 창 전체 제목을 지정해야 하거나 기존 초안을 편집하려면 UTF-8 JSON 파일로 `desktop_select.py recorder --request <파일>`을 실행한다. 예를 들어 새 녹화 요청은 `{"command":"record","task":"조건 조회","exe":"Example.exe","window":"전체 제목"}`, 검토 요청은 `{"command":"review","task":"조건 조회"}`다. 보완 시연은 `continue-recording`과 `from_step`을 사용한다. 이 방식에서는 같은 명령의 준비 응답과 저장 후 최종 응답을 이어 읽는다. [PowerShell 호출 예제](../사용가이드.md#녹화창-열기)

@@ -99,3 +99,32 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.result, dict(
                 header=[200+left,100+top,200+right],
                 point=[200+point[0],100+point[1]], value='PART-42'))
+
+    def test_clipped_edge_crop_preserves_source_header_and_cell_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'partial.png'
+            image = tk.PhotoImage(master=self.root, width=1296, height=839)
+            image.write(str(path), format='png')
+            review = local.ResultReview(self.root, path, 'Code', [10,197,1286,562], 'PART-42',
+                                        frame_size=[1296,839])
+            review.press(self.event(20,10))
+            review.release(self.event(90,10))
+            review.press(self.event(45,35))
+            review.release(self.event(45,35))
+            review.value.set('PART-42')
+            review.accept()
+            self.assertEqual(review.result, dict(header=[30,207,100],point=[55,232],value='PART-42'))
+
+    def test_image_size_mismatch_and_unclipped_crop_keep_precise_geometry_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'partial.png'
+            image = tk.PhotoImage(master=self.root, width=160, height=120)
+            image.write(str(path), format='png')
+            with self.assertRaises(local.ResultReviewError) as error:
+                local.ResultReview(self.root, path, 'Code', [20,10,120,80], frame_size=[161,120])
+            self.assertEqual(error.exception.code, 'result_capture_size_mismatch')
+            self.assertEqual(error.exception.geometry, dict(capture_size=[161,120], image_size=[160,120]))
+            with self.assertRaises(local.ResultReviewError) as error:
+                local.ResultReview(self.root, path, 'Code', [20,10,150,80])
+            self.assertEqual(error.exception.code, 'result_table_outside_frame')
+            self.assertEqual(error.exception.geometry['crop_relative'], [20,10,150,80])

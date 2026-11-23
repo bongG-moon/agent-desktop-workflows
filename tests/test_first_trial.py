@@ -128,18 +128,39 @@ class FirstTrial(unittest.TestCase):
             again = self.trial('--task',self.task['name'])
         self.assertEqual(again['source_stopped_at'],2)
         self.worker.assert_called_once()
+        pixels = bytes((31, 61, 91, 0)) * 64
+        png = grounding._png(8, 8, pixels)
         with (patch.object(app.bridge, 'Binding') as bind, patch.object(grounding, '_capture',
-                return_value=([20,30,100,120], b'frame')) as capture,
+                return_value=([20,30,8,8], png)) as capture,
+              patch.object(app, 'worker_receipt', self.worker),
               patch.object(grounding, '_directory',return_value=self.directory)):
             frame = app.run(app.parser().parse_args(paused['result_inspection']['args']))
             bind.assert_called_once_with(window)
             self.assertEqual(frame['result_match'],'unverified')
             self.assertFalse(frame['input_dispatched'])
             self.assertTrue(Path(frame['image']).is_file())
+            identical = app.run(app.parser().parse_args(paused['result_inspection']['args']))
+            self.assertEqual((identical['frame'], identical['image']), (frame['frame'], frame['image']))
+            self.assertEqual(Path(frame['image']).read_bytes(), png)
+            changed_pixels = bytearray(pixels)
+            changed_pixels[0] ^= 255
+            changed_png = grounding._png(8, 8, changed_pixels)
+            capture.return_value = ([20,30,8,8], changed_png)
+            changed = app.run(app.parser().parse_args(paused['result_inspection']['args']))
+            self.assertNotEqual(changed['frame'], frame['frame'])
+            self.assertNotEqual(changed['image'], frame['image'])
+            self.assertEqual(Path(changed['image']).read_bytes(), changed_png)
+            self.assertEqual(Path(frame['image']).read_bytes(), png)
+            for inspected in (frame, identical, changed):
+                self.assertFalse(inspected['input_dispatched'])
+                self.assertFalse(inspected['prior_steps_replayed'])
+                self.assertEqual(inspected['trial_receipt'], paused['trial_receipt'])
+            self.assertEqual(len(list(self.directory.glob('*.png'))), 2)
+            self.worker.assert_called_once()  # Only the initial query trial, never the inspections.
             with patch.object(first_trial.time,'time',return_value=time.time()+grounding.TTL+1):
                 with self.assertRaisesRegex(tasks.TaskError, 'result_inspection_expired'):
                     app.run(app.parser().parse_args(paused['result_inspection']['args']))
-            capture.assert_called_once()
+            self.assertEqual(capture.call_count, 3)  # Freshness checked even when the token is reused.
 
     def test_dependent_unknown_step_does_not_observe_prefix_or_register(self):
         task = dict(self.task, steps=[self.task['steps'][1], dict(action='manual',

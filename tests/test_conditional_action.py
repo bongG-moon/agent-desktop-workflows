@@ -51,6 +51,70 @@ class ConditionalExecutionTests(TestCase):
         self.assertEqual((result['condition'],result['diagnostic'],clicks,waits),
                          ('absent','conditional_open_dispatched',[list(self.target)],[10]))
 
+    def retry_scenes(self, outcomes, *, captures=None, clock=None, answers=None):
+        png=grounding._png(*self.box[2:],image(self.target))
+        session=mock.Mock()
+        session.ask.side_effect=answers
+        session.ask.return_value=dict(decision='absent',point=self.target)
+        outcomes=iter(outcomes)
+        def click(binding,spec,guard,*,before_input):
+            before_input(self.target)
+            return next(outcomes)
+        with ExitStack() as ctx:
+            ctx.enter_context(mock.patch.object(row_action,'foreground'))
+            ctx.enter_context(mock.patch.object(action,'_wait'))
+            capture=ctx.enter_context(mock.patch.object(grounding,'_capture',side_effect=captures,
+                                                        return_value=(self.box,png)))
+            fresh=ctx.enter_context(mock.patch.object(action,'_fresh'))
+            send=ctx.enter_context(mock.patch.object(visual_target,'execute',side_effect=click))
+            if clock is not None:
+                ctx.enter_context(mock.patch.object(action.time,'monotonic',side_effect=clock))
+            result=action.execute(None,self.step,lambda:None,session,self.report,3,'Demo')
+        return result,session,send,capture,fresh
+
+    def test_same_scene_after_no_input_failure_reuses_answer_once_and_rechecks_frame(self):
+        blocked=dict(status='blocked',input_dispatched=False,diagnostic='visual_target_changed_before_input')
+        delivered=dict(status='delivered_unverified',input_dispatched=True,diagnostic='visual_click_dispatched')
+        result,session,send,capture,fresh=self.retry_scenes([blocked,delivered])
+        self.assertEqual(result['diagnostic'],'conditional_open_dispatched')
+        self.assertEqual((session.ask.call_count,send.call_count,capture.call_count,fresh.call_count),(1,2,2,2))
+        result,session,send,capture,fresh=self.retry_scenes([blocked,blocked])
+        self.assertEqual(result['diagnostic'],'conditional_scene_unstable')
+        self.assertIs(result['input_dispatched'],False)
+        self.assertEqual((session.ask.call_count,send.call_count,capture.call_count,fresh.call_count),(1,2,3,2))
+
+    def test_changed_frame_or_expired_answer_requires_new_scene_decision(self):
+        blocked=dict(status='blocked',input_dispatched=False,diagnostic='conditional_scene_changed')
+        delivered=dict(status='delivered_unverified',input_dispatched=True,diagnostic='visual_click_dispatched')
+        pixels=bytearray(image(self.target))
+        first=grounding._png(*self.box[2:],pixels)
+        pixels[0] ^= 255
+        second=grounding._png(*self.box[2:],pixels)
+        for options in (dict(captures=[(self.box,first),(self.box,second)]),
+                        dict(captures=[(self.box,first),([1,0,170,120],first)]),
+                        dict(clock=[0,scenes.ANSWER_TTL+1])):
+            with self.subTest(options=tuple(options)):
+                result,session,send,capture,fresh=self.retry_scenes([blocked,delivered],**options)
+                self.assertEqual(result['diagnostic'],'conditional_open_dispatched')
+                self.assertEqual((session.ask.call_count,send.call_count,fresh.call_count),(2,2,2))
+
+    def test_uncertain_delivery_never_reuses_scene_answer(self):
+        uncertain=dict(status='uncertain',input_dispatched=None,diagnostic='visual_click_delivery_uncertain')
+        result,session,send,capture,fresh=self.retry_scenes([uncertain])
+        self.assertEqual(result['status'],'uncertain')
+        self.assertIsNone(result['input_dispatched'])
+        self.assertEqual((session.ask.call_count,send.call_count),(1,1))
+
+    def test_phase_change_after_a_sent_dismiss_always_requests_new_scene(self):
+        # Even equal pixels cannot reuse the condition answer after a delivered dismiss.
+        delivered=dict(status='delivered_unverified',input_dispatched=True,diagnostic='visual_click_dispatched')
+        with mock.patch.object(action,'_reject_window_chrome'):
+            result,session,send,capture,fresh=self.retry_scenes([delivered,delivered],answers=[
+                dict(decision='present',point=self.target),dict(decision='absent',point=self.target)])
+        self.assertEqual(result['condition'],'present')
+        self.assertEqual([call.args[1]['phase'] for call in session.ask.call_args_list],['condition','after_dismiss'])
+        self.assertEqual(send.call_count,2)
+
     def test_ad_and_simultaneously_visible_game_require_dismiss_first(self):
         result,clicks,waits=self.run_scenes(['present','absent'],[self.close,self.target])
         self.assertEqual((result['condition'],clicks,waits),('present',[list(self.close),list(self.target)],[10,.35]))
@@ -130,3 +194,24 @@ class ConditionalExecutionTests(TestCase):
             pending.unlink()
             with self.assertRaisesRegex(ValueError,'expired_or_used'):
                 scenes.answer(ticket,'present',[35,37])
+
+    def test_scene_reply_includes_same_image_hash_as_one_use_ticket(self):
+        with TemporaryDirectory() as td, mock.patch.object(scenes,'_root',return_value=Path(td)):
+            ticket='8'*64
+            folder,_=scenes._paths(ticket)
+            folder.mkdir()
+            session=scenes.Session(ticket,30)
+            png=b'private local image'
+            seen=[]
+            def answer_prompt(message):
+                seen.append(message)
+                token=message['ticket'][32:]
+                pending=scenes._read(folder/('pending-'+token+'.json'))
+                self.assertEqual(message['image_sha256'],pending['sha256'])
+                self.assertEqual(Path(message['image']).read_bytes(),png)
+                scenes._json(folder/('answer-'+token+'.json'),dict(decision='absent',point=[100,80]))
+            with mock.patch.object(session,'arm'),mock.patch.object(session,'send',side_effect=answer_prompt):
+                answer=session.ask(png,dict(phase='condition'),dict(input_dispatched=False))
+            self.assertEqual(answer,dict(decision='absent',point=[100,80]))
+            self.assertEqual(seen[0]['image_sha256'],scenes.hashlib.sha256(png).hexdigest())
+            self.assertFalse(Path(seen[0]['image']).exists())

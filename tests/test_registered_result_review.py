@@ -1,5 +1,5 @@
 """Resume a registered lookup locally, without redispatching its query or sharing its image."""
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 import json
@@ -51,8 +51,9 @@ class RegisteredResultTests(unittest.TestCase):
         stack.enter_context(patch.object(grounding, '_directory', return_value=self.directory))
         self.capture = stack.enter_context(patch.object(grounding, '_capture', side_effect=self.snapshot))
         self.dpi = stack.enter_context(patch.object(flow.app.bridge, 'set_dpi_awareness'))
+        self.foreground = stack.enter_context(patch.object(flow.row_action, 'foreground'))
         stack.enter_context(patch.object(flow.app.bridge, 'Binding'))
-        stack.enter_context(patch.object(flow.app.bridge, 'UIA'))
+        self.uia = stack.enter_context(patch.object(flow.app.bridge, 'UIA'))
         stack.enter_context(patch.object(flow.app, 'guard'))
         stack.enter_context(patch.object(flow.app.visibility, 'require_observable'))
         stack.enter_context(patch.object(flow, 'result_surface', side_effect=flow.WorkflowError('result_table_missing')))
@@ -106,6 +107,7 @@ class RegisteredResultTests(unittest.TestCase):
         self.assertEqual([s['number'] for s in result['steps']], [3, 4, 5])
         self.assertEqual(result['steps'][1]['receipt']['value'], 'sample note')
         self.assertFalse(result['prior_steps_replayed'])
+        self.assertEqual(result['host_action'], 'report_execution_receipt')
         self.assertEqual(self.capture.call_count, 3)
         self.assertFalse(list(self.directory.glob('*.png')))
         self.assertNotIn('.png', json.dumps(result))
@@ -129,6 +131,7 @@ class RegisteredResultTests(unittest.TestCase):
             self.assertEqual(report['diagnostic'], code)
             self.assertFalse(report['input_dispatched'])
             self.assertEqual(report['result_review']['resume_args'], args)
+        self.foreground.assert_not_called()
         self.choose.return_value = self.proof
         self.capture.side_effect = lambda *a, **k: self.snapshot(*a, **k) if k else self.changed_at(9,10)
         self.assertEqual(self.call(*args)[1]['diagnostic'], 'result_frame_changed')
@@ -177,6 +180,113 @@ class RegisteredResultTests(unittest.TestCase):
         self.assertEqual(report['steps'][1]['receipt']['value_evidence']['source'], 'local_visual_confirmation')
         self.assertEqual(report['status'], 'completed_unverified')  # Query delivery is still unverified.
         self.assertEqual(self.run.call_count, 2)
+
+    def test_foreground_and_input_lease_start_after_choice_and_end_before_detail_suffix(self):
+        state = dict(locked=False, chosen=False, activated=False)
+        @contextmanager
+        def lease():
+            self.assertFalse(state['locked'])
+            state['locked'] = True
+            try:
+                yield
+            finally:
+                state['locked'] = False
+        def choose(*args, **kwargs):
+            self.assertFalse(state['locked'])
+            self.assertFalse(state['activated'])
+            state['chosen'] = True
+            return self.proof
+        def foreground(*args):
+            self.assertTrue(state['locked'])
+            self.assertTrue(state['chosen'])
+            state['activated'] = True
+        def capture(*args, **kwargs):
+            self.assertEqual(state['locked'],state['activated'])
+            return self.snapshot(*args, **kwargs)
+        def run(*args, **kwargs):
+            self.assertFalse(state['locked'])
+            return self.finished() if state['chosen'] else deepcopy(self.blocked)
+        self.choose.side_effect = choose
+        self.foreground.side_effect = foreground
+        self.capture.side_effect = capture
+        self.run.side_effect = run
+        with patch.object(flow.coordination,'desktop_input',side_effect=lease):
+            _, report = self.call('--set','Part=D27','--allow-physical','--local-result-review')
+        self.foreground.assert_called_once()
+        self.assertEqual(self.run.call_count,2)
+        self.assertFalse(report['prior_steps_replayed'])
+        self.assertEqual([s['action'] for s in self.run.call_args.args[0]['steps']],['visual-click','read-value','invoke'])
+
+    def test_exposing_reviewed_window_still_rejects_a_moved_capture(self):
+        self.choose.return_value = self.proof
+        self.capture.side_effect = lambda *args, **kwargs: (
+            ([101,100,128,128],self.png) if self.foreground.called else self.snapshot(*args, **kwargs))
+        _, report = self.call('--set','Part=D27','--allow-physical','--local-result-review')
+        self.foreground.assert_called_once()
+        self.assertEqual(report['review_diagnostic'],'result_frame_changed')
+        self.assertEqual(self.run.call_count,1)
+
+    def test_oversized_recorded_table_is_clipped_for_review_but_raw_geometry_is_preserved(self):
+        self.box = dict(x=110,y=297,width=1393,height=562)
+        self.pixels = random.Random(224).randbytes(1296*839*4)
+        self.png = grounding._png(1296,839,self.pixels)
+        self.frame = ([100,100,1296,839],self.png)
+        self.proof = dict(header=[30,210,100],point=[55,240],value='D27')
+        self.choose.return_value = self.proof
+        self.run.side_effect = [deepcopy(self.blocked),self.finished()]
+        self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+        with (patch.object(flow,'_result_target',return_value=(MagicMock(),self.group)),
+              patch.object(registered_result.ResultReview,'_check_header'),
+              patch.object(flow,'check_result_point') as point):
+            _, report = self.call('--set','Part=D27','--allow-physical','--local-result-review')
+        self.assertEqual(self.choose.call_args.kwargs['table_box'],[10,197,1286,562])
+        self.assertEqual(self.choose.call_args.kwargs['frame_size'],[1296,839])
+        confirmation = self.run.call_args.kwargs['result_confirmation']
+        self.assertEqual(confirmation['table_box'],self.box)
+        self.assertEqual(confirmation['point'],[55,240])
+        self.assertEqual(point.call_args.args[-1],(155,340))
+        self.assertEqual(point.call_args.kwargs['reviewed_frame'],self.frame[0])
+        self.assertEqual([s['action'] for s in self.run.call_args.args[0]['steps']],['visual-click','read-value','invoke'])
+        self.assertEqual(self.run.call_count,2)
+        self.assertEqual(report['status'],'completed_unverified')
+        self.assertFalse(report['prior_steps_replayed'])
+
+    def test_table_outside_frame_reports_raw_geometry_without_opening_review_or_replaying(self):
+        self.box = dict(x=300,y=107,width=111,height=101)
+        self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+        with patch.object(flow,'_result_target',return_value=(MagicMock(),self.group)):
+            _, report = self.call('--set','Part=D27','--allow-physical','--local-result-review')
+        self.assertEqual(report['review_diagnostic'],'result_table_outside_frame')
+        self.assertEqual(report['result_geometry'],dict(capture_rect=self.frame[0],table_absolute=self.box,
+                                                       table_relative=[200,7,111,101]))
+        self.assertIn('resume_args',report['result_review'])
+        self.choose.assert_not_called()
+        self.assertEqual(self.run.call_count,1)
+
+    def test_clipped_review_still_rejects_geometry_change_and_keeps_exact_image_diagnostic(self):
+        self.box = dict(x=105,y=107,width=150,height=101)
+        uia = self.uia.return_value.__enter__.return_value
+        self.choose.return_value = self.proof
+        self.run.return_value = deepcopy(self.blocked)
+        with (patch.object(flow,'_result_target',return_value=(MagicMock(),self.group)),
+              patch.object(registered_result.ResultReview,'_try_elements',return_value=None),
+              patch.object(registered_result.ResultReview,'_check_header')):
+            args = self.start()
+            uia.bounds.side_effect = [self.box,dict(self.box,width=151)]
+            _, changed = self.call(*args)
+            self.assertEqual(changed['diagnostic'],'result_table_changed')
+            self.assertFalse(changed['input_dispatched'])
+            self.assertEqual(changed['result_geometry']['visible_relative'],[5,7,123,101])
+            self.assertEqual(changed['result_review']['resume_args'],args)
+            uia.bounds.side_effect = None
+            uia.bounds.return_value = self.box
+            self.choose.side_effect = local_result_review.ResultReviewError(
+                'result_capture_size_mismatch',capture_size=[128,128],image_size=[127,128])
+            _, mismatch = self.call(*args)
+            self.assertEqual(mismatch['diagnostic'],'result_capture_size_mismatch')
+            self.assertEqual(mismatch['result_geometry']['image_size'],[127,128])
+            self.assertFalse(mismatch['input_dispatched'])
+        self.assertEqual(self.run.call_count,1)
 
     def test_cancelled_local_review_reports_time_spent_after_the_query(self):
         self.blocked['elapsed_seconds'] = 4.5

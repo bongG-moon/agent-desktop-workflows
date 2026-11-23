@@ -35,7 +35,8 @@ def wait_for_idle(seconds=1.5, timeout=30):
 
 
 def exercise(package, work, baseline, repeat, drive_review=False, separate_review=False, native_table=False,
-             provider_grid=False, verify_only=False):
+             provider_grid=False, verify_only=False, oversized_grid=False, unknown_offscreen=False,
+             duplicate_column_value=False, cover_during_review=False):
     work.mkdir(parents=True, exist_ok=False)
     skills = work / '.claude/skills'
     with ZipFile(package) as archive:
@@ -43,6 +44,12 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
     scripts = skills/'desktop-select/scripts'
     exe = build_lookup_fixture(work)
     flags = ['--provider-grid'] if provider_grid else [] if native_table else ['--group-only']
+    if oversized_grid:
+        flags.append('--oversized-grid')
+    if duplicate_column_value:
+        flags.append('--duplicate-column-value')
+    if cover_during_review:
+        flags.append('--cover-during-review')
     fixture = Fixture(exe, *flags)
     title = fixture.ready['title']
     scope = dict(exe=exe.name,title='Item details',related=True,after_step=4)
@@ -58,6 +65,8 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
              label='Exit',command_name='Exit',window_context=scope)])
     if verify_only:
         recipe['steps'] = recipe['steps'][:3]
+    if oversized_grid:
+        recipe['steps'][2]['selector'] = dict(role='group', automation_id='PaintedResults')
     env = dict(os.environ, DESKTOP_SELECT_TASK_DIR=str(work/'tasks'), LOCALAPPDATA=str(work/'local'))
     if drive_review or provider_grid:
         driver = work / 'review-driver'
@@ -87,18 +96,25 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
             fixture.command('reset')
             before = fixture.command('state')
             value = ('LAB-42','LAB-73','PART-A')[n-1] if drive_review or provider_grid else 'LAB-42'
+            cover_this_review = cover_during_review and n == 1
             args = [runner,'--set','Part='+value,'--allow-physical','--summary']
+            layout = None
             if verify_only:
                 args.remove('--allow-physical')
             def review_env():
+                nonlocal layout
                 if provider_grid:
                     return dict(PYTHONPATH=str(driver), DESKTOP_SELECT_SMOKE_ELEMENT_TRACE=str(trace_path))
                 if not drive_review:
                     return {}
-                layout = fixture.command('review-layout')
+                layout = fixture.command('review-layout' if separate_review else 'review-layout-next')
                 (work/('layout-'+str(n)+'.json')).write_text(json.dumps(layout), encoding='utf8')
-                return dict(PYTHONPATH=str(driver), DESKTOP_SELECT_SMOKE_UI_REVIEW=json.dumps(
-                    dict(layout=layout, expected=value, receipt=str(ui_receipt))))
+                extra = dict(PYTHONPATH=str(driver), DESKTOP_SELECT_SMOKE_UI_REVIEW=json.dumps(
+                    dict(layout=layout, expected=value, receipt=str(ui_receipt),
+                         cover_hwnd=fixture.ready.get('coverHwnd') if cover_this_review else 0)))
+                if unknown_offscreen:
+                    extra['DESKTOP_SELECT_SMOKE_UNKNOWN_OFFSCREEN'] = str(work / ('offscreen-'+str(n)+'.txt'))
+                return extra
             if not baseline and not separate_review and not native_table and not verify_only:
                 args.append('--local-result-review')
             if drive_review:
@@ -109,7 +125,7 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
                     wait_for_idle()
             prefix_report = None
             if separate_review:
-                prefix_report, prefix_elapsed = run(args, 'query-'+str(n))
+                prefix_report, prefix_elapsed = run(args, 'query-'+str(n), review_env())
                 review_state = fixture.command('state')
                 (work/('state-query-'+str(n)+'.json')).write_text(json.dumps(review_state), encoding='utf8')
                 assert prefix_report.get('stopped_at')==3 and prefix_report['status']=='blocked',prefix_report
@@ -143,6 +159,8 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
                 assert not ticket_file.exists()
                 elapsed = round(prefix_elapsed + time.monotonic()-started_review,3)
             else:
+                if drive_review:
+                    wait_for_idle()
                 report, elapsed = run(args,'run-'+str(n),review_env())
             after = fixture.command('state')
             assert after['queries']==before['queries']+1 and not after['archiveClicks'], (after, report)
@@ -159,7 +177,14 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
                 assert not after['detailOpen'] and after['wrongRows']==0 and ('Note for '+value) in json.dumps(report), report
             if drive_review:
                 review = json.loads(ui_receipt.read_text(encoding='utf8'))
-                assert review['wrong_value_rejected'] and review['cropped'] == (n>1),review
+                assert review['wrong_value_rejected'] and review['cropped'] == (oversized_grid or n>1),review
+                assert after['wrongColumns'] == 0, after
+                assert review['covered_target'] == cover_this_review, review
+                if oversized_grid:
+                    assert layout['rawEnd'][0] == layout['imageSize'][0] + 107, layout
+                    assert review['crop_origin'] == layout['visibleOrigin'], review
+                if unknown_offscreen:
+                    assert 'fixture_group_offscreen_unknown' in (work / ('offscreen-'+str(n)+'.txt')).read_text(), n
             observation = next((row.get('receipt',row).get('result_observation') for row in (prefix_report or report).get('steps',[])
                                 if row['number']==3),None)
             if native_table:
@@ -184,6 +209,14 @@ def exercise(package, work, baseline, repeat, drive_review=False, separate_revie
             if separate_review:
                 result.update(query_seconds=prefix_elapsed, confirm_seconds=round(elapsed-prefix_elapsed,3),
                               resumed_at=report['resumed_at'], prior_steps_replayed=report['prior_steps_replayed'])
+            if oversized_grid:
+                result.update(native_right_overflow=107, unknown_offscreen_fault_injected=unknown_offscreen,
+                              duplicate_column_value=duplicate_column_value,
+                              covered_during_review=cover_this_review,
+                              row=after['matchRow'], column=after['keyColumn'], query_value=value,
+                              visible_region=[*layout['visibleOrigin'],
+                                  *[end-start for end,start in zip(layout['visibleEnd'],layout['visibleOrigin'])]],
+                              local_review_seconds=report.get('local_review_seconds'))
             if provider_grid:
                 result.update(column=after['keyColumn'], row=after['matchRow'], query_value=value,
                               header_reads=after['HeaderReads']-before['HeaderReads'],
@@ -226,6 +259,14 @@ if __name__=='__main__':
     parser.add_argument('--provider-grid',action='store_true',
                         help='verify a value-only grid with changing columns and rows, forbidding image capture')
     parser.add_argument('--verify-only',action='store_true',help='register just the query and value comparison')
+    parser.add_argument('--oversized-grid',action='store_true',
+                        help='native UIA group extends 107 px past window; rows and columns change each query')
+    parser.add_argument('--unknown-offscreen',action='store_true',
+                        help='fault-inject missing IsOffscreen only for the oversized fixture group')
+    parser.add_argument('--duplicate-column-value',action='store_true',
+                        help='repeat the requested value in another column of the same owner-drawn row')
+    parser.add_argument('--cover-during-review',action='store_true',
+                        help='cover the isolated target after selection before the first local confirmation')
     parser.add_argument('--repeat',type=int,choices=(1,2,3),default=1)
     args=parser.parse_args()
     if args.baseline and (args.drive_review or args.separate_review):
@@ -236,5 +277,14 @@ if __name__=='__main__':
         parser.error('choose one fixture')
     if args.verify_only and not args.provider_grid:
         parser.error('verify-only exercises the provider grid')
+    if args.oversized_grid and (not args.drive_review or args.native_table or args.provider_grid or args.baseline):
+        parser.error('oversized-grid requires the real local review driver')
+    if args.unknown_offscreen and not args.oversized_grid:
+        parser.error('unknown-offscreen requires oversized-grid')
+    if args.duplicate_column_value and not args.oversized_grid:
+        parser.error('duplicate-column-value requires oversized-grid')
+    if args.cover_during_review and not args.drive_review:
+        parser.error('cover-during-review requires the real local review driver')
     exercise(args.package.resolve(strict=True),args.work.resolve(),args.baseline,args.repeat,
-             args.drive_review,args.separate_review,args.native_table,args.provider_grid,args.verify_only)
+             args.drive_review,args.separate_review,args.native_table,args.provider_grid,args.verify_only,
+             args.oversized_grid,args.unknown_offscreen,args.duplicate_column_value,args.cover_during_review)

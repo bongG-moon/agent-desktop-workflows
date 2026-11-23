@@ -5,6 +5,13 @@ from tkinter import ttk
 import recorder_theme
 
 
+class ResultReviewError(ValueError):
+    def __init__(self, code, **geometry):
+        super().__init__(code)
+        self.code = code
+        self.geometry = geometry
+
+
 def valid_choice(header, point, value, bounds):
     if not header or not point or not value or not value.strip() or value != value.strip():
         return False
@@ -16,7 +23,7 @@ def valid_choice(header, point, value, bounds):
 
 
 class ResultReview:
-    def __init__(self, root, image_path, column, table_box, expected=None):
+    def __init__(self, root, image_path, column, table_box, expected=None, *, frame_size=None):
         self.root = root
         self.expected = expected
         self.result = self.header = self.point = self.start = None
@@ -42,9 +49,13 @@ class ResultReview:
         second_instruction.pack(anchor='w', pady=(px(4), 0))
         source = tk.PhotoImage(master=root, file=str(image_path))
         full_w, full_h = source.width(), source.height()
+        if frame_size is not None and list(frame_size) != [full_w, full_h]:
+            raise ResultReviewError('result_capture_size_mismatch',
+                                    capture_size=list(frame_size), image_size=[full_w, full_h])
         x, y, w, h = table_box if table_box is not None else (0, 0, full_w, full_h)
         if not (0 <= x < x + w <= full_w and 0 <= y < y + h <= full_h):
-            raise ValueError('result_table_outside_frame')
+            raise ResultReviewError('result_table_outside_frame',
+                                    crop_relative=[x, y, w, h], image_size=[full_w, full_h])
         self.bounds = (x, y, w, h)
         self.photo = source
         if table_box is not None:
@@ -185,11 +196,11 @@ class ResultReview:
         self.root.destroy()
 
 
-def choose(image_path, column, *, table_box=None, expected=None):
+def choose(image_path, column, *, table_box=None, expected=None, frame_size=None):
     """Return a local selection, a refresh request, or None on cancel."""
     root = tk.Tk()
     try:
-        review = ResultReview(root, image_path, column, table_box, expected)
+        review = ResultReview(root, image_path, column, table_box, expected, frame_size=frame_size)
         root.mainloop()
         return review.result
     finally:

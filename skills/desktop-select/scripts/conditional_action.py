@@ -86,11 +86,14 @@ def execute(binding, step, guard, session, progress, number, title):
     import coordination
     import desktop_select as app
     import row_action
+    from scene_session import ANSWER_TTL
     from python_workflow import combine
     dispatched = False
     clicks = []
     dismissed = False
     decision = None
+    scene_answer = None
+    retry_without_input = False
     def receipt(status, diagnostic):
         return dict(status=status,diagnostic=diagnostic,input_dispatched=dispatched,
                     waited_seconds=step['seconds'],condition=decision,actions=clicks,
@@ -104,6 +107,7 @@ def execute(binding, step, guard, session, progress, number, title):
             row_action.foreground(binding)
         for _ in range(8):
             window,png = grounding._capture(app,binding,guard)
+            captured_at = time.monotonic()
             frame = grounding._pixels(png)
             target = None
             # Two independently taught markers can identify a known intervening
@@ -117,8 +121,23 @@ def execute(binding, step, guard, session, progress, number, title):
                 pending = dict(step=number, phase=phase, window=title, width=window[2],height=window[3],
                                instruction=step['label'], condition_name=step['when_present']['name'],
                                close_target=step['dismiss']['name'], final_target=step['always']['name'])
-                answer = session.ask(png,pending,dict(progress,input_dispatched=combine(progress['input_dispatched'],dispatched),
-                                                      current_step_actions=list(clicks)))
+                same_scene = (retry_without_input and scene_answer is not None
+                              and scene_answer['window'] == window and scene_answer['png'] == png
+                              and scene_answer['phase'] == phase
+                              and captured_at - scene_answer['captured_at'] < ANSWER_TTL)
+                if same_scene:
+                    if scene_answer['reused']:
+                        return receipt('blocked','conditional_scene_unstable')
+                    # Reuse a model decision only once for the identical freshly
+                    # captured scene after a proven zero-input validation failure.
+                    # Current-scene and native input guards still run below.
+                    answer = scene_answer['answer']
+                    scene_answer['reused'] = True
+                else:
+                    answer = session.ask(png,pending,dict(progress,input_dispatched=combine(progress['input_dispatched'],dispatched),
+                                                          current_step_actions=list(clicks)))
+                    scene_answer = dict(window=list(window), png=png, phase=phase, answer=answer,
+                                        captured_at=captured_at, reused=False)
                 branch,target = answer['decision'],answer['point']
                 if branch == 'unknown':
                     return receipt('blocked','conditional_scene_unresolved')
@@ -141,11 +160,13 @@ def execute(binding, step, guard, session, progress, number, title):
                         raise tasks.TaskError('conditional_scene_changed')
                     _reject_window_chrome(binding, point, app)
                 _fresh(binding,window,png,guard,app,dismiss_point=(match or target) if branch=='present' else None)
+            retry_without_input = False
             click = visual.execute(binding,spec,guard,before_input=recheck)
             if click.get('input_dispatched') is False and click.get('diagnostic') in (
                     'conditional_scene_changed','visual_target_not_found','visual_target_changed_before_input'):
-                # Nothing was sent. Ask the host about the new frame; never
-                # retry a dispatch that might already have reached the app.
+                # Nothing was sent. A changed frame needs a new decision;
+                # identical frames reuse the previous answer at most once.
+                retry_without_input = True
                 continue
             clicks.append(dict(action='dismiss' if branch=='present' else 'open',**click))
             dispatched = combine(dispatched,click['input_dispatched'])

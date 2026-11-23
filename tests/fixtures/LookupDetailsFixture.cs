@@ -32,21 +32,36 @@ public sealed class PaintedCell : FrameworkElement {
 // No header, row or cell peers. Both hit tests inside this grid reach the same group.
 public sealed class PaintedGroup : FrameworkElement {
     public string Key = "OLD";
+    public bool Oversized, DuplicateColumnValue;
+    public int KeyColumn, MatchRow = 2, WrongColumns;
+    [StructLayout(LayoutKind.Sequential)] struct NativeRect { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
     protected override AutomationPeer OnCreateAutomationPeer() { return new GroupPeer(this); }
     sealed class GroupPeer : FrameworkElementAutomationPeer {
         public GroupPeer(FrameworkElement owner) : base(owner) {}
         protected override AutomationControlType GetAutomationControlTypeCore() { return AutomationControlType.Group; }
         protected override bool IsControlElementCore() { return true; }
         protected override bool IsContentElementCore() { return true; }
+        protected override Rect GetBoundingRectangleCore() {
+            Rect actual = base.GetBoundingRectangleCore();
+            var group = (PaintedGroup)Owner;
+            if (!group.Oversized || actual.IsEmpty) return actual;
+            NativeRect window;
+            if (!GetWindowRect(new WindowInteropHelper(Window.GetWindow(group)).Handle, out window))
+                throw new InvalidOperationException("fixture_window_bounds");
+            return new Rect(actual.X, actual.Y, window.Right + 107 - actual.X, actual.Height);
+        }
     }
     protected override void OnRender(DrawingContext dc) {
         dc.DrawRectangle(Brushes.White, new Pen(Brushes.SteelBlue,1), new Rect(RenderSize));
-        int index = 0;
-        foreach (string value in new [] {"Equip ID","Category","OTHER","decoy",Key,"requested"}) {
+        for (int row = 0; row < 3; row++) for (int column = 0; column < 2; column++) {
+            string value = row == 0 ? (column == KeyColumn ? "Equip ID" : "Category") :
+                column == KeyColumn ? (row == MatchRow ? Key : "OTHER") :
+                (row == MatchRow ? (DuplicateColumnValue ? Key : "requested") : "decoy");
             var label = new FormattedText(value, System.Globalization.CultureInfo.InvariantCulture,
                 FlowDirection.LeftToRight, new Typeface("Segoe UI"), 15, Brushes.Black,
                 VisualTreeHelper.GetDpi(this).PixelsPerDip);
-            dc.DrawText(label, new Point(10 + 180*(index % 2), 5+28*(index/2))); index++;
+            dc.DrawText(label, new Point(10 + 180*column, 5+28*row));
         }
     }
 }
@@ -60,7 +75,7 @@ sealed class LookupDetailsFixture : Window {
     readonly PaintedGroup opaque = new PaintedGroup { Height=140, Margin=new Thickness(8) };
     readonly ProviderResultGrid providerGrid = new ProviderResultGrid();
     readonly Button view = new Button { Content="VIEW", Width=70 };
-    Window detail;
+    Window detail, cover;
     TextBox comment;
     Button exit;
     int queries, opened, closed, archiveClicks;
@@ -91,7 +106,9 @@ sealed class LookupDetailsFixture : Window {
     void Fill(string key) {
         resultKey=key;
         providerGrid.Fill(key, queries);
-        opaque.Key=key; opaque.InvalidateVisual();
+        opaque.Key=key;
+        if (opaque.Oversized) { opaque.KeyColumn=queries%2; opaque.MatchRow=queries%2==0?1:2; }
+        opaque.InvalidateVisual();
         results.ItemsSource = new [] { new Record { Key="OTHER", Note="decoy" }, new Record { Key=key, Note="requested" } };
     }
     LookupDetailsFixture() {
@@ -106,6 +123,8 @@ sealed class LookupDetailsFixture : Window {
         results.View=grid;
         AutomationProperties.SetAutomationId(results,"ResultGrid");
         bool groupOnly = Environment.GetCommandLineArgs().Contains("--group-only");
+        opaque.Oversized = Environment.GetCommandLineArgs().Contains("--oversized-grid");
+        opaque.DuplicateColumnValue = Environment.GetCommandLineArgs().Contains("--duplicate-column-value");
         AutomationProperties.SetAutomationId(opaque, "PaintedResults");
         bool providerOnly = Environment.GetCommandLineArgs().Contains("--provider-grid");
         providerGrid.OpenResult = OpenDetail;
@@ -118,10 +137,20 @@ sealed class LookupDetailsFixture : Window {
             if(rec!=null) OpenDetail(rec.Key);
         };
         opaque.MouseLeftButtonDown+=delegate(object sender, MouseButtonEventArgs e) {
-            double y=e.GetPosition(opaque).Y;
-            if(e.ClickCount==2 && y>=33 && y<89) OpenDetail(y<61?"OTHER":resultKey);
+            Point p=e.GetPosition(opaque);
+            if(e.ClickCount==2 && p.Y>=33 && p.Y<89) {
+                if ((p.X < 180 ? 0 : 1) != opaque.KeyColumn) opaque.WrongColumns++;
+                OpenDetail((p.Y<61?1:2)==opaque.MatchRow?resultKey:"OTHER");
+            }
         };
-        ContentRendered+=delegate { Emit("ready"); new Thread(ReadCommands){IsBackground=true}.Start(); };
+        ContentRendered+=delegate {
+            if (Environment.GetCommandLineArgs().Contains("--cover-during-review")) {
+                cover=new Window {Title="Result review fixture cover",Width=Width,Height=Height,
+                    Left=Left,Top=Top,ShowInTaskbar=false,Content=new TextBlock {Text="Isolated background cover fixture"}};
+                cover.Show(); cover.Hide(); Activate();
+            }
+            Emit("ready"); new Thread(ReadCommands){IsBackground=true}.Start();
+        };
     }
     void OpenDetail(string key) {
             if (detail!=null) return;
@@ -148,15 +177,23 @@ sealed class LookupDetailsFixture : Window {
     }
     void Emit(string command) {
         var hwnd=new WindowInteropHelper(this).Handle.ToInt64();
-        if(command=="review-layout" && opaque.IsVisible) {
+        if(command.StartsWith("review-layout") && opaque.IsVisible) {
             NativeRect window;
             if (!GetWindowRect(new IntPtr(hwnd),out window)) throw new InvalidOperationException("fixture_window_bounds");
             Func<double,double,int[]> imagePoint=(x,y)=>{
                 var p=opaque.PointToScreen(new Point(x,y));
                 return new []{(int)Math.Round(p.X)-window.Left,(int)Math.Round(p.Y)-window.Top};
             };
+            int keyColumn=opaque.KeyColumn, matchRow=opaque.MatchRow;
+            if(command=="review-layout-next" && opaque.Oversized) { keyColumn=(queries+1)%2; matchRow=(queries+1)%2==0?1:2; }
+            var origin=imagePoint(0,0);
+            var end=imagePoint(opaque.ActualWidth,opaque.ActualHeight);
+            var rawEnd=opaque.Oversized?new []{window.Right-window.Left+107,end[1]}:end;
             Console.WriteLine(json.Serialize(new {
-                headerLeft=imagePoint(6,15),headerRight=imagePoint(165,15),cell=imagePoint(35,72),decoy=imagePoint(35,44),
+                headerLeft=imagePoint(6+180*keyColumn,15),headerRight=imagePoint(165+180*keyColumn,15),
+                cell=imagePoint(35+180*keyColumn,16+28*matchRow),decoy=imagePoint(35+180*keyColumn,16+28*(3-matchRow)),
+                visibleOrigin=origin,visibleEnd=new []{Math.Min(rawEnd[0],window.Right-window.Left),Math.Min(rawEnd[1],window.Bottom-window.Top)},
+                rawOrigin=origin,rawEnd,
                 groupOrigin=imagePoint(0,0),groupEnd=imagePoint(opaque.ActualWidth,opaque.ActualHeight),
                 imageSize=new []{window.Right-window.Left,window.Bottom-window.Top}}));
         } else if(command.StartsWith("point:")){
@@ -167,8 +204,11 @@ sealed class LookupDetailsFixture : Window {
                 Console.WriteLine(json.Serialize(new {x=(int)p.X,y=(int)p.Y,hwnd=new WindowInteropHelper(Window.GetWindow(target)).Handle.ToInt64()}));
             } else Console.WriteLine("{}");
         } else Console.WriteLine(json.Serialize(new {kind=command,hwnd,pid=Process.GetCurrentProcess().Id,title=Title,
+            coverHwnd=cover==null?0:new WindowInteropHelper(cover).Handle.ToInt64(),
             resultKey,last,queries,opened,closed,archiveClicks,wrongRows,detailOpen=detail!=null,
-            keyColumn=providerGrid.KeyColumn, matchRow=providerGrid.MatchRow, wrongColumns=providerGrid.WrongColumns,
+            keyColumn=opaque.IsVisible?opaque.KeyColumn:providerGrid.KeyColumn,
+            matchRow=opaque.IsVisible?opaque.MatchRow:providerGrid.MatchRow,
+            wrongColumns=providerGrid.WrongColumns+opaque.WrongColumns,
             providerGrid.HeaderReads, providerGrid.ItemReads, providerGrid.ValueReads}));
         Console.Out.Flush();
     }
@@ -176,7 +216,7 @@ sealed class LookupDetailsFixture : Window {
         string cmd; while((cmd=Console.ReadLine())!=null){
             string current=cmd;
             Dispatcher.Invoke(new Action(delegate {
-                if(current=="quit"){Close();return;}
+                if(current=="quit"){if(cover!=null)cover.Close();Close();return;}
                 if(current=="focus")Activate();
                 if(current=="reset"){input.Text="OLD";Fill("OLD");}
                 if(current=="missing" || current=="duplicate")providerGrid.Scenario=current;

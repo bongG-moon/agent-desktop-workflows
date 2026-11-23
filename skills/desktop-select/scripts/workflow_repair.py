@@ -535,6 +535,8 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
                             continuation['previous_input_dispatched'] = report['input_dispatched']
                             return continuation
                         report['review_diagnostic'] = continuation.get('diagnostic')
+                        if continuation.get('result_geometry'):
+                            report['result_geometry'] = continuation['result_geometry']
                         report['original_elapsed_seconds'] = report.get('elapsed_seconds')
                         report['elapsed_seconds'] = continuation['elapsed_seconds']
                     return report

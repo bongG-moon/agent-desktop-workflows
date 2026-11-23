@@ -182,12 +182,13 @@ class Session:
         pending = self.folder / ('pending-' + token + '.json')
         answer = self.folder / ('answer-' + token + '.json')
         expires = time.time() + ANSWER_TTL
+        image_sha256 = hashlib.sha256(png).hexdigest()
         _publish(image, png)
         try:
             _json(pending, dict(expires=expires, timeout=self.timeout, pid=os.getpid(), clock=coordination.clock_token(),
-                                sha256=hashlib.sha256(png).hexdigest()))
+                                sha256=image_sha256))
             self.arm(ANSWER_TTL + 5)
-            self.send(dict(progress, **prompt, status='needs_scene', image=str(image), ticket=ticket,
+            self.send(dict(progress, **prompt, status='needs_scene', image=str(image), image_sha256=image_sha256, ticket=ticket,
                            expires_seconds=ANSWER_TTL))
             self.cursor = token
             deadline = time.monotonic() + ANSWER_TTL
