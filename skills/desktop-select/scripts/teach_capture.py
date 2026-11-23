@@ -56,8 +56,11 @@ def capture_step(step):
     """Copy only data used by a Desktop Select command. All other inputs are review stops."""
     if step['action'] == 'visual-click':
         from visual_target import validate_spec
-        return dict(id=step['id'], action='visual-click', label=step['label'],
-                    visual=copy.deepcopy(validate_spec(step['visual'])))
+        result = dict(id=step['id'], action='visual-click', label=step['label'],
+                      visual=copy.deepcopy(validate_spec(step['visual'])))
+        if surface := learned_tasks.result_surface_hint(step):
+            result['result_surface'] = surface
+        return result
     target = step['target']
     locator = target.get('locator', {})
     action, role = step['action'], locator.get('role')
@@ -104,8 +107,14 @@ def capture_step(step):
                 for node in [step, target, *chain])
             if protected:
                 return manual('protected_input_not_recorded', step['id'])
-            surface = learned_tasks.recorded_result_surface(locator)
-            if surface:
+            if role in {'textfield', 'combobox', 'statictext'} and _capture_locator_valid(locator):
+                # Clicking a field can demonstrate where to read, without
+                # changing its value. Keep that identity as a hint only.
+                unknown['target'] = dict(kind='element', locator=copy.deepcopy(locator))
+                if step.get('field_label'):
+                    unknown['field_label'] = step['field_label']
+                    unknown['label'] = step['field_label']
+            elif surface := learned_tasks.recorded_result_surface(locator):
                 unknown['target'] = dict(kind='element', locator=surface)
         return unknown
     result = {'id': step['id'], 'action': action, 'label': (step.get('field_label')
@@ -1195,6 +1204,8 @@ class _Worker(recorder.CaptureWorker):
     def capture_double(self, down, observation):
         previous = self.recent_click or {}
         previous_id = previous.get('step_id')
+        with self.model.lock:
+            surface = learned_tasks.result_surface_hint(self.model.steps.get(previous_id, {}))
         result = super().capture_double(down,observation)
         if result:
             with self.model.lock:
@@ -1215,6 +1226,12 @@ class _Worker(recorder.CaptureWorker):
                     if step.get('recognition', {}).get('reason') == 'double_click_needs_review':
                         self.model.add(dict(id=previous_id, action='visual-click', label='녹화한 항목 더블클릭',
                                             visual=dict(spec, gesture='double-click')))
+            if (surface and previous_id and down.get('scope_proven') is True
+                    and down.get('window') == self.binding.hwnd):
+                with self.model.lock:
+                    step = self.model.steps.get(previous_id, {})
+                    if learned_tasks.is_double_click_step(step):
+                        step['result_surface'] = surface
         return result
 
     def _drop_watch(self):

@@ -101,6 +101,93 @@ class ResultCellTests(unittest.TestCase):
         with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
             self.find()
 
+    def test_current_single_row_needs_no_recorded_text_or_column_match(self):
+        self.cell.values[30005] = 'changed runtime value'
+        self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid), self.row)
+        self.cell.values[30005] = 'another runtime value'
+        self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid), self.row)
+
+    def test_single_row_rejects_multiple_but_explicit_first_uses_current_vertical_order(self):
+        lower = self.node(self.grid, 50007, 'next row', 0, 240)
+        lower.box['y'] = 50
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_ambiguous'):
+            result_cell.find_row(self.binding, self.uia, self.grid)
+        self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid, mode='first'), self.row)
+        lower.box['y'] = 0
+        self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid, mode='first'), lower)
+        lower.box['y'] = self.row.box['y']
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_ambiguous'):
+            result_cell.find_row(self.binding, self.uia, self.grid, mode='first')
+
+    def test_first_row_grid_provider_uses_only_current_row_zero_without_text_reads(self):
+        self.grid.values.update({30030: True, 30062: 4, 30063: 2})
+        self.cell.values.update({30064: 0, 30065: 0, 30005: 'a new value'})
+        with patch.object(result_cell.grid_provider, 'column_cells', return_value=iter([self.cell])) as cells:
+            self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid, mode='first'), self.cell)
+            cells.assert_called_once_with(self.grid, 0, 1)
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_ambiguous'):
+            result_cell.find_row(self.binding, self.uia, self.grid)
+        self.grid.values[30062] = 0
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_missing'):
+            result_cell.find_row(self.binding, self.uia, self.grid, mode='first')
+
+    def test_current_row_rejects_missing_or_false_grid_row_zero(self):
+        self.grid.values.update({30030: True, 30062: 1, 30063: 2})
+        self.cell.values[30064] = 1
+        with patch.object(result_cell.grid_provider, 'column_cells', return_value=iter([self.cell])):
+            with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+                result_cell.find_row(self.binding, self.uia, self.grid)
+        self.cell.values[30064] = 0
+        self.cell.values[30022] = True
+        self.grid.values[30063] = 1
+        with patch.object(result_cell.grid_provider, 'column_cells', return_value=iter([self.cell])):
+            with self.assertRaisesRegex(win.BridgeError, 'result_row_not_visible'):
+                result_cell.find_row(self.binding, self.uia, self.grid)
+
+    def test_opaque_table_returns_once_without_subtree_value_scans(self):
+        group = self.prepare_painted_group()
+        with patch.object(result_cell, '_cells_in', side_effect=AssertionError('unnecessary subtree scan')):
+            with self.assertRaisesRegex(win.BridgeError, 'result_column_unavailable'):
+                result_cell.find(self.binding, self.uia, group, 'runtime', column='Code')
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_unavailable'):
+            result_cell.find_row(self.binding, self.uia, group)
+
+    def test_current_row_guard_blocks_a_new_second_row_before_input(self):
+        sent = self.prepare_pointer()
+        def change():
+            self.node(self.grid, 50007, 'new second row', 0, 240).box['y'] = 50
+        guards = iter((lambda: None, change))
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_ambiguous'):
+            result_cell.execute_row(self.binding, self.uia, self.grid, lambda: next(guards)())
+        sent.assert_not_called()
+
+    def test_current_row_rejects_visible_peer_under_hidden_row_ancestor(self):
+        self.row.values[30022] = True
+        child = self.node(self.row, 50007, 'misreported visible row', 0, 240)
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_not_visible'):
+            result_cell.find_row(self.binding, self.uia, self.grid)
+        self.grid.values.update({30030: True, 30062: 1, 30063: 2})
+        self.cell.values.update({30064: 0, 30065: 0})
+        with patch.object(result_cell.grid_provider, 'column_cells', return_value=iter([self.cell])):
+            with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+                result_cell.find_row(self.binding, self.uia, self.grid)
+
+    def test_current_row_does_not_hide_additional_offscreen_results(self):
+        hidden = self.node(self.grid, 50007, 'offscreen result', 0, 240)
+        hidden.values[30022] = True
+        hidden.box['y'] = 50
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_ambiguous'):
+            result_cell.find_row(self.binding, self.uia, self.grid, mode='single')
+        with self.assertRaisesRegex(win.BridgeError, 'result_row_not_visible'):
+            result_cell.find_row(self.binding, self.uia, self.grid, mode='first')
+
+    def test_current_single_row_sends_one_double_click(self):
+        sent = self.prepare_pointer()
+        receipt = result_cell.execute_row(self.binding, self.uia, self.grid, lambda: None)
+        self.assertEqual(receipt['target_resolution'], 'current_single_result')
+        self.assertTrue(receipt['input_dispatched'])
+        sent.assert_called_once_with(120, 29, 'double-click')
+
     def test_nested_grid_same_x_coordinate_is_not_a_match(self):
         inner = self.node(self.row, 50008, 'Other table', 0, 240)
         inner_row = self.node(inner, 50007, 'row', 0, 240)

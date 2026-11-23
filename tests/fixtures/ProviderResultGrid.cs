@@ -12,6 +12,8 @@ using System.Windows.Media;
 public sealed class ProviderResultGrid : Grid {
     public int HeaderReads, ItemReads, ValueReads, WrongColumns;
     public int KeyColumn, MatchRow;
+    public int VisibleRows = 2;
+    readonly bool rowOnly = Array.IndexOf(Environment.GetCommandLineArgs(), "--row-only") >= 0;
     public string Scenario = "match";
     public Action<string> OpenResult;
     readonly DisplayCell[,] cells = new DisplayCell[3,2];
@@ -30,17 +32,19 @@ public sealed class ProviderResultGrid : Grid {
         MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e) {
             var cell = e.OriginalSource as DisplayCell;
             if (e.ClickCount != 2 || cell == null || cell.Row == 0) return;
-            if (cell.Column != KeyColumn) WrongColumns++;
+            if (!rowOnly && cell.Column != KeyColumn) WrongColumns++;
             OpenResult(cells[cell.Row, KeyColumn].Caption);
         };
     }
     public void Fill(string expected, int queryNumber) {
         KeyColumn = queryNumber % 2;
-        MatchRow = (queryNumber % 2 == 0 ? 1 : 2);
+        VisibleRows = Scenario == "empty" ? 0 : Scenario == "single" ? 1 : 2;
+        MatchRow = Scenario == "single" || Scenario == "first" ? 1 : (queryNumber % 2 == 0 ? 1 : 2);
         for (int column=0; column<2; column++) {
             cells[0, column].Show(column == KeyColumn ? "Equip ID" : "Category");
             AutomationProperties.SetAutomationId(cells[0, column], column == KeyColumn ? "KeyHeader" : "CategoryHeader");
             for (int row=1; row<=2; row++) {
+                cells[row, column].Visibility = row <= VisibleRows ? Visibility.Visible : Visibility.Collapsed;
                 // The other row has the requested text in a DIFFERENT column.
                 string key = Scenario == "missing" ? "OTHER-" + row :
                     (row == MatchRow || Scenario == "duplicate" ? expected : "OTHER");
@@ -61,7 +65,7 @@ public sealed class ProviderResultGrid : Grid {
             return pattern == PatternInterface.Table || pattern == PatternInterface.Grid ? this : base.GetPattern(pattern);
         }
         public int ColumnCount { get { return 2; } }
-        public int RowCount { get { return 2; } }
+        public int RowCount { get { return grid.VisibleRows; } }
         public RowOrColumnMajor RowOrColumnMajor { get { return RowOrColumnMajor.RowMajor; } }
         public IRawElementProviderSimple[] GetColumnHeaders() {
             grid.HeaderReads++;

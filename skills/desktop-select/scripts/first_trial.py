@@ -1,5 +1,6 @@
 """Test a saved demonstration once, without creating a business skill."""
 import json
+from hashlib import sha256
 import os
 import re
 import stat
@@ -78,16 +79,54 @@ def inspect_result(app, receipt_id):
     def check():
         app.guard(binding, binding, identity['title'])
         app.visibility.require_observable(binding)
-    rect, image = grounding._capture(app, binding, check)
+    geometry = None
+    if inspection.get('result_row'):
+        import python_workflow
+        with app.bridge.UIA() as uia:
+            table, selector = python_workflow._result_target(binding, uia, inspection['selector'], None)
+            box = dict(uia.bounds(table))
+            rect, image = grounding._capture(app, binding, check)
+            if uia.bounds(table) != box:
+                raise tasks.TaskError('result_table_changed')
+            result_trial.visible_table_box(rect, box)
+            geometry = dict(selector=selector, table_box=box, window_rect=list(rect))
+    else:
+        rect, image = grounding._capture(app, binding, check)
     token, path = grounding.store_frame(grounding._directory(), receipt_id.encode('ascii'), image)
+    image_digest = sha256(image).hexdigest()
+    image_unchanged = inspection.get('image_sha256') == image_digest
+    frame_geometry = dict(geometry, frame=token) if geometry else None
+    if not image_unchanged or (geometry and inspection.get('frame_geometry') != frame_geometry):
+        inspection['image_sha256'] = image_digest
+        if geometry:
+            inspection['frame_geometry'] = frame_geometry
+        # Bind the host's later point to this exact table/frame, never an old marker.
+        report.pop('previous_trial', None)
+        report.pop('this_call_dispatched_input', None)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=directory, mode='w', encoding='utf8', delete=False) as stream:
+                tmp = stream.name
+                json.dump(report, stream, ensure_ascii=False, allow_nan=False)
+            os.replace(tmp, directory / (receipt_id + '.json'))
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
     result = dict(status='observed', diagnostic='current_result_window_captured', input_dispatched=False,
-                source_step=inspection['source_step'], column=inspection['column'],
+                source_step=inspection['source_step'], column=inspection.get('column'),
                 window=identity['title'], frame=token, image=str(path), width=rect[2], height=rect[3],
+                image_sha256=image_digest, image_unchanged=image_unchanged,
+                image_review='reuse_if_already_seen' if image_unchanged else 'review_current_image',
                 trial_receipt=receipt_id, result_match='unverified', prior_steps_replayed=False)
     if inspection.get('resume_supported'):
-        result['resume_args'] = ['resume-trial','--receipt',receipt_id,'--frame',token,
-            '--column',inspection['column'],'--value','<observed exact cell text>',
-            '--point','<cell text x>','<cell text y>','--allow-physical']
+        result['resume_args'] = ['resume-trial','--receipt',receipt_id,'--frame',token]
+        if inspection.get('result_row'):
+            result.update(result_row=inspection['result_row'], table_box=geometry['table_box'],
+                          row_confirmation='confirm_current_visible_rows_in_this_frame')
+            result['resume_args'] += ['--row-policy', inspection['result_row']]
+        else:
+            result['resume_args'] += ['--column',inspection['column'],'--value','<observed exact cell text>']
+        result['resume_args'] += ['--point','<cell text x>','<cell text y>','--allow-physical']
     return result
 
 
@@ -106,6 +145,9 @@ def _once(directory, key, callback):
         result = callback()
     except Exception:
         return _previous(path)
+    if result.get('diagnostic') == 'no_interactive_desktop' and result.get('input_dispatched') is False:
+        path.unlink(missing_ok=True)
+        return result
     # A process crash or interrupted write leaves the original reservation intact.
     try:
         with tempfile.NamedTemporaryFile(dir=folder, delete=False, mode='w', encoding='utf-8') as file:
@@ -141,6 +183,10 @@ def run(app, args):
                                  args.hwnd, args.trial_id])
     existing = tasks._directory(directory / 'first-trials') / (key + '.json')
     if existing.exists():
+        import trial_menu
+        menu_resumed = trial_menu.prior(app, key)
+        if menu_resumed:
+            return menu_resumed
         import result_trial
         resumed = result_trial.prior(existing.parent, key)
         if resumed:
@@ -184,12 +230,19 @@ def run(app, args):
     if profile['physical_input_required'] and not args.allow_physical:
         return dict(status='needs_consent', diagnostic='first_trial_physical_input_required', required_option='--allow-physical',
                     input_requirements=profile, input_dispatched=False)
+    refusal = input_policy.interactive_desktop_blocked(profile)
+    if refusal:
+        return refusal
     def dispatch():
         if recovery._fingerprint(tasks.read_document(doc['name'], directory)) != source_key:
             return dict(status='blocked', diagnostic='recording_draft_changed', input_dispatched=False)
         prepared_at = time.monotonic()
-        report = app.worker_receipt(['_plan'], mutating=True, payload=dict(recipe=recipe,
-                    overrides=overrides, hwnd=args.hwnd, background_only=args.background_only))
+        payload = dict(recipe=recipe, overrides=overrides, hwnd=args.hwnd, background_only=args.background_only)
+        if any(python_workflow.workflow_repair.menu(step) for step in recipe['steps']):
+            import trial_menu
+            trial_menu.prepare(app, key, doc, name, envelope)
+            payload['menu_trial'] = dict(receipt=key, auto_repair_frame=getattr(args, 'auto_repair_frame', False))
+        report = app.worker_receipt(['_plan'], mutating=True, payload=payload)
         observations = []
         for row in report.get('steps', []):
             step = recipe['steps'][row['number'] - 1]
@@ -212,7 +265,9 @@ def run(app, args):
             if source_steps:
                 report['original_stopped_steps'] = [int(n) for n, prepared in source_steps.items()
                                                     if prepared == report['source_stopped_at']]
-        if report.get('status') in ('blocked', 'uncertain', 'needs_grounding') and report.get('input_dispatched') is not False:
+        if (report.get('status') in ('blocked', 'uncertain', 'needs_grounding')
+                and report.get('input_dispatched') is not False
+                and not (report.get('menu_repair') or report.get('input_pause', {}).get('ticket'))):
             report['host_action'] = 'check_current_effect_before_continuing'
         if report.get('source_stopped_at') and report.get('steps'):
             last = report['steps'][-1]
@@ -234,9 +289,23 @@ def run(app, args):
                     if result_trial.supported(recipe, number) and diagnostic not in ('result_table_missing', 'target_missing'):
                         report['result_inspection'].update(resume_supported=True, recipe_hash=recovery._fingerprint(recipe),
                             expected_hash=recovery._fingerprint([key, expected]), source_hash=source_key, source_task=doc['name'])
+            elif (last['number'] == number and step['action'] == 'double-click-result' and step.get('result_row')
+                  and receipt.get('input_dispatched') is False and window):
+                if receipt.get('diagnostic') == 'result_row_unavailable':
+                    import result_trial
+                    report.update(host_action='inspect_current_result_without_replaying',
+                        result_inspection=dict(source_step=report['source_stopped_at'], result_row=step['result_row'],
+                            selector=receipt.get('result_surface_selector') or step['selector'],
+                            observed_at=time.time(), window=window, capture_requires_consent=True,
+                            args=['inspect-trial', '--receipt', key]))
+                    if result_trial.supported(recipe, number):
+                        report['result_inspection'].update(resume_supported=True, recipe_hash=recovery._fingerprint(recipe),
+                            source_hash=source_key, source_task=doc['name'])
+                else:
+                    report['host_action'] = 'report_unmatched_result'
         elif report.get('status') in ('verified', 'completed_unverified'):
             report['host_action'] = 'report_completed_trial'
-        report.update(effective_task=name, trial_receipt=key, preparation_seconds=round(prepared_at-started, 3),
+        report.update(effective_task=report.get('effective_task', name), trial_receipt=key, preparation_seconds=round(prepared_at-started, 3),
                       execution_seconds=round(time.monotonic()-prepared_at, 3))
         if source_steps:
             report['source_steps'] = source_steps

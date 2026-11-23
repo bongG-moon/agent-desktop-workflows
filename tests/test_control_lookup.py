@@ -122,6 +122,9 @@ class FakeUIA:
     def parent(self, node):
         return node.parent_node
 
+    def children(self, node):
+        return (item for item in self.nodes.values() if item.parent_node is node)
+
     def from_handle(self, hwnd):
         return self.root if hwnd == 123 else None
 

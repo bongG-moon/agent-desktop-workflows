@@ -30,6 +30,17 @@ class StoragePathsTests(unittest.TestCase):
         self.assertEqual(observed['source'], 'skill_installation')
         self.assertFalse(self.project.exists(), 'Path selection must not create data or project folders')
 
+    def test_capture_locations_explain_expiry_without_creating_or_deleting_files(self):
+        temp_root=self.base/'system-temp'
+        store=self.project/'.desktop-select/tasks'
+        before=list(self.base.iterdir())
+        observed=storage.capture_info(store,temporary_root=temp_root)
+        self.assertEqual(Path(observed['temporary_frames']['directory']), temp_root/'desktop-select-grounding')
+        self.assertEqual(observed['temporary_frames']['expires_seconds'],600)
+        self.assertIn('next_access',observed['temporary_frames']['cleanup'])
+        self.assertIn('kept_with_recording',observed['recorded_markers']['cleanup'])
+        self.assertEqual(list(self.base.iterdir()),before)
+
     def test_same_named_tasks_in_separate_project_installs_do_not_collide(self):
         second = self.base / 'project-b' / '.claude' / 'skills' / 'desktop-select' / 'scripts' / 'storage_paths.py'
         first_store = storage.default_store(module_path=self.module, home=self.home, env={})

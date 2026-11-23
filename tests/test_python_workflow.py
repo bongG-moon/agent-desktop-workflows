@@ -236,6 +236,98 @@ class RuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(receipt['result_observation']['wait_seconds'],1.8)
         structure.assert_not_called()
 
+    def test_row_only_mode_opens_current_result_without_old_image_or_value_comparison(self):
+        import result_cell
+        import visual_target
+        selector = dict(role='table', automation_id='Results')
+        data = dict(recipe(), steps=[dict(action='invoke', selector=dict(role='button', name='VIEW')),
+                     dict(action='double-click-result', result_row='single', selector=selector, label='Open current row')])
+        self.uia.same.side_effect = lambda a, b: a is b
+        sent = dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched',
+                    input_dispatched=True, physical_input=True)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'find_row', return_value=self.element) as read,
+              patch.object(result_cell, 'execute_row', return_value=sent) as click,
+              patch.object(result_cell, 'find', side_effect=AssertionError('no requested equality')),
+              patch.object(visual_target, 'observe', side_effect=AssertionError('no fixed image baseline')),
+              patch.object(visual_target, 'execute', side_effect=AssertionError('no old image click')),
+              patch.object(flow.live, 'execute', side_effect=self.execute) as invoke):
+            result = flow.run(data)
+        self.assertEqual(result['status'], 'completed_unverified', result)
+        self.assertFalse(result['steps'][-1]['receipt']['value_comparison'])
+        self.assertEqual(result['steps'][-1]['receipt']['query_freshness'], 'not_asserted')
+        self.assertEqual(read.call_args.kwargs['mode'], 'single')
+        self.assertEqual(click.call_args.kwargs['mode'], 'single')
+        invoke.assert_called_once()
+        self.assertEqual([n for n, _ in flow.selected_steps(data, 2)], [2])
+
+    def test_row_only_opaque_surface_has_one_scoped_handoff_and_no_retry(self):
+        import result_cell
+        selector = dict(role='group', automation_id='PaintedResults')
+        step = dict(action='double-click-result', result_row='single', selector=selector)
+        box = dict(x=20, y=150, width=900, height=400)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'find_row', side_effect=flow.app.bridge.BridgeError('result_row_unavailable')) as read,
+              patch.object(result_cell, 'execute_row') as click,
+              patch.object(self.uia, 'bounds', return_value=box),
+              patch.object(flow.time, 'sleep') as sleep):
+            result = flow.run(dict(recipe(), steps=[step]))
+        receipt = result['steps'][-1]['receipt']
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(receipt['diagnostic'], 'result_row_unavailable')
+        self.assertEqual(receipt['result_surface_selector'], selector)
+        self.assertEqual(receipt['result_table_bounds'], box)
+        self.assertIn('result_window', receipt)
+        self.assertFalse(result['input_dispatched'])
+        read.assert_called_once()
+        click.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_row_only_schema_rejects_value_and_unknown_row_policy(self):
+        step = dict(action='double-click-result', result_row='first', selector=dict(role='table'))
+        self.assertEqual(flow.validate(dict(recipe(), steps=[step]))['steps'], [step])
+        for change in ({'result_row': 'any'}, {'value': 'old literal'}, {'selector': {'role': 'button', 'name':'VIEW'}}):
+            with self.assertRaises(flow.WorkflowError):
+                flow.validate(dict(recipe(), steps=[dict(step, **change)]))
+
+    def test_waiting_for_result_reuses_only_unique_table_locator_not_value(self):
+        import result_cell
+        selector = dict(role='table', automation_id='CurrentResults')
+        step = dict(action='verify-value', selector=dict(role='table'), result_column='Code', value='LAB-42')
+        now = [200.]
+        def sleep(seconds):
+            now[0] += seconds
+        with (patch.object(flow, 'result_surface', return_value=self.element) as resolve,
+              patch.object(flow, '_stable_result_selector', return_value=selector) as stable,
+              patch.object(result_cell, 'find', side_effect=[flow.app.bridge.BridgeError('result_cell_missing'), self.element]) as read,
+              patch.object(flow.time, 'monotonic', side_effect=lambda: now[0]),
+              patch.object(flow.time, 'sleep', side_effect=sleep)):
+            receipt = flow.observe_result(self.binding, self.uia, step, 'LAB-42', lambda: None, wait_seconds=5)
+        self.assertEqual(receipt['status'], 'verified')
+        self.assertEqual([call.args[-1] for call in resolve.call_args_list], [{'role':'table'}, selector])
+        stable.assert_called_once()
+        self.assertEqual(read.call_count, 2)
+
+    def test_row_only_waits_for_empty_grid_but_does_not_retry_ambiguous_rows(self):
+        import result_cell
+        step = dict(action='double-click-result', result_row='single', selector=dict(role='table'))
+        now = [200.]
+        def sleep(seconds):
+            now[0] += seconds
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'find_row', side_effect=[flow.app.bridge.BridgeError('result_row_missing'), self.element]),
+              patch.object(flow.time, 'monotonic', side_effect=lambda: now[0]),
+              patch.object(flow.time, 'sleep', side_effect=sleep)):
+            receipt = flow.observe_result_row(self.binding, self.uia, step, lambda: None, wait_seconds=5)
+        self.assertEqual(receipt['status'], 'observed')
+        self.assertEqual(receipt['result_observation']['attempts'], 2)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'find_row', side_effect=flow.app.bridge.BridgeError('result_row_ambiguous')),
+              patch.object(flow.time, 'sleep') as sleep):
+            receipt = flow.observe_result_row(self.binding, self.uia, step, lambda: None, wait_seconds=5)
+        self.assertEqual(receipt['diagnostic'], 'result_row_ambiguous')
+        sleep.assert_not_called()
+
     def test_generic_surface_keeps_native_resolution_and_ambiguity_ahead_of_history(self):
         group = dict(role='group', automation_id='PaintedSurface')
         table = dict(role='table')

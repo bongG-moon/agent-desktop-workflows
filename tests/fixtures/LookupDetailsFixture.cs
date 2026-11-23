@@ -219,7 +219,8 @@ sealed class LookupDetailsFixture : Window {
                 if(current=="quit"){if(cover!=null)cover.Close();Close();return;}
                 if(current=="focus")Activate();
                 if(current=="reset"){input.Text="OLD";Fill("OLD");}
-                if(current=="missing" || current=="duplicate")providerGrid.Scenario=current;
+                if(current=="missing" || current=="duplicate" || current=="single" || current=="first" || current=="empty")
+                    providerGrid.Scenario=current;
                 Emit(current);
             }));
             if(cmd=="quit")break;

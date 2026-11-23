@@ -102,10 +102,12 @@ class ReviewedPointTests(unittest.TestCase):
             self.assertTrue(result_cell.readable_surface(self.binding, self.uia, self.table, self.uia.root))
             with self.assertRaisesRegex(ValueError, 'result_point_outside_table'):
                 self.check()
-            # The opaque group must now reach the column-read diagnostic and local handoff.
-            with patch.object(result_cell, '_column', side_effect=win.BridgeError('result_column_unavailable')):
+            # An owned, clipped empty group reaches the local handoff without
+            # searching for column/row descendants that it does not expose.
+            with patch.object(result_cell, '_column', side_effect=AssertionError('unnecessary column scan')) as scan:
                 with self.assertRaisesRegex(win.BridgeError, 'result_column_unavailable'):
                     result_cell.find(self.binding, self.uia, self.table, 'A1', column='ID')
+                scan.assert_not_called()
 
     def test_partial_read_rejects_offscreen_minimized_hidden_and_nonoverlapping_surfaces(self):
         with patch.object(row_vision, '_window_rect', return_value=self.rect):

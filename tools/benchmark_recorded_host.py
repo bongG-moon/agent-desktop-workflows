@@ -123,13 +123,21 @@ def request(seed):
     return (
         f'저장한 작업 "{ORIGINAL}"을 현재 열린 "{seed["fixtureWindow"]}" 화면에서 첫 시험하고, '
         '현재 화면에 맞지 않는 위치는 화면을 보고 보정한 뒤 이 프로젝트의 업무 스킬로 등록해줘. '
-        f'스킬 폴더 이름은 {REGISTERED}로 해줘. Family=Hybrid, MES Setup=N으로 실행하고 '
+        f'스킬 폴더 이름은 {REGISTERED}로 해줘. Family는 이번 입력값 Hybrid로 실행하고 '
+        'MES Setup은 녹화에 저장된 고정값 N을 유지해. '
         '원본 녹화는 그대로 남겨줘. 이 합성 시험 창에서 조회와 결과 표 우클릭, '
         'Export to excel > Active sheet 내보내기, 필요한 마우스 조작과 보정용 화면 캡처까지 허용해. '
-        '조회부터 중복 실행하지 말고 결과를 확인해줘. 아래는 저장 시 받은 응답이야. '
-        '이 녹화는 테스트 하네스가 생성한 합성 녹화이며 실제 사람의 시연 기록은 아니야.\n\n'
-        + json.dumps(seed['preparedReceipt'], ensure_ascii=False)
+        '조회부터 중복 실행하지 말고 결과를 확인해줘. '
+        '이 녹화는 테스트 하네스가 생성한 합성 녹화이며 실제 사람의 시연 기록은 아니야.'
     )
+
+
+def verified_output(receipt):
+    """Trials retain step receipts; registered summary runs also aggregate outputs."""
+    return receipt.get('status') == 'verified' and bool(receipt.get('verified_outputs') or any(
+        row.get('receipt', {}).get('status') == 'verified'
+        and row['receipt'].get('workbook_verified') is True
+        for row in receipt.get('steps', [])))
 
 
 def permission_validator(root, project, skill):
@@ -144,12 +152,35 @@ def permission_validator(root, project, skill):
         result = Path(value)
         return (result if result.is_absolute() else (directory or project) / result).resolve()
 
-    def frame_images():
-        found = set()
+    def receipt_grants():
+        """Only returned receipt arguments authorize continuation, never arbitrary IDs."""
+        found = dict(images=set(), tickets=set(), frame_pairs=set(), frames={}, tasks={ORIGINAL, EFFECTIVE},
+                     frameless=set())
         def walk(value):
             if isinstance(value, dict):
+                if isinstance(value.get('effective_task'), str):
+                    found['tasks'].add(value['effective_task'])
                 if isinstance(value.get('image'), str):
-                    found.add(path(value['image']))
+                    found['images'].add(path(value['image']))
+                token = value.get('frame')
+                if (isinstance(token, str) and re.fullmatch('[a-f0-9]{64}', token)
+                        and type(value.get('width')) is int and type(value.get('height')) is int):
+                    found['frames'][token] = (value['width'], value['height'])
+                for key in ('args', 'resume_args', 'frame_args'):
+                    arguments = value.get(key)
+                    if not isinstance(arguments, list) or not all(isinstance(v, str) for v in arguments):
+                        continue
+                    pairs = dict(zip(arguments, arguments[1:]))
+                    command = arguments[0] if arguments and not arguments[0].startswith('--') else 'run'
+                    for flag, length in (('--receipt', 64), ('--resume-menu', 48),
+                                         ('--repair-frame', 48), ('--resume-input', 48)):
+                        ticket = pairs.get(flag, '')
+                        if re.fullmatch('[a-f0-9]{' + str(length) + '}', ticket):
+                            found['tickets'].add((command, flag, ticket))
+                            if re.fullmatch('[a-f0-9]{64}', pairs.get('--frame', '')):
+                                found['frame_pairs'].add((command, flag, ticket, pairs['--frame']))
+                            elif command == 'resume-menu-trial' and '--frame' not in arguments and '--point' not in arguments:
+                                found['frameless'].add((command, ticket))
                 for child in value.values():
                     walk(child)
             elif isinstance(value, list):
@@ -181,7 +212,7 @@ def permission_validator(root, project, skill):
                 return True
             return (candidate.parent == (Path(tempfile.gettempdir()) / 'desktop-select-grounding').resolve()
                     and re.fullmatch('[a-f0-9]{64}\\.png', candidate.name) is not None
-                    and candidate in frame_images())
+                    and candidate in receipt_grants()['images'])
         if name not in ('PowerShell', 'Bash'):
             return False
         command = inputs.get('command')
@@ -227,34 +258,87 @@ def permission_validator(root, project, skill):
             return False
         if tail == ['--help']:
             return True
-        if kind == 'workflow' and (not tail or tail.pop(0) != 'register'):
+        action = tail.pop(0) if kind != 'runner' else 'run'
+        contracts = {
+            ('desktop', 'show'): ({'--task'}, set(), {'--task'}),
+            ('desktop', 'plan'): ({'--task'}, set(), {'--task'}),
+            ('desktop', 'recover'): ({'--task'}, {'--prepare', '--restore-window'}, {'--task'}),
+            ('desktop', 'try-recording'): ({'--task', '--set'},
+                {'--allow-physical', '--background-only', '--auto-repair-frame'}, {'--task'}),
+            ('desktop', 'inspect-trial'): ({'--receipt'}, set(), {'--receipt'}),
+            ('desktop', 'inspect-menu-trial'): ({'--receipt', '--set'}, {'--allow-physical'},
+                                               {'--receipt', '--allow-physical'}),
+            ('desktop', 'resume-menu-trial'): ({'--receipt', '--frame', '--point', '--set'}, {'--allow-physical'},
+                                              {'--receipt', '--allow-physical'}),
+            ('desktop', 'resume-trial'): ({'--receipt', '--frame', '--point', '--row-policy'},
+                                         {'--allow-physical'}, {'--receipt', '--frame', '--point', '--allow-physical'}),
+            ('workflow', 'register'): ({'--task', '--out', '--set'},
+                {'--summary', '--run', '--allow-physical', '--auto-repair-frame', '--background-only'}, {'--task', '--out'}),
+            ('runner', 'run'): ({'--set', '--resume-menu', '--repair-frame', '--resume-input', '--frame', '--point'},
+                {'--summary', '--allow-physical', '--auto-repair-frame', '--read-only', '--input-plan', '--background-only'}, set()),
+        }
+        contract = contracts.get((kind, action))
+        if contract is None:
             return False
-        if kind == 'desktop' and (not tail or tail.pop(0) not in ('show', 'plan', 'recover')):
-            return False
-        flags = {'--summary', '--allow-physical', '--auto-repair-frame', '--run', '--prepare',
-                 '--restore-window', '--read-only', '--input-plan'}
+        valued, flags, required = contract
+        parsed = {}
         while tail:
             flag = tail.pop(0)
+            if flag in parsed and flag != '--set':
+                return False
             if flag in flags:
+                parsed[flag] = True
                 continue
+            if flag not in valued:
+                return False
             if flag == '--point':
                 if len(tail) < 2 or any(not value.isdecimal() or int(value) > 10000 for value in tail[:2]):
                     return False
+                parsed[flag] = tuple(map(int, tail[:2]))
                 del tail[:2]
                 continue
             if not tail:
                 return False
             value = tail.pop(0)
-            if flag == '--task' and value in (ORIGINAL, EFFECTIVE):
+            if flag == '--set':
+                supplied = parsed.setdefault(flag, [])
+                if value not in ('Family=Hybrid', 'MES Setup=N') or value in supplied:
+                    return False
+                supplied.append(value)
+                continue
+            parsed[flag] = value
+            if flag == '--task' and value in receipt_grants()['tasks']:
                 continue
             if flag == '--out' and path(value, command_directory) == registered.resolve():
                 continue
-            if flag == '--set' and value == 'Family=Hybrid':
+            if flag in ('--resume-menu', '--repair-frame', '--resume-input', '--receipt'):
                 continue
-            if flag in ('--resume-menu', '--repair-frame') and re.fullmatch('[a-f0-9]{48}', value):
+            if flag == '--frame':
                 continue
-            if flag == '--frame' and re.fullmatch('[a-f0-9]{64}', value):
+            if flag == '--row-policy' and value in ('single', 'first'):
                 continue
+            return False
+        if not required <= parsed.keys() or ('--allow-physical' in parsed and '--background-only' in parsed):
+            return False
+        continuing = [flag for flag in ('--resume-menu', '--repair-frame', '--resume-input', '--receipt') if flag in parsed]
+        if len(continuing) > 1:
+            return False
+        grants = receipt_grants() if continuing else None
+        for flag in continuing:
+            if (action, flag, parsed[flag]) not in grants['tickets']:
+                return False
+        if '--frame' in parsed or '--point' in parsed:
+            if not continuing or not {'--frame', '--point'} <= parsed.keys():
+                return False
+            frame = parsed['--frame']
+            if (action, continuing[0], parsed[continuing[0]], frame) not in grants['frame_pairs']:
+                return False
+            width, height = grants['frames'].get(frame, (0, 0))
+            if not (0 <= parsed['--point'][0] < width and 0 <= parsed['--point'][1] < height):
+                return False
+        if '--resume-menu' in parsed and not {'--frame', '--point', '--allow-physical'} <= parsed.keys():
+            return False
+        if action == 'resume-menu-trial' and '--frame' not in parsed and (action, parsed['--receipt']) not in grants['frameless']:
             return False
         return True
     return validate
@@ -300,8 +384,9 @@ def observe_model(root, fixture, project, skill, args, prompt):
     receipts = summary.get('receipts', [])
     repair = next((row for row in receipts if row['receipt'].get('menu_repair')), None)
     completed = next((row for row in receipts if row['receipt'].get('menu_corrections')), None)
-    verified = next((row for row in receipts if row['receipt'].get('status') == 'verified'
-                     and row['receipt'].get('verified_outputs')), None)
+    verified = next((row for row in receipts if verified_output(row['receipt'])), None)
+    trial = next((row for row in receipts if row['receipt'].get('trial_receipt')), None)
+    registration = next((row for row in receipts if row['receipt'].get('status') == 'registered'), None)
     poll_lead = summary['cliStartedMonotonic'] - started
     first_mutation = round(first['elapsedSeconds'] - poll_lead, 6) if first else None
     prompt_sent = summary.get('promptSentSeconds')
@@ -314,6 +399,8 @@ def observe_model(root, fixture, project, skill, args, prompt):
                   workflowModelToolCount=len(calls) - len(hook_calls), publicCliToolCount=len(public_calls),
                   publicCliPreToolBlockedCount=sum(call.get('blockedByPreToolHook', False) for call in public_calls),
                   inheritedHookToolCount=len(hook_calls),
+                  imageReadCount=sum(call.get('tool') == 'Read' and str(
+                      call.get('input', {}).get('file_path', '')).lower().endswith('.png') for call in calls),
                   deniedToolCount=sum(not decision['allowed'] for decision in summary.get('permissionDecisions', [])),
                   firstToolSeconds=next((call['startedSeconds'] for call in summary.get('toolCalls', [])), None),
                   firstPublicCliSeconds=public_calls[0]['startedSeconds'] if public_calls else None,
@@ -324,6 +411,10 @@ def observe_model(root, fixture, project, skill, args, prompt):
                       if prompt_sent is not None and first_mutation is not None else None),
                   repairResponseSeconds=repair['elapsedSeconds'] if repair else None,
                   correctionResponseSeconds=completed['elapsedSeconds'] if completed else None,
+                  firstTrialResponseSeconds=trial['elapsedSeconds'] if trial else None,
+                  firstTrialPreparationSeconds=trial['receipt'].get('preparation_seconds') if trial else None,
+                  firstTrialExecutionSeconds=trial['receipt'].get('execution_seconds') if trial else None,
+                  registrationResponseSeconds=registration['elapsedSeconds'] if registration else None,
                   verifiedOutputResponseSeconds=verified['elapsedSeconds'] if verified else None,
                   verifiedOutputFromPromptSeconds=(round(verified['elapsedSeconds'] - prompt_sent, 6)
                       if prompt_sent is not None and verified else None),

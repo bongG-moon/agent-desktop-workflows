@@ -397,7 +397,8 @@ def restore_routes(flow, recipe, record, routes):
         routes.bindings[flow.window_context._key(spec)] = child
 
 
-def run_registered(flow, recipe, args, overrides, scene_session=None):
+def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_result_review=True,
+                   allow_recorded_selection=False):
     """One worker owns the stored ticket until its checked input has been consumed."""
     import review_drafts
     session = RepairSession(args.recipe)
@@ -450,8 +451,8 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
             recipe = run_recipe = current
             result_ticket = getattr(args, 'confirm_result_locally', None)
             local_review = getattr(args, 'local_result_review', False)
-            if (not args.only and not args.repair_frame and not args.resume_menu and not resume_input
-                    and any('result_column' in s for s in recipe['steps'])):
+            if (enable_result_review and not args.only and not args.repair_frame and not args.resume_menu and not resume_input
+                    and any('result_column' in s or 'result_row' in s for s in recipe['steps'])):
                 import registered_result
                 result_review = registered_result.ResultReview(session, recipe, args.recipe)
                 if registered_result.eligible(recipe):
@@ -498,7 +499,7 @@ def run_registered(flow, recipe, args, overrides, scene_session=None):
         started = time.monotonic()
         report = flow.run(run_recipe, overrides, hwnd=resume['scope'][0][0] if resume else args.hwnd,
                           only=resume['only'] if resume else args.only, track_menu=True, resume=resume,
-                          scene_session=scene_session, **surface_options)
+                          scene_session=scene_session, allow_recorded_selection=allow_recorded_selection, **surface_options)
         if result_review and not resume:
             learned = [dict(row['receipt']['result_element'], number=row['number']) for row in report.get('steps',[])
                        if row.get('receipt',{}).get('result_element') and row['receipt']['status'] == 'verified']

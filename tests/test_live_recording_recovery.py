@@ -65,7 +65,7 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
 
     def test_prepare_and_instruct_on_original_draft_point_straight_to_double_click_grounding(self):
         from recording_followup import followup
-        text = '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'
+        text = '설정 항목을 더블 클릭해서 팝업 창을 띄워줘'
         self.rows = [dict(step=teach_capture.manual('double_click_needs_review'),
                           form=dict(alias='',text=text,mode=None,argument=''))]
         self.store.save_draft(self.rows, 'invalid_step_instruction', 1)

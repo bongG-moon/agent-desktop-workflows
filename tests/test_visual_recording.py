@@ -101,10 +101,16 @@ class VisualRecordingTests(TestCase):
 
     def test_gesture_prose_accepts_natural_open_phrasing_and_preserves_changed_intent_for_review(self):
         recorded = dict(action='visual-click',visual=dict(self.proof,gesture='double-click'),label='녹화한 항목 더블클릭')
-        for text in ('이 행을 두 번 눌러 상세 창을 열어 줘','결과 행 더블클릭해서 상세 팝업을 띄워 줘',
-                     '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘','이 항목을 두 번 눌러 주세요'):
+        for text in ('이 행을 두 번 눌러 상세 창을 열어 줘','설정 항목 더블클릭해서 상세 팝업을 띄워 줘',
+                     '설정 항목을 더블 클릭해서 팝업 창을 띄워줘','이 항목을 두 번 눌러 주세요'):
             with self.subTest(text=text):
                 self.assertEqual(tasks.compile_instruction(recorded,text)['mode'],'visual-click')
+        for text in ('결과 행 더블클릭해서 상세 팝업을 띄워 줘',
+                     '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'):
+            with self.subTest(text=text):
+                spec = tasks.compile_instruction(recorded,text)
+                self.assertEqual((spec['mode'],spec['result_row']), ('double-click-result','single'))
+                self.assertNotIn('visual',spec)
         for text in ('이 행을 한 번만 클릭해줘','더블 클릭하지 말고 이 행을 삭제해줘','열렸으면 이 행을 더블 클릭해줘',
                      '팝업을 닫고 이 행을 두 번 눌러줘','이 행을 두 번 눌러 상세를 삭제해줘'):
             with self.subTest(text=text):

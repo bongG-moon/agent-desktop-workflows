@@ -66,6 +66,38 @@ class LocalReviewTests(unittest.TestCase):
         self.review.refresh()
         self.assertEqual(self.review.result,dict(refresh=True))
 
+    def test_row_review_accepts_one_point_and_explicit_confirmation_without_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'rows.png'
+            image = tk.PhotoImage(master=self.root, width=160, height=120)
+            image.write(str(path), format='png')
+            review = local.ResultReview(self.root, path, None, [20,10,120,80], row_policy='single')
+            self.assertIsNone(review.entry)
+            review.press(self.event(18,32))
+            review.release(self.event(18,32))
+            self.assertTrue(review.confirm.instate(['disabled']))
+            review.confirmed.set(True)
+            review.update_button()
+            review.accept()
+            self.assertEqual(review.result,dict(point=[38,42],row_policy='single',confirmed=True))
+
+    def test_row_review_resets_confirmation_after_point_change_and_requires_table_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'rows.png'
+            image = tk.PhotoImage(master=self.root, width=160, height=120)
+            image.write(str(path), format='png')
+            review = local.ResultReview(self.root, path, None, [20,10,120,80], row_policy='first')
+            review.press(self.event(18,32))
+            review.release(self.event(18,32))
+            review.confirmed.set(True)
+            review.update_button()
+            review.press(self.event(22,35))
+            review.release(self.event(22,35))
+            self.assertFalse(review.confirmed.get())
+            self.assertTrue(review.confirm.instate(['disabled']))
+            with self.assertRaisesRegex(local.ResultReviewError, 'result_row_review_scope_required'):
+                local.ResultReview(self.root, path, None, None, row_policy='first')
+
     def test_resized_scrolled_image_keeps_original_source_coordinates(self):
         root = tk.Tk()
         root.withdraw()
@@ -81,7 +113,13 @@ class LocalReviewTests(unittest.TestCase):
             image.write(str(path), format='png')
             review = local.ResultReview(root, path, 'Code', [200,100,1200,900], 'PART-42')
             review.canvas.configure(width=320, height=180)
+            # The hidden dialog retains its initial allocated geometry. Prevent
+            # grid stretching so this test really exercises a small viewport,
+            # including when another test enabled process-wide DPI awareness.
+            review.canvas.grid_configure(sticky='nw')
             root.update_idletasks()
+            self.assertLess(review.canvas.winfo_width(), 1200)
+            self.assertLess(review.canvas.winfo_height(), 900)
             review.canvas.xview_moveto(.2)
             review.canvas.yview_moveto(.3)
             left = int(review.canvas.canvasx(12))

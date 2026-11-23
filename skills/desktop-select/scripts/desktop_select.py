@@ -262,6 +262,7 @@ def storage_info():
     directory = task_directory()
     info = tasks.storage_paths.storage_info()
     return dict(status='observed', **info, execution_plan_directory=str(directory / 'execution-plans'),
+                capture_storage=tasks.storage_paths.capture_info(directory),
                 input_dispatched=False)
 
 
@@ -914,6 +915,9 @@ def run(args):
     if args.command == 'resume-trial':
         import result_trial
         return result_trial.resume(sys.modules[__name__], args)
+    if args.command in ('inspect-menu-trial', 'resume-menu-trial'):
+        import trial_menu
+        return trial_menu.continue_menu(sys.modules[__name__], args, inspect=args.command == 'inspect-menu-trial')
     if args.command == '_record_app':
         result = record_application(args.app, args.task)
         if result.get('status') == 'recorded' and getattr(args, 'session', None):
@@ -1219,15 +1223,26 @@ def parser():
     policy.add_argument('--background-only', action='store_true')
     trial.add_argument('--hwnd', type=int, help='disambiguate identical business windows')
     trial.add_argument('--trial-id', help='reuse the same ID on interruption; use a new ID for a deliberate repeat')
+    trial.add_argument('--auto-repair-frame', action='store_true',
+                       help='include an approved local menu-area image only after a before-click position failure')
     inspection = commands.add_parser('inspect-trial', help='capture the still-open result window from a paused trial without sending input')
     inspection.add_argument('--receipt', required=True)
     resume = commands.add_parser('resume-trial', help='continue from a unique result cell confirmed in a scoped trial image')
     resume.add_argument('--receipt', required=True)
     resume.add_argument('--frame', required=True)
-    resume.add_argument('--column', required=True)
-    resume.add_argument('--value', required=True)
+    resume.add_argument('--column')
+    resume.add_argument('--value')
+    resume.add_argument('--row-policy', choices=('single', 'first'), help='confirm visible rows without a value comparison')
     resume.add_argument('--point', type=int, nargs=2, required=True)
     resume.add_argument('--allow-physical', action='store_true')
+    for verb in ('inspect-menu-trial', 'resume-menu-trial'):
+        menu_trial = commands.add_parser(verb, help='continue a first-trial menu without repeating prior actions')
+        menu_trial.add_argument('--receipt', required=True)
+        menu_trial.add_argument('--allow-physical', action='store_true')
+        menu_trial.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
+        if verb == 'resume-menu-trial':
+            menu_trial.add_argument('--frame')
+            menu_trial.add_argument('--point', type=int, nargs=2)
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
@@ -1383,7 +1398,11 @@ def main():
         import python_workflow
         try:
             payload = json.load(sys.stdin)
-            result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
+            if 'menu_trial' in payload:
+                import trial_menu
+                result = trial_menu.execute(sys.modules[__name__], payload)
+            else:
+                result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
                                          allow_recorded_selection=True,
                                          background_only=payload.get('background_only', False), only=payload.get('only'),
                                          **({'result_confirmation': payload['result_confirmation']}
@@ -1415,7 +1434,7 @@ def main():
         return 2
     # Recording lasts as long as the user demonstrates. Replay has one timeout
     # per direct step, with the original window lifetime pinned throughout.
-    return worker(args) if is_worker or args.command in ('recorder', 'record', 'review', 'continue-recording', 'record-rows', 'replay', 'try-recording', 'resume-trial', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
+    return worker(args) if is_worker or args.command in ('recorder', 'record', 'review', 'continue-recording', 'record-rows', 'replay', 'try-recording', 'resume-trial', 'inspect-menu-trial', 'resume-menu-trial', 'tasks', 'show', 'plan', 'instruct', 'storage') else supervise(args, argv)
 
 
 if __name__ == '__main__':

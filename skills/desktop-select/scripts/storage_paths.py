@@ -4,6 +4,7 @@ This module only selects paths. The task store's existing local-path and reparse
 checks still apply before any file is read or written. No folder is created here.
 """
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -59,3 +60,24 @@ def storage_info(*, module_path=None, home=None, env=None):
 
 def default_store(*, module_path=None, home=None, env=None):
     return Path(storage_info(module_path=module_path, home=home, env=env)['task_directory'])
+
+
+def capture_info(task_directory, *, temporary_root=None):
+    """Explain retention without capturing, scanning, deleting or creating anything."""
+    temp = Path(tempfile.gettempdir() if temporary_root is None else temporary_root)
+    return {
+        'temporary_frames': {
+            'directory': str(temp / 'desktop-select-grounding'),
+            'expires_seconds': 600,
+            'cleanup': 'expired_pngs_on_next_access; successful_binding_and_local_review_delete_immediately',
+        },
+        'conditional_frames': {
+            'directory': str(temp / 'desktop-select-scenes'),
+            'cleanup': 'after_answer_or_worker_finish; expired_stopped_workers_on_next_start',
+        },
+        'recorded_markers': {
+            'directory': str(task_directory),
+            'format': 'small_pixel_patches_embedded_in_task_and_execution_plan_json',
+            'cleanup': 'kept_with_recording; copied_markers_also_remain_in_registered_workflow_json',
+        },
+    }

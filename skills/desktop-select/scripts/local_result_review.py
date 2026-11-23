@@ -22,10 +22,21 @@ def valid_choice(header, point, value, bounds):
             and left <= px <= right)
 
 
+def valid_row_choice(point, bounds, confirmed):
+    if (confirmed is not True or not isinstance(point, (list, tuple)) or len(point) != 2
+            or any(type(v) is not int for v in point)):
+        return False
+    x, y, w, h = bounds
+    return x <= point[0] < x + w and y <= point[1] < y + h
+
+
 class ResultReview:
-    def __init__(self, root, image_path, column, table_box, expected=None, *, frame_size=None):
+    def __init__(self, root, image_path, column, table_box, expected=None, *, frame_size=None, row_policy=None):
+        if row_policy is not None and (row_policy not in ('single', 'first') or table_box is None):
+            raise ResultReviewError('result_row_review_scope_required')
         self.root = root
         self.expected = expected
+        self.row_policy = row_policy
         self.result = self.header = self.point = self.start = None
         self.theme = recorder_theme.configure(root)
         scale = root.winfo_fpixels('1i') / 96.0
@@ -39,12 +50,15 @@ class ResultReview:
         ttk.Label(body, text='이어서 실행할 행 확인', style='Title.TLabel').pack(
             anchor='w', pady=(0, px(6)))
         first_instruction = ttk.Label(
-            body, text=f'1  「{column}」 열에서 열 제목의 왼쪽부터 오른쪽 끝까지 드래그하세요.',
+            body, text=('현재 표에 데이터 행이 한 개만 있으면 그 행의 셀을 클릭하세요.' if row_policy == 'single' else
+                        '현재 표의 첫 번째 데이터 행에서 셀을 클릭하세요.' if row_policy == 'first' else
+                        f'1  「{column}」 열에서 열 제목의 왼쪽부터 오른쪽 끝까지 드래그하세요.'),
             wraplength=px(760))
         first_instruction.pack(anchor='w')
         target = f'「{expected}」' if expected is not None else '요청한 값'
         second_instruction = ttk.Label(
-            body, text=f'2  {target}이 한 행에만 보이면 그 셀의 글자를 클릭하세요.',
+            body, text=('열 제목과 빈 영역은 선택하지 마세요. 데이터 행이 없거나 구별되지 않으면 취소하세요.'
+                        if row_policy else f'2  {target}이 한 행에만 보이면 그 셀의 글자를 클릭하세요.'),
             style='Muted.TLabel', wraplength=px(760))
         second_instruction.pack(anchor='w', pady=(px(4), 0))
         source = tk.PhotoImage(master=root, file=str(image_path))
@@ -87,15 +101,24 @@ class ResultReview:
         value_card = ttk.Frame(footer, style='Card.TFrame', padding=(px(14), px(8)))
         value_card.grid(row=0, column=0, sticky='ew')
         value_card.columnconfigure(1, weight=1)
-        ttk.Label(value_card, text='셀에 보이는 글자', style='Card.Section.TLabel').grid(
+        ttk.Label(value_card, text='현재 행 확인' if row_policy else '셀에 보이는 글자', style='Card.Section.TLabel').grid(
             row=0, column=0, sticky='w', pady=(0, px(6)))
         self.status = tk.StringVar(master=root)
         ttk.Label(value_card, textvariable=self.status, style='Badge.TLabel').grid(
             row=0, column=1, sticky='e', pady=(0, px(6)))
         self.value = tk.StringVar(master=root)
-        self.entry = ttk.Entry(value_card, textvariable=self.value)
-        self.entry.grid(row=1, column=0, columnspan=2, sticky='ew')
-        self.hint = tk.StringVar(master=root, value='화면에서 값을 구별하기 어렵거나 같은 값이 여러 행에 있으면 취소하세요.')
+        self.confirmed = tk.BooleanVar(master=root, value=False)
+        self.entry = None
+        if row_policy:
+            self.row_check = ttk.Checkbutton(value_card, variable=self.confirmed, command=self.update_button,
+                text='데이터 행이 한 개만 있고, 그 행을 선택했습니다.' if row_policy == 'single' else
+                     '현재 표의 첫 번째 데이터 행을 선택했습니다.')
+            self.row_check.grid(row=1, column=0, columnspan=2, sticky='w')
+        else:
+            self.entry = ttk.Entry(value_card, textvariable=self.value)
+            self.entry.grid(row=1, column=0, columnspan=2, sticky='ew')
+        self.hint = tk.StringVar(master=root, value=('선택한 행을 확인하고 체크하세요. 입력값과의 비교는 하지 않습니다.'
+                                if row_policy else '화면에서 값을 구별하기 어렵거나 같은 값이 여러 행에 있으면 취소하세요.'))
         hint_label = ttk.Label(value_card, textvariable=self.hint, style='Card.Muted.TLabel',
                                wraplength=px(740))
         hint_label.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(px(6), 0))
@@ -138,7 +161,7 @@ class ResultReview:
         self.start = self.xy(event)
 
     def drag(self, event):
-        if self.start is None:
+        if self.start is None or self.row_policy:
             return
         self.canvas.delete('preview')
         x,y = self.start
@@ -152,6 +175,16 @@ class ResultReview:
         ox,oy,w,h = self.bounds
         self.start = None
         self.canvas.delete('preview')
+        if self.row_policy:
+            self.point = None
+            self.confirmed.set(False)
+            self.canvas.delete('cell')
+            point = [ox+px, oy+py]
+            if abs(px-sx) < 4 and abs(py-sy) < 4 and valid_row_choice(point, self.bounds, True):
+                self.point = point
+                self.canvas.create_oval(px-6,py-6,px+6,py+6,outline=self.theme['accent'],width=2,tags='cell')
+            self.update_button()
+            return
         if abs(px-sx) >= 4:
             self.canvas.delete('selection')
             self.header = self.point = None
@@ -176,6 +209,11 @@ class ResultReview:
         self.update_button()
 
     def update_button(self):
+        if self.row_policy:
+            enabled = valid_row_choice(self.point, self.bounds, self.confirmed.get())
+            self.confirm.state(['!disabled'] if enabled else ['disabled'])
+            self.status.set('선택 완료' if enabled else '행 확인 필요' if self.point else '셀 선택 필요')
+            return
         value = self.value.get()
         exact = self.expected is None or self.expected == value
         if value and self.point:
@@ -188,7 +226,8 @@ class ResultReview:
 
     def accept(self):
         if self.confirm.instate(['!disabled']):
-            self.result = dict(header=self.header, point=self.point, value=self.value.get())
+            self.result = (dict(point=self.point, row_policy=self.row_policy, confirmed=True) if self.row_policy else
+                           dict(header=self.header, point=self.point, value=self.value.get()))
             self.root.destroy()
 
     def refresh(self):
@@ -196,11 +235,11 @@ class ResultReview:
         self.root.destroy()
 
 
-def choose(image_path, column, *, table_box=None, expected=None, frame_size=None):
+def choose(image_path, column=None, *, table_box=None, expected=None, frame_size=None, row_policy=None):
     """Return a local selection, a refresh request, or None on cancel."""
     root = tk.Tk()
     try:
-        review = ResultReview(root, image_path, column, table_box, expected, frame_size=frame_size)
+        review = ResultReview(root, image_path, column, table_box, expected, frame_size=frame_size, row_policy=row_policy)
         root.mainloop()
         return review.result
     finally:

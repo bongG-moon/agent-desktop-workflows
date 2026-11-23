@@ -109,13 +109,19 @@ def compile_plan(task, *, replacements=None):
             steps[number - 1] = step
     if len(steps) > 100:
         return _result('not_compatible', diagnostic='execution_plan_step_limit')
-    for i in range(1, len(steps)):
-        if tasks.same_result_double(steps[i], steps[i - 1]):
+    for i in range(len(steps)):
+        if i and tasks.same_result_double(steps[i], steps[i - 1]):
             source = steps[i]
             steps[i] = dict(action='double-click-result', label=source.get('instruction_draft') or
                             source.get('description') or source['label'])
             if 'window_context' in source:
                 steps[i]['window_context'] = source['window_context']
+        elif tasks.is_double_click_step(steps[i]):
+            source = steps[i]
+            sentence = source.get('instruction_draft') or source.get('description') or source.get('label', '')
+            intent = tasks.current_result_intent(source, sentence)
+            if intent:
+                steps[i] = tasks.instructed_step(source, intent)
     # Establish whole-task compatibility before deriving any executable steps.
     for number, step in enumerate(steps, 1):
         reason = None
@@ -147,7 +153,7 @@ def compile_plan(task, *, replacements=None):
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
         if step['action'] in (*tasks.OBSERVE_ACTIONS, 'close-popup', 'double-click-result'):
-            current = {k: deepcopy(step[k]) for k in ('action', 'label', 'selector', 'result_column') if k in step}
+            current = {k: deepcopy(step[k]) for k in ('action', 'label', 'selector', 'result_column', 'result_row') if k in step}
             if context is not None:
                 current['window_context'] = context
             if step['action'] == 'verify-value':
@@ -219,6 +225,11 @@ def compile_plan(task, *, replacements=None):
             elif (next_step['action'] == 'verify-value' and current_scope == next_scope
                   and tasks.is_query_button(step)):
                 pass  # The next read waits for the requested current result value.
+            elif (next_step['action'] == 'double-click-result' and next_step.get('result_row')
+                  and current_scope == next_scope):
+                # The typed row observer owns readiness. Its existence check
+                # does not depend on the preceding button's language or caption.
+                notes.append(dict(step=number, diagnostic='open_current_result', business_result='not_verified'))
             elif not independent and not dialog_sequence:
                 return _result('not_compatible', diagnostic='execution_plan_wait_required', step=number)
         selector = dict(role=step['role'])

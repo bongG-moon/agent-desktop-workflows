@@ -116,16 +116,22 @@ class ResultReview:
                 or not result_trial.supported(self.recipe, number)):
             return None
         receipt = rows[-1]['receipt']
-        if (not receipt.get('result_window') or receipt['input_dispatched'] is not False
-                or receipt.get('diagnostic') not in flow.RESULT_IMAGE_ERRORS):
-            return None
         step = self.recipe['steps'][number - 1]
-        values, _ = flow.values_for(self.recipe, overrides)
-        expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
+        row_policy = step.get('result_row')
+        image_errors = {'result_row_unavailable'} if row_policy else flow.RESULT_IMAGE_ERRORS
+        if (not receipt.get('result_window') or receipt['input_dispatched'] is not False
+                or receipt.get('diagnostic') not in image_errors):
+            return None
         ticket = secrets.token_hex(32)
         record = dict(ticket=ticket, recipe=self.fingerprint, number=number, window=receipt['result_window'],
-                      variables=_variables(overrides), expected=repair.digest([ticket, expected]),
+                      variables=_variables(overrides),
                       prior_input=report['input_dispatched'], expires=time.time() + grounding.TTL)
+        if row_policy:
+            record['row_policy'] = row_policy
+        else:
+            values, _ = flow.values_for(self.recipe, overrides)
+            expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
+            record['expected'] = repair.digest([ticket, expected])
         if receipt.get('result_surface_selector'):
             record['selector'] = receipt['result_surface_selector']
         if remember and repair.tested_rows(self.recipe, rows[:-1], 1, number):
@@ -182,8 +188,12 @@ class ResultReview:
         step = self.recipe['steps'][number-1]
         original_selector = step['selector']
         hint = record.get('selector')
+        row_policy = step.get('result_row')
+        repair.need(not row_policy or record.get('row_policy') == row_policy, 'result_row_policy_changed')
         values, _ = flow.values_for(self.recipe, overrides)
-        expected = values.get(step['parameter'].casefold()) if 'parameter' in step else step['value']
+        expected = None
+        if not row_policy:
+            expected = values.get(step['parameter'].casefold()) if 'parameter' in step else step['value']
         path = None
         local_review_seconds = 0
         geometry = {}
@@ -203,9 +213,9 @@ class ResultReview:
                 with flow.app.bridge.UIA() as uia:
                     try:
                         table, selector = flow._result_target(binding, uia, original_selector, hint,
-                                                             column=step['result_column'])
+                                                             column=step.get('result_column'))
                     except (ValueError, flow.app.bridge.BridgeError) as error:
-                        if selector != {'role':'table'} or getattr(error, 'code', None) != 'result_table_missing':
+                        if row_policy or selector != {'role':'table'} or getattr(error, 'code', None) != 'result_table_missing':
                             raise
                         group_boxes = {}
                     else:
@@ -221,22 +231,28 @@ class ResultReview:
                         geometry['visible_relative'] = table_box
                 frame, path = grounding.store_frame(grounding._directory(), key.encode('ascii'), png)
                 opened = time.monotonic()
-                choice = local_result_review.choose(path, step['result_column'], table_box=table_box,
-                                                    expected=expected, frame_size=rect[2:])
+                options = dict(row_policy=row_policy) if row_policy else {}
+                choice = local_result_review.choose(path, step.get('result_column'), table_box=table_box,
+                                                    expected=expected, frame_size=rect[2:], **options)
                 local_review_seconds += time.monotonic() - opened
                 if not choice or not choice.get('refresh'):
                     break
                 path.unlink(missing_ok=True)
             if choice is None:
                 return self.feedback(record, 'local_result_review_cancelled')
-            if repair.digest([key, choice['value']]) != record['expected']:
-                return self.feedback(record, 'confirmed_result_value_mismatch')
             x, y = choice['point']
-            left, head_y, right = choice['header']
-            repair.need(0 <= left < right < rect[2] and left <= x <= right
-                        and 0 <= head_y < y < rect[3], 'result_point_outside_column')
+            if row_policy:
+                repair.need(choice.get('row_policy') == row_policy and
+                            local_result_review.valid_row_choice(choice['point'], table_box, choice.get('confirmed')),
+                            'result_row_not_confirmed')
+            else:
+                if repair.digest([key, choice['value']]) != record['expected']:
+                    return self.feedback(record, 'confirmed_result_value_mismatch')
+                left, head_y, right = choice['header']
+                repair.need(0 <= left < right < rect[2] and left <= x <= right
+                            and 0 <= head_y < y < rect[3], 'result_point_outside_column')
             repair.need(time.time() < record['expires'], 'result_review_expired')
-            head = (rect[0] + (right + left)//2, rect[1] + head_y)
+            head = None if row_policy else (rect[0] + (right + left)//2, rect[1] + head_y)
             point = (rect[0]+x, rect[1]+y)
             # Reviewing the snapshot never reserves desktop input. Only this
             # explicitly confirmed physical continuation needs the target exposed.
@@ -252,14 +268,19 @@ class ResultReview:
                         repair.need(group_boxes.get((key_type, selector[key_type])) == box, 'result_table_changed')
                     else:
                         table, current_selector = flow._result_target(binding, uia, original_selector, hint,
-                                                                     column=step['result_column'])
+                                                                     column=step.get('result_column'))
                         repair.need(current_selector == selector, 'result_table_changed')
                         box = uia.bounds(table)
                         repair.need(box == recorded_box, 'result_table_changed')
-                        self._check_header(flow, binding, uia, table, step['result_column'], head, point)
+                        if not row_policy:
+                            self._check_header(flow, binding, uia, table, step['result_column'], head, point)
                     repair.need(result_trial.same_table_pixels(png, current, rect, box), 'result_frame_changed')
-                    repair.need(box['x'] <= rect[0]+left < rect[0]+right < box['x']+box['width']
-                                and box['y'] <= head[1] < point[1] < box['y']+box['height'], 'result_point_outside_table')
+                    if row_policy:
+                        repair.need(box['x'] <= point[0] < box['x']+box['width']
+                                    and box['y'] <= point[1] < box['y']+box['height'], 'result_point_outside_table')
+                    else:
+                        repair.need(box['x'] <= rect[0]+left < rect[0]+right < box['x']+box['width']
+                                    and box['y'] <= head[1] < point[1] < box['y']+box['height'], 'result_point_outside_table')
                     flow.check_result_point(binding, uia, selector, point, reviewed_frame=rect)
             suffix = result_trial.visual_suffix(self.recipe, number, png, [x, y], reviewed=True)
             repair.need(flow.load(recipe_path) == self.recipe, 'workflow_changed_during_repair')
@@ -270,8 +291,9 @@ class ResultReview:
             self._write(self.pending, dict(record, claimed=True))
             result = flow.run(suffix, hwnd=owner['hwnd'], result_confirmation=confirmation)
             result['local_review_seconds'] = round(local_review_seconds,4)
-            learned = dict(number=number, selector=selector) if selector.get('role') == 'group' else None
-            return self._finish(result, record, recipe_path, number, 'local_visual_confirmation', learned)
+            learned = dict(number=number, selector=selector) if not row_policy and selector.get('role') == 'group' else None
+            return self._finish(result, record, recipe_path, number - 1 if row_policy else number,
+                                'local_row_confirmation' if row_policy else 'local_visual_confirmation', learned)
         except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
             if geometry:
                 error.result_geometry = dict(geometry, **getattr(error, 'geometry', {}))
@@ -287,6 +309,20 @@ class ResultReview:
         import result_cell
         owner = record['window']
         number, hint = record['number'], record.get('selector')
+        if step.get('result_row'):
+            with flow.app.bridge.UIA() as uia:
+                probe = flow.observe_result_row(binding, uia, step, guard, wait_seconds=0)
+            if probe['status'] == 'observed':
+                suffix = result_trial.continuation(self.recipe, number)
+                repair.need(flow.load(recipe_path) == self.recipe, 'workflow_changed_during_repair')
+                self._write(self.pending, dict(record, claimed=True))
+                result = flow.run(suffix, hwnd=owner['hwnd'], result_owner=owner)
+                return self._finish(result, record, recipe_path, number-1, 'accessibility_row', None)
+            if probe.get('diagnostic') != 'result_row_unavailable':
+                reply = self.feedback(record, probe['diagnostic'])
+                reply.update(host_action='report_current_result', result_observation=probe.get('result_observation'))
+                return reply
+            return None
         if expected is None:
             # Old tickets deliberately contain only a salted hash. Use the original
             # argument for a live provider. An opaque window can still be reviewed.
@@ -310,12 +346,9 @@ class ResultReview:
             probe = flow.observe_result(binding, uia, step, expected, guard, wait_seconds=0,
                                         reviewed_group=hint, remember=True)
         if probe['status'] == 'verified':
-            suffix = deepcopy(self.recipe)
-            suffix['steps'] = suffix['steps'][number-1:]
+            suffix = result_trial.continuation(self.recipe, number, confirmed_initial_value=True)
             suffix['steps'][0].pop('parameter', None)
             suffix['steps'][0]['value'] = expected
-            for action in suffix['steps'][2:]:
-                action['window_context']['after_step'] = 2
             element = probe.get('result_element')
             options = dict(result_surface_hint=dict(number=1, **element)) if element else {}
             repair.need(flow.load(recipe_path) == self.recipe, 'workflow_changed_during_repair')

@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 import ctypes as C
 from ctypes import wintypes as W
+import os
 
 
 _POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'row-open', 'visual-click', 'double-click-result', 'conditional-open'})
@@ -64,6 +65,55 @@ def blocked(requirements):
     return dict(status='blocked', diagnostic='background_requires_desktop_interaction',
                 input_dispatched=False, physical_input=False, steps=[],
                 blocked_steps=blocked_steps, input_policy='background_only',
+                input_requirements=deepcopy(requirements))
+
+
+def _interactive_desktop(win=None):
+    """Read desktop identity only. Never switch, unlock or activate a desktop."""
+    if win is None:
+        if os.name != 'nt':
+            # The real window binding rejects non-Windows execution. Keep
+            # platform-independent recipe validation usable in tests/tools.
+            return True
+        import win_bridge as win
+    desktop = None
+    try:
+        user = win.user32
+        open_input = win._sig(user, 'OpenInputDesktop', W.HANDLE, W.DWORD, W.BOOL, W.DWORD)
+        close = win._sig(user, 'CloseDesktop', W.BOOL, W.HANDLE)
+        thread_desktop = win._sig(user, 'GetThreadDesktop', W.HANDLE, W.DWORD)
+        current_thread = win._sig(win.kernel32, 'GetCurrentThreadId', W.DWORD)
+        info = win._sig(user, 'GetUserObjectInformationW', W.BOOL, W.HANDLE, C.c_int,
+                        C.c_void_p, W.DWORD, C.POINTER(W.DWORD))
+        desktop = open_input(0, False, 1)  # DESKTOP_READOBJECTS, no switching access.
+        if not desktop:
+            return False
+        thread = thread_desktop(current_thread())
+        if not thread:
+            return False
+        names = []
+        for handle in (desktop, thread):
+            name, size = C.create_unicode_buffer(256), W.DWORD()
+            if not info(handle, 2, name, C.sizeof(name), C.byref(size)) or not name.value:
+                return False
+            names.append(name.value.casefold())  # UOI_NAME; Windows names ignore case.
+        return names[0] == names[1]
+    except (OSError, AttributeError, ValueError):
+        return False
+    finally:
+        if desktop:
+            close(desktop)  # The thread desktop is borrowed and must stay open.
+
+
+def interactive_desktop_blocked(requirements):
+    """Fail before a mixed workflow starts if its physical steps cannot run."""
+    physical = [row['number'] for row in requirements['steps']
+                if row['input_mode'] in ('physical_pointer', 'physical_keyboard')]
+    if not physical or _interactive_desktop():
+        return None
+    return dict(status='blocked', diagnostic='no_interactive_desktop',
+                host_action='unlock_desktop_before_retry', input_dispatched=False,
+                physical_input=False, steps=[], blocked_steps=physical,
                 input_requirements=deepcopy(requirements))
 
 

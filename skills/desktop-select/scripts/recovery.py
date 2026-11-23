@@ -9,6 +9,8 @@ import learned_tasks as tasks
 import review_drafts
 from window_context import ContextError, WindowRoutes, validate_context
 
+INTERPRETED_MODES = tasks.INTERPRETED_ACTIONS
+
 
 def _require(ok, reason):
     if not ok:
@@ -50,7 +52,8 @@ def _rows(doc):
     edits, rows = StepEdits(), []
     for number, row in enumerate(doc['rows'], 1):
         raw, form = row['step'], row['form']
-        entry = dict(text=form['text'], mode=form['mode'], argument=form['argument'], context=None)
+        entry = dict(text=form['text'], mode=form['mode'], argument=form['argument'], context=None,
+                     interpretation_source=deepcopy(raw))
         # A transient popup can be compiled as manual even when the recorder
         # identified a control. Keep its role/name when deciding what to fold.
         locator = raw.get('target', {}).get('locator', {})
@@ -112,6 +115,8 @@ def _summary(number, row, doc):
     if 'hint' in row:
         item['recorded_hint'] = {key: row['hint'][key] for key in ('match', 'target', 'role', 'label')
                                  if key in row['hint']}
+    if selector := tasks._recorded_selector(row.get('interpretation_source', step)):
+        item['recorded_selector'] = selector
     problem = row.get('scope_problem') or row.get('field_problem')
     if problem:
         item['diagnostic'] = problem
@@ -251,6 +256,27 @@ def _field(row, item, inventory):
         step['wait_after'] = wait
     step['instruction'] = tasks.compile_instruction(step, sentence, mode=mode, argument=argument)
     _require(step['instruction'] and step['instruction']['mode'] == mode, 'instruction_requires_structure')
+    return step
+
+
+def _interpreted_binding(row, item, inventory=None, *, app=None, surface=None):
+    """Bind the host's typed intent without requiring a particular source phrasing."""
+    _require(set(item) <= {'number', 'mode', 'selector', 'result_row'}, 'invalid_recovery_binding')
+    _require(row['mode'] not in ('fixed', 'required'), 'instruction_binding_conflict')
+    source = deepcopy(row.get('interpretation_source', row['step']))
+    if row['context']:
+        source['window_context'] = deepcopy(row['context'])
+    step = tasks.interpret_step(source, row['text'], item['mode'], item.get('selector'),
+                                result_row=item.get('result_row'))
+    if inventory is None:
+        # A closed downstream window cannot be observed now. Only retain its
+        # actual demonstrated identity, then resolve it after the opener runs.
+        captured = (tasks.result_surface_hint(source) if item['mode'] == 'double-click-result'
+                    else tasks._recorded_selector(source))
+        _require(captured == step['selector'] and any(k in captured for k in ('name', 'automation_id')),
+                 'recorded_target_required_for_deferred_binding')
+    else:
+        _observe_command(step, inventory, app, surface)
     return step
 
 
@@ -542,7 +568,7 @@ def _binding_map(file, fingerprint, count):
     indexed = {}
     for item in data['steps']:
         _require(isinstance(item, dict) and type(item.get('number')) is int and 1 <= item['number'] <= count and
-                 item.get('mode') in ('context-menu', 'recorded', 'fixed', 'required') and
+                 item.get('mode') in ('context-menu', 'recorded', 'fixed', 'required', *INTERPRETED_MODES) and
                  item['number'] not in indexed, 'invalid_recovery_binding')
         indexed[item['number']] = item
     return indexed
@@ -670,6 +696,13 @@ def _binding_lookups(operations, rows, context):
     for number, item in operations.items():
         if rows[number-1]['context'] != context:
             continue
+        if item['mode'] in INTERPRETED_MODES:
+            selector = item.get('selector')
+            from python_workflow import validate_selector
+            validate_selector(selector)
+            if selector not in selectors:
+                selectors.append(selector)
+            continue
         if item['mode'] == 'context-menu':
             # _menu revalidates the region/point independently. A supplied frame
             # also needs to disambiguate an untyped region name in the inventory.
@@ -691,7 +724,7 @@ def _binding_lookups(operations, rows, context):
 def _observe_command(step, inventory, app=None, surface=None):
     selector = step['selector']
     candidates = [node for node in inventory['targets'] if node.get('recorded_selector') == selector]
-    if not candidates and app is not None and surface is not None and 'anchor' in selector:
+    if not candidates and app is not None and surface is not None and any(k in selector for k in ('anchor', 'ancestors')):
         # A mixed draft can require a full inventory for another unknown step.
         # That inventory deliberately omits unnamed inputs. Resolve this exact
         # recorded input directly and reuse the result for its Enter stage.
@@ -809,14 +842,15 @@ def run(app, args):
                     # demonstration. Keep identified literal steps and validate
                     # their live targets immediately after their actual opener.
                     context = row.get('context')
-                    if not (prepare and error.code == 'recorded_window_not_open' and context
+                    interpreted = operation and operation['mode'] in INTERPRETED_MODES
+                    if not ((prepare or interpreted) and error.code == 'recorded_window_not_open' and context
                             and context.get('related') is True and origin in remap
-                            and not row.get('field_problem') and row['step']['action'] != 'manual'
+                            and (interpreted or (not row.get('field_problem') and row['step']['action'] != 'manual'
                             and (row['step']['action'] in (*tasks.CAPTURE_COMMANDS, *tasks.OBSERVE_ACTIONS,
                                                           'close-popup')
-                                 or row['step'].get('match') in ('automation_id', 'name'))):
+                                 or row['step'].get('match') in ('automation_id', 'name'))))):
                         raise
-                    step = deepcopy(row['step'])
+                    step = _interpreted_binding(row, operation) if interpreted else deepcopy(row['step'])
                     step['window_context'] = dict(context, after_step=remap[origin])
                     revised.append(step)
                     remap[number] = len(revised)
@@ -854,6 +888,8 @@ def run(app, args):
             if operation and operation['mode'] == 'context-menu':
                 step, skip_until = _menu(app, rows, operation, owner, surface, doc['window'], fingerprint,
                                          prepare=prepare, detail=detail, inventory=observation)
+            elif operation and operation['mode'] in INTERPRETED_MODES:
+                step = _interpreted_binding(row, operation, observation, app=app, surface=surface)
             elif operation:
                 step = _field(row, operation, observation)
             else:
@@ -900,6 +936,12 @@ def run(app, args):
                           'recorded_window_opener_unresolved') and row.get('context'):
                 detail['opener_step'] = row['context'].get('after_step')
             if deferred_prefix and reason == 'recorded_window_not_open' and number == deferred_prefix + 1:
+                if detail.get('recorded_selector') and not row.get('scope_problem'):
+                    return _blocked(result, 'instruction_requires_structure', step_number=number,
+                        bindings_template=template, host_action='bind_recorded_instructions_from_live_scopes',
+                        interpretation_hint=dict(number=number, text=detail['text'],
+                            selector=detail['recorded_selector'], window_context=row['context'],
+                            supported_modes=sorted(INTERPRETED_MODES), validation='after_recorded_opener'))
                 return _blocked(result, reason, step_number=number,
                         host_action='inspect_recorded_step_when_popup_opens', opener_step=origin,
                         instruction=detail['text'], window=detail['window'],

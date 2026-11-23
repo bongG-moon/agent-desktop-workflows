@@ -1,4 +1,4 @@
-"""Resume only a host-confirmed result row and its recorded detail dialog."""
+"""Resume a confirmed result without replaying earlier steps or losing dependencies."""
 from copy import deepcopy
 import struct
 import time
@@ -9,21 +9,53 @@ import learned_tasks as tasks
 import recovery
 
 
+def continuation(recipe, start_number, *, confirmed_initial_value=False):
+    """Keep original later operations and remap only their in-suffix dependencies.
+
+    An earlier opener is not replayed and cannot supply a fresh window binding.
+    Required values are not stored in review tickets, so a suffix needing one
+    needs a separate value-bearing continuation rather than an invented value.
+    """
+    if type(start_number) is not int or not 1 <= start_number <= len(recipe['steps']):
+        raise tasks.TaskError('result_resume_unavailable')
+    import python_workflow
+    python_workflow.validate(recipe)
+    suffix = deepcopy(recipe)
+    suffix['steps'] = suffix['steps'][start_number-1:]
+    for index, step in enumerate(suffix['steps']):
+        if 'parameter' in step and not (index == 0 and confirmed_initial_value):
+            raise tasks.TaskError('result_resume_parameter_required')
+        scope = step.get('window_context', {})
+        if 'after_step' in scope:
+            if scope['after_step'] < start_number:
+                raise tasks.TaskError('result_resume_prior_window_required')
+            step['window_context'] = dict(scope, after_step=scope['after_step'] - start_number + 1)
+    python_workflow.validate(suffix)
+    return suffix
+
+
 def supported(recipe, check_number):
     if type(check_number) is not int or not 1 <= check_number <= len(recipe['steps']):
         return False
     check = recipe['steps'][check_number - 1]
-    suffix = recipe['steps'][check_number:]
-    if (check.get('action') != 'verify-value' or not check.get('result_column')
-            or check.get('window_context') or check.get('popup') or len(suffix) < 2
-            or suffix[0]['action'] != 'double-click-result' or suffix[0].get('window_context')):
+    if check.get('action') == 'double-click-result' and check.get('result_row') in ('single', 'first'):
+        start = check_number
+    elif (check.get('action') == 'verify-value' and check.get('result_column')
+          and check_number < len(recipe['steps'])
+          and recipe['steps'][check_number]['action'] == 'double-click-result'):
+        start = check_number + 1
+    else:
         return False
-    scope = suffix[1].get('window_context') or {}
-    return (scope.get('related') is True and scope.get('after_step') == check_number + 1
-            and all(step.get('window_context') == scope and 'popup' not in step for step in suffix[1:])
-            and all(step['action'] == 'read-value' for step in suffix[1:-1])
-            and (suffix[-1]['action'] == 'read-value' or
-                 suffix[-1]['action'] == 'invoke' and suffix[-1].get('verify_closed') is True))
+    if any(recipe['steps'][i].get('window_context') or recipe['steps'][i].get('popup')
+           for i in range(check_number - 1, start)):
+        return False
+    try:
+        # Legacy value matching still needs its immediately preceding verified
+        # value while validating; visual_suffix replaces the linked pair below.
+        continuation(recipe, check_number, confirmed_initial_value=start != check_number)
+    except (ValueError, KeyError, TypeError):
+        return False
+    return True
 
 
 def visual_suffix(recipe, offset, image, point, *, reviewed=False):
@@ -37,10 +69,13 @@ def visual_suffix(recipe, offset, image, point, *, reviewed=False):
     builder = visual_target._frame_patch if reviewed else visual_target.from_frame
     spec = builder(rect, pixels, tuple(point))
     spec['gesture'] = 'double-click'
-    remaining = deepcopy(recipe['steps'][offset:])
-    remaining[0] = dict(action='visual-click', label=remaining[0]['label'], visual=spec)
+    start = offset - 1 if recipe['steps'][offset-1].get('result_row') else offset
+    remaining = deepcopy(recipe['steps'][start:])
+    remaining[0] = dict(action='visual-click', label=remaining[0].get('label', '현재 결과 행 열기'), visual=spec)
     for step in remaining[1:]:
-        step['window_context']['after_step'] = 1
+        scope = step.get('window_context', {})
+        if 'after_step' in scope:
+            step['window_context'] = dict(scope, after_step=scope['after_step'] - start)
     return dict(recipe, steps=remaining)
 
 
@@ -122,8 +157,13 @@ def resume(app, args):
                         required_option='--allow-physical', input_dispatched=False)
         if not 0 <= time.time() - inspection['observed_at'] <= grounding.TTL:
             raise tasks.TaskError('result_inspection_expired')
-        if (args.column != inspection['column'] or
-                recovery._fingerprint([receipt_id, args.value]) != inspection['expected_hash']):
+        row_mode = inspection.get('result_row')
+        if row_mode:
+            if (getattr(args, 'row_policy', None) != row_mode or args.column is not None or args.value is not None
+                    or inspection.get('frame_geometry', {}).get('frame') != args.frame):
+                raise tasks.TaskError('confirmed_result_row_mismatch')
+        elif (getattr(args, 'row_policy', None) is not None or args.column != inspection['column'] or
+              recovery._fingerprint([receipt_id, args.value]) != inspection['expected_hash']):
             raise tasks.TaskError('confirmed_result_value_mismatch')
         root = app.task_directory()
         source = tasks.read_document(inspection['source_task'], root)
@@ -137,11 +177,14 @@ def resume(app, args):
                 or not supported(recipe, offset)):
             raise tasks.TaskError('prepared_recording_changed')
         _, png = grounding.read_frame(grounding._directory(), receipt_id.encode('ascii'), args.frame)
-        suffix = visual_suffix(recipe, offset, png, args.point)
+        suffix = visual_suffix(recipe, offset, png, args.point, reviewed=bool(row_mode))
         remaining = suffix['steps']
         python_workflow.validate(suffix)
         confirmation = dict(owner=inspection['window'], frame=args.frame, receipt=receipt_id, point=args.point,
                             selector=deepcopy(recipe['steps'][offset-1]['selector']))
+        if row_mode:
+            confirmation.update({k: deepcopy(v) for k,v in inspection['frame_geometry'].items() if k != 'frame'})
+            offset -= 1
 
         def dispatch():
             result = app.worker_receipt(['_plan'], mutating=True, payload=dict(recipe=suffix, overrides={},
@@ -150,8 +193,12 @@ def resume(app, args):
             prior_steps = deepcopy(report['steps'])
             # Preserve the original unsuccessful UIA read alongside the separate
             # host observation. The visual observation is not provider evidence.
-            prior_steps[-1]['visual_observation'] = dict(column=args.column, value=args.value,
-                                                         evidence='host_read_scoped_image', frame=args.frame)
+            observation = dict(column=args.column, value=args.value, evidence='host_read_scoped_image', frame=args.frame)
+            if row_mode:
+                observation = dict(result_row=row_mode, evidence='host_confirmed_current_rows', frame=args.frame)
+                prior_steps = prior_steps[:-1]
+            else:
+                prior_steps[-1]['visual_observation'] = observation
             observations = list(report.get('observations', []))
             for row in result.get('steps', []):
                 number = row['number']
@@ -159,13 +206,19 @@ def resume(app, args):
                 row['source_step'] = envelope['source_steps'][row['number'] - 1]
                 info = row.get('receipt', row)
                 if remaining[number - 1]['action'] == 'read-value' and info.get('status') == 'observed':
-                    observations.append(dict(source_step=row['source_step'], field=remaining[number - 1]['label'],
+                    observed_step = remaining[number - 1]
+                    observed_selector = observed_step.get('selector', {})
+                    field = (observed_step.get('label') or observed_selector.get('name')
+                             or observed_selector.get('automation_id') or 'value')
+                    observations.append(dict(source_step=row['source_step'], field=field,
                                              value=info['value']))
             response = dict(result, steps=prior_steps + result.get('steps', []), trial_receipt=receipt_id,
                 frame=args.frame, image_point=args.point, resumed_after=offset, prior_steps_replayed=False,
                 resume_dispatched_input=result.get('input_dispatched'), observations=observations,
                 effective_task=report['effective_task'],
                 input_dispatched=python_workflow.combine(report['input_dispatched'],result.get('input_dispatched')))
+            if row_mode:
+                response['result_row_observation'] = observation
             if result.get('stopped_at'):
                 response['stopped_at'] = result['stopped_at'] + offset
                 response['source_stopped_at'] = envelope['source_steps'][response['stopped_at'] - 1]

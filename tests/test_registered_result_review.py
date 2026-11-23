@@ -90,6 +90,116 @@ class RegisteredResultTests(unittest.TestCase):
             dict(number=2, receipt=dict(status='observed', value='sample note', value_evidence=dict(status='observed'), input_dispatched=False)),
             dict(number=3, receipt=dict(status='verified', input_dispatched=True))])
 
+    def row_review(self, mode='single'):
+        scope = dict(exe='Demo.exe', title='Details', after_step=2, related=True)
+        self.recipe['steps'][1:3] = [dict(action='double-click-result', label='Open current row',
+                                              result_row=mode, selector=self.group)]
+        for step in self.recipe['steps'][2:]:
+            step['window_context'] = deepcopy(scope)
+        self.path.write_text(json.dumps(self.recipe), encoding='utf8')
+        self.blocked['steps'][-1]['receipt']['diagnostic'] = 'result_row_unavailable'
+        session = workflow_repair.RepairSession(self.path)
+        review = registered_result.ResultReview(session, self.recipe, self.path)
+        record = review.offer(flow, self.blocked, {})
+        return review, record
+
+    def test_current_row_offer_has_no_value_hash_and_rejects_missing_or_ambiguous_rows(self):
+        review, record = self.row_review()
+        self.assertEqual(record['row_policy'], 'single')
+        self.assertNotIn('expected', record)
+        self.capture.assert_not_called()
+        for diagnostic in ('result_row_missing', 'result_row_ambiguous', 'result_table_missing'):
+            self.blocked['steps'][-1]['receipt']['diagnostic'] = diagnostic
+            self.assertIsNone(review.offer(flow, self.blocked, {}))
+
+    def test_local_current_row_confirmation_skips_header_and_value_and_runs_only_suffix(self):
+        for mode in ('single', 'first'):
+            with self.subTest(mode=mode):
+                if mode == 'first':
+                    # Keep the same three suffix operations; only the declared row policy changes.
+                    self.recipe['steps'][1]['result_row'] = mode
+                    self.path.write_text(json.dumps(self.recipe), encoding='utf8')
+                    review = registered_result.ResultReview(workflow_repair.RepairSession(self.path), self.recipe, self.path)
+                    record = review.offer(flow, self.blocked, {})
+                else:
+                    review, record = self.row_review(mode)
+                self.choose.return_value = dict(point=[48,51], row_policy=mode, confirmed=True)
+                self.run.return_value = self.finished()
+                self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+                with (patch.object(flow, '_result_target', return_value=(MagicMock(), self.group)),
+                      patch.object(review, '_check_header', side_effect=AssertionError('no header needed'))):
+                    report = review.confirm(flow, record, self.path, {})
+                self.assertEqual([r['number'] for r in report['steps']], [2,3,4])
+                self.assertEqual(report['result_match_source'], 'local_row_confirmation')
+                self.assertFalse(report['prior_steps_replayed'])
+                self.assertEqual(self.choose.call_args.kwargs['row_policy'], mode)
+                self.assertIsNone(self.choose.call_args.kwargs['expected'])
+                self.assertEqual([s['action'] for s in self.run.call_args.args[0]['steps']],
+                                 ['visual-click','read-value','invoke'])
+                self.assertEqual(self.run.call_args.args[0]['steps'][1]['window_context']['after_step'], 1)
+                self.assertEqual(flow.load(self.path), self.recipe)
+                self.assertFalse(list(self.directory.glob('*.png')))
+                self.hit.assert_not_called()
+
+    def test_current_row_local_confirmation_keeps_scope_choice_and_frame_guards(self):
+        review, record = self.row_review()
+        self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+        with patch.object(flow, '_result_target', return_value=(MagicMock(), self.group)):
+            for choice in (dict(point=[48,51], row_policy='first', confirmed=True),
+                           dict(point=[48,51], row_policy='single', confirmed=False),
+                           dict(point=[127,127], row_policy='single', confirmed=True)):
+                self.choose.return_value = choice
+                report = review.confirm(flow, record, self.path, {})
+                self.assertEqual(report['diagnostic'], 'result_row_not_confirmed')
+                self.assertFalse(list(self.directory.glob('*.png')))
+            self.choose.return_value = dict(point=[48,51], row_policy='single', confirmed=True)
+            self.capture.side_effect = lambda *a, **k: self.snapshot(*a, **k) if not self.foreground.called else self.changed_at(82,30)
+            self.assertEqual(review.confirm(flow, record, self.path, {})['diagnostic'], 'result_frame_changed')
+            self.assertFalse(list(self.directory.glob('*.png')))
+        self.run.assert_not_called()
+
+    def test_current_row_missing_surface_never_prompts_for_an_unscoped_click(self):
+        review, record = self.row_review()
+        with patch.object(flow, '_result_target', side_effect=flow.WorkflowError('result_table_missing')):
+            report = review.confirm(flow, record, self.path, {})
+        self.assertEqual(report['diagnostic'], 'result_table_missing')
+        self.choose.assert_not_called()
+        self.capture.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_row_provider_becomes_readable_on_resume_without_query_or_image(self):
+        review, record = self.row_review()
+        self.run.return_value = self.finished()
+        with patch.object(flow, 'observe_result_row', return_value=dict(status='observed')) as probe:
+            report = review.confirm(flow, record, self.path, {}, try_elements=True)
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(probe.call_args.kwargs['wait_seconds'], 0)
+        self.assertEqual(report['result_match_source'], 'accessibility_row')
+        self.assertEqual([r['number'] for r in report['steps']], [2,3,4])
+        self.assertEqual([s['action'] for s in self.run.call_args.args[0]['steps']],
+                         ['double-click-result','read-value','invoke'])
+        self.assertEqual(self.run.call_args.args[0]['steps'][1]['window_context']['after_step'], 1)
+        self.choose.assert_not_called()
+        self.capture.assert_not_called()
+
+    def test_registered_row_review_one_call_keeps_action_number_and_never_adds_value_verification(self):
+        review, record = self.row_review()
+        review.pending.unlink()  # Start a fresh registered run, not a prior ticket.
+        self.recipe['steps'][1].pop('label')
+        self.path.write_text(json.dumps(self.recipe), encoding='utf8')
+        self.run.side_effect = [deepcopy(self.blocked), self.finished()]
+        self.choose.return_value = dict(point=[48,51], row_policy='single', confirmed=True)
+        self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+        with patch.object(flow, '_result_target', return_value=(MagicMock(), self.group)):
+            code, report = self.call('--allow-physical', '--local-result-review')
+        self.assertEqual(code, 3, report)
+        self.assertEqual(self.run.call_count, 2)
+        self.assertEqual([r['number'] for r in report['steps']], [1,2,3,4])
+        self.assertEqual(report['steps'][1]['receipt']['status'], 'delivered_unverified')
+        self.assertEqual(report['result_match_source'], 'local_row_confirmation')
+        self.assertFalse(report['prior_steps_replayed'])
+        self.assertNotIn('value_evidence', report['steps'][1]['receipt'])
+
     def test_registration_reuses_pending_query_and_runs_only_verified_detail_then_caches_surface(self):
         args = self.start()
         _, repeat = self.call('--set', 'part=D27', '--allow-physical')

@@ -198,34 +198,41 @@ class CompilationTests(unittest.TestCase):
         self.assertFalse(tasks.same_result_double(dict(action='manual', reason='double_click_needs_review',
                          instruction_draft='설정 아이콘을 더블클릭해줘'), verify))
 
-    def test_visual_double_click_preserves_legacy_draft_and_waits_for_the_recorded_row_after_view(self):
+    def test_result_double_click_uses_current_rows_instead_of_recording_pixels(self):
         from test_visual_target import image, visual, VisualTargets
         sentence = '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'
         raw = dict(action='manual', target={'kind':'manual'}, recognition={'reason':'double_click_needs_review'})
         draft = tasks.instructed_step(raw, tasks.compile_instruction(raw, sentence))
-        self.assertEqual(draft, dict(action='manual', reason='double_click_needs_review', instruction_draft=sentence))
-        self.assertTrue(tasks.has_groundable_draft(draft))
-        self.assertFalse(tasks.is_recoverable(draft))
+        self.assertEqual(draft['action'], 'double-click-result')
+        self.assertEqual(draft['result_row'], 'single')
+        self.assertFalse(tasks.has_groundable_draft(draft))
         marker = visual.from_frame(VisualTargets.window, image((35,42)), (235,162))
         hinted = dict(raw, visual_hint=marker)
         step = tasks.instructed_step(hinted, tasks.compile_instruction(hinted, sentence))
-        self.assertEqual(step['visual'], dict(marker, gesture='double-click'))
-        self.assertEqual(tasks.compile_instruction(step, '버튼을 한 번 눌러줘')['mode'], 'draft')
-        self.assertEqual(tasks.compile_instruction(step, '더블 클릭하지 마')['mode'], 'draft')
+        self.assertNotIn('visual', step)
+        self.assertIsNone(tasks.current_result_intent(hinted, '다음 결과 행을 더블클릭해줘'))
+        self.assertIsNone(tasks.current_result_intent(hinted, '결과를 더블 클릭하지 마'))
+        self.assertIsNone(tasks.current_result_intent(dict(raw, protected=True), sentence))
         self.assertFalse(tasks.is_double_click_step(dict(raw, protected=True)))
         src = recording()
         src['steps'] = [dict(action='open', role='button', match='automation_id', target='view',
                              command_name='VIEW', expand=False), draft]
-        self.assertEqual(plans.compile_plan(src)['diagnostic'], 'instruction_requires_structure')
-        self.assertEqual(plans.compile_plan(src, replacements={2:dict(step, visual=marker)})['status'], 'not_compatible')
-        src['steps'][1] = step
         envelope = plans.compile_plan(src)['envelope']
-        self.assertEqual([row['action'] for row in envelope['recipe']['steps']], ['invoke','visual-click'])
-        self.assertEqual(envelope['recipe']['steps'][1]['visual']['gesture'], 'double-click')
-        self.assertEqual(envelope['notes'][0]['diagnostic'], 'wait_for_double_click_target')
+        self.assertEqual([row['action'] for row in envelope['recipe']['steps']], ['invoke','double-click-result'])
+        self.assertEqual(envelope['recipe']['steps'][1]['result_row'], 'single')
+        self.assertNotIn('visual', str(envelope['recipe']))
+        self.assertEqual(envelope['notes'][0]['diagnostic'], 'open_current_result')
+        first = tasks.compile_instruction(raw, '조회 결과의 첫 행을 더블클릭해줘')
+        self.assertEqual(first['result_row'], 'first')
+        twice = tasks.compile_instruction(raw, '결과 행을 두 번 눌러 상세 창을 열어줘')
+        self.assertEqual(twice['result_row'], 'single')
         for caption in ('Delete', 'Apply'):
             src['steps'][0]['command_name'] = caption
-            self.assertEqual(plans.compile_plan(src)['diagnostic'], 'execution_plan_wait_required')
+            # The preceding command is recorded; current-row readiness is
+            # determined by its typed observer, not by a caption allowlist.
+            generic = plans.compile_plan(src)['envelope']
+            self.assertEqual([s['action'] for s in generic['recipe']['steps']], ['invoke', 'double-click-result'])
+            self.assertEqual(generic['notes'][0]['business_result'], 'not_verified')
 
     def test_run_time_values_on_unrelated_combo_and_text_field(self):
         zone = combo('배송 권역', 'deliveryZone', '배송 권역에 "서울"을 선택해줘. 매번 실행할 때 물어봐')

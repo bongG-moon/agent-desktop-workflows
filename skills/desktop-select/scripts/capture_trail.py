@@ -9,6 +9,29 @@ import learned_tasks
 import win_bridge as bridge
 
 
+def _double_opener(step):
+    """A reviewed action keeps the same gesture as its raw recording evidence."""
+    return (learned_tasks.is_double_click_step(step)
+            or isinstance(step, dict) and step.get('action') == 'double-click-result')
+
+
+def _query_then_double(steps):
+    """A demonstrated result double follows lookup/observation, not independent launches."""
+    if not steps or not _double_opener(steps[-1]):
+        return False
+    for previous in steps[:-1]:
+        if (previous.get('action') in learned_tasks.OBSERVE_ACTIONS
+                or previous.get('instruction', {}).get('mode') in learned_tasks.OBSERVE_ACTIONS):
+            continue
+        try:
+            command = learned_tasks.recorded_step(previous)
+        except (ValueError, bridge.BridgeError):
+            return False
+        if command.get('action') not in learned_tasks.OBSERVE_ACTIONS and not learned_tasks.is_query_button(command):
+            return False
+    return True
+
+
 def resolve_menu_scope(scope, steps, number):
     """Link a confirmed menu or reviewed result double-click to its opened window."""
     if not isinstance(scope, dict) or '_openers' not in scope or scope.get('related') is not True:
@@ -28,24 +51,10 @@ def resolve_menu_scope(scope, steps, number):
                 return scope
         except (ValueError, bridge.BridgeError):
             return scope
-    elif learned_tasks.is_double_click_step(latest):
-        # Review can establish that the preceding clicks were a lookup and a
-        # read-only row check, and the double-click was the requested opener.
-        text = (latest.get('instruction') or {}).get('text', '')
-        if not learned_tasks.double_click_instruction(text) or not any(
-                word in text.casefold() for word in ('열', '띄', 'open')):
-            return scope
-        prior = [step for _, step in candidates[:-1]]
-        if not prior or prior[-1].get('instruction', {}).get('mode') != 'verify-value':
-            return scope
-        for earlier in prior:
-            if earlier.get('instruction', {}).get('mode') in learned_tasks.OBSERVE_ACTIONS:
-                continue
-            try:
-                if not learned_tasks.is_query_button(learned_tasks.recorded_step(earlier)):
-                    return scope
-            except (ValueError, bridge.BridgeError):
-                return scope
+    elif _query_then_double([step for _, step in candidates]):
+        # The captured gesture and newly related window establish the route.
+        # A separate value-check step or "open window" wording is not required.
+        pass
     else:
         return scope
     resolved = dict(scope)
@@ -182,7 +191,8 @@ class CaptureTrail:
                     if not 0 <= at-when <= 90:
                         continue
                     reason = step.get('recognition', {}).get('reason')
-                    if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click','submit')
+                    if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click',
+                                          'double-click-result','submit')
                             or reason in ('row_capture_requires_review', 'stable_locator_unavailable',
                                           'capture_target_unavailable', 'unsupported_recorded_action',
                                           'right_click_requires_menu_teaching', 'popup_scope_unproven',
@@ -214,8 +224,9 @@ class CaptureTrail:
                             step.get('target', {}).get('locator', {}).get('role') == 'menuitem' or
                             reason == 'popup_scope_unproven')
             immediate_double = (at - last[0] <= 1.5 and (len(result) == 1 or last[0] - result[-2][0] > 1.5)
-                                and learned_tasks.is_double_click_step(step))
-            if (menu_command or immediate_double) and all(row[1] is part for row in result):
+                                and _double_opener(step))
+            lookup_double = _query_then_double([source.notes.steps[event] for _, source, event in result])
+            if (menu_command or immediate_double or lookup_double) and all(row[1] is part for row in result):
                 return [last]
         return result
 

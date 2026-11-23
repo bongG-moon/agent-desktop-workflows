@@ -16,7 +16,7 @@ class HostGroundingTests(TestCase):
         import random
         import review_drafts
         import teach_capture
-        sentence = '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'
+        sentence = '설정 항목을 더블 클릭해서 팝업 창을 띄워줘'
         with TemporaryDirectory() as td:
             folder = Path(td)
             source = review_drafts.ReviewStorage('demo','Example.exe','Example',folder)

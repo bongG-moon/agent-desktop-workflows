@@ -101,6 +101,81 @@ class WindowRecordingTests(TestCase):
         clicked(self.session.primary, 'launch-b', 1.2)
         self.assertEqual([r[2] for r in self.session._openers(1.4)], ['launch-a', 'launch-b'])
 
+    def test_query_then_double_links_delayed_same_process_detail_without_prose_or_value_check(self):
+        from test_recorded_plan import button
+        notes = self.session.primary.notes
+        notes.steps['query'] = dict(button(), id='query')
+        notes.times['query'] = 1.1
+        notes.steps['double'] = teach.manual('double_click_needs_review', 'double')
+        notes.times['double'] = 1.3
+        detail = Binding(5, self.parent.pid, 'Equipment detail')
+        key = (detail.hwnd, detail.pid)
+        self.pool[key] = detail
+        self.keys.add(key)
+        self.foreground = key
+        self.now = 4.  # The application need not open its form inside 1.5 seconds.
+        self.session.poll()
+        self.assertEqual(self.session.scope['after_id'], 'double')
+        self.assertTrue(self.session.scope['related'])
+        clicked(self.session.active, 'read-comment', 4.1)
+        saved = teach.finalize_contexts(self.session.snapshot())
+        self.assertEqual(saved[-1]['window_context'], dict(exe=detail.exe, title=detail.title,
+                                                         after_step=2, related=True))
+
+    def test_unknown_command_before_double_does_not_get_assumed_to_be_a_query(self):
+        notes = self.session.primary.notes
+        clicked(self.session.primary, 'launch', 1.1)
+        notes.steps['double'] = teach.manual('double_click_needs_review', 'double')
+        notes.times['double'] = 1.3
+        self.assertEqual([r[2] for r in self.session._openers(4.)], ['launch', 'double'])
+
+    def test_sole_opener_is_independent_of_caption_gesture_and_delay(self):
+        # A unique captured opener needs neither an application-specific button
+        # name nor a rapid arrival. No extra UI lookup is needed to decide it.
+        variants = [dict(action='click', label='Afficher'), dict(action='submit'),
+                    dict(action='visual-click', visual=dict(gesture='double-click')),
+                    teach.manual('double_click_needs_review', 'open'),
+                    dict(action='double-click-result', result_row='single'),
+                    dict(action='double-click-result', result_row='first')]
+        notes = self.session.primary.notes
+        for raw in variants:
+            for delay in (.1, 2., 30.):
+                with self.subTest(action=raw, delay=delay):
+                    notes.steps.clear()
+                    notes.times.clear()
+                    notes.steps['open'] = dict(raw, id='open')
+                    notes.times['open'] = 1.1
+                    self.assertEqual([row[2] for row in self.session._openers(1.1 + delay)], ['open'])
+
+    def test_reviewed_result_gesture_keeps_the_same_related_window_route(self):
+        # Review changes representation, not the demonstrated window relation.
+        observation = dict(id='observation', action='read-value')
+        variants = [teach.manual('double_click_needs_review', 'open'),
+                    dict(id='open', action='visual-click', visual=dict(gesture='double-click')),
+                    dict(id='open', action='double-click-result', result_row='single'),
+                    dict(id='open', action='double-click-result', result_row='first'),
+                    dict(id='open', action='double-click-result')]
+        for title in ('Invoice details', '注文の詳細', '선택 항목'):
+            scope = dict(exe='AnyApplication.exe', title=title, related=True,
+                         _openers=('observation', 'open'))
+            for opener in variants:
+                with self.subTest(title=title, action=opener):
+                    resolved = trail.resolve_menu_scope(scope, [observation, opener], 3)
+                    self.assertEqual(resolved, dict(exe=scope['exe'], title=title, related=True,
+                                                    after_id='open'))
+                    unknown = dict(id='unknown', action='click', label='Independent launch')
+                    ambiguous = dict(scope, _openers=('unknown', 'observation', 'open'))
+                    self.assertEqual(trail.resolve_menu_scope(ambiguous, [unknown, observation, opener], 4),
+                                     ambiguous)
+
+    def test_single_reviewed_opener_and_unrelated_window_keep_their_scope(self):
+        opener = dict(id='open', action='double-click-result', result_row='single')
+        scope = dict(exe='AnyApplication.exe', title='Details', related=True, _openers=('open',))
+        self.assertEqual(trail.resolve_menu_scope(scope, [opener], 2),
+                         dict(exe=scope['exe'], title=scope['title'], related=True, after_id='open'))
+        unrelated = dict(scope, related=False)
+        self.assertEqual(trail.resolve_menu_scope(unrelated, [opener], 2), unrelated)
+
     def test_opener_and_return_order_survive_delayed_capture_and_review_edits(self):
         clicked(self.session.primary,'unrelated',-100.)
         clicked(self.session.primary,'launch',1.2)

@@ -272,7 +272,15 @@ class RegisterFirstRunTests(unittest.TestCase):
         self.assertEqual(json.loads((self.destination / 'source-task.json').read_text(encoding='utf8')), before)
         self.assertEqual(source_task, before)
         self.assertEqual(engine.call_args.args[1], {'Family': 'Hybrid'})
-        self.assertEqual(flow.load(self.destination / 'workflow.json'), compiled['envelope']['recipe'])
+        registration.assert_not_called()
+        execution.assert_called_once()
+        engine.assert_called_once()
+        self.assertFalse(engine.call_args.kwargs['read_only'])
+        expected = deepcopy(compiled['envelope']['recipe'])
+        for step in expected['steps']:
+            if step['action'] == 'set-value' and step['selector']['role'] == 'combobox':
+                step['allow_option_select'] = True
+        self.assertEqual(flow.load(self.destination / 'workflow.json'), expected)
 
 
 if __name__ == '__main__':

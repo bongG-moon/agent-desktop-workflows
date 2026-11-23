@@ -369,7 +369,7 @@ class DraftSaveUITests(unittest.TestCase):
         from test_visual_target import image, visual, VisualTargets
 
         marker = visual.from_frame(VisualTargets.window, image((35, 42)), (235, 162))
-        gesture = '결과 행을 더블클릭해 상세 창을 열어 줘'
+        gesture = '설정 항목을 더블클릭해 상세 창을 열어 줘'
         rows = [row('status', 'MES Setup을 N으로 설정', field='MES Setup'),
                 row('family', '입력받은 변수를 Family 조건에 입력해줘', field='Family'),
                 dict(step=dict(id='item', action='visual-click', label=gesture,
