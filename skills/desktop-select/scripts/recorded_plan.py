@@ -177,6 +177,8 @@ def compile_plan(task, *, replacements=None):
             if step['action'] == 'field-input':
                 key = 'parameter' if 'parameter' in step else 'value'
                 current[key] = step[key]
+            elif step['action'] == 'press-key':
+                current['keys'] = step['keys']
             converted.append(current)
             source_steps.append(number)
             continue

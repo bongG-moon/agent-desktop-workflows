@@ -79,6 +79,39 @@ class RecorderRequestTests(unittest.TestCase):
             caption.assert_called_once_with(42)
             enumerate_windows.assert_not_called()
 
+    def test_exact_request_and_inventory_bind_the_same_high_bit_window(self):
+        canonical = 0xbadc1242
+        extended = 0xffffffff00000000 | canonical
+        title = self.request['window']
+        exe = self.request['exe']
+        with (patch.object(app.bridge, 'set_dpi_awareness'), patch.object(app.bridge, '_windows'),
+              patch.object(app.bridge, 'user32', create=True) as api,
+              patch.object(app.bridge, 'kernel32', create=True),
+              patch.object(app.bridge, 'hwnd_pid', return_value=123),
+              patch.object(app.bridge, '_process_identity', return_value=(exe, '456')),
+              patch.object(app.bridge, 'window_text', return_value=title),
+              patch.object(app.C, 'WINFUNCTYPE', return_value=lambda callback: callback, create=True),
+              patch.object(app.bridge, '_sig', side_effect=lambda lib, key, *rest: getattr(lib, key)),
+              patch.object(app, 'task_directory', return_value=self.folder),
+              patch.object(app, 'edit_recording', return_value={'status': 'cancelled'}) as editor):
+            api.GetAncestor.return_value = extended
+            api.EnumWindows.side_effect = lambda callback, arg: callback(extended, arg)
+            for representation in (None, canonical, canonical - (1 << 32), extended):
+                with self.subTest(representation=representation):
+                    request = dict(self.request)
+                    if representation is None:
+                        del request['hwnd']
+                    else:
+                        request['hwnd'] = representation
+                    self.write(request)
+                    self.assertEqual(app.run(self.cli), {'status': 'cancelled'})
+                    owner, storage = editor.call_args.args
+                    self.assertEqual((owner.hwnd, owner.pid, owner.created, storage.title),
+                                     (canonical, 123, '456', title))
+                    self.assertTrue(editor.call_args.kwargs['report_ready'])
+            self.assertEqual(editor.call_count, 4)
+            self.assertEqual(api.EnumWindows.call_count, 1)
+
     def test_review_and_continuation_use_the_existing_command_defaults(self):
         for command in ('review', 'continue-recording'):
             for extra in ([{}, {'from_step': 2, 'save_as': '저장 사본', 'supplement': '보완 녹화'}]
@@ -93,7 +126,8 @@ class RecorderRequestTests(unittest.TestCase):
 
     def test_bad_requests_emit_one_terminal_error_before_window_lookup(self):
         invalid = [[], {'command': 'open', 'task': '업무'},
-                   dict(self.request, hwnd=True), dict(self.request, window=''),
+                   dict(self.request, hwnd=True), dict(self.request, hwnd=-1),
+                   dict(self.request, hwnd=0x10000002a), dict(self.request, window=''),
                    dict(self.request, window=['업무']), dict(self.request, extra='--open')]
         with patch.object(app, 'windows') as lookup:
             for data in invalid:

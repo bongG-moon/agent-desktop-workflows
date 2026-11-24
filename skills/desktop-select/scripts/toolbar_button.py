@@ -109,8 +109,9 @@ def _toolbars(binding):
     callback = C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
     @callback
     def visit(hwnd, _):
-        if native_toolbar(binding,hwnd):
-            handles.append(int(hwnd))
+        hwnd = bridge.normalize_hwnd(hwnd)
+        if hwnd and native_toolbar(binding,hwnd):
+            handles.append(hwnd)
         return len(handles) <= 16
     bridge._sig(bridge.user32,'EnumChildWindows',W.BOOL,W.HWND,callback,W.LPARAM)(binding.hwnd,visit,0)
     _need(len(handles)<=16,'visual_scope_incomplete')

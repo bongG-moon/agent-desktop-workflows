@@ -54,7 +54,7 @@ def _key(spec):
 def effect_scopes(steps, active):
     """A single-step test still observes the window its recorded gesture should open."""
     numbers = set(active)
-    openers = {n for n in numbers if steps[n-1]['action'] in ('row-open', 'double-click-result') or
+    openers = {n for n in numbers if steps[n-1]['action'] in ('row-open', 'double-click-result', 'press-key') or
                (steps[n-1]['action'] == 'visual-click' and steps[n-1]['visual'].get('gesture') == 'double-click')}
     if openers:
         numbers.update(n for n, step in enumerate(steps, 1)
@@ -117,7 +117,7 @@ class WindowRoutes:
             rows = self._rows(spec)
             exact = self._match(spec, rows)
             opener = self.steps[number-1]
-            if exact is not None and (opener.get('action') == 'double-click-result' or
+            if exact is not None and (opener.get('action') in ('double-click-result', 'press-key') or
                     (opener.get('action') == 'visual-click' and opener['visual'].get('gesture') == 'double-click')):
                 raise ContextError('expected_new_window_already_open')
             self.baselines[key] = ({_identity(row) for row in rows},

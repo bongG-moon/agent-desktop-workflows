@@ -224,8 +224,8 @@ def safe_provider(binding, uia, element):
         return True
     # A cross-process renderer can expose one UIA Pane hosted inside the
     # selected top-level HWND. A foreign UIA descendant alone proves nothing.
-    hwnd = element.property(30020)
-    return (type(pid) is int and pid > 0 and type(hwnd) is int
+    hwnd = bridge.normalize_hwnd(element.property(30020))
+    return (type(pid) is int and pid > 0 and hwnd != 0
             and element.property(30003) in (50025, 50026, 50033)
             and element.property(30019) is False and native_child(binding, hwnd, pid)
             and bool(bridge.user32.IsWindowVisible(hwnd))
@@ -243,7 +243,7 @@ def _enabled_canvas(binding, uia, painted, hit):
     # WindowFromPoint skips disabled HWNDs. A disabled paint-only child
     # from another process can sit over its enabled native input receiver.
     # Require agreement between the Win32 and UIA parent relationships.
-    pane = painted.property(30020)
+    pane = bridge.normalize_hwnd(painted.property(30020))
     if (painted.property(30010) is not False or uia.pid(painted) == binding.pid
             or not safe_provider(binding, uia, painted)
             or not native_child(binding, hit, binding.pid) or not bridge.user32.IsChild(hit,pane)
@@ -251,7 +251,7 @@ def _enabled_canvas(binding, uia, painted, hit):
             or not bridge.user32.IsWindowEnabled(binding.hwnd)):
         return False
     receiver = uia.from_handle(hit)
-    return (receiver is not None and receiver.property(30020) == hit and uia.pid(receiver) == binding.pid
+    return (receiver is not None and bridge.normalize_hwnd(receiver.property(30020)) == hit and uia.pid(receiver) == binding.pid
             and receiver.property(30003) in (50025,50026,50033) and receiver.property(30010) is True
             and safe_provider(binding,uia,receiver) and uia.within(painted,receiver)
             and not any(receiver.property(k) is True for k in (30040,30043,30149)))
@@ -292,7 +292,7 @@ def _safe_patch(binding, uia, box, point, *, exposed, gesture=None, data_surface
                  and _enabled_canvas(binding,uia,element,hit), 'visual_hit_not_actionable')
         if bridge.hwnd_pid(hit) != binding.pid:
             embedded = uia.from_handle(hit)
-            _require(embedded is not None and embedded.property(30020) == hit
+            _require(embedded is not None and bridge.normalize_hwnd(embedded.property(30020)) == hit
                      and uia.pid(embedded) == bridge.hwnd_pid(hit) and safe_provider(binding,uia,embedded),
                      'visual_hit_not_actionable')
     pending = deque([(root, False)])

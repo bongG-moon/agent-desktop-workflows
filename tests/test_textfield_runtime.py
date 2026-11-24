@@ -259,6 +259,11 @@ class TextFieldWorkflowTests(unittest.TestCase):
                 result = json.loads(output.getvalue())
                 self.assertEqual((result['status'], result['input_dispatched'], result['diagnostic']),
                                  ('blocked', False, diagnostic))
+                if diagnostic == 'unknown_parameter':
+                    self.assertEqual(result['required_parameters'], ['Family', '검색어'])
+                    self.assertNotIn('Unexpected', json.dumps(result))
+                else:
+                    self.assertNotIn('required_parameters', result)
                 subprocess_run.assert_not_called()
                 flow.bind.assert_not_called()
 

@@ -6,7 +6,7 @@
 
 `try-recording`이 `menu_repair`를 반환하면 **그 응답으로 이어간다**. 새 `recover`, `plan`, 등록 후 재시험이나 소스 조사를 먼저 하지 않는다. 이미지가 없으면 `frame_script`와 `frame_args`를 사용한다. 이미지가 있으면 현재 표의 데이터 지점을 확인하여 반환된 `resume_script`와 `resume_args`의 좌표 자리만 채운다. 앞선 값 입력과 조회는 반복하지 않는다. `--auto-repair-frame`은 화면 확인까지 허용받았을 때만 첫 시험에 붙이며, 메뉴 위치 실패가 없으면 캡처하지 않는다.
 
-재개가 성공하면 `correction_saved`와 `effective_task`를 확인한다. 엔진은 원본을 보존하고 보정한 실행용 사본을 만든다. 등록은 그 작업명과 `register_args`를 사용한다. 이전 작업명으로 다시 등록하면 보정 전 위치를 쓰게 된다. 이미 전달된 입력이 불확실한 실패에는 메뉴 티켓을 임의로 만들거나 조회부터 재시도하지 않는다.
+재개가 성공하면 `correction_saved`와 `effective_task`를 확인한다. `--summary`로 시험한 경우 재개 명령에도 이 옵션이 포함되며, 생성이 확인된 파일 경로는 `verified_outputs`에 표시된다. 엔진은 원본을 보존하고 보정한 실행용 사본을 만든다. 등록은 그 작업명과 `register_args`를 사용한다. 이전 작업명으로 다시 등록하면 보정 전 위치를 쓰게 된다. 이미 전달된 입력이 불확실한 실패에는 메뉴 티켓을 임의로 만들거나 조회부터 재시도하지 않는다.
 
 파일 생성까지 요청받고 출력 폴더가 정해지지 않았으면 `python_workflow.py discover-output --exe "<실행 파일명>" --window "<창 제목>"`으로 해당 앱 주변의 로컬 후보를 확인한다. 이미 `verified_outputs`가 있으면 그 결과를 보고한다.
 

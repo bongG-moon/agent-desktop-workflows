@@ -11,6 +11,7 @@ import unicodedata
 import uuid
 
 import win_bridge as bridge
+import key_chords
 from live_action import combo_readback
 import live_action
 import learned_tasks
@@ -89,6 +90,8 @@ def capture_step(step):
     supported = (pointed or (action == 'set-value' and role == 'combobox' and bool(step.get('value')))
                  or (action == 'set-value' and role == 'textfield' and isinstance(step.get('value'), str))
                  or (action == 'submit' and role == 'textfield')
+                 or (action == 'press-key' and role in key_chords.TARGET_ROLES
+                     and _capture_locator_valid(locator) and key_chords.virtual_keys(step.get('keys')))
                  or (action == 'click' and role in {'menuitem', 'button', 'splitbutton', 'hyperlink'})
                  or (action == 'select' and role in {'tab', 'treeitem', 'listitem'})
                  or (action == 'expand' and role in {'treeitem', 'menuitem', 'splitbutton'}))
@@ -97,6 +100,8 @@ def capture_step(step):
         if action == 'right-click':
             reason = 'right_click_requires_menu_teaching'
         unknown = manual(reason or 'unsupported_recorded_action', step['id'])
+        if reason == 'keyboard_transition_needs_review' and key_chords.virtual_keys(step.get('keys')):
+            unknown['description'] = step['keys'] + ' 키 누르기'
         # The click is only a hint. Preserve its containing result surface
         # without saving the clicked cell's business value or authorizing input.
         if (action in ('click', 'select', 'manual') and target.get('kind') in ('element', 'region')
@@ -129,6 +134,8 @@ def capture_step(step):
             result['description'] = locator['name'].strip()
     if step.get('field_label'):
         result['field_label'] = step['field_label']
+    if action == 'press-key':
+        result['keys'] = step['keys']
     if action == 'set-value':
         result['value'] = step['value']
         if 'selection' in step:
@@ -232,6 +239,8 @@ def default_text(step):
         return step['label']
     if step.get('recognition', {}).get('reason') == 'double_click_needs_review':
         return '녹화한 항목 더블클릭'
+    if step.get('recognition', {}).get('reason') == 'keyboard_transition_needs_review':
+        return step.get('description', '')
     if (step.get('recognition', {}).get('reason') == 'row_capture_requires_review'
             and step.get('label', '').endswith('번째 행 버튼')):
         return step['label'] + '을 눌러줘'
@@ -254,6 +263,8 @@ def default_text(step):
         return f"이 입력란을 {json.dumps(command.get('value', ''), ensure_ascii=False)}로 설정해줘"
     if command['action'] == 'submit':
         return '이 입력란에서 Enter를 눌러 적용해줘'
+    if command['action'] == 'press-key':
+        return command['keys'] + ' 키 누르기'
     if command['action'] == 'choose-item':
         return f"{command['selector'].get('name', field)} 항목을 선택해줘"
     if command['action'] == 'open':
@@ -303,6 +314,8 @@ def review_interpretation(step, data, *, compiled=None):
         label = command['label'] + ' 클릭 후 창 닫힘 확인'
     elif action == 'row-launch':
         label = f"{command['ordinal']}번째 행 실행"
+    elif action == 'press-key':
+        label = command['keys'] + ' 키 누르기'
     else:
         label = {'submit': 'Enter 입력', 'choose-item': '항목 선택', 'row-action': '행 버튼 실행',
                  'row-open': '행 열기', 'conditional-open': '조건에 따라 열기'}.get(action, step['label'])
@@ -532,7 +545,7 @@ class _BoundWindow:
                 return False
             if root in self.other_roots:
                 return True
-            root = int(bridge.user32.GetWindow(root, 4) or 0)
+            root = bridge.owner_window(root)
         return False
 
     def contains_window(self, hwnd):
@@ -653,25 +666,37 @@ def _semantic_list_selection(node):
             and 'Select' in actions and 'Click' not in actions)
 
 
+class _GuiThreadInfo(recorder.ctypes.Structure):
+    _fields_ = [('size', recorder.wintypes.DWORD), ('flags', recorder.wintypes.DWORD),
+                ('active', recorder.wintypes.HWND), ('focus', recorder.wintypes.HWND),
+                ('capture', recorder.wintypes.HWND), ('menu', recorder.wintypes.HWND),
+                ('move', recorder.wintypes.HWND), ('caret', recorder.wintypes.HWND), ('rect', recorder.wintypes.RECT)]
+
+
 class _RowHookPump(recorder.HookPump):
     visual_tracker = None
 
+    def _key_event(self, code, *, ctrl, shift, alt, win):
+        if code == 13 and not (ctrl or shift or alt or win):
+            return {'kind': 'enter'}
+        keys = key_chords.from_vk(code, ctrl=ctrl, shift=shift, alt=alt, win=win)
+        if keys:
+            return dict(kind='press-key', keys=keys)
+        if (ctrl or shift or alt or win) and code in (9, 13, 27):
+            return {'kind': 'shortcut'}
+        return super()._key_event(code, ctrl=ctrl, shift=shift, alt=alt, win=win)
+
     def _emit(self, event):
-        if event.get('kind') == 'enter':
-            # Native focus is cheap enough to sample before the target handles
-            # Enter. The UIA peer can be rebuilt immediately by that handler.
+        if event.get('kind') in ('enter', 'press-key'):
+            # A Tab, Escape or submit can move focus before the UIA worker runs.
             C, W = recorder.ctypes, recorder.wintypes
-            class GuiInfo(C.Structure):
-                _fields_ = [('size', W.DWORD), ('flags', W.DWORD),
-                            ('active', W.HWND), ('focus', W.HWND), ('capture', W.HWND),
-                            ('menu', W.HWND), ('move', W.HWND), ('caret', W.HWND), ('rect', W.RECT)]
-            info = GuiInfo(size=C.sizeof(GuiInfo))
-            read = bridge._sig(bridge.user32, 'GetGUIThreadInfo', W.BOOL, W.DWORD, C.POINTER(GuiInfo))
+            info = _GuiThreadInfo(size=C.sizeof(_GuiThreadInfo))
+            read = bridge._sig(bridge.user32, 'GetGUIThreadInfo', W.BOOL, W.DWORD, C.POINTER(_GuiThreadInfo))
             if read(0, C.byref(info)):
-                event['submit_focus'] = int(info.focus or 0)
-                event['submit_window'] = int(bridge.root_window(info.focus) or 0)
+                event['submit_focus'] = bridge.normalize_hwnd(info.focus)
+                event['submit_window'] = bridge.root_window(event['submit_focus'])
         if self.visual_tracker is not None and (event.get('kind') in
-                ('scroll', 'candidate_scroll', 'typing', 'enter', 'tab', 'escape', 'shortcut', 'pause', 'outside')
+                ('scroll', 'candidate_scroll', 'typing', 'enter', 'press-key', 'tab', 'escape', 'shortcut', 'pause', 'outside')
                 or (event.get('kind') == 'down' and event.get('action') != 'click')):
             self.visual_tracker.invalidate(event.get('at'))
         if event.get('kind') == 'down' and event.get('scope_proven'):
@@ -957,7 +982,7 @@ class _Worker(recorder.CaptureWorker):
         return observation
 
     def handle(self, event):
-        if event['kind'] in ('down', 'outside', 'scroll', 'candidate_scroll', 'tab', 'escape', 'shortcut', 'pause'):
+        if event['kind'] in ('down', 'outside', 'scroll', 'candidate_scroll', 'tab', 'escape', 'shortcut', 'press-key', 'pause'):
             self._pending_field_activation = None
         if event['kind'] == 'typing' and self.watched:
             activation = self.watched.get('_recorded_activation_at')
@@ -996,7 +1021,7 @@ class _Worker(recorder.CaptureWorker):
                 finally:
                     self.model.event_at = None
                 return
-        if event['kind'] in ('outside', 'scroll', 'candidate_scroll', 'typing', 'enter', 'tab',
+        if event['kind'] in ('outside', 'scroll', 'candidate_scroll', 'typing', 'enter', 'press-key', 'tab',
                              'escape', 'shortcut', 'pause'):
             self.menu_gesture = None
         if self.row_tracker and event['kind'] in ('scroll','candidate_scroll'):
@@ -1009,6 +1034,9 @@ class _Worker(recorder.CaptureWorker):
                 if not event['inside'] or abs(event['x'] - down['x']) > 8 or abs(event['y'] - down['y']) > 8:
                     self.menu_gesture = None
         try:
+            if event['kind'] == 'press-key':
+                self._capture_key(event)
+                return
             if event['kind'] == 'enter' and self._capture_submit(event):
                 return
             result = super().handle(event)
@@ -1017,6 +1045,82 @@ class _Worker(recorder.CaptureWorker):
             return result
         finally:
             self.model.event_at = None
+
+    def _key_target(self, event):
+        """Use the pre-key native focus, even when Tab has already moved it."""
+        focus, window = event.get('submit_focus'), event.get('submit_window')
+        if not focus or window != self.binding.hwnd:
+            return None
+        watched = self.watched
+        proved = (watched and watched.get('_recorded_field_target') and watched['window'] == window
+                  and watched.get('_key_field_seen_at', float('inf')) <= event['at'])
+        if (proved and focus != window and watched.get('_recorded_native_focus') == focus
+                and not bridge.user32.IsWindow(focus)):
+            # Escape or a shortcut may already have destroyed its HWND. Use
+            # only the prior qualified field matched by the hook before dispatch.
+            return copy.deepcopy(watched['_recorded_field_target']), True
+        if bridge.root_window(focus) != window or bridge.hwnd_pid(focus) != self.binding.pid:
+            return None
+        self.binding.check()
+        if proved and watched.get('_key_virtual_focus') and self.uia.same(watched['element'], self.uia.focused()):
+            live_action.key_target_ready(self.binding, self.uia, watched['element'], {'role': 'textfield'})
+            return copy.deepcopy(watched['_recorded_field_target']), True
+        if focus == window:
+            return None
+        element = self.uia.from_handle(focus)
+        if element is None or bridge.normalize_hwnd(element.property(30020)) != focus:
+            return None
+        role = bridge.ROLES.get(element.property(30003))
+        # A shared HWND can host several virtual editors. Only a dedicated
+        # field or button identifies itself after focus has already moved.
+        if role not in key_chords.TARGET_ROLES or (role not in ('textfield', 'button')
+                and not self.uia.same(element, self.uia.focused())):
+            return None
+        root = live_action.key_target_ready(self.binding, self.uia, element, {'role': role})
+        same_field = bool(watched and watched['window'] == window and self.uia.same(element, watched['element']))
+        if proved and same_field:
+            return copy.deepcopy(watched['_recorded_field_target']), True
+        locator = self.uia.locator(element, root)
+        if role == 'textfield' and (watched and watched['node'].get('role') == 'combobox'
+                or any(node.get('role') == 'combobox' for node in locator.get('ancestors', ()))):
+            from control_lookup import ancestry
+            chain = ancestry(self.uia, element, root, pid=self.binding.pid)
+            owner = next((peer for peer in chain[1:-1] if peer.property(30003) == 50003), None)
+            if owner is not None:
+                live_action.key_target_ready(self.binding, self.uia, owner, {'role': 'combobox'})
+                locator = self.uia.locator(owner, root)
+                same_field = bool(watched and self.uia.same(watched['element'], owner))
+                target = dict(kind='element', locator=locator) if recorder._locator_valid(locator) else None
+                return target, same_field
+        if role == 'textfield' and not recorder._locator_valid(locator):
+            locator = self.uia.anchored_field(element, root)
+        if _capture_locator_valid(locator):
+            return dict(kind='element', locator=locator), same_field
+        return None, same_field  # Known unprotected focus; keep the chord for review.
+
+    def _capture_key(self, event):
+        try:
+            proof = self._key_target(event)
+        except (bridge.BridgeError, recorder.RecorderError, OSError):
+            proof = None
+        point = self.watched_step if proof and proof[1] else None
+        self.freeze_watch(event['at'])
+        self.option_history.clear()
+        if proof is None:
+            self.model.manual('', 'keyboard_transition_needs_review')
+            return
+        if proof[0] is None:
+            self.model.add(dict(manual('keyboard_transition_needs_review'), keys=event['keys']))
+            return
+        step = dict(id=uuid.uuid4().hex, action='press-key', keys=event['keys'], label=event['keys'],
+                    target=proof[0], recognition=dict(target='identified', action='supported', result='manual'))
+        with self.model.lock:
+            # A click solely to focus this field needs no invented input value.
+            if (point and point['action'] == 'teach-target' and self.model.steps
+                    and next(reversed(self.model.steps)) == point['id'] and self.model.steps[point['id']]['action'] == 'teach-target'):
+                step['id'] = point['id']
+                self.model.times[step['id']] = event['at']
+            self.model.add(step)
 
     def _capture_submit(self, event):
         """An observed Enter on a writable focused field becomes an explicit submit."""
@@ -1317,10 +1421,14 @@ class _Worker(recorder.CaptureWorker):
             self.watched_samples.append((time.monotonic(), value))
             try:
                 observation['_recorded_field_target'] = copy.deepcopy(self.target(observation, 'element'))
-                native = int(observation['element'].property(30020) or 0) & 0xffffffff
+                native = bridge.normalize_hwnd(observation['element'].property(30020))
                 if (native and bridge.hwnd_pid(native) == self.binding.pid
                         and bridge.root_window(native) == observation['window']):
                     observation['_recorded_native_focus'] = native
+                if observation['element'].property(30009) is True:
+                    if (not native or native == observation['window']) and observation['element'].property(30008) is True:
+                        observation['_key_virtual_focus'] = True
+                    observation['_key_field_seen_at'] = time.monotonic()
             except (bridge.BridgeError, recorder.RecorderError):
                 pass
             except (AttributeError, TypeError, ValueError):

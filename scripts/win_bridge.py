@@ -145,31 +145,64 @@ def set_dpi_awareness():
 configure_dpi = set_dpi_awareness
 
 
+def normalize_hwnd(value):
+    """Return a window's unsigned 32-bit identity, or zero for a non-target.
+
+    UIA exposes a signed LONG. A Win32 HWND or enumeration callback can expose
+    the same bits zero-extended or sign-extended to the width of a pointer.
+    Check the extension before truncating so an arbitrary integer cannot alias
+    a real target.
+    """
+    if type(value) is not int:
+        return 0
+    if not (-0x80000000 <= value <= 0xffffffff or
+            0xffffffff80000000 <= value <= 0xffffffffffffffff):
+        return 0
+    hwnd = value & 0xffffffff
+    # HWND_TOP/DESKTOP, BOTTOM, BROADCAST, MESSAGE, NOTOPMOST, TOPMOST.
+    return 0 if hwnd in (0, 1, 0xffff, 0xfffffffd, 0xfffffffe, 0xffffffff) else hwnd
+
+
 def hwnd_pid(hwnd):
     _windows()
+    hwnd = normalize_hwnd(hwnd)
+    if not hwnd:
+        return 0
     pid = W.DWORD()
     user32.GetWindowThreadProcessId(hwnd, C.byref(pid))
     return pid.value
 
 
 def root_window(hwnd):
-    return int(user32.GetAncestor(hwnd, 2) or 0)
+    hwnd = normalize_hwnd(hwnd)
+    return normalize_hwnd(user32.GetAncestor(hwnd, 2)) if hwnd else 0
+
+
+def owner_window(hwnd):
+    hwnd = normalize_hwnd(hwnd)
+    return normalize_hwnd(user32.GetWindow(hwnd, 4)) if hwnd else 0
 
 
 def window_text(hwnd):
+    hwnd = normalize_hwnd(hwnd)
+    if not hwnd:
+        return ''
     out = C.create_unicode_buffer(1024)
     user32.GetWindowTextW(hwnd, out, len(out))
     return out.value
 
 
 def window_class(hwnd):
+    hwnd = normalize_hwnd(hwnd)
+    if not hwnd:
+        return ''
     out = C.create_unicode_buffer(512)
     user32.GetClassNameW(hwnd, out, len(out))
     return out.value
 
 
 def foreground():
-    return int(user32.GetForegroundWindow() or 0)
+    return normalize_hwnd(user32.GetForegroundWindow())
 
 
 def input_tick():
@@ -202,7 +235,7 @@ def wait_for_quiet_foreground(original, tick):
 
 
 def window_from_point(x, y):
-    return int(user32.WindowFromPoint(POINT(int(x), int(y))) or 0)
+    return normalize_hwnd(user32.WindowFromPoint(POINT(int(x), int(y))))
 
 
 def cursor():
@@ -213,12 +246,15 @@ def cursor():
 
 
 def owned(child, owner):
+    child, owner = normalize_hwnd(child), normalize_hwnd(owner)
+    if not owner:
+        return False
     seen = set()
     for _ in range(12):
         if not child or child in seen:
             break
         seen.add(child)
-        child = int(user32.GetWindow(child, 4) or 0)
+        child = owner_window(child)
         if child == owner:
             return True
     return False
@@ -243,8 +279,8 @@ class Binding:
         _windows()
         if not isinstance(request, dict):
             raise BridgeError('invalid_target')
-        self.pid, self.hwnd, self.exe = request.get('pid'), request.get('hwnd'), request.get('exe_name')
-        if type(self.pid) is not int or not 1 <= self.pid <= 0x7fffffff or type(self.hwnd) is not int or not 1 <= self.hwnd <= 0x7fffffffffffffff:
+        self.pid, self.hwnd, self.exe = request.get('pid'), normalize_hwnd(request.get('hwnd')), request.get('exe_name')
+        if type(self.pid) is not int or not 1 <= self.pid <= 0x7fffffff or not self.hwnd:
             raise BridgeError('invalid_target')
         if not isinstance(self.exe, str) or not self.exe.lower().endswith('.exe') or not 1 <= len(self.exe) <= 200 or re.search(r'[<>:"/\\|?*\x00-\x1f]', self.exe) or self.exe.strip() != self.exe:
             raise BridgeError('invalid_exe_name')
@@ -270,6 +306,7 @@ class Binding:
             raise BridgeError('target_lifetime_changed')
 
     def contains_window(self, hwnd):
+        hwnd = normalize_hwnd(hwnd)
         if not hwnd or hwnd_pid(hwnd) != self.pid:
             return False
         root = root_window(hwnd)
@@ -285,8 +322,9 @@ class Binding:
         handles = []
         callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
         def visit(hwnd, _):
-            if user32.IsWindowVisible(hwnd) and self.contains_window(hwnd):
-                handles.append(int(hwnd))
+            hwnd = normalize_hwnd(hwnd)
+            if hwnd and user32.IsWindowVisible(hwnd) and self.contains_window(hwnd):
+                handles.append(hwnd)
             return len(handles) < 64
         callback = callback_type(visit)
         complete = _sig(user32, 'EnumWindows', W.BOOL, callback_type, W.LPARAM)(callback, 0)
@@ -303,8 +341,8 @@ class Binding:
         except AttributeError:
             pass
         return {'pid': self.pid, 'hwnd': self.hwnd, 'exe_name': self.exe, 'title': window_text(self.hwnd),
-                'class_name': window_class(self.hwnd), 'owner_hwnd': int(user32.GetWindow(self.hwnd, 4) or 0),
-                'root_owner_hwnd': int(user32.GetAncestor(self.hwnd, 3) or 0), 'process_started_utc_ticks': self.created,
+                'class_name': window_class(self.hwnd), 'owner_hwnd': owner_window(self.hwnd),
+                'root_owner_hwnd': normalize_hwnd(user32.GetAncestor(self.hwnd, 3)), 'process_started_utc_ticks': self.created,
                 'visible': bool(user32.IsWindowVisible(self.hwnd)), 'minimized': bool(user32.IsIconic(self.hwnd)), 'dpi': dpi}
 
 
@@ -498,7 +536,8 @@ class UIA:
         return Element(pointer, self) if pointer.value else None
 
     def from_handle(self, hwnd):
-        return self._element(6, (W.HWND,), hwnd)
+        hwnd = normalize_hwnd(hwnd)
+        return self._element(6, (W.HWND,), hwnd) if hwnd else None
 
     def from_point(self, x, y):
         return self._element(7, (POINT,), POINT(int(x), int(y)))
@@ -812,9 +851,7 @@ class UIA:
         states = self.states(element)
         if not valid and 'offscreen' not in states:
             states.append('offscreen')
-        native_handle = element.property(30020)
-        # NativeWindowHandle is a 32-bit UIA property even on x64; HWNDs are sign-extended.
-        hwnd = int(native_handle or 0) & 0xffffffff
+        hwnd = normalize_hwnd(element.property(30020))
         return {'name': element.property(30005) or '', 'role': ROLES.get(element.property(30003), 'unknown'),
                 'automation_id': element.property(30011) or '', **self.value_observation(element),
                 **self.semantic_label(element, root),
@@ -828,7 +865,7 @@ class UIA:
         hit = window_from_point(x, y)
         if hwnd_pid(hit) != binding.pid:
             raise BridgeError('point_outside_target')
-        window = int(window if window is not None else root_window(hit))
+        window = normalize_hwnd(window) if window is not None else root_window(hit)
         # Native ComboLBox HWNDs can have no GW_OWNER while their UIA list is
         # a descendant of the selected combo. Prove that relation on this COM
         # worker; never widen scope to arbitrary same-process business windows.
@@ -1124,12 +1161,13 @@ def inventory():
     callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
     def visit(hwnd, _):
         try:
-            if not user32.IsWindowVisible(hwnd):
+            hwnd = normalize_hwnd(hwnd)
+            if not hwnd or not user32.IsWindowVisible(hwnd):
                 return True
             pid = hwnd_pid(hwnd)
             if pid and pid != os.getpid():
                 exe, _ = _process_identity(pid)
-                rows.append(Binding({'pid': pid, 'hwnd': int(hwnd), 'exe_name': exe}).info())
+                rows.append(Binding({'pid': pid, 'hwnd': hwnd, 'exe_name': exe}).info())
         except (BridgeError, OSError):
             pass
         return len(rows) < 250

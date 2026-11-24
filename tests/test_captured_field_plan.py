@@ -27,6 +27,56 @@ def field(action='set-value'):
 
 
 class CapturedPlanTests(unittest.TestCase):
+    def test_shortcut_keeps_the_demonstrated_key_and_focus_through_save_and_child_window(self):
+        import capture_trail
+        import teach_capture
+        shortcut = dict(field('press-key'), keys='Ctrl+F', id='open-find')
+        child = dict(field('press-key'), keys='Esc', id='dismiss',
+                     _capture_window=dict(exe='Example.exe', title='Find', related=True, after_id='open-find'))
+        rows = []
+        for step in (shortcut, child):
+            form = dict(alias='', text=f"{step['keys']} 키 누르기", mode=None, argument='')
+            rows.append(dict(step=step, form=form))
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            storage = review_drafts.ReviewStorage('찾기', 'Example.exe', 'Data window', directory)
+            storage.save_draft(rows, 'test_review', 2)
+            restored = review_drafts.ReviewStorage('찾기', 'Example.exe', 'Data window', directory).initial_rows()
+            editor = teach_capture.StepEdits()
+            compiled = editor.apply(editor.restore_rows(restored))
+            self.assertTrue(all(s['instruction']['mode'] == 'recorded' for s in compiled))
+            source = tasks.from_recording('찾기', 'Example.exe', 'Data window',
+                                          capture_trail.finalize_contexts(compiled))
+            plan = recorded_plan.compile_plan(source)
+            self.assertEqual(plan['status'], 'compiled', plan)
+            recipe = plan['envelope']['recipe']['steps']
+            self.assertEqual([(s['action'], s['keys']) for s in recipe],
+                             [('press-key', 'Ctrl+F'), ('press-key', 'Esc')])
+            self.assertEqual(recipe[1]['window_context'], dict(exe='Example.exe', title='Find', related=True, after_step=1))
+            self.assertEqual(recipe[0]['selector'], shortcut['target']['locator'])
+            saved = review_drafts.rows_from_task(source)
+            self.assertEqual([row['step']['saved']['keys'] for row in saved], ['Ctrl+F', 'Esc'])
+            source['steps'][0].pop('instruction')
+            self.assertEqual(review_drafts.rows_from_task(source)[0]['form']['text'], 'Ctrl+F 키 누르기')
+
+    def test_edited_shortcut_preserves_evidence_and_never_sends_an_unrequested_key(self):
+        raw = dict(field('press-key'), keys='Shift+Tab')
+        for text in ('Shift + Tab 키 눌러줘', '조회 필터에서 shift+tab을 눌러주세요', 'press Shift+Tab',
+                     '쉬프트 + 탭 키를 눌러줘'):
+            self.assertEqual(tasks.compile_instruction(raw, text)['mode'], 'recorded', text)
+        for text in ('Tab을 눌러줘', 'Shift+Tab 키는 누르지 마', '다른 필드에서 Shift+Tab 키 누르기'):
+            edited = tasks.instructed_step(raw, tasks.compile_instruction(raw, text))
+            self.assertEqual(edited['keys'], 'Shift+Tab')
+            self.assertEqual(edited['instruction_draft'], text)
+            result = recorded_plan.compile_plan(dict(schema=1, name='수정', exe='Example.exe',
+                                                     window='Data window', steps=[edited]))
+            self.assertEqual(result['diagnostic'], 'instruction_requires_structure')
+        for chord in ('', 'A', 'Enter', 'Ctrl+S;F5'):
+            self.assertEqual(tasks.recorded_step(dict(raw, keys=chord))['action'], 'manual', chord)
+        self.assertEqual(tasks.recorded_step(dict(raw, secure=True))['action'], 'manual')
+        unbound_popup = dict(raw, target=dict(raw['target'], window=dict(class_name='Dialog', title='Other')))
+        self.assertEqual(tasks.recorded_step(unbound_popup)['reason'], 'popup_needs_live_binding')
+
     def test_late_completed_menu_resolves_the_real_draft_window_candidates(self):
         import capture_trail
         import teach_capture

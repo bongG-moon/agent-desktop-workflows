@@ -43,7 +43,10 @@ for identifier, caption in (('QueryCommand','Search'),('ExportCommand','Excel'))
     if identifier=='QueryCommand':raw['wait_after']=.1
     rows.append(raw)
 args=app.parser().parse_args(['record','--task','Variable query','--exe',sys.argv[2],'--window',sys.argv[3]])
-with patch('teach_capture.capture',return_value=dict(status='recorded',steps=rows,input_dispatched=False)):
+def save_fixture_rows(owner, *, save_recording, **options):
+    return save_recording(rows)
+
+with patch('teach_capture.capture', side_effect=save_fixture_rows):
     receipt=app.run(args)
 print(json.dumps(dict(receipt=receipt,source=tasks.load_task('Variable query',app.task_directory())),ensure_ascii=False))
 '''

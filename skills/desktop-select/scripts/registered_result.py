@@ -65,6 +65,7 @@ class ResultReview:
                 temporary.unlink(missing_ok=True)
 
     def existing(self, overrides, ticket, hwnd=None):
+        from win_bridge import normalize_hwnd
         record = self._read(self.pending)
         active = (record and record['recipe'] == self.fingerprint and record['expires'] > time.time())
         if ticket:
@@ -72,7 +73,11 @@ class ResultReview:
                         and secrets.compare_digest(record['ticket'], ticket), 'result_review_expired')
             repair.need(not overrides or record['variables'] == _variables(overrides), 'result_review_parameters_changed')
             return record
-        if active and record['variables'] == _variables(overrides) and (not hwnd or hwnd == record['window']['hwnd']):
+        if hwnd is not None:
+            hwnd = normalize_hwnd(hwnd)
+            repair.need(hwnd, 'invalid_target')
+        if active and record['variables'] == _variables(overrides) and (
+                hwnd is None or hwnd == normalize_hwnd(record['window']['hwnd'])):
             return record
         self.pending.unlink(missing_ok=True)
         return None

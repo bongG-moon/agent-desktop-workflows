@@ -90,6 +90,69 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([s['receipt']['status'] for s in result['steps']],
                          ['verified', 'verified', 'delivered_unverified', 'waited', 'delivered_unverified'])
 
+    def key_timeline(self, steps, **options):
+        now = 0.0
+        dispatched = []
+
+        def advance(seconds):
+            nonlocal now
+            now += seconds
+
+        def dispatch(surface, uia, element, node, action, value, *, still_valid, **kwargs):
+            still_valid()
+            dispatched.append((action, value, round(now, 4)))
+            if action == 'submit':
+                return dict(status='delivered_unverified', input_dispatched=True,
+                            diagnostic='submit_enter_sent', keyboard_events_sent=2)
+            if action == 'press-key':
+                return dict(status='delivered_unverified', input_dispatched=True,
+                            diagnostic='key_chord_sent', keys=value,
+                            keyboard_events_sent=2 * len(flow.key_chords.virtual_keys(value)))
+            return dict(status='verified', input_dispatched=True)
+
+        self.uia.actions.return_value = ['SetValue', 'SetFocus']
+        with (patch.object(flow, 'time') as clock, patch.object(flow.live, 'execute', side_effect=dispatch),
+              patch.object(flow.live, 'submit_ready'), patch.object(flow.live, 'key_target_ready')):
+            clock.monotonic.side_effect = lambda: now
+            clock.sleep.side_effect = advance
+            flow.wait.side_effect = lambda binding, title, seconds: advance(seconds)
+            report = flow.run(dict(recipe(), steps=steps), **options)
+        expected = 'observed' if options.get('read_only') else 'completed_unverified'
+        self.assertEqual(report['status'], expected, report)
+        return dispatched, round(now, 4)
+
+    def test_default_intervals_apply_only_to_keys_and_adjacent_keys_share_one_gap(self):
+        selector = dict(automation_id='entry', role='textfield')
+        fixed = dict(action='set-value', selector=selector, value='first')
+        variable = dict(action='set-value', selector=selector, parameter='Part')
+        enter = dict(action='submit', selector=selector)
+        tab = dict(action='press-key', selector=selector, keys='Tab')
+        events, end = self.key_timeline([fixed, variable, enter, tab, fixed], overrides={'Part': 'next'})
+        self.assertEqual(events, [('fill', 'first', 0), ('fill', 'next', 0), ('submit', None, 0.8),
+                                  ('press-key', 'Tab', 1.6), ('fill', 'first', 2.4)])
+        self.assertEqual(end, 2.4)
+
+    def test_explicit_workflow_waits_replace_default_key_intervals_on_either_side(self):
+        key = dict(action='press-key', selector=dict(automation_id='entry', role='textfield'), keys='F5')
+        for before, between, after in ((0, 0, 0), (0.2, 0.3, 1.25), (1.5, 2.5, 0.1)):
+            with self.subTest(before=before, between=between, after=after):
+                steps = [dict(action='wait', seconds=before), key, dict(action='wait', seconds=between),
+                         key, dict(action='wait', seconds=after)]
+                events, end = self.key_timeline(steps)
+                self.assertEqual(events, [('press-key', 'F5', before), ('press-key', 'F5', before + between)])
+                self.assertAlmostEqual(end, before + between + after)
+
+    def test_selected_enter_uses_both_intervals_when_neighboring_waits_are_not_executed(self):
+        enter = dict(action='submit', selector=dict(automation_id='entry', role='textfield'))
+        steps = [dict(action='wait', seconds=0.1), enter, dict(action='wait', seconds=0.2)]
+        self.assertEqual(self.key_timeline(steps, only=2), ([('submit', None, 0.8)], 1.6))
+
+    def test_read_only_keys_and_wait_have_no_delay(self):
+        selector = dict(automation_id='entry', role='textfield')
+        steps = [dict(action='submit', selector=selector), dict(action='wait', seconds=2),
+                 dict(action='press-key', selector=selector, keys='Ctrl+S')]
+        self.assertEqual(self.key_timeline(steps, read_only=True), ([], 0))
+
     def test_reviewed_result_point_requires_the_current_table_and_noneditable_data(self):
         import grounding
         target = MagicMock()

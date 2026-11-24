@@ -47,7 +47,7 @@ def _native_menu_owner(binding):
     read = win._sig(win.user32, 'GetGUIThreadInfo', W.BOOL, W.DWORD, C.POINTER(_GUI_THREAD_INFO))
     if not read(thread, C.byref(state)):
         return None
-    owner = int(state.hwndMenuOwner or 0)
+    owner = win.normalize_hwnd(state.hwndMenuOwner)
     # GUI_INMENUMODE / GUI_POPUPMENUMODE. A stale nonzero HWND is insufficient.
     if (not state.flags & (0x4 | 0x10) or not owner or not binding.contains_window(owner)
             or _thread_identity(owner) != (thread, binding.pid)):
@@ -64,8 +64,8 @@ def _scoped_windows(binding):
     found = []
     callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
     def visit(hwnd, _):
-        hwnd = int(hwnd)
-        if (win.user32.IsWindowVisible(hwnd) and win.window_class(hwnd) == '#32768'
+        hwnd = win.normalize_hwnd(hwnd)
+        if (hwnd and win.user32.IsWindowVisible(hwnd) and win.window_class(hwnd) == '#32768'
                 and win.root_window(hwnd) == hwnd
                 and _thread_identity(hwnd) == (state[0], binding.pid)):
             found.append(hwnd)
@@ -266,7 +266,8 @@ def _visual_point(binding, uia, region, point):
         # Require the actual hit HWND, equal geometry and the same parent;
         # two unrelated panels in a process do not establish an alias.
         a, b = uia.parent(element), uia.parent(region)
-        alias = (hit != binding.hwnd and region.property(30020) == hit == element.property(30020)
+        alias = (hit != binding.hwnd and win.normalize_hwnd(region.property(30020)) == hit
+                 and win.normalize_hwnd(element.property(30020)) == hit
                  and _rect(uia, element) == _rect(uia, region) and a is not None and b is not None
                  and uia.same(a, b))
         _need(alias, 'context_point_outside_region')

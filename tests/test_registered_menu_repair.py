@@ -44,6 +44,20 @@ class RegisteredRepairTests(unittest.TestCase):
     def write(self, value):
         self.path.write_text(json.dumps(value), encoding='utf8')
 
+    def test_saved_menu_scope_accepts_handle_alias_only_for_the_original_lifetime(self):
+        hwnd = 0x81560002
+        self.ui.owner.hwnd = hwnd
+        record = dict(number=2, scope=[
+            [hwnd - 2**32, self.ui.owner.pid, self.ui.owner.created],
+            [0xffffffff00000000 | hwnd, self.ui.owner.pid, self.ui.owner.created],
+        ])
+        bound, guard = repair.recorded_surface(flow, self.recipe, record)
+        self.assertIs(bound, self.ui.owner)
+        guard()
+        record['scope'][1][2] += 1
+        with self.assertRaisesRegex(flow.app.tasks.TaskError, 'menu_repair_window_changed'):
+            repair.recorded_surface(flow, self.recipe, record)
+
     def cli(self, *args):
         with redirect_stdout(StringIO()) as stdout:
             flow.main(['--_worker', 'run', '--recipe', str(self.path), *args])

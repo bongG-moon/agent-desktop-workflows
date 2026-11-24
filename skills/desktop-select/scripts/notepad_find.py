@@ -49,7 +49,7 @@ def _rect(hwnd):
 def _overlay(binding, window, scale):
     candidates = []
     enabled = win._sig(win.user32, 'IsWindowEnabled', W.BOOL, W.HWND)
-    hwnd = int(win.user32.GetWindow(binding.hwnd, 5) or 0)  # GW_CHILD
+    hwnd = win.normalize_hwnd(win.user32.GetWindow(binding.hwnd, 5))  # GW_CHILD
     for _ in range(128):
         if not hwnd:
             break
@@ -60,7 +60,7 @@ def _overlay(binding, window, scale):
             if (vision._inside(rect, window) and rect[2] >= 180*scale and 60*scale <= rect[3] <= 92*scale
                     and 55*scale <= rect[1]-window[1] <= 110*scale):
                 candidates.append((hwnd, rect))
-        hwnd = int(win.user32.GetWindow(hwnd, 2) or 0)  # GW_HWNDNEXT
+        hwnd = win.normalize_hwnd(win.user32.GetWindow(hwnd, 2))  # GW_HWNDNEXT
     _require(not hwnd and len(candidates) == 1, 'notepad_find_overlay_unavailable')
     return candidates[0]
 
@@ -149,9 +149,9 @@ def _exposed_hit(binding, overlay, point):
         return hit
     # WinUI composes the Find panel above the editor, but WindowFromPoint can
     # report the underlying RichEdit. Accept only this known native hierarchy.
-    parent = win.user32.GetAncestor(hit, 1)  # GA_PARENT
-    _require(win.window_class(hit) == _EDIT and win.window_class(parent) == _EDIT_PARENT
-             and win.user32.GetAncestor(parent, 1) == binding.hwnd,
+    parent = win.normalize_hwnd(win.user32.GetAncestor(hit, 1))  # GA_PARENT
+    _require(parent and win.window_class(hit) == _EDIT and win.window_class(parent) == _EDIT_PARENT
+             and win.normalize_hwnd(win.user32.GetAncestor(parent, 1)) == binding.hwnd,
              'notepad_find_point_not_exposed')
     return hit
 

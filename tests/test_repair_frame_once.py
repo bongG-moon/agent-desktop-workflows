@@ -37,6 +37,17 @@ class RepairFrameOnceTests(unittest.TestCase):
         self.recipe['steps'].append(output())
         self.write(self.recipe)
 
+    def test_summary_returns_only_the_next_menu_action_when_the_frame_is_attached(self):
+        flow.context_menu.execute.side_effect = self.menu
+        with patch.object(repair, 'capture_region', side_effect=self.frame) as capture:
+            result = self.cli('--allow-physical', '--auto-repair-frame', '--summary')
+        handed = result['menu_repair']
+        self.assertEqual(handed['host_action'], 'inspect_menu_repair_image')
+        self.assertTrue(handed['image'])
+        self.assertEqual(handed['resume_args'][0], '--resume-menu')
+        self.assertNotIn('frame_args', handed)
+        capture.assert_called_once()
+
     def test_one_response_frame_keeps_exact_variables_and_resume_does_not_repeat_query(self):
         self.with_parameter()
         runner = self.path.parent / 'scripts' / 'run.py'

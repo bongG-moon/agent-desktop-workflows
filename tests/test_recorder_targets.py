@@ -17,7 +17,7 @@ def row(hwnd, title, exe='Example.exe', pid=7):
 
 
 class RecorderInventoryTests(unittest.TestCase):
-    def inventory(self, rows, *, inaccessible=(), incomplete=False, limit=None):
+    def inventory(self, rows, *, inaccessible=(), incomplete=False, limit=None, callback_handles=None):
         sources = {r['hwnd']: r for r in rows}
         identities = {}
         for value in rows:
@@ -29,7 +29,8 @@ class RecorderInventoryTests(unittest.TestCase):
             return identities[pid]
 
         def enumerate_windows(callback, arg):
-            for hwnd in sources:
+            handles = sources if callback_handles is None else callback_handles
+            for hwnd in handles:
                 if not callback(hwnd, arg):
                     return False
             return not incomplete
@@ -71,8 +72,13 @@ class RecorderInventoryTests(unittest.TestCase):
         self.assertEqual(actual, [row(44, 'C', pid=8)])
         self.assertEqual(lookup.call_count, 2)
 
+    def test_inventory_compares_and_returns_canonical_window_handle(self):
+        target = row(0x80000042, 'Original caption  ')
+        records, _ = self.inventory([target], callback_handles=[0, 0xffffffff80000042])
+        self.assertEqual(records, [target])
+
     def test_empty_or_truncated_titles_are_not_exact_recording_candidates(self):
-        actual, lookup = self.inventory([row(1, '', pid=10), row(2, '  ', pid=11),
+        actual, lookup = self.inventory([row(41, '', pid=10), row(2, '  ', pid=11),
                                          row(3, 'x' * 1023, pid=12), row(4, ' Kept ')])
         self.assertEqual(actual, [row(4, ' Kept ')])
         self.assertNotIn(10, [call.args[0] for call in lookup.call_args_list])
@@ -81,7 +87,7 @@ class RecorderInventoryTests(unittest.TestCase):
         for options in ({'incomplete': True}, {'limit': 2}):
             with self.subTest(options=options), self.assertRaisesRegex(targets.bridge.BridgeError,
                                                                       'window_list_incomplete'):
-                self.inventory([row(1, 'A'), row(2, 'B')], **options)
+                self.inventory([row(41, 'A'), row(42, 'B')], **options)
 
 
 class RecorderMatchTests(unittest.TestCase):
@@ -120,6 +126,68 @@ class RecorderMatchTests(unittest.TestCase):
         rows = [row(1, 'Warehouse'), row(2, 'Warehousx'), row(3, 'Warehouse')]
         self.assertEqual(targets.match_windows('Warehouze', rows), [rows[0], rows[2]])
         self.assertEqual(targets.match_windows('Warehousz', rows), rows)
+
+    def test_spaced_typo_can_identify_an_executable_or_a_compound_title_name(self):
+        cases = [
+            ('fx menu agnet', row(1, '업무', 'Fx-Menu Agent.exe')),
+            ('menu agnet', row(2, '업무', 'FXMenuAgentClient.exe')),
+            ('menu agnet', row(3, '생산  "ＦｘＭｅｎｕＡｇｅｎｔ"  ', 'Host.exe')),
+            ('packign desk.exe', row(4, '업무', 'PackingDesk.exe')),
+        ]
+        for hint, target in cases:
+            with self.subTest(hint=hint, target=target), patch.object(targets, '_choose_window') as picker:
+                self.assertIs(targets.choose_window(hint, [target]), target)
+                picker.assert_not_called()
+
+    def test_spacing_and_typo_keep_all_plausible_apps_and_same_app_windows(self):
+        rows = [row(7, 'Main', 'FXMenuAgentClient.exe'), row(8, 'Other', 'FXMenuAgentClient.exe'),
+                row(9, 'Support MenuAgent - Viewer', 'Other.exe')]
+        self.assertEqual(targets.match_windows('menu agnet', rows), rows)
+
+    def test_abbreviated_caption_uses_whole_words_in_order_and_keeps_the_original_title(self):
+        cases = [('설비 목록', '  설비  정기 점검 목록  '),
+                 ('DOWN List', '다운 현황 – Down Equipment List'),
+                 ('line audit status list', 'Line 5 Audit – Current Status Change List')]
+        for hint, title in cases:
+            chosen = row(5, title, 'ShellHost.exe')
+            with self.subTest(hint=hint), patch.object(targets, '_choose_window') as picker:
+                self.assertIs(targets.choose_window(hint, [chosen]), chosen)
+                picker.assert_not_called()
+                self.assertEqual(chosen['title'], title)
+
+    def test_abbreviated_caption_ties_open_picker_and_respect_stronger_matches(self):
+        hint = 'Down List'
+        rows = [row(6, 'Down Equipment List'), row(7, 'Down Machine List'),
+                row(8, 'App', 'DownLits.exe')]
+        self.assertEqual(targets.match_windows(hint, rows), rows)
+        with patch.object(targets, '_choose_window', return_value=rows[1]) as picker:
+            self.assertIs(targets.choose_window(hint, rows), rows[1])
+            picker.assert_called_once()
+        direct = row(9, 'Current - Down List')
+        self.assertEqual(targets.match_windows(hint, [*rows, direct]), [direct])
+
+    def test_abbreviated_caption_rejects_reordering_reused_words_fragments_and_noise(self):
+        cases = [('List Down', 'Down Equipment List'),
+                 ('Line Line', 'Line Equipment'),
+                 ('설비 목', '설비 점검 목'),
+                 ('D List', 'D Equipment List'),
+                 ('Dow List', 'Down Equipment List'),
+                 ('Down Lits', 'Down Equipment List'),
+                 ('02 목록', '02 점검 목록'),
+                 ('of the', 'Of Equipment The'),
+                 ('down machine group status list', 'Down Machine Group Current Status List')]
+        for hint, title in cases:
+            with self.subTest(hint=hint):
+                self.assertEqual(targets.match_windows(hint, [row(5, title)]), [])
+
+    def test_spaced_hint_does_not_fuzzy_match_an_arbitrary_substring_or_caption_sentence(self):
+        cases = [('menu agnet', row(1, 'fxmenuagentreport')),
+                 ('vendor warehosue', row(2, 'Vendor Warehouse')),
+                 ('menu wzard', row(3, 'Menu prod Wizard')),
+                 ('me nu a g ne t', row(4, 'MenuAgent'))]
+        for hint, target in cases:
+            with self.subTest(hint=hint):
+                self.assertEqual(targets.match_windows(hint, [target]), [])
 
     def test_short_hints_two_edits_sentences_and_giant_caption_tokens_are_not_fuzzy(self):
         cases = [('Foam', 'Form'), ('Wazehouze', 'Warehouse'),

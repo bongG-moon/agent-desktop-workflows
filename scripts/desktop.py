@@ -157,15 +157,26 @@ def inventory(work_dir=None):
 
 
 def _binding(binding):
-    if (not isinstance(binding, dict) or type(binding.get('pid')) is not int
-            or type(binding.get('hwnd')) is not int or binding['pid'] <= 0 or binding['hwnd'] <= 0):
+    if not isinstance(binding, dict) or type(binding.get('pid')) is not int or binding['pid'] <= 0:
         raise EngineError('invalid_target_binding')
-    return {'pid': binding['pid'], 'hwnd': binding['hwnd'],
+    hwnd = binding.get('hwnd')
+    if type(hwnd) is not int or hwnd == 0:
+        raise EngineError('invalid_target_binding')
+    if not 0 < hwnd <= 0xffffffff:
+        # Older external inventories can carry a signed or pointer-width HWND.
+        # Only this compatibility path needs to load the verified native module.
+        _bridge_script()
+        from win_bridge import normalize_hwnd
+        hwnd = normalize_hwnd(hwnd)
+        if not hwnd:
+            raise EngineError('invalid_target_binding')
+    return {'pid': binding['pid'], 'hwnd': hwnd,
             'exe_name': observe.exe_name(binding.get('exe_name'))}
 
 
 def inspect(binding, run_dir):
-    value = _native('inspect', _binding(binding), local_dir(run_dir, True))
+    binding = _binding(binding)
+    value = _native('inspect', binding, local_dir(run_dir, True))
     data = value.get('data')
     if value.get('ok') is not True or not isinstance(data, dict) or not isinstance(data.get('nodes'), list):
         raise EngineError('target_observation_unavailable')

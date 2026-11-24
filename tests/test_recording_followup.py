@@ -6,6 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/desktop-select/scripts'))
 from recording_followup import followup
+from recorder_launch import _receipt
 
 
 class RecordingFollowupTests(unittest.TestCase):
@@ -35,6 +36,29 @@ class RecordingFollowupTests(unittest.TestCase):
         self.assertEqual(registration['args'], ['register', '--task', '원본', '--run', '--summary'])
         self.assertEqual(registration['required_options'], ['--out'])
         self.assertFalse(result['input_dispatched'])
+
+    def test_host_output_preserves_the_session_trial_and_effective_registration(self):
+        token = '3' * 32
+        for name in ('원본', '보정 사본'):
+            with self.subTest(name=name):
+                source = self.ready()
+                if name != '원본':
+                    source['execution_plan'] = dict(status='not_compatible')
+                    source['live_recovery'] = dict(self.ready(name), host_action='use_prepared_task')
+                session = _receipt(followup(source), token)
+                rendered = followup(deepcopy(session))
+                self.assertEqual(rendered['next_action']['args'], ['try-recording', '--session', token])
+                self.assertEqual(rendered['next_action']['register_and_test']['args'],
+                                 ['register', '--task', name, '--run', '--summary'])
+                self.assertEqual(rendered, session)
+
+    def test_session_with_an_unresolved_binding_still_offers_the_binding_step(self):
+        source = dict(status='recorded', input_dispatched=False, task={'name':'원본'},
+                      live_recovery=dict(status='needs_grounding', source_task='원본',
+                                         live_scopes=[], bindings_template={'steps': []}))
+        session = _receipt(followup(source), '4' * 32)
+        self.assertEqual(followup(deepcopy(session)), session)
+        self.assertEqual(session['next_action']['args'], ['recover', '--task', '원본'])
 
     def test_unresolved_binding_uses_existing_scope_and_template(self):
         receipt = dict(status='recorded', input_dispatched=False, task={'name':'원본'},

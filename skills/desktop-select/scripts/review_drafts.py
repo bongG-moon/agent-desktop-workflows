@@ -11,7 +11,8 @@ KIND = 'recording-review'
 
 def saved_form(step):
     instruction = step.get('instruction', {})
-    text = instruction.get('text') or step.get('instruction_draft') or step.get('description') or step.get('label', '')
+    fallback = f"{step['keys']} 키 누르기" if step.get('action') == 'press-key' else step.get('label', '')
+    text = instruction.get('text') or step.get('instruction_draft') or step.get('description') or fallback
     mode = instruction.get('mode')
     return dict(alias=step.get('alias', ''), text=text, mode=mode if mode in ('fixed', 'required') else None,
                 argument=instruction.get('parameter', instruction.get('value', '')))
@@ -78,7 +79,7 @@ def validate(doc):
         require(isinstance(step, dict) and tasks._text(step.get('id'), 200)
                 and step['id'] not in ids and isinstance(step.get('label'), str))
         ids.add(step['id'])
-        require(step.get('action') in ('manual', 'click', 'set-value', 'select', 'expand', 'teach-target', 'submit',
+        require(step.get('action') in ('manual', 'click', 'set-value', 'select', 'expand', 'teach-target', 'submit', 'press-key',
                                        'result-menu', 'row-action', 'visual-click', 'saved-step'))
         if step['action'] == 'saved-step':
             require(set(step) <= {'id', 'action', 'label', 'saved', '_capture_window'}
@@ -111,6 +112,9 @@ def validate(doc):
             tasks._menu_window_point(step['menu_window_point'], step.get('recognition', {}).get('reason'))
         if step['action'] == 'set-value':
             require(isinstance(step.get('value'), str))
+        if step['action'] == 'press-key':
+            import key_chords
+            require(bool(key_chords.virtual_keys(step.get('keys'))))
         if '_capture_window' in step:
             scope = step['_capture_window']
             require(isinstance(scope, dict))

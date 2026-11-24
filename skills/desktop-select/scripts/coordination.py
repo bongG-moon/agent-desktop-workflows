@@ -167,14 +167,22 @@ def desktop_input():
     return _lease('Input', 'desktop_input_queue_timeout')
 
 
+def _window_key(value):
+    from desktop_select import bridge
+    hwnd = bridge.normalize_hwnd(value)
+    if not hwnd:
+        raise CoordinationError('invalid_target')
+    return hwnd
+
+
 def handle(binding):
-    hwnd = binding['hwnd'] if isinstance(binding, dict) else binding.hwnd
-    return _lease('Window.' + str(hwnd), 'window_queue_timeout')
+    value = binding['hwnd'] if isinstance(binding, dict) else binding.hwnd
+    return _lease('Window.' + str(_window_key(value)), 'window_queue_timeout')
 
 
 def reserve_handles(stack, held, hwnds):
     """Keep already-open secondary windows reserved before the first action."""
-    for hwnd in sorted(set(hwnds) - held):
+    for hwnd in sorted({_window_key(value) for value in hwnds} - held):
         stack.enter_context(handle({'hwnd': hwnd}))
         held.add(hwnd)
 

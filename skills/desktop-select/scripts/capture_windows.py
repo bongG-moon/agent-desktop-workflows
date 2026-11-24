@@ -25,8 +25,9 @@ def visible_window_keys():
     keys = set()
     callback = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
     def visit(hwnd, _):
-        if bridge.user32.IsWindowVisible(hwnd):
-            keys.add((int(hwnd), bridge.hwnd_pid(hwnd)))
+        hwnd = bridge.normalize_hwnd(hwnd)
+        if hwnd and bridge.user32.IsWindowVisible(hwnd):
+            keys.add((hwnd, bridge.hwnd_pid(hwnd)))
         return True
     enum = bridge._sig(bridge.user32, 'EnumWindows', W.BOOL, callback, W.LPARAM)
     if not enum(callback(visit), 0):

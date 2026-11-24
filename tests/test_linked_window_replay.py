@@ -32,7 +32,7 @@ class LinkedWindowTests(TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.owner = SimpleNamespace(hwnd=1, exe='Manager.exe', pid=1, created='1111', check=mock.Mock())
+        self.owner = SimpleNamespace(hwnd=0x81230007, exe='Manager.exe', pid=1, created='1111', check=mock.Mock())
         self.records = []
         self.stack.enter_context(mock.patch.object(flow.app, 'windows', side_effect=lambda _:list(self.records)))
         self.stack.enter_context(mock.patch.object(flow.app.bridge, 'Binding', side_effect=binding))
@@ -61,7 +61,7 @@ class LinkedWindowTests(TestCase):
             return dict(status='verified', input_dispatched=True)
         with mock.patch.object(flow.live, 'execute', side_effect=execute):
             report = flow.run(self.recipe)
-        self.assertEqual(sent,[1,2,1])
+        self.assertEqual(sent, [self.owner.hwnd, 2, self.owner.hwnd])
         self.assertEqual(report['status'],'verified')
         self.assertEqual(report['steps'][0]['receipt']['verification_scope'],'recorded_window_opened')
         self.assertEqual(report['steps'][1]['receipt']['window_context'],self.child['window_context'])
@@ -88,6 +88,32 @@ class LinkedWindowTests(TestCase):
             send.assert_called_once()
             child_action.assert_not_called()
 
+    def test_keyboard_opener_waits_for_its_window_in_full_and_single_step_runs(self):
+        self.recipe['steps'][0] = dict(action='press-key', keys='Ctrl+F',
+                                       selector=dict(automation_id='editor', role='textfield'))
+        sent = []
+        def execute(bound, uia, element, node, action, value, **kwargs):
+            sent.append((bound.hwnd, action))
+            if action == 'press-key':
+                self.assertEqual(value, 'Ctrl+F')
+                self.records.append(window(2))
+                return dict(status='delivered_unverified', input_dispatched=True, diagnostic='key_chord_sent',
+                            keys=value, keyboard_events_sent=4, physical_input=True)
+            return dict(status='verified', input_dispatched=True)
+        for only, expected in [(1, [(self.owner.hwnd, 'press-key')]),
+                               (None, [(self.owner.hwnd, 'press-key'), (2, 'fill'), (self.owner.hwnd, 'invoke')])]:
+            with self.subTest(only=only), mock.patch.object(flow.live, 'execute', side_effect=execute):
+                self.records.clear()
+                sent.clear()
+                report = flow.run(self.recipe, only=only)
+                self.assertEqual(report['status'], 'verified', report)
+                self.assertEqual(report['steps'][0]['receipt']['verification_scope'], 'recorded_window_opened')
+                self.assertEqual(sent, expected)
+                blocked = flow.run(self.recipe, only=only)
+                self.assertEqual(blocked['diagnostic'], 'expected_new_window_already_open')
+                self.assertFalse(blocked['input_dispatched'])
+                self.assertEqual(sent, expected)
+
     def test_duplicate_or_renamed_existing_window_never_receives_followup(self):
         for scenario in ('duplicate','renamed','missing'):
             with self.subTest(scenario=scenario):
@@ -103,7 +129,7 @@ class LinkedWindowTests(TestCase):
                                 diagnostic='business_result_not_verified')
                 with mock.patch.object(flow.live,'execute',side_effect=execute):
                     report = flow.run(self.recipe)
-                self.assertEqual(sent,[1])
+                self.assertEqual(sent, [self.owner.hwnd])
                 self.assertEqual(report['status'],'blocked')
                 self.assertTrue(report['input_dispatched'])
                 self.assertEqual(report['stopped_at'],2)
@@ -144,7 +170,7 @@ class LinkedWindowTests(TestCase):
             with mock.patch.object(flow.live, 'execute', side_effect=send):
                 self.assertEqual(flow.run(self.recipe)['status'], 'verified')
             self.assertEqual(other.submit(probe).result(timeout=2), 'available')
-        self.assertEqual(probes, [(hwnd, 'window_queue_timeout') for hwnd in (1, detail.hwnd, 1)])
+        self.assertEqual(probes, [(hwnd, 'window_queue_timeout') for hwnd in (self.owner.hwnd, detail.hwnd, self.owner.hwnd)])
 
     def test_only_opened_child_requires_opener_but_explicit_existing_child_can_be_used(self):
         self.records[:]=[window(2)]
@@ -196,7 +222,7 @@ class LinkedWindowTests(TestCase):
                 result = flow.run(self.recipe)
             self.assertTrue(verify.called)
             self.assertEqual(result['status'],'verified' if related_ok else 'blocked')
-            self.assertEqual(sent,[5,2,1] if related_ok else [5])
+            self.assertEqual(sent, [5, 2, self.owner.hwnd] if related_ok else [5])
 
     def test_compile_preserves_source_numbers_and_translates_references_across_waits(self):
         raw=recording()
@@ -222,7 +248,8 @@ class LinkedWindowTests(TestCase):
         self.stack.enter_context(mock.patch.object(flow,'resolve_step',return_value=(element, {}, None)))
         self.stack.enter_context(mock.patch.object(flow.app,'field_label',
                                 return_value=dict(label_source='labeled_by',semantic_label=field['label'])))
-        for stop, expected in ((1, [1]), (2, [1,1]), (0, [1,1,2,3])):
+        owner = self.owner.hwnd
+        for stop, expected in ((1, [owner]), (2, [owner, owner]), (0, [owner, owner, 2, 3])):
             with self.subTest(missing_window_after=stop):
                 self.records.clear()
                 sent = []

@@ -192,7 +192,7 @@ class CaptureTrail:
                         continue
                     reason = step.get('recognition', {}).get('reason')
                     if (step['action'] in ('click','select','expand','row-action','result-menu','visual-click',
-                                          'double-click-result','submit')
+                                          'double-click-result','submit','press-key')
                             or reason in ('row_capture_requires_review', 'stable_locator_unavailable',
                                           'capture_target_unavailable', 'unsupported_recorded_action',
                                           'right_click_requires_menu_teaching', 'popup_scope_unproven',

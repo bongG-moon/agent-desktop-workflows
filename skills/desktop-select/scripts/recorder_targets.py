@@ -13,6 +13,9 @@ import win_bridge as bridge
 _SHELL_CLASSES = {'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd',
                   'tooltips_class32', '#32768'}
 _MAX_WINDOWS = 512
+_WORD = re.compile(r'[^\W_]+')
+_NAME_BOUNDARY = re.compile(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+_CAPTION_STOP_WORDS = frozenset('an and as at by for from in of on or the to with'.split())
 
 
 def inventory():
@@ -25,7 +28,8 @@ def inventory():
     def visit(hwnd, _):
         nonlocal truncated
         try:
-            if not bridge.user32.IsWindowVisible(hwnd) or bridge.root_window(hwnd) != hwnd:
+            hwnd = bridge.normalize_hwnd(hwnd)
+            if not hwnd or not bridge.user32.IsWindowVisible(hwnd) or bridge.root_window(hwnd) != hwnd:
                 return True
             pid = bridge.hwnd_pid(hwnd)
             if not pid or pid == os.getpid() or bridge.window_class(hwnd) in _SHELL_CLASSES:
@@ -65,7 +69,7 @@ def inventory():
 
 
 def _words(value):
-    return re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', value).casefold())
+    return _WORD.findall(unicodedata.normalize('NFKC', value).casefold())
 
 
 def _normalized(value):
@@ -92,6 +96,24 @@ def _one_edit(left, right):
     return shorter[index:] == longer[index + 1:]
 
 
+def _near_name(query, name):
+    """Compare at observed name boundaries (e.g. MenuAgent in FXMenuAgentClient)."""
+    name = unicodedata.normalize('NFKC', name)
+    shortest, longest = max(6, len(query) - 1), min(80, len(query) + 1)
+    if len(name.casefold()) < shortest:
+        return False
+    parts = _WORD.findall(_NAME_BOUNDARY.sub(' ', name).casefold())
+    for start in range(len(parts)):
+        joined = ''
+        for index in range(start, len(parts)):
+            joined += parts[index]
+            if len(joined) > longest:
+                break
+            if len(joined) >= shortest and _one_edit(query, joined):
+                return True
+    return False
+
+
 def match_windows(hint, rows):
     """Return every match in the strongest tier; never break a tie by score or focus."""
     if not isinstance(hint, str) or not hint.strip():
@@ -103,24 +125,35 @@ def match_windows(hint, rows):
                                                row['title'].casefold())]
     if exact:
         return exact
-    query = _normalized(hint)
+    hint_words = _words(hint)
+    query = ''.join(hint_words)
     if not query:
         return []
     partial = [row for row in rows if any(query in _normalized(value)
-               for value in (row['exe_name'], _stem(row['exe_name']), row['title']))]
+               for value in (row['exe_name'], row['title']))]
     if partial:
         return partial
-    # Fuzzy matching is restricted to one sufficiently long app/name token. A long
-    # sentence or an entire document caption is not a fuzzy identifier.
-    tokens = _words(_stem(hint))
-    if len(tokens) != 1 or not 6 <= len(tokens[0]) <= 80:
+    match_caption = (2 <= len(hint_words) <= 4 and all(
+        len(word) >= 2 and word not in _CAPTION_STOP_WORDS and any(ch.isalpha() for ch in word)
+        for word in hint_words))
+    # A spaced app name may contain a typo. Caption phrases only match exact words.
+    app_words = _words(_stem(hint)) if hint.casefold().endswith('.exe') else hint_words
+    app_name = ''.join(app_words)
+    match_app = len(app_words) <= 4 and 6 <= len(app_name) <= 80
+    if not (match_caption or match_app):
         return []
-    query = tokens[0]
     result = []
     for row in rows:
-        names = set(_words(_stem(row['exe_name'])) + _words(row['title']))
-        if any(6 <= len(name) <= 80 and _one_edit(query, name) for name in names):
-            result.append(row)
+        if match_caption:
+            remaining = iter(_words(row['title']))
+            # Each membership check consumes words through the match.
+            if all(word in remaining for word in hint_words):
+                result.append(row)
+                continue
+        if match_app:
+            title_words = _WORD.findall(unicodedata.normalize('NFKC', row['title']))
+            if any(_near_name(app_name, name) for name in (_stem(row['exe_name']), *title_words)):
+                result.append(row)
     return result
 
 

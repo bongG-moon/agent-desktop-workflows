@@ -11,7 +11,7 @@ VERSION = '0.4.28'
 FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'references/host-details.md',
                                          'references/recording-recovery.md', 'references/table-export.md',
                                          'references/rows-and-windows.md', 'scripts/desktop_select.py',
-                                         'scripts/live_action.py', 'scripts/targeting.py',
+                                         'scripts/live_action.py', 'scripts/key_chords.py', 'scripts/targeting.py',
                                          'scripts/teach_capture.py', 'scripts/recorder_theme.py', 'scripts/recorder_menu.py',
                                          'scripts/learned_tasks.py', 'scripts/review_drafts.py',
                                          'scripts/recorder_launch.py', 'scripts/recorder_targets.py',

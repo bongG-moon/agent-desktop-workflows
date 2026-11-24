@@ -99,3 +99,19 @@ class AppRecordingEntryTests(unittest.TestCase):
             self.assertEqual(app.run(app.parser().parse_args(['recorder', '--session', 'a' * 32])),
                              {'status': 'recording'})
             status.assert_called_once_with('a' * 32)
+
+    def test_unnamed_app_uses_one_picker_with_optional_task_name(self):
+        import recorder_launch as launcher
+        import recorder_targets as targets
+        with (patch.object(launcher, 'launch') as start,
+              patch.object(targets, 'inventory', return_value=[]) as inventory,
+              patch.object(targets, 'choose_window', return_value=None) as picker,
+              patch.object(app.bridge, 'Binding') as binding, patch.object(app.bridge, 'set_dpi_awareness')):
+            for options, task in (([], None), (['--task', '설비 조회'], '설비 조회')):
+                args = app.parser().parse_args(['recorder', *options])
+                app.run(args)
+                start.assert_called_with(None, task=task)
+            self.assertEqual(app.record_application(None), dict(status='cancelled', input_dispatched=False))
+            inventory.assert_called_once_with()
+            self.assertEqual(picker.call_args.args, ('', []))
+            binding.assert_not_called()

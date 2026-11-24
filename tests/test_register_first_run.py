@@ -90,6 +90,8 @@ class RegisterFirstRunTests(unittest.TestCase):
             self.assertFalse(result['input_dispatched'])
             if diagnostic:
                 self.assertEqual(result['diagnostic'], diagnostic)
+                self.assertEqual(result['required_parameters'], ['Family'])
+                self.assertNotIn('Hybrid', json.dumps(result))
             else:
                 self.assertEqual(result['missing_parameters'], ['Family'])
             self.assertFalse(self.destination.exists())
@@ -281,6 +283,59 @@ class RegisterFirstRunTests(unittest.TestCase):
             if step['action'] == 'set-value' and step['selector']['role'] == 'combobox':
                 step['allow_option_select'] = True
         self.assertEqual(flow.load(self.destination / 'workflow.json'), expected)
+
+    def test_unresolved_draft_returns_the_step_and_direct_preparation_arguments(self):
+        import review_drafts
+        store = self.destination.parent / 'tasks'
+        raw = dict(id='1', action='manual', label='unresolved', target={'kind': 'manual'},
+                   recognition={'reason': 'capture_target_unavailable'})
+        review_drafts.ReviewStorage('초안', 'A.exe', '업무', store).save_draft(
+            [dict(step=raw, form=dict(alias='', text='나중에 필요한 내용', mode=None, argument=''))],
+            'invalid_step_instruction', 1)
+        with (patch.object(flow.app, 'task_directory', return_value=store),
+              self.workers() as (registration, execution, engine), redirect_stdout(StringIO()) as stdout):
+            code = flow.main(['register', '--task', '초안', '--out', str(self.destination)])
+        result = json.loads(stdout.getvalue())
+        self.assertEqual((code, result['status'], result['step']), (2, 'needs_grounding', 1))
+        self.assertEqual(result['diagnostic'], 'target_grounding_required')
+        self.assertTrue(result['grounding_steps'])
+        self.assertEqual(result['recover_args'], ['recover', '--task', '초안', '--prepare'])
+        self.assertFalse(result['input_dispatched'])
+        self.assertFalse(self.destination.exists())
+        registration.assert_not_called()
+        execution.assert_not_called()
+        engine.assert_not_called()
+
+    def test_successful_trial_of_editable_draft_registers_offline_using_its_effective_name(self):
+        import review_drafts
+        from test_recorded_plan import combo
+        store = self.destination.parent / 'tasks'
+        raw = combo(label='Region', identifier='REG', sentence='입력받은 변수를 Region에 입력해줘')
+        review_drafts.ReviewStorage('영역 초안', 'A.exe', '업무', store).save_draft(
+            [dict(step=dict(raw, id='1', label='Region'), form=dict(alias='', text=raw['instruction']['text'],
+                  mode=None, argument=''))], 'invalid_step_instruction', 1)
+        source = store / '영역 초안.json'
+        original = source.read_bytes()
+        with (patch.object(flow.app, 'task_directory', return_value=store),
+              patch.object(flow.app, 'worker_receipt', return_value=dict(
+                  status='verified', input_dispatched=True, steps=[
+                      dict(number=1, receipt=dict(status='verified', input_dispatched=True))])) as trial_worker,
+              self.workers() as (registration, execution, engine)):
+            tested = flow.app.run(flow.app.parser().parse_args(
+                ['try-recording', '--task', '영역 초안', '--set', 'Region=North']))
+            self.assertEqual(tested['status'], 'verified')
+            with redirect_stdout(StringIO()) as stdout:
+                code = flow.main(['register', '--task', tested['effective_task'], '--out', str(self.destination)])
+            result = json.loads(stdout.getvalue())
+            self.assertEqual((code, result['status']), (0, 'registered'), result)
+            self.assertEqual(result['required_parameters'], ['Region'])
+            self.assertEqual(result['target_validation'], 'recorded_evidence')
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(flow.load(self.destination / 'workflow.json')['steps'][0]['parameter'], 'Region')
+            trial_worker.assert_called_once()
+            registration.assert_not_called()
+            execution.assert_not_called()
+            engine.assert_not_called()
 
 
 if __name__ == '__main__':

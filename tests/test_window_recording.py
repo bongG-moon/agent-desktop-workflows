@@ -132,7 +132,7 @@ class WindowRecordingTests(TestCase):
     def test_sole_opener_is_independent_of_caption_gesture_and_delay(self):
         # A unique captured opener needs neither an application-specific button
         # name nor a rapid arrival. No extra UI lookup is needed to decide it.
-        variants = [dict(action='click', label='Afficher'), dict(action='submit'),
+        variants = [dict(action='click', label='Afficher'), dict(action='submit'), dict(action='press-key', keys='Ctrl+F'),
                     dict(action='visual-click', visual=dict(gesture='double-click')),
                     teach.manual('double_click_needs_review', 'open'),
                     dict(action='double-click-result', result_row='single'),

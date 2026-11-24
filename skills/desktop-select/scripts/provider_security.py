@@ -30,8 +30,8 @@ def _passive_list_peer(win, uia, element):
     if (owner is None or owner.property(30003) != 50008 or owner.property(30019) is not False
             or uia.pid(owner) != pid):
         return False
-    hwnd = owner.property(30020)
-    if (type(hwnd) is not int or hwnd <= 0 or type(pid) is not int or pid <= 0
+    hwnd = win.normalize_hwnd(owner.property(30020))
+    if (not hwnd or type(pid) is not int or pid <= 0
             or not win.user32.IsWindow(hwnd) or win.hwnd_pid(hwnd) != pid):
         return False
     native_class = win.window_class(hwnd)
@@ -83,8 +83,8 @@ def secure(win, uia, element):
             return False
         if protected is not None or not _shell_metadata(element):
             return True
-        hwnd, pid = element.property(30020), uia.pid(element)
-        if (type(hwnd) is not int or not 0 < hwnd <= 0x7fffffffffffffff
+        hwnd, pid = win.normalize_hwnd(element.property(30020)), uia.pid(element)
+        if (not hwnd
                 or type(pid) is not int or not 0 < pid <= 0x7fffffff):
             return True
 
@@ -96,7 +96,7 @@ def secure(win, uia, element):
             return True
         current = uia.from_handle(hwnd)
         if (current is None or not uia.same(element, current) or uia.pid(current) != pid
-                or current.property(30020) != hwnd or not _shell_metadata(current)):
+                or win.normalize_hwnd(current.property(30020)) != hwnd or not _shell_metadata(current)):
             return True
         # A destroyed/replaced HWND or a changed protection flag invalidates
         # the evidence gathered above. No permissive result is cached.

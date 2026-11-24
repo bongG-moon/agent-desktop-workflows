@@ -25,6 +25,19 @@ def combo_postcondition_failure():
 
 
 class TargetResolutionTests(unittest.TestCase):
+    def test_inspect_matches_an_older_inventory_with_a_sign_extended_handle(self):
+        hwnd = 0x80001234
+        record = dict(hwnd=hwnd, pid=42, nodes=[])
+        with tempfile.TemporaryDirectory() as folder, patch.object(desktop, '_native') as native:
+            native.return_value = dict(ok=True, data=record)
+            for value in (hwnd - (1 << 32), hwnd | 0xffffffff00000000):
+                with self.subTest(value=value):
+                    target = dict(pid=42, hwnd=value, exe_name='Example.exe')
+                    self.assertEqual(desktop.inspect(target, Path(folder)), record)
+                    self.assertEqual(native.call_args.args[1]['hwnd'], hwnd)
+            with self.assertRaisesRegex(desktop.EngineError, 'invalid_target_binding'):
+                desktop.inspect(dict(pid=42, hwnd=0x100000000 | hwnd, exe_name='Example.exe'), Path(folder))
+
     def test_combo_postcondition_only_error_requires_all_delivery_evidence(self):
         node = {'path': '0', 'role': 'combobox', 'name': 'Status', 'native_id': 'stable'}
         after = {'ok': True, 'data': {'tree': dict(node, value=''), 'complete': True}}

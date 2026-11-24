@@ -50,7 +50,8 @@ class BackgroundRuntimeTests(unittest.TestCase):
         return fixture
 
     def test_later_submit_or_menu_rejects_entire_plan_before_binding(self):
-        for later in (submit(), context_fixture.context()):
+        for later in (submit(), context_fixture.context(),
+                      dict(action='press-key', keys='F5', selector=dict(automation_id='table', role='table'))):
             with self.subTest(action=later['action'], anchored='anchor' in later.get('selector', {})), \
                     patch.object(flow, 'bind') as bind, \
                     patch.object(app.bridge, 'UIA') as uia, \

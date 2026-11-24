@@ -10,7 +10,7 @@
 
 ## 저장 영수증에 미확정 대상이 있을 때
 
-저장 후 첫 시험은 `try-recording --session <세션 번호>` 또는 `try-recording --task "<작업명>"`에서 시작한다. 사용자에게 받은 변수는 같은 호출에 넘긴다. 값 비교를 요청한 경우에만 지정한 열의 현재 셀을 이번 입력값과 비교한다. `report_unmatched_result`이면 불일치나 중복 등 실제 판정 사유를 보고한다.
+저장 후 첫 시험은 `try-recording --summary --session <세션 번호>` 또는 `try-recording --summary --task "<작업명>"`에서 시작한다. 사용자에게 받은 변수는 같은 호출에 넘긴다. 시험이 끝나면 `observations`에서 녹화 단계별로 읽은 값을 확인한다. 값 비교를 요청한 경우에만 지정한 열의 현재 셀을 이번 입력값과 비교한다. `report_unmatched_result`이면 불일치나 중복 등 실제 판정 사유를 보고한다.
 
 `inspect_current_result_without_replaying`이면 캡처가 허용된 경우에만 `result_inspection.args`로 방금 조회한 창을 확인한다. 값 비교 방식에서는 요청한 열에 정확히 한 건이 보이고 `resume_args`가 있으면 해당 글자와 이미지 좌표를 넣어 후속 단계부터 이어간다. `--row-policy`가 있는 현재 행 방식은 글자 입력 없이 확인한 행 좌표로 이어간다. `single`은 한 행인 경우만, `first`는 사용자가 첫 행을 지정한 경우만 사용한다. 현재 행의 존재를 확인한 것은 조회 최신성이나 값 일치를 확인한 것이 아니다.
 

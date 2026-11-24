@@ -20,6 +20,8 @@ import storage_paths
 
 STARTUP_WAIT_SECONDS = 8.0
 STARTUP_GRACE_SECONDS = 30.0
+# The read-only provider worker started after a draft save can run for 90s.
+SAVED_PROCESSING_WAIT_SECONDS = 95.0
 MAX_REQUEST_BYTES = 65536
 MAX_EVENT_BYTES = 4 * 1024 * 1024
 LIVE_EVENTS = {'recorder_ready', 'recorder_selection_required', 'recorder_starting',
@@ -72,7 +74,7 @@ def _request(folder):
 
 
 def _validate(app_hint, task):
-    if not tasks._text(app_hint, 200):
+    if app_hint is not None and not tasks._text(app_hint, 200):
         raise ValueError('invalid_recorder_request')
     if task is not None:
         tasks._name(task)
@@ -125,7 +127,14 @@ def _events(folder):
 
 def _receipt(result, token):
     receipt = dict(result, session=token, status_args=['recorder', '--session', token, '--wait', '8'])
-    if result.get('status') == 'recorded':
+    state = result['status']
+    if state in ('recorder_ready', 'recording'):
+        receipt['host_action'] = 'wait_for_user_to_save'
+    elif state == 'recorder_selection_required':
+        receipt['host_action'] = 'wait_for_user_to_select_window'
+    elif state == 'cancelled':
+        receipt['host_action'] = 'report_recording_cancelled'
+    elif state == 'recorded':
         receipt['first_trial_args'] = ['try-recording', '--session', token]
         if result.get('next_action', {}).get('kind') == 'run_prepared_recording':
             receipt['next_action'] = dict(result['next_action'], args=receipt['first_trial_args'])
@@ -208,20 +217,31 @@ def _observe(folder, token, *, initial=False, exited=False):
     return _receipt(dict(status='recorder_starting', input_dispatched=False), token)
 
 
-def status(token, *, wait_seconds=0):
+def wait_for_trial(token):
+    """Keep a requested trial in the same call while its saved draft is being prepared."""
+    return status(token, wait_seconds=STARTUP_WAIT_SECONDS, wait_for_saved=True)
+
+
+def status(token, *, wait_seconds=0, wait_for_saved=False):
     """Read this project's session without ever reopening or replaying the recorder."""
     try:
         if (type(wait_seconds) not in (int, float) or not math.isfinite(wait_seconds)
                 or not 0 <= wait_seconds <= 30):
             raise ValueError('invalid_recorder_wait')
         folder = _folder(token)
-        deadline = time.monotonic() + wait_seconds
+        started = time.monotonic()
+        deadline = started + wait_seconds
         while True:
             result = _observe(folder, token)
-            remaining = deadline - time.monotonic()
+            if wait_for_saved and result['status'] == 'recorder_processing' and result.get('saved') is True:
+                deadline = time.monotonic() + SAVED_PROCESSING_WAIT_SECONDS
+                wait_for_saved = False  # Bound the wait even if the worker stops making progress.
+            now = time.monotonic()
+            remaining = deadline - now
             if result['status'] not in ('recorder_starting', 'recorder_processing') or remaining <= 0:
                 return result
-            time.sleep(min(0.1, remaining))
+            interval = 0.5 if now - started >= STARTUP_WAIT_SECONDS else 0.1
+            time.sleep(min(interval, remaining))
     except (OSError, ValueError) as error:
         return _failure(error, token if isinstance(token, str) and re.fullmatch('[0-9a-f]{32}', token) else None)
 

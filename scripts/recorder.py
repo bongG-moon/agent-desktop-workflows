@@ -227,6 +227,15 @@ class HookPump:
             self.enabled.clear()
             self.notices.put(('fatal', 'recording_queue_full'))
 
+    def _key_event(self, code, *, ctrl, shift, alt, win):
+        """The standalone recorder retains only transition categories."""
+        if code in (16, 17, 18, 0x5b, 0x5c, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5):
+            return None
+        if code in (27, 13, 9):
+            return {'kind': {27: 'escape', 13: 'enter', 9: 'tab'}[code]}
+        shortcut = alt or win or (ctrl and code not in (65, 86, 88)) or code in range(0x21, 0x29) or code in range(0x70, 0x88)
+        return {'kind': 'shortcut' if shortcut else 'typing'}
+
     def start(self):
         if self.thread and self.thread.is_alive():
             return
@@ -335,22 +344,25 @@ class HookPump:
                     self.notices.put(('fatal', 'input_observation_failed'))
                 return user.CallNextHookEx(mouse_hook, code, message, data)
 
+            held_command_keys = set()
+
             @HOOKPROC
             def keyboard_callback(code, message, data):
                 try:
-                    if (code >= 0 and self.enabled.is_set() and message in (0x100, 0x104)
-                            and self.binding.contains_window(self.bridge.foreground())):
+                    if code >= 0 and self.enabled.is_set() and message in (0x101, 0x105):
+                        if held_command_keys:
+                            held_command_keys.discard(ctypes.cast(data, ctypes.POINTER(Keyboard)).contents.code)
+                    elif (code >= 0 and self.enabled.is_set() and message in (0x100, 0x104)
+                          and self.binding.contains_window(self.bridge.foreground())):
                         key = ctypes.cast(data, ctypes.POINTER(Keyboard)).contents
-                        # Character codes are never sent to the worker or persisted.
-                        control = bool(user.GetAsyncKeyState(0x11) & 0x8000)
-                        alternate = any(user.GetAsyncKeyState(k) & 0x8000 for k in (0x12, 0x5b, 0x5c))
-                        if key.code in (16, 17, 18, 0x5b, 0x5c, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5):
-                            return user.CallNextHookEx(keyboard_hook, code, message, data)
-                        kind = ('escape' if key.code == 27 else 'enter' if key.code == 13 else
-                                'tab' if key.code == 9 else 'shortcut' if alternate or (control and key.code not in (65, 86, 88))
-                                or key.code in range(0x21, 0x29) or key.code in range(0x70, 0x88)
-                                else 'typing')
-                        self._emit({'kind': kind, 'at': time.monotonic()})
+                        if key.code not in held_command_keys:
+                            event = self._key_event(key.code, ctrl=bool(user.GetAsyncKeyState(0x11) & 0x8000),
+                                shift=bool(user.GetAsyncKeyState(0x10) & 0x8000), alt=bool(user.GetAsyncKeyState(0x12) & 0x8000),
+                                win=bool(user.GetAsyncKeyState(0x5b) & 0x8000 or user.GetAsyncKeyState(0x5c) & 0x8000))
+                            if event:
+                                if event['kind'] == 'press-key':
+                                    held_command_keys.add(key.code)
+                                self._emit(dict(event, at=time.monotonic()))
                 except Exception:
                     self.notices.put(('fatal', 'input_observation_failed'))
                 return user.CallNextHookEx(keyboard_hook, code, message, data)

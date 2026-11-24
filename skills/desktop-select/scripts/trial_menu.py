@@ -99,6 +99,22 @@ def prior(app, key):
     return first_trial._previous(app.task_directory() / 'first-trials' / (attempt + '.json'))
 
 
+def summarize_resume(app, key, report, *, recipe=None, expected_start=None):
+    """Use the saved repair start and the complete remaining recipe, including cached runs."""
+    import python_workflow as flow
+    start = report.get('resumed_at')  # run_registered copies this from the claimed repair ticket.
+    if (report.get('status') not in ('verified', 'completed_unverified') or 'stopped_at' in report
+            or type(start) is not int or start < 1 or (expected_start is not None and start != expected_start)):
+        return report
+    if recipe is None:
+        try:
+            recipe = flow.load(_folder(app, key) / 'workflow.json')
+        except (OSError, ValueError):
+            return report  # An older receipt can outlive its prepared recipe.
+    entries = list(enumerate(recipe['steps'][start - 1:], start))
+    return flow.summarize_execution(report, entries)
+
+
 def _public(app, key, report, overrides):
     report = dict(report, trial_receipt=key)
     values = [part for name, value in overrides.items() for part in ('--set', name + '=' + value)]
@@ -109,13 +125,17 @@ def _public(app, key, report, overrides):
             continue
         pending = report[field] = dict(pending)
         if field == 'menu_repair':
-            pending.update(frame_script=script,
-                frame_args=['inspect-menu-trial', '--receipt', key, '--allow-physical', *values])
-            if pending.get('frame'):
+            if pending.get('frame') and pending.get('image'):
+                pending.pop('frame_args', None)
+                pending.pop('frame_script', None)
                 pending.update(resume_script=script,
                     resume_args=['resume-menu-trial', '--receipt', key, '--frame', pending['frame'],
                                  '--point', '<data cell x>', '<data cell y>', '--allow-physical', *values])
-            report['host_action'] = 'inspect_current_menu_without_replaying'
+                report['host_action'] = 'inspect_menu_repair_image'
+            else:
+                pending.update(frame_script=script,
+                    frame_args=['inspect-menu-trial', '--receipt', key, '--allow-physical', *values])
+                report['host_action'] = 'inspect_current_menu_without_replaying'
         else:
             pending.update(resume_script=script,
                 resume_args=['resume-menu-trial', '--receipt', key, '--allow-physical', *values])
@@ -211,7 +231,7 @@ def continue_menu(app, args, *, inspect=False):
         record = repair.RepairSession(folder / 'workflow.json').read(None, recipe)
     except ValueError:
         if previous:
-            return previous
+            return summarize_resume(app, key, previous, recipe=recipe) if args.summary else previous
         raise
     overrides = tasks.parse_overrides(args.set)
     _need(repair.digest(overrides) == record['variables'], 'menu_repair_parameters_changed')
@@ -228,4 +248,6 @@ def continue_menu(app, args, *, inspect=False):
         report.update(prior_steps_replayed=False, resume_dispatched_input=report.get('input_dispatched'),
                       effective_task=report.get('effective_task', state['effective_task']))
         return report
-    return first_trial._once(app.task_directory(), attempt, dispatch)
+    report = first_trial._once(app.task_directory(), attempt, dispatch)
+    return (summarize_resume(app, key, report, recipe=recipe, expected_start=record['number'])
+            if args.summary else report)

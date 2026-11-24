@@ -32,7 +32,7 @@ class WindowTaskStorageTests(TestCase):
             return dict(status='verified', input_dispatched=True, effect_verification='matched')
 
         args = Namespace(**{**vars(self.args), 'only': None})
-        row = dict(hwnd=1, pid=11, exe_name='Agent.exe', title='Device Setup')
+        row = dict(hwnd=11, pid=11, exe_name='Agent.exe', title='Device Setup')
         with (mock.patch.object(app, 'windows', return_value=[row]),
               mock.patch.object(app.coordination, 'window', reserve),
               mock.patch.object(app, 'worker_receipt', side_effect=verified)):
@@ -93,7 +93,7 @@ class WindowTaskStorageTests(TestCase):
             trigger=None, ready=None, output=dict(kind='directory', path=r'C:\DesktopSelectTest'),
             menu=dict(target=dict(role='table', name='Results'), point=[.4, .4], path=['Workbook'])))
         args = Namespace(**{**vars(self.args), 'only': None})
-        row = dict(hwnd=1, pid=11, exe_name='Agent.exe', title='Device Setup')
+        row = dict(hwnd=11, pid=11, exe_name='Agent.exe', title='Device Setup')
         with (mock.patch.object(app, 'windows', return_value=[row]),
               mock.patch.object(app.coordination, '_lease', side_effect=lease),
               mock.patch.object(app, 'worker_receipt', side_effect=worker)):
@@ -103,7 +103,7 @@ class WindowTaskStorageTests(TestCase):
                                   'result-menu', ('end', 'window_queue_timeout'), ('end', 'export_queue_timeout')])
 
     def test_window_queue_timeout_sends_no_step(self):
-        row = dict(hwnd=1, pid=11, exe_name='Agent.exe', title='Device Setup')
+        row = dict(hwnd=11, pid=11, exe_name='Agent.exe', title='Device Setup')
         with (mock.patch.object(app, 'windows', return_value=[row]),
               mock.patch.object(app.coordination, 'window',
                                 side_effect=app.coordination.CoordinationError('window_queue_timeout')),
@@ -114,7 +114,7 @@ class WindowTaskStorageTests(TestCase):
         worker.assert_not_called()
 
     def test_partial_fallback_sends_only_to_existing_recorded_window(self):
-        main = dict(hwnd=1, pid=11, exe_name='Agent.exe', title='Device Setup', process_started_utc_ticks='1')
+        main = dict(hwnd=11, pid=11, exe_name='Agent.exe', title='Device Setup', process_started_utc_ticks='1')
         viewer = dict(hwnd=2, pid=12, exe_name='Viewer.exe', title='Second viewer', process_started_utc_ticks='2')
         def windows(exe):
             return [main if exe == main['exe_name'] else viewer]

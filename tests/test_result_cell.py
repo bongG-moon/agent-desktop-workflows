@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from test_control_lookup import Binding, FakeUIA, Node, win
+import python_workflow as flow
 import result_cell
 
 
@@ -34,6 +35,26 @@ class ResultCellTests(unittest.TestCase):
 
     def find(self):
         return result_cell.find(self.binding, self.uia, self.grid, 'Q42', column='Order')
+
+    def test_multiple_result_tables_share_one_window_scan_per_observation(self):
+        other = self.node(self.uia.root, 50028, 'History', 250, 120)
+        header = self.node(other, 50035, 'History ID', 250, 120)
+        step = dict(action='verify-value', selector={'role': 'table'}, result_column='Order', value='Q42')
+        for first, second, expected_status in (('Order', 'History ID', 'verified'),
+                                               ('Order', 'Order', 'blocked'), ('Part', 'History ID', 'blocked')):
+            with (self.subTest(columns=(first, second)),
+                  patch.object(flow.lookup, 'find_all', wraps=flow.lookup.find_all) as search):
+                self.header.values[30005], header.values[30005] = first, second
+                receipt = flow.observe_result(self.binding, self.uia, step, 'Q42', lambda: None, wait_seconds=0)
+                self.assertEqual(receipt['status'], expected_status, receipt)
+                self.assertFalse(receipt['input_dispatched'])
+                if expected_status == 'blocked':
+                    self.assertEqual(receipt['diagnostic'], 'result_table_ambiguous')
+                else:
+                    self.assertEqual(receipt['result_element']['selector'], {'role': 'list', 'name': 'Results'})
+                scans = [call for call in search.call_args_list if call.kwargs == {'roles': ('table', 'list')}]
+                self.assertEqual(len(scans), 1)
+                self.assertIs(scans[0].args[1], self.uia.root)
 
     def prepare_painted_group(self):
         self.grid.values[30022] = True

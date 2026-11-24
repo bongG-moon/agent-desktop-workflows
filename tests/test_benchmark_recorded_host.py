@@ -52,7 +52,8 @@ class RecordedHostPermissionTests(unittest.TestCase):
         self.assertTrue(self.validate(self.command(self.desktop, 'try-recording', '--task', benchmark.ORIGINAL,
                                                   '--set', 'Family=Hybrid', '--set', 'MES Setup=N', '--allow-physical')))
         self.assertTrue(self.validate(self.command(self.desktop, 'try-recording', '--task', benchmark.ORIGINAL,
-                                                  '--set', 'Family=Hybrid', '--allow-physical', '--auto-repair-frame')))
+                                                  '--set', 'Family=Hybrid', '--allow-physical', '--auto-repair-frame',
+                                                  '--summary')))
         self.assertTrue(self.validate(self.command(self.workflow, 'register', '--task', benchmark.ORIGINAL,
                                                   '--out', self.registered)))
         self.assertTrue(self.validate(self.command(self.runner, '--summary', '--set', 'Family=Hybrid',
@@ -120,13 +121,13 @@ class RecordedHostPermissionTests(unittest.TestCase):
     def test_public_menu_trial_uses_issued_receipt_and_frame(self):
         receipt, frame = 'a' * 64, 'b' * 64
         inspect = self.command(self.desktop, 'inspect-menu-trial', '--receipt', receipt, '--allow-physical',
-                               '--set', 'Family=Hybrid')
+                               '--set', 'Family=Hybrid', '--summary')
         self.assertFalse(self.validate(inspect))
         self.receipt(dict(status='blocked', menu_repair=dict(
             frame_args=['inspect-menu-trial', '--receipt', receipt, '--allow-physical', '--set', 'Family=Hybrid'])))
         self.assertTrue(self.validate(inspect))
         resume = self.command(self.desktop, 'resume-menu-trial', '--receipt', receipt, '--frame', frame,
-                              '--point', 100, 50, '--allow-physical', '--set', 'Family=Hybrid')
+                              '--point', 100, 50, '--allow-physical', '--set', 'Family=Hybrid', '--summary')
         self.assertFalse(self.validate(resume))
         self.receipt(dict(status='observed', frame=frame, width=400, height=200,
             resume_args=['resume-menu-trial', '--receipt', receipt, '--frame', frame, '--point', '<x>', '<y>',

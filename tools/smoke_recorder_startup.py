@@ -236,7 +236,7 @@ def startup(native, skill, work, name, app, *, baseline=False, hint='FXMENUAGNET
         else:
             assert process.wait(timeout=3) == 0
             exited = time.perf_counter() - started
-            assert receipt['status_args'] == ['recorder', '--session', receipt['session']]
+            assert receipt['status_args'] == ['recorder', '--session', receipt['session'], '--wait', '8'], receipt
             assert own['pid'] != process.pid and native.windows({own['pid']}), 'detached_editor_not_visible'
         if shot:
             time.sleep(.15)
@@ -248,10 +248,7 @@ def startup(native, skill, work, name, app, *, baseline=False, hint='FXMENUAGNET
             _, line = output.get(timeout=3)
             final = json.loads(line)
         else:
-            def cancelled():
-                value = cli(skill, 'recorder', '--session', receipt['session'])
-                return value if value['status'] == 'cancelled' else None
-            final = until(cancelled)
+            final = cli(skill, *receipt['status_args'])
         assert final['status'] == 'cancelled' and final['input_dispatched'] is False, final
         return dict(case=name, mode='unmodified_installed_zip_native_ui', ready_seconds=received-started,
                     parent_return_seconds=exited, editor_window=matches[0], receipt=receipt, final=final,
@@ -402,14 +399,23 @@ def run(args):
             assert synthetic['baseline']['review'] == synthetic['candidate']['review'], synthetic
             stored = synthetic['candidate']['session_receipt']
             old_saved = json.loads((work / 'baseline-save/stdout.jsonl').read_text(encoding='utf-8').splitlines()[-1])
-            def normalized_receipt(value):
+            def normalized_receipt(value, installation):
                 value = json.loads(json.dumps(value))
-                value.pop('session', None)
-                value.pop('status_args', None)
-                if 'path' in value.get('execution_plan', {}):
-                    value['execution_plan']['path'] = Path(value['execution_plan']['path']).name
+                token = value.pop('session', None)
+                if token:
+                    assert value.pop('status_args') == ['recorder', '--session', token, '--wait', '8']
+                    assert value.pop('first_trial_args') == ['try-recording', '--session', token]
+                    assert value['next_action']['args'] == ['try-recording', '--session', token]
+                    value['next_action']['args'] = ['try-recording', '--task', value['effective_task']]
+                plan = value.get('execution_plan', {})
+                if 'path' in plan:
+                    plan['path'] = str(Path(plan['path']).relative_to(installation))
+                followup = value.get('next_action', {})
+                for action in (followup, followup.get('register_and_test', {})):
+                    if 'script' in action:
+                        action['script'] = str(Path(action['script']).relative_to(installation))
                 return value
-            assert normalized_receipt(old_saved) == normalized_receipt(stored), (old_saved, stored)
+            assert normalized_receipt(old_saved, baseline) == normalized_receipt(stored, candidate), (old_saved, stored)
             status = cli(candidate, *stored['status_args'])
             assert status == stored, (status, stored)
             results['synthetic_save'] = dict(schema_unchanged=True, review_receipt_unchanged=True,

@@ -711,11 +711,18 @@ def _convert(raw, *, allow_point=False):
     return step
 
 
-CAPTURE_COMMANDS = frozenset({'field-input', 'submit', 'choose-item'})
+CAPTURE_COMMANDS = frozenset({'field-input', 'submit', 'press-key', 'choose-item'})
+
+_KEY_SPELLINGS = {
+    'Tab': r'(?:Tab|탭)', 'Esc': r'(?:Esc(?:ape)?|이스케이프)', 'Enter': r'(?:Enter|Return|엔터)',
+    'Ctrl': r'(?:Ctrl|Control|컨트롤)', 'Shift': r'(?:Shift|시프트|쉬프트)', 'Alt': r'(?:Alt|알트)',
+    'Left': r'(?:Left|왼쪽\s*(?:방향|화살표)?)', 'Right': r'(?:Right|오른쪽\s*(?:방향|화살표)?)',
+    'Up': r'(?:Up|위(?:쪽)?\s*(?:방향|화살표)?)', 'Down': r'(?:Down|아래(?:쪽)?\s*(?:방향|화살표)?)',
+}
 
 
 def _capture_command(raw):
-    """Retain a safely witnessed field, submit or non-combo item as a literal task step."""
+    """Retain a witnessed field, keyboard gesture or item as a literal task step."""
     if raw.get('action') in CAPTURE_COMMANDS and 'selector' in raw:
         result = dict(raw)
         _validate_capture_command(result)
@@ -734,7 +741,12 @@ def _capture_command(raw):
             node.get(key) is True for key in ('secure', 'protected', 'is_protected', 'is_password', 'password')))
            for node in [raw, source, locator, *chain]):
         return None
-    if not ((action == 'set-value' and role == 'textfield' and 'anchor' in locator)
+    if action == 'press-key':
+        import key_chords
+        if ('window' in source or not isinstance(role, str) or role not in key_chords.TARGET_ROLES
+                or not key_chords.virtual_keys(raw.get('keys'))):
+            return None
+    elif not ((action == 'set-value' and role == 'textfield' and 'anchor' in locator)
             or (action == 'submit' and role in ('textfield', 'combobox'))
             or (action == 'select' and role == 'listitem'
                 and not any(a.get('role') == 'combobox' for a in chain))):
@@ -751,10 +763,12 @@ def _capture_command(raw):
     recognition = raw.get('recognition', {})
     if recognition.get('target') != 'identified' or recognition.get('action') != 'supported':
         return None
-    result = dict(action='field-input' if action == 'set-value' else 'choose-item' if action == 'select' else 'submit',
+    result = dict(action={'set-value': 'field-input', 'select': 'choose-item'}.get(action, action),
                   selector=selector, label=raw.get('field_label') or raw.get('label') or
                   locator.get('name') or ('입력란' if role == 'textfield' else '항목'))
-    if action == 'set-value':
+    if action == 'press-key':
+        result['keys'] = raw['keys']
+    elif action == 'set-value':
         if recognition.get('result') != 'checkable' or not valid_value(raw.get('value'), role):
             return None
         result['value'] = raw['value']
@@ -780,6 +794,11 @@ def _validate_capture_command(step):
     elif step['action'] == 'submit':
         if selector['role'] not in ('textfield', 'combobox'):
             raise TaskError('invalid_submit')
+    elif step['action'] == 'press-key':
+        import key_chords
+        allowed.add('keys')
+        if selector['role'] not in key_chords.TARGET_ROLES or not key_chords.virtual_keys(step.get('keys')):
+            raise TaskError('invalid_key_chord')
     elif step['action'] == 'choose-item':
         if selector['role'] not in CHOOSE:
             raise TaskError('invalid_item_selection')
@@ -826,7 +845,23 @@ def _command_instruction(step, sentence, mode=None, argument=None):
         return _binding(fake, sentence, mode, argument)
     if mode not in (None, 'recorded') or argument not in (None, ''):
         raise TaskError('instruction_action_mismatch')
-    if step['action'] == 'submit':
+    if step['action'] == 'press-key':
+        # Keep an edit attached to the witnessed chord. A different key or a
+        # conditional instruction remains editable until its intent is resolved.
+        chord = r'\s*\+\s*'.join(_KEY_SPELLINGS.get(key, re.escape(key)) for key in step['keys'].split('+'))
+        match = re.fullmatch(
+            rf'(?:(?P<subject>.+?)(?:에서|에)\s*)?{chord}(?:\s*키)?(?:을|를)?\s*'
+            rf'(?:누르기|누르세요|누른다|눌러(?:\s*(?:줘|주세요))?|입력(?:해\s*(?:줘|주세요))?)?[.!。]?'
+            rf'|(?:press|send)\s+{chord}[.!]?', sentence, re.I)
+        if not match or _conditional_sentence(sentence):
+            return dict(mode='draft', text=sentence)
+        subject = match['subject']
+        if subject and ''.join(subject.split()) not in ('현재입력란', '해당입력란', '현재항목', '해당항목'):
+            try:
+                _instruction_subject(dict(label=step['label'], target=step['selector'].get('name', '')), subject)
+            except TaskError:
+                return dict(mode='draft', text=sentence)
+    elif step['action'] == 'submit':
         affirmative = re.fullmatch(
             r'(?:.+?(?:에서|에)\s*)?(?:Enter|Return|엔터)(?:\s*키)?(?:을|를)?\s*'
             r'(?:눌러(?:서)?|누르기|입력|적용)(?:\s*(?:적용|조회))?(?:해)?\s*(?:줘|주세요)?[.!。]?'

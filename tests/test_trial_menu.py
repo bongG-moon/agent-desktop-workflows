@@ -1,5 +1,8 @@
 """Public first-trial menu repair keeps one query and persists only proven points."""
 from copy import deepcopy
+from contextlib import redirect_stdout
+from io import StringIO
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -59,6 +62,11 @@ class MenuTrialTests(unittest.TestCase):
     def trial(self, *extra):
         return self.cli('try-recording', '--task', self.source['name'], '--allow-physical', *extra)
 
+    def host(self, *args):
+        with redirect_stdout(StringIO()) as output:
+            app.worker(app.parser().parse_args(args))
+        return json.loads(output.getvalue())
+
     def dispatch(self, argv, *, payload, **kwargs):
         self.assertEqual(argv, ['_plan'])
         if 'menu_trial' in payload:
@@ -115,11 +123,73 @@ class MenuTrialTests(unittest.TestCase):
 
     def test_auto_frame_only_after_failed_menu_and_never_without_explicit_option(self):
         with patch.object(repair, 'inspect_or_adjust', side_effect=self.adjust) as image:
-            first = self.trial('--auto-repair-frame')
+            first = self.host('try-recording', '--task', self.source['name'], '--allow-physical',
+                              '--auto-repair-frame', '--summary')
             image.assert_called_once()
             self.assertEqual(first['menu_repair']['frame'], 'frame-one')
             self.assertEqual(first['menu_repair']['resume_args'][0], 'resume-menu-trial')
+            self.assertIn('--summary', first['menu_repair']['resume_args'])
+            self.assertEqual(first['host_action'], 'inspect_menu_repair_image')
+            self.assertNotIn('frame_args', first['menu_repair'])
             self.worker.assert_called_once()
+            args = first['menu_repair']['resume_args']
+            point = args.index('--point') + 1
+            args[point:point + 2] = ['20', '30']
+            resumed = self.host(*args)
+            self.assertTrue(resumed['correction_saved'])
+            self.assertFalse(resumed['prior_steps_replayed'])
+            self.assertEqual(self.worker.call_count, 2)
+            self.assertEqual(image.call_count, 2)
+            self.assertEqual(image.call_args.args[3:], ('frame-one', [20, 30]))
+
+    def test_host_summary_survives_menu_inspection_resume_and_cached_success(self):
+        def export(*args, **kwargs):
+            result = self.menu(*args, **kwargs)
+            if result['status'] == 'delivered_unverified':
+                result.update(status='verified', diagnostic='export_workbook_verified', workbook_verified=True, effect_verification='matched',
+                              verified_path='example.xlsx')
+            return result
+        trial = ['try-recording', '--task', self.source['name'], '--allow-physical', '--summary']
+        with (patch.object(repair, 'inspect_or_adjust', side_effect=self.adjust),
+              patch.object(flow.result_menu, 'execute', side_effect=export)):
+            first = self.host(*trial)
+            self.assertIn('receipt', first['steps'][-1])
+            inspect = first['menu_repair']['frame_args']
+            self.assertIn('--summary', inspect)
+            frame = self.host(*inspect)
+            args = frame['resume_args']
+            self.assertIn('--summary', args)
+            args[args.index('--point') + 1:args.index('--point') + 3] = ['20', '30']
+            completed = self.host(*args)
+            cached = self.host(*args)
+            latest = self.host(*trial)
+            for result in (completed, cached, latest, self.host(*inspect)):
+                self.assertEqual(result['outcome'], 'workbook_verified')
+                self.assertEqual(result['verified_outputs'], [dict(number=3, path='example.xlsx')])
+                self.assertEqual(result['steps'][0]['action'], 'result-menu')
+                self.assertTrue(result['correction_saved'])
+                self.assertEqual(result['effective_task'], completed['effective_task'])
+                self.assertIn('register_args', result)
+                self.assertFalse(result['prior_steps_replayed'])
+            self.assertFalse(cached['this_call_dispatched_input'])
+            raw = self.trial()
+            self.assertTrue(raw['steps'][0]['receipt']['workbook_verified'])
+            self.assertNotIn('verified_outputs', raw)
+            self.assertEqual(self.worker.call_count, 3)
+            self.assertEqual(flow.live.execute.call_count, 1)
+            self.assertEqual(len(self.menu_calls), 2)
+
+    def test_menu_summary_requires_all_steps_from_the_claimed_resume_index(self):
+        recipe = dict(steps=[dict(action='invoke'), dict(action='wait'), dict(action='result-menu')])
+        row = dict(number=3, receipt=dict(status='verified', diagnostic='export_workbook_verified',
+                   workbook_verified=True, verified_path='example.xlsx'))
+        missing = dict(status='verified', resumed_at=2, steps=[row])
+        self.assertIs(trial_menu.summarize_resume(app, '', missing, recipe=recipe, expected_start=2), missing)
+        wrong_start = dict(missing, resumed_at=3)
+        self.assertIs(trial_menu.summarize_resume(app, '', wrong_start, recipe=recipe, expected_start=2), wrong_start)
+        for status in ('blocked', 'uncertain', 'delivered_unverified'):
+            stopped = dict(wrong_start, status=status)
+            self.assertIs(trial_menu.summarize_resume(app, '', stopped, recipe=recipe), stopped)
 
     def test_worker_desktop_lock_before_input_reuses_untouched_preparation(self):
         import input_policy
@@ -235,9 +305,10 @@ class MenuTrialTests(unittest.TestCase):
                     input_dispatched=True, leaf_dispatched=True, menu_path_completed=True, menu_items=self.spec['path'])
         with patch.object(flow.result_menu, 'execute', side_effect=[pause, done]) as menu, patch.object(
                 repair, 'inspect_or_adjust') as image:
-            first = self.trial()
+            first = self.host('try-recording', '--task', self.source['name'], '--allow-physical', '--summary')
             self.assertEqual(first['host_action'], 'wait_for_user_idle_then_resume')
-            resumed = self.cli(*first['input_pause']['resume_args'])
+            self.assertIn('--summary', first['input_pause']['resume_args'])
+            resumed = self.host(*first['input_pause']['resume_args'])
             self.assertFalse(resumed['prior_steps_replayed'])
             self.assertIsNone(menu.call_args.args[1]['trigger'])
             self.assertEqual(menu.call_count, 2)

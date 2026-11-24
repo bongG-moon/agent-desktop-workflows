@@ -79,10 +79,12 @@ print(json.dumps(dict(status='recorded', app=args.app, task=args.task, recover_a
 return 0''') as spawn:
             first = launcher.launch(app_hint, task)
         self.assertEqual(first['status'], 'recorder_ready')
+        self.assertEqual(first['host_action'], 'wait_for_user_to_save')
         self.assertLess(first['startup_wait_seconds'], launcher.STARTUP_WAIT_SECONDS)
         spawn.assert_called_once()
         self.assertEqual(first['status_args'], ['recorder', '--session', first['session'], '--wait', '8'])
-        self.assertEqual(launcher.status(first['session'])['status'], 'recording')
+        active = launcher.status(first['session'])
+        self.assertEqual((active['status'], active['host_action']), ('recording', 'wait_for_user_to_save'))
         self.children[0].wait(timeout=5)
         last = launcher.status(first['session'])
         self.assertEqual(last['status'], 'recorded')
@@ -129,6 +131,19 @@ return 2'''):
             result = launcher.launch('업무 앱')
         self.assertEqual(result['status'], 'cancelled')
         self.assertEqual(result['diagnostic'], 'app_selection_cancelled')
+        self.assertEqual(result['host_action'], 'report_recording_cancelled')
+
+    def test_unspecified_app_reaches_the_child_as_a_picker_request(self):
+        with self.fake_child('''assert args.app is None
+print(json.dumps(dict(status='recorder_selection_required', input_dispatched=False)), flush=True)
+time.sleep(0.2)
+print(json.dumps(dict(status='cancelled', input_dispatched=False)), flush=True)
+return 2''') as spawn:
+            first = launcher.launch(None)
+        self.assertEqual(first['status'], 'recorder_selection_required')
+        self.assertEqual(first['host_action'], 'wait_for_user_to_select_window')
+        self.assertIsNone(launcher._request(launcher._folder(first['session']))['app'])
+        spawn.assert_called_once()
 
     def test_selection_event_is_live_and_does_not_claim_editor_readiness(self):
         with self.fake_child('''print(json.dumps(dict(status='recorder_selection_required', input_dispatched=False)), flush=True)
@@ -171,6 +186,22 @@ return 0'''):
         self.assertEqual(first['status'], 'recorder_processing')
         final = launcher.status(first['session'], wait_seconds=2)
         self.assertEqual(final['status'], 'recorded')
+
+    def test_one_trial_wait_handles_slow_saved_preparation_and_has_a_deadline(self):
+        self.session()
+        processing = dict(status='recorder_processing', saved=True, input_dispatched=False)
+        finished = dict(status='recorded', task={'name': '업무'}, input_dispatched=False)
+        for finishes, expected in ((18.3, finished), (float('inf'), processing)):
+            clock = [0.0]
+            def sleep(seconds):
+                clock[0] += seconds
+            def observe(*args):
+                return finished if clock[0] >= finishes else processing
+            with (self.subTest(finishes=finishes), patch.object(launcher, '_observe', side_effect=observe),
+                  patch.object(launcher.time, 'monotonic', side_effect=lambda: clock[0]),
+                  patch.object(launcher.time, 'sleep', side_effect=sleep)):
+                self.assertEqual(launcher.wait_for_trial(self.token), expected)
+                self.assertAlmostEqual(clock[0], min(finishes, launcher.SAVED_PROCESSING_WAIT_SECONDS), delta=.5)
 
     def test_status_never_waits_on_user_recording_even_with_wait_requested(self):
         folder = self.session(events=b'{"status":"recorder_ready"}\n')

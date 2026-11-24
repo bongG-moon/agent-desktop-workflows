@@ -26,7 +26,7 @@ def followup(result):
         result['preparation'] = 'ready'
         result['next_action'] = dict(
             kind='run_prepared_recording', script=str(scripts / 'desktop_select.py'),
-            args=['try-recording', '--task', task['name']],
+            args=result.get('first_trial_args', ['try-recording', '--task', task['name']]),
             required_parameters=plan.get('required_parameters', []),
             physical_input_required=plan.get('physical_input_required', False),
             register_and_test=dict(script=str(scripts / 'python_workflow.py'),

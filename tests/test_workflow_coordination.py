@@ -31,6 +31,14 @@ class CoordinationTests(unittest.TestCase):
             result = c.run_worker(script, capture_output=True, timeout=5, encoding='utf8')
         self.assertEqual((result.returncode, result.stdout.strip()), (0, 'other window'))
 
+    def test_high_bit_aliases_share_the_window_mutex_across_processes(self):
+        hwnd = 0x81000000 + os.getpid()
+        with c.handle({'hwnd': hwnd - 2**32}):
+            command = self.child("c.QUEUE_SECONDS = 0\ntry:\n"
+                                 f" with c.handle({{'hwnd': {0xffffffff00000000 | hwnd}}}): print('free')\n"
+                                 "except c.CoordinationError as error: print(error.code)")
+            self.assertEqual(subprocess.check_output(command, text=True, timeout=5).strip(), 'window_queue_timeout')
+
     def test_same_window_cross_process_waits_without_spending_worker_watchdog(self):
         with tempfile.TemporaryDirectory() as directory:
             ready = Path(directory) / 'ready'

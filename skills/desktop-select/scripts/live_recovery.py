@@ -140,7 +140,9 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None, bi
             result['tree_diagnostic'] = error.code
         # Explicit bindings are checked only against their own recorded window.
         # Popup inventories aid discovery but cannot satisfy these bindings.
-        for popup in (() if bindings_only else app.owned_popups(surface)):
+        needs_popups = not bindings_only and (
+            result.get('lookup_mode') != 'recorded_selectors' or bool(lookups.get('captions')))
+        for popup in (app.owned_popups(surface) if needs_popups else ()):
             entry = dict(popup)
             try:
                 owned = app.bind_surface(surface, popup['hwnd'])
@@ -151,7 +153,7 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None, bi
             except (app.SelectionError, app.bridge.BridgeError) as error:
                 entry['diagnostic'] = error.code
             result['owned_popups'].append(entry)
-        if not bindings_only and context_menu._native_menu_owner(surface):
+        if needs_popups and context_menu._native_menu_owner(surface):
             try:
                 result['open_menu_items'] = [item.name for item in context_menu._menus(surface, uia)]
             except app.bridge.BridgeError as error:

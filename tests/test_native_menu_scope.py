@@ -63,6 +63,20 @@ class NativeMenuScopeTests(unittest.TestCase):
         self.assertFalse(menu._contains_window(self.binding, 201))
         self.assertFalse(menu._contains_window(self.binding, 202))
 
+    def test_menu_owner_and_enumerated_popup_have_one_high_bit_identity(self):
+        owner, popup = 0x81234000, 0x81234001
+        self.binding.hwnd = owner
+        self.binding.contains_window.side_effect = lambda hwnd: hwnd == owner
+        self.binding.scoped_windows.return_value = [owner]
+        self.owner = 0xffffffff00000000 | owner
+        self.enumerated = [0xffffffff00000000 | popup]
+        self.identities.update({owner: (9, 7), popup: (9, 7)})
+        self.classes[popup] = '#32768'
+        self.shown = {popup}
+        self.assertEqual(menu._scoped_windows(self.binding), [owner, popup])
+        self.identities[popup] = (9, 8)
+        self.assertEqual(menu._scoped_windows(self.binding), [owner])
+
     def test_nonzero_menu_owner_without_active_menu_flags_is_rejected(self):
         self.flags = 0
         self.assertIsNone(menu._native_menu_owner(self.binding))

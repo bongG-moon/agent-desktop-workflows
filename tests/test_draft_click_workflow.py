@@ -44,7 +44,7 @@ class DraftClickTests(TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.primary=SimpleNamespace(hwnd=1,pid=101,exe='Manager.exe',created='100')
+        self.primary=SimpleNamespace(hwnd=0x81230016,pid=101,exe='Manager.exe',created='100')
         self.rows = []
         self.patch(flow, 'bind', return_value=self.primary)
         self.patch(flow.app, 'windows', side_effect=lambda _:list(self.rows))

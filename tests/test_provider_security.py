@@ -25,7 +25,7 @@ class Node:
 class SecurityTests(unittest.TestCase):
     def setUp(self):
         self.element, self.current = Node(), Node()
-        self.win = SimpleNamespace(user32=Mock(), hwnd_pid=Mock(return_value=7),
+        self.win = SimpleNamespace(user32=Mock(), normalize_hwnd=app.bridge.normalize_hwnd, hwnd_pid=Mock(return_value=7),
                                    root_window=Mock(return_value=11), window_class=Mock(return_value='#32770'))
         self.win.user32.IsWindow.return_value = True
         self.uia = SimpleNamespace(pid=lambda item: item.property(30002),
@@ -44,6 +44,16 @@ class SecurityTests(unittest.TestCase):
         self.element.props[30019] = True
         self.assertTrue(self.protected())
         self.uia.from_handle.assert_not_called()
+
+    def test_signed_dialog_handle_requires_same_live_canonical_identity(self):
+        hwnd = 0x81234567
+        self.element.props[30020] = hwnd - 2**32
+        self.current.props[30020] = hwnd
+        self.win.root_window.return_value = hwnd
+        self.assertFalse(self.protected())
+        self.uia.from_handle.assert_called_once_with(hwnd)
+        self.current.props[30020] = 0x1234567881234567
+        self.assertTrue(self.protected())
 
     def test_explicit_false_keeps_existing_non_dialog_behavior(self):
         self.element.props.update({30019: False, 30003: 50004, 30012: 'Edit'})

@@ -48,7 +48,8 @@ def windows(exe, *, only_hwnd=None):
 
     def visit(hwnd, _):
         nonlocal truncated
-        if not bridge.user32.IsWindowVisible(hwnd):
+        hwnd = bridge.normalize_hwnd(hwnd)
+        if not hwnd or not bridge.user32.IsWindowVisible(hwnd):
             return True
         pid = bridge.hwnd_pid(hwnd)
         try:
@@ -56,7 +57,7 @@ def windows(exe, *, only_hwnd=None):
         except (bridge.BridgeError, OSError):
             return True
         if actual.casefold() == exe.casefold():
-            records.append({'exe_name': actual, 'pid': pid, 'hwnd': int(hwnd),
+            records.append({'exe_name': actual, 'pid': pid, 'hwnd': hwnd,
                             'title': bridge.window_text(hwnd), 'process_started_utc_ticks': started})
             if len(records) >= 256:
                 truncated = True
@@ -64,7 +65,8 @@ def windows(exe, *, only_hwnd=None):
         return True
 
     if only_hwnd is not None:
-        if 0 < only_hwnd <= 0x7fffffffffffffff and bridge.root_window(only_hwnd) == only_hwnd:
+        only_hwnd = bridge.normalize_hwnd(only_hwnd)
+        if only_hwnd and bridge.root_window(only_hwnd) == only_hwnd:
             visit(only_hwnd, 0)
         return records
     callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
@@ -77,6 +79,10 @@ def windows(exe, *, only_hwnd=None):
 def pick_window(records, title, hwnd):
     if not title.strip():
         raise SelectionError('exact_business_window_title_required')
+    if hwnd is not None:
+        hwnd = bridge.normalize_hwnd(hwnd)
+        if not hwnd:
+            raise SelectionError('invalid_target')
     matches = [r for r in records if r['title'] == title and (hwnd is None or r['hwnd'] == hwnd)]
     if len(matches) != 1:
         raise SelectionError('ambiguous_window' if matches else 'window_not_found')
@@ -105,6 +111,7 @@ def owned_popups(owner):
 def bind_surface(owner, selected):
     if selected is None:
         return owner
+    selected = bridge.normalize_hwnd(selected)
     if not any(p['hwnd'] == selected for p in owned_popups(owner)):
         raise SelectionError('popup_not_owned_or_closed')
     return bridge.Binding({'pid': owner.pid, 'exe_name': owner.exe, 'hwnd': selected,
@@ -515,17 +522,17 @@ def fast_replay(plan, args, overrides):
             return dict(status='blocked',diagnostic=saved.get('diagnostic'),steps=[],input_dispatched=False)
         selected = tasks._step_number(plan, args.only) if args.only is not None else None
         rows = tasks.resolve_saved_intents(plan)['steps']
-        if any(s['action'] in (*tasks.OBSERVE_ACTIONS, 'close-popup', 'double-click-result')
+        if any(s['action'] in (*tasks.OBSERVE_ACTIONS, 'close-popup', 'double-click-result', 'submit', 'press-key')
                for n, s in enumerate(rows, 1) if selected is None or selected == n):
             return dict(status='needs_review', diagnostic=saved.get('diagnostic', 'execution_plan_required'),
                         stopped_at=saved.get('step'), steps=[], input_dispatched=False)
         return None
     source_steps = saved['envelope']['source_steps']
     has_host_binding = any(step['action'] in ('conditional-open', 'row-open') for step in recipe['steps'])
-    uses_observations = any(step['action'] in (*tasks.OBSERVE_ACTIONS, 'double-click-result') or step.get('verify_closed')
-                            for step in recipe['steps'])
-    if uses_observations and overrides:
-        # Aliases on a value field also refer to the downstream result check.
+    requires_plan = any(step['action'] in (*tasks.OBSERVE_ACTIONS, 'double-click-result', 'submit', 'press-key')
+                        or step.get('verify_closed') for step in recipe['steps'])
+    if requires_plan and overrides:
+        # Keep field aliases when a later step requires the literal plan executor.
         declared = {s['parameter'].casefold() for s in recipe['steps'] if 'parameter' in s}
         aliases = {key: value for key, value in overrides.items() if key.casefold() not in declared}
         if aliases:
@@ -539,9 +546,9 @@ def fast_replay(plan, args, overrides):
                     raise tasks.TaskError('duplicate_override')
                 names.add(key.casefold())
                 overrides[key] = value
-    if legacy_values and not (has_host_binding or uses_observations):
+    if legacy_values and not (has_host_binding or requires_plan):
         return None
-    if uses_observations and legacy_values:
+    if requires_plan and legacy_values:
         # Keep legacy recorded defaults, including when a result assertion
         # references the same parameter. An explicit required input still wins.
         recipe = deepcopy(recipe)
@@ -557,7 +564,7 @@ def fast_replay(plan, args, overrides):
             if key in defaults and key not in supplied | required and len(defaults[key]) == 1:
                 step['value'] = next(iter(defaults[key]))
                 del step['parameter']
-    elif has_host_binding and not uses_observations:
+    elif has_host_binding and not requires_plan:
         # A host interpretation can coexist with 0.4 recorded defaults. A raw
         # field whose prose now describes a conditional is no longer an input.
         recipe = deepcopy(recipe)
@@ -586,14 +593,14 @@ def fast_replay(plan, args, overrides):
         chosen = recipe['steps'][matches[0]]
         if chosen['action'] == 'double-click-result':
             return dict(status='blocked', diagnostic='verified_result_row_required', input_dispatched=False, steps=[])
-        if (chosen['action'] not in ('conditional-open','row-open', *tasks.OBSERVE_ACTIONS)
+        if (chosen['action'] not in ('conditional-open','row-open','submit','press-key', *tasks.OBSERVE_ACTIONS)
                 and not chosen.get('verify_closed') and not tasks.is_double_click_step(chosen)):
             return None
         only = str(matches[0] + 1)
         active = dict(recipe, steps=[recipe['steps'][matches[0]]])
     parameters = {s['parameter'].casefold() for s in active['steps'] if 'parameter' in s}
     if any(key.casefold() not in parameters for key in overrides):
-        if uses_observations:
+        if requires_plan:
             raise tasks.TaskError('unknown_parameter')
         return None  # Keep the original alias and fixed-value-override rules.
     import python_workflow
@@ -787,7 +794,7 @@ def record_application(hint, name=None):
     from uuid import uuid4
     from recorder_targets import inventory, choose_window
 
-    if not tasks._text(hint, 200):
+    if hint is not None and not tasks._text(hint, 200):
         raise SelectionError('invalid_recorder_app')
     if name is not None:
         tasks._name(name)
@@ -797,7 +804,7 @@ def record_application(hint, name=None):
         print(json.dumps(dict(status='recorder_selection_required', app=hint,
                               input_dispatched=False)), flush=True)
 
-    row = choose_window(hint, inventory(), on_ready=selecting)
+    row = choose_window(hint or '', inventory(), on_ready=selecting)
     if row is None:
         return dict(status='cancelled', input_dispatched=False)
     # Pin the inventory's process lifetime and preserve the actual caption,
@@ -895,7 +902,11 @@ def recorder_request(path):
         if key in ('edit', 'restart'):
             if type(value) is not bool:
                 raise SelectionError('invalid_recorder_request')
-        elif key in ('hwnd', 'from_step'):
+        elif key == 'hwnd':
+            request[key] = bridge.normalize_hwnd(value)
+            if not request[key]:
+                raise SelectionError('invalid_recorder_request')
+        elif key == 'from_step':
             if type(value) is not int or value < 1:
                 raise SelectionError('invalid_recorder_request')
         elif not tasks._text(value):
@@ -925,17 +936,15 @@ def run(args):
             return after_save(sys.modules[__name__], args.session, result)
         return result
     if args.command == 'recorder':
-        if getattr(args, 'app', None) is not None or getattr(args, 'session', None) is not None:
-            from recorder_launch import launch, status
-            if args.session is not None:
-                if args.task is not None:
-                    raise SelectionError('invalid_recorder_arguments')
-                return status(args.session, wait_seconds=args.wait) if args.wait is not None else status(args.session)
-            if args.wait is not None:
+        from recorder_launch import launch, status
+        if args.session is not None:
+            if args.task is not None:
                 raise SelectionError('invalid_recorder_arguments')
-            return launch(args.app, task=args.task)
-        if getattr(args, 'task', None) is not None or getattr(args, 'wait', None) is not None:
+            return status(args.session, wait_seconds=args.wait) if args.wait is not None else status(args.session)
+        if args.wait is not None or (args.request is not None and args.task is not None):
             raise SelectionError('invalid_recorder_arguments')
+        if args.request is None:
+            return launch(args.app, task=args.task)
         args = recorder_request(args.request)
     if args.command == 'storage':
         return storage_info()
@@ -1207,11 +1216,11 @@ def parser():
     p = argparse.ArgumentParser(description='Select an exact field or command in one Windows business window.')
     commands = p.add_subparsers(dest='command', required=True)
     host = commands.add_parser('recorder', help='open a recorder by app name and return when visible; or use a literal JSON request')
-    start = host.add_mutually_exclusive_group(required=True)
+    start = host.add_mutually_exclusive_group()
     start.add_argument('--app', help='human app name or title fragment; opens a window picker if ambiguous')
     start.add_argument('--session', help='read the saved or cancelled result of an earlier recorder launch')
     start.add_argument('--request', type=Path, help='UTF-8 JSON file for record, review or continue-recording (streaming)')
-    host.add_argument('--task', help='optional task name with --app; defaults to a new timestamped name')
+    host.add_argument('--task', help='optional name for a new recording; defaults to a new timestamped name')
     host.add_argument('--wait', type=float, help='with --session, wait up to 30 seconds only for startup or saved-draft processing')
     trial = commands.add_parser('try-recording', help='test the saved recording once, without registering a skill')
     source = trial.add_mutually_exclusive_group(required=True)
@@ -1235,14 +1244,18 @@ def parser():
     resume.add_argument('--row-policy', choices=('single', 'first'), help='confirm visible rows without a value comparison')
     resume.add_argument('--point', type=int, nargs=2, required=True)
     resume.add_argument('--allow-physical', action='store_true')
+    trial_commands = [trial, inspection, resume]
     for verb in ('inspect-menu-trial', 'resume-menu-trial'):
         menu_trial = commands.add_parser(verb, help='continue a first-trial menu without repeating prior actions')
+        trial_commands.append(menu_trial)
         menu_trial.add_argument('--receipt', required=True)
         menu_trial.add_argument('--allow-physical', action='store_true')
         menu_trial.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
         if verb == 'resume-menu-trial':
             menu_trial.add_argument('--frame')
             menu_trial.add_argument('--point', type=int, nargs=2)
+    for command in trial_commands:
+        command.add_argument('--summary', action='store_true', help='return a compact completed trial receipt')
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)
@@ -1339,14 +1352,22 @@ def worker(args):
         dispatched = getattr(error, 'input_dispatched', False)
         result = {'status': 'blocked' if dispatched is False else 'uncertain', 'diagnostic': getattr(error, 'code', 'invalid_request'),
                   'input_dispatched': dispatched}
+        if result['diagnostic'] == 'unknown_parameter' and hasattr(error, 'required_parameters'):
+            result['required_parameters'] = error.required_parameters
     if result.get('status') in ('recorded', 'needs_grounding'):
         from recording_followup import followup
         result = followup(result)
+    if getattr(args, 'summary', False):
+        from first_trial import host_summary
+        result = host_summary(result)
     print(json.dumps(result, ensure_ascii=args is not None and args.command == 'recorder'))
-    return result_code(result)
+    return result_code(result, summary=getattr(args, 'summary', False))
 
 
-def result_code(result):
+def result_code(result, *, summary=False):
+    if (summary and result['status'] == 'completed_unverified' and 'stopped_at' not in result
+            and result.get('outcome') == 'workbook_verified'):
+        return 0
     if result['status'] in ('verified', 'resolved', 'observed', 'recorded', 'bound', 'completed', 'planned',
                            'recorder_ready', 'recorder_selection_required', 'recorder_starting',
                            'recorder_processing', 'recording'):
@@ -1388,7 +1409,7 @@ def supervise(args, argv):
     receipt = worker_receipt(['_worker', *argv], mutating=mutating,
                              may_queue=args.command == 'recover' and args.restore_window)
     print(json.dumps(receipt, ensure_ascii=False))
-    return result_code(receipt)
+    return result_code(receipt, summary=getattr(args, 'summary', False))
 
 
 def main():
@@ -1422,8 +1443,11 @@ def main():
     except SystemExit as error:
         if error.code != 2 or argv[:1] not in (['recorder'], ['record'], ['review'], ['continue-recording']):
             raise
+        hint = 'recorder --request <UTF-8 JSON file>'
+        if argv[:1] == ['recorder'] and '--request' not in argv:
+            hint = 'recorder --session "<session>"' if '--session' in argv else 'recorder [--app "<app or title>"]'
         print(json.dumps(dict(status='blocked', diagnostic='invalid_recorder_arguments',
-                              hint='recorder --request <UTF-8 JSON file>', input_dispatched=False)))
+                              hint=hint, input_dispatched=False)))
         return 2
     if args.command in ('inspect', 'select', 'fill', 'open') and (
             bool(args.task) != bool(args.near) or (args.popup is not None and args.near)):

@@ -14,6 +14,43 @@ import recovery
 import review_drafts
 
 
+def host_summary(report):
+    """Render a trial for the host without changing its durable recovery receipt."""
+    def continuation_options(receipt):
+        result = dict(receipt)
+        for field in ('args', 'retry_args', 'frame_args', 'resume_args'):
+            args = receipt.get(field)
+            if (isinstance(args, list) and args and args[0] in (
+                    'try-recording', 'inspect-trial', 'resume-trial', 'inspect-menu-trial', 'resume-menu-trial')
+                    and '--summary' not in args):
+                result[field] = [*args, '--summary']
+        return result
+
+    result = continuation_options(report)
+    for field in ('result_inspection', 'menu_repair', 'input_pause'):
+        if isinstance(report.get(field), dict):
+            result[field] = continuation_options(report[field])
+
+    if report.get('status') not in ('verified', 'completed_unverified') or 'stopped_at' in report:
+        return result
+    values = {(o['source_step'], o['value']) for o in report.get('observations', [])
+              if isinstance(o, dict) and type(o.get('source_step')) is int and isinstance(o.get('value'), str)}
+    if not values:
+        return result
+    steps = []
+    for row in report.get('steps', []):
+        # A resumed trial can contain raw prefix receipts and summarized suffix steps.
+        detail = row.get('receipt', row)
+        if (detail.get('status') == 'observed' and row.get('action', 'read-value') == 'read-value'
+                and type(row.get('source_step')) is int and isinstance(detail.get('value'), str)
+                and (row['source_step'], detail['value']) in values):
+            detail = {k: v for k, v in detail.items() if k != 'value'}
+            row = dict(row, receipt=detail) if 'receipt' in row else detail
+        steps.append(row)
+    result['steps'] = steps
+    return result
+
+
 def _compiled(doc, directory):
     if doc.get('kind') != review_drafts.KIND:
         return recorded_plan.get_plan(doc, directory)
@@ -165,28 +202,55 @@ def _once(directory, key, callback):
 def run(app, args):
     started = time.monotonic()
     directory = app.task_directory()
+    if args.hwnd is not None:
+        args.hwnd = app.bridge.normalize_hwnd(args.hwnd)
+        if not args.hwnd:
+            raise tasks.TaskError('invalid_target')
     if args.trial_id and not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', args.trial_id):
         raise tasks.TaskError('invalid_first_trial_id')
     overrides = tasks.parse_overrides(args.set)
     name, saved = args.task, {}
     if args.session:
-        from recorder_launch import status
-        event = status(args.session, wait_seconds=8)
+        from recorder_launch import wait_for_trial
+        event = wait_for_trial(args.session)
         if event['status'] != 'recorded':
+            if event['status'] in ('recorder_processing', 'recorder_starting'):
+                retry = ['try-recording', '--session', args.session]
+                for name, value in overrides.items():
+                    retry += ['--set', name + '=' + value]
+                for field in ('hwnd', 'trial_id'):
+                    if getattr(args, field) is not None:
+                        retry += ['--' + field.replace('_', '-'), str(getattr(args, field))]
+                for flag in ('allow_physical', 'background_only', 'auto_repair_frame'):
+                    if getattr(args, flag):
+                        retry.append('--' + flag.replace('_', '-'))
+                pending = dict(event, host_action='continue_same_trial', retry_args=retry)
+                pending.pop('status_args', None)
+                return pending
             return event
         name = event['task']['name']
         saved = event.get('live_recovery') or {}
     doc = tasks.load_task(name, directory, allow_review=True)
     source_key = recovery._fingerprint(doc)
     revision = (directory / (doc['name'] + '.json')).stat().st_mtime_ns
-    key = recovery._fingerprint([doc['name'], revision, source_key, {k.casefold():v for k,v in overrides.items()},
-                                 args.hwnd, args.trial_id])
-    existing = tasks._directory(directory / 'first-trials') / (key + '.json')
+    trial_scope = [doc['name'], revision, source_key, {k.casefold():v for k,v in overrides.items()}]
+    key = recovery._fingerprint([*trial_scope, args.hwnd, args.trial_id])
+    folder = tasks._directory(directory / 'first-trials')
+    existing = folder / (key + '.json')
+    # Earlier installations keyed receipts by the exact --hwnd number. Keep a
+    # completed or interrupted trial under its original key when resuming.
+    if args.hwnd is not None and args.hwnd >= 0x80000000 and not existing.exists():
+        for alias in (args.hwnd - (1 << 32), args.hwnd | 0xffffffff00000000):
+            legacy_key = recovery._fingerprint([*trial_scope, alias, args.trial_id])
+            legacy = folder / (legacy_key + '.json')
+            if legacy.exists():
+                key, existing = legacy_key, legacy
+                break
     if existing.exists():
         import trial_menu
         menu_resumed = trial_menu.prior(app, key)
         if menu_resumed:
-            return menu_resumed
+            return trial_menu.summarize_resume(app, key, menu_resumed) if args.summary else menu_resumed
         import result_trial
         resumed = result_trial.prior(existing.parent, key)
         if resumed:
@@ -221,15 +285,15 @@ def run(app, args):
     recipe = envelope['recipe']
     import python_workflow
     values, missing = python_workflow.values_for(recipe, overrides)
-    if missing:
-        return dict(status='needs_input', diagnostic='required_parameter_missing',
-                    missing_parameters=missing, input_dispatched=False)
     profile = input_policy.profile(recipe['steps'])
     if args.background_only and not profile['background_eligible']:
         return input_policy.blocked(profile)
     if profile['physical_input_required'] and not args.allow_physical:
         return dict(status='needs_consent', diagnostic='first_trial_physical_input_required', required_option='--allow-physical',
-                    input_requirements=profile, input_dispatched=False)
+                    missing_parameters=missing, input_requirements=profile, input_dispatched=False)
+    if missing:
+        return dict(status='needs_input', diagnostic='required_parameter_missing',
+                    missing_parameters=missing, input_dispatched=False)
     refusal = input_policy.interactive_desktop_blocked(profile)
     if refusal:
         return refusal

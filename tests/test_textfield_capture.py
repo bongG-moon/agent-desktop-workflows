@@ -289,6 +289,138 @@ class TextfieldWorkerTests(unittest.TestCase):
         self.assertEqual(self.notes.snapshot()[-1]['action'], 'submit')
         self.uia.focused.assert_not_called()
 
+    def test_key_classification_keeps_text_and_modified_enter_separate(self):
+        pump = capture._RowHookPump(self.binding, Mock(), queue.Queue(), queue.Queue())
+        def classify(code, **modifiers):
+            return pump._key_event(code, **dict(dict(ctrl=False, shift=False, alt=False, win=False), **modifiers))
+        self.assertEqual(classify(9, shift=True), dict(kind='press-key', keys='Shift+Tab'))
+        self.assertEqual(classify(0x1b), dict(kind='press-key', keys='Esc'))
+        self.assertEqual(classify(ord('F'), ctrl=True), dict(kind='press-key', keys='Ctrl+F'))
+        self.assertEqual(classify(13), dict(kind='enter'))
+        self.assertEqual(classify(13, ctrl=True), dict(kind='press-key', keys='Ctrl+Enter'))
+        for code, mods in [(ord('A'), {}), (ord('V'), dict(ctrl=True)), (ord('X'), dict(ctrl=True))]:
+            self.assertEqual(classify(code, **mods), dict(kind='typing'))
+        for code, mods in [(13, dict(alt=True)), (9, dict(alt=True)), (ord('F'), dict(ctrl=True, alt=True))]:
+            self.assertEqual(classify(code, **mods), dict(kind='shortcut'))
+
+    def _native_key_field(self):
+        self.binding.pid = 42
+        self.element = Mock()
+        self.properties = {30020: 77, 30010: True, 30009: True, 30003: 50004}
+        self.element.property.side_effect = self.properties.get
+        self.observed['element'] = self.element
+        self.uia.from_handle.side_effect = {5: self.root, 77: self.element}.get
+        self.uia.pid.return_value = 42
+        for name, result in [('root_window', 5), ('hwnd_pid', 42)]:
+            fake = patch.object(capture.bridge, name, return_value=result)
+            fake.start()
+            self.addCleanup(fake.stop)
+        parent = patch('control_lookup._raw_parent', return_value=self.root)
+        parent.start()
+        self.addCleanup(parent.stop)
+        visible = patch.object(capture.live_action, '_visible', return_value=True)
+        visible.start()
+        self.addCleanup(visible.stop)
+        user = patch.object(capture.bridge, 'user32', create=True)
+        self.native = user.start()
+        self.native.IsWindow.return_value = True
+        self.addCleanup(user.stop)
+        return dict(kind='press-key', keys='Tab', submit_focus=77, submit_window=5, at=time.monotonic())
+
+    def test_tab_records_pre_key_field_and_does_not_invent_its_value(self):
+        event = self._native_key_field()
+        self.worker.capture_action(dict(action='click'), self.observed)
+        event['at'] = time.monotonic()
+        self.uia.focused.return_value = object()  # Windows has moved on to the next field.
+        self.worker.handle(event)
+        recorded, = self.notes.snapshot()
+        self.assertEqual((recorded['action'], recorded['keys']), ('press-key', 'Tab'))
+        self.assertEqual(recorded['target'], textfield()['target'])
+        self.assertEqual(capture.default_text(recorded), 'Tab 키 누르기')
+        self.assertEqual(self.notes.times[recorded['id']], event['at'])
+
+    def test_focused_unchanged_combo_then_down_does_not_require_an_invented_value(self):
+        event = self._native_key_field()
+        self.properties[30003] = 50003
+        self.observed['node'].update(role='combobox', locator=dict(role='combobox', automation_id='family'))
+        self.uia.combo_observation.return_value = self.observed
+        self.uia.locator.return_value = self.observed['node']['locator']
+        self.uia.focused.return_value = self.element
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.worker.handle(dict(event, keys='Down', at=time.monotonic()))
+        key, = self.notes.snapshot()
+        self.assertEqual((key['action'], key['keys']), ('press-key', 'Down'))
+
+    def test_native_combo_editor_records_down_on_the_owning_combo(self):
+        event = self._native_key_field()
+        combo_element = Mock()
+        combo_element.property.side_effect = {30003: 50003, 30009: True, 30010: True}.get
+        selector = dict(role='combobox', automation_id='family')
+        self.observed.update(element=combo_element)
+        self.observed['node'].update(role='combobox', locator=selector)
+        self.uia.combo_observation.return_value = self.observed
+        self.uia.locator.side_effect = lambda item, root: selector if item is combo_element else {'role': 'textfield'}
+        self.worker.capture_action(dict(action='click'), self.observed)
+        parent = {self.element: combo_element, combo_element: self.root}
+        with patch('control_lookup._raw_parent', side_effect=lambda uia, item: parent[item]), \
+                patch.object(capture.live_action, '_combo_visible', return_value=True):
+            self.worker.handle(dict(event, keys='Down', at=time.monotonic()))
+        key, = self.notes.snapshot()
+        self.assertEqual((key['keys'], key['target']['locator']), ('Down', selector))
+
+    def test_confirmed_typing_and_shortcut_produce_two_ordered_steps(self):
+        event = self._native_key_field()
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.worker._commit_value('changed')
+        self.worker.watched_samples.append((time.monotonic(), 'changed'))
+        self.worker.handle(dict(event, keys='Ctrl+S', at=time.monotonic()))
+        value, key = self.notes.snapshot()
+        self.assertEqual((value['action'], value['value']), ('set-value', 'changed'))
+        self.assertEqual((key['action'], key['keys']), ('press-key', 'Ctrl+S'))
+
+    def test_virtual_field_uses_focus_observed_on_both_sides_of_shortcut(self):
+        event = self._native_key_field()
+        self.properties.update({30020: 0, 30008: True})
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.uia.focused.return_value = self.element
+        self.worker.handle(dict(event, keys='F5', submit_focus=5, at=time.monotonic()))
+        key, = self.notes.snapshot()
+        self.assertEqual((key['keys'], key['target']), ('F5', textfield()['target']))
+
+    def test_virtual_tab_cannot_bind_a_different_post_key_field(self):
+        event = self._native_key_field()
+        self.properties.update({30020: 0, 30008: True})
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.uia.focused.return_value = object()
+        self.worker.handle(dict(event, submit_focus=5, at=time.monotonic()))
+        self.assertEqual(self.notes.snapshot()[-1]['action'], 'manual')
+
+    def test_escape_can_close_the_previously_focused_native_field(self):
+        event = self._native_key_field()
+        self.worker.capture_action(dict(action='click'), self.observed)
+        self.native.IsWindow.return_value = False
+        self.binding.check.side_effect = capture.bridge.BridgeError('window_closed')
+        self.worker.handle(dict(event, keys='Esc', at=time.monotonic()))
+        self.assertEqual(self.notes.snapshot()[-1]['keys'], 'Esc')
+
+    def test_unscoped_or_protected_key_does_not_retarget_new_focus(self):
+        event = self._native_key_field()
+        self.worker.handle(dict(event, submit_window=6))
+        self.uia.secure.return_value = True
+        self.worker.handle(event)
+        self.assertEqual([step['action'] for step in self.notes.snapshot()], ['manual', 'manual'])
+        self.uia.locator.assert_not_called()
+        self.uia.focused.assert_not_called()
+
+    def test_proven_unprotected_field_keeps_key_clue_if_locator_missing(self):
+        event = self._native_key_field()
+        self.uia.locator.return_value = dict(role='textfield')
+        self.uia.anchored_field.return_value = None
+        self.worker.handle(dict(event, keys='Ctrl+S'))
+        row, = self.notes.snapshot()
+        self.assertEqual(row['action'], 'manual')
+        self.assertEqual(capture.default_text(row), 'Ctrl+S 키 누르기')
+
     def test_recent_command_click_is_recorded_after_its_dialog_closes(self):
         now = time.monotonic()
         raw = dict(id='finish', action='click', label='Finish',
@@ -442,14 +574,27 @@ class ClosedDialogFieldTests(unittest.TestCase):
     setUp = TextfieldWorkerTests.setUp
 
     def test_watch_keeps_validated_native_focus_even_if_display_node_has_no_handle(self):
+        hwnd = 0x81230063
         native_element = Mock()
-        native_element.property.return_value = 99
+        native_element.property.return_value = hwnd - 2**32
         self.observed['element'] = native_element
         self.observed['node'].pop('hwnd', None)
         with (patch.object(capture.bridge, 'hwnd_pid', return_value=self.binding.pid),
               patch.object(capture.bridge, 'root_window', return_value=self.observed['window'])):
             self.worker.capture_action(dict(action='click'), self.observed)
-        self.assertEqual(self.observed['_recorded_native_focus'], 99)
+        self.assertEqual(self.observed['_recorded_native_focus'], hwnd)
+
+        def read_focus(thread, info):
+            info._obj.focus = 0xffffffff00000000 | hwnd
+            return True
+
+        events = queue.Queue()
+        hook = capture._RowHookPump(self.binding, capture.bridge, events, queue.Queue())
+        with (patch.object(capture.bridge, '_sig', return_value=read_focus),
+              patch.object(capture.bridge, 'root_window', return_value=self.observed['window']) as root):
+            hook._emit({'kind': 'enter'})
+        root.assert_called_once_with(hwnd)
+        self.assertEqual(events.get_nowait()['submit_focus'], self.observed['_recorded_native_focus'])
 
     def test_closed_dialog_keeps_only_the_last_pre_transition_observed_value(self):
         self.worker.capture_action(dict(action='click'), self.observed)

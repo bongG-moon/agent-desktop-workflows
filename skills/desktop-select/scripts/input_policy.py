@@ -4,6 +4,7 @@ from copy import deepcopy
 import ctypes as C
 from ctypes import wintypes as W
 import os
+import key_chords
 
 
 _POINTER_ACTIONS = frozenset({'context-menu', 'result-menu', 'row-action', 'row-launch', 'row-open', 'visual-click', 'double-click-result', 'conditional-open'})
@@ -39,7 +40,7 @@ def profile(steps, numbers=None):
         mode, foreground, eligible = 'unknown', False, False
         if action in _POINTER_ACTIONS:
             mode, foreground = 'physical_pointer', True
-        elif action == 'submit':
+        elif action in ('submit', 'press-key'):
             mode, foreground = 'physical_keyboard', True
         elif action in _ACCESSIBILITY_ACTIONS:
             mode, eligible = 'accessibility', True
@@ -47,6 +48,8 @@ def profile(steps, numbers=None):
             mode, eligible = 'observation', True
         entries.append(dict(number=number, action=action, input_mode=mode,
                             requires_foreground=foreground, background_eligible=eligible))
+        if action == 'press-key' and key_chords.virtual_keys(step.get('keys')):
+            entries[-1]['keys'] = step['keys']
 
     return dict(independent_desktop=False,
                 physical_input_required=any(row['input_mode'] in ('physical_pointer', 'physical_keyboard')

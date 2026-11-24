@@ -90,6 +90,20 @@ class RegisteredResultTests(unittest.TestCase):
             dict(number=2, receipt=dict(status='observed', value='sample note', value_evidence=dict(status='observed'), input_dispatched=False)),
             dict(number=3, receipt=dict(status='verified', input_dispatched=True))])
 
+    def test_previous_guide_duplicate_set_can_resume_only_with_the_same_value(self):
+        args = self.start()
+        self.assertIn('part=D27', args)
+        self.assertEqual(self.call(*args, '--set', 'Part=Other')[1]['diagnostic'], 'duplicate_override')
+        self.assertEqual(self.run.call_count, 1)
+        self.choose.return_value = self.proof
+        self.run.return_value = self.finished()
+        _, resumed = self.call(*args, '--set', 'Part=D27')
+        self.assertEqual(resumed['status'], 'completed_unverified', resumed)
+        self.assertEqual(resumed['resumed_at'], 3)
+        self.assertEqual(self.run.call_count, 2)
+        self.assertEqual(self.call('--allow-physical', '--set', 'Part=D27', '--set', 'part=D27')[1]['diagnostic'],
+                         'duplicate_override')
+
     def row_review(self, mode='single'):
         scope = dict(exe='Demo.exe', title='Details', after_step=2, related=True)
         self.recipe['steps'][1:3] = [dict(action='double-click-result', label='Open current row',
@@ -111,6 +125,16 @@ class RegisteredResultTests(unittest.TestCase):
         for diagnostic in ('result_row_missing', 'result_row_ambiguous', 'result_table_missing'):
             self.blocked['steps'][-1]['receipt']['diagnostic'] = diagnostic
             self.assertIsNone(review.offer(flow, self.blocked, {}))
+
+    def test_window_aliases_recover_the_existing_pending_review(self):
+        hwnd = 0x81aa0011
+        self.owner['hwnd'] = hwnd
+        review, record = self.row_review()
+        for alias in (hwnd - 2**32, 0xffffffff00000000 | hwnd):
+            self.assertEqual(review.existing({}, None, alias)['ticket'], record['ticket'])
+        with self.assertRaisesRegex(flow.app.tasks.TaskError, 'invalid_target'):
+            review.existing({}, None, 0x100000000 | hwnd)
+        self.assertEqual(review.existing({}, None, hwnd)['ticket'], record['ticket'])
 
     def test_local_current_row_confirmation_skips_header_and_value_and_runs_only_suffix(self):
         for mode in ('single', 'first'):

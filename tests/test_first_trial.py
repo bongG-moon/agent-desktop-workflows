@@ -1,4 +1,6 @@
 """Test the public first-trial command with real recording storage and a counted input boundary."""
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import random
 from pathlib import Path
@@ -37,6 +39,67 @@ class FirstTrial(unittest.TestCase):
         with patch.object(app,'worker_receipt', self.worker):
             return app.run(args)
 
+    def host_receipt(self, *argv):
+        with redirect_stdout(StringIO()) as output, patch.object(app, 'worker_receipt', self.worker):
+            app.worker(app.parser().parse_args(argv))
+        return json.loads(output.getvalue())
+
+    def test_host_summary_returns_one_verbatim_read_value_and_preserves_cached_receipt(self):
+        value = 'ABC12345' * 512
+        task = dict(self.task, steps=[dict(action='read-value', label='Memo',
+                                            selector=dict(role='textfield', automation_id='memo'))])
+        tasks.save_task(task, self.directory)
+        evidence = dict(status='observed', source='value_pattern')
+        self.worker.return_value = dict(status='verified', input_dispatched=False, steps=[dict(number=1,
+            label='Memo', receipt=dict(status='observed', diagnostic='value_observed', value=value,
+                                       input_dispatched=False, value_evidence=evidence))])
+        args = ['try-recording', '--task', task['name']]
+        first = self.host_receipt(*args, '--summary')
+        path = self.directory / 'first-trials' / (first['trial_receipt'] + '.json')
+        saved = path.read_bytes()
+        raw = self.host_receipt(*args)
+        compact = self.host_receipt(*args, '--summary')
+        self.assertEqual(raw['steps'][0]['value'], value)
+        self.assertEqual(json.loads(saved)['steps'][0]['value'], value)
+        for result in (first, compact):
+            self.assertEqual(result['observations'], [dict(field='Memo', value=value, source_step=1)])
+            self.assertEqual(result['steps'][0]['value_evidence'], evidence)
+            self.assertEqual(result['steps'][0]['source_step'], 1)
+            self.assertNotIn('value', result['steps'][0])
+        self.assertEqual(len(json.dumps(raw)) - len(json.dumps(compact)), len(value) + len(', "value": ""'))
+        self.assertFalse(compact['this_call_dispatched_input'])
+        self.assertEqual(path.read_bytes(), saved)
+        self.worker.assert_called_once()
+
+    def test_host_summary_preserves_ambiguous_or_interrupted_value_evidence(self):
+        observed = dict(status='observed', value='previous', value_evidence=dict(source='provider'))
+        previous = dict(number=1, source_step=1, receipt=observed)
+        other = dict(number=2, source_step=2, action='read-value', **observed)
+        report = dict(status='completed_unverified', observations=[dict(source_step=1, value='previous')],
+                      steps=[previous, other])
+        result = first_trial.host_summary(report)
+        self.assertNotIn('value', result['steps'][0]['receipt'])
+        self.assertEqual(result['steps'][0]['receipt']['value_evidence'], observed['value_evidence'])
+        self.assertEqual(result['steps'][1], other)
+        self.assertEqual(report['steps'][0]['receipt']['value'], 'previous')
+        for status in ('blocked', 'uncertain', 'needs_grounding'):
+            interrupted = dict(report, status=status, stopped_at=2, host_action='check_current_effect_before_continuing')
+            self.assertEqual(first_trial.host_summary(interrupted), interrupted)
+
+    def test_wrong_parameter_name_returns_the_recorded_names_before_any_input(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        tasks.save_task(self.task, self.directory)
+        args = app.parser().parse_args(['try-recording', '--task', self.task['name'],
+                                        '--set', 'Zone=sample-user-value'])
+        with redirect_stdout(StringIO()) as output, patch.object(app, 'worker_receipt') as worker:
+            self.assertEqual(app.worker(args), 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual((result['diagnostic'], result['required_parameters'], result['input_dispatched']),
+                         ('unknown_parameter', ['Region'], False))
+        self.assertNotIn('sample-user-value', output.getvalue())
+        worker.assert_not_called()
+
     def test_one_call_offline_draft_then_single_dispatch_reuses_previous_result(self):
         review_drafts.ReviewStorage('초안', 'A.exe', '업무', self.directory).save_draft(
             [dict(step=dict(self.raw, id='1', label='Region'), form=dict(alias='',text=self.raw['instruction']['text'],
@@ -55,6 +118,32 @@ class FirstTrial(unittest.TestCase):
         self.trial(*args,'--trial-id','deliberate-2')
         self.assertEqual(self.worker.call_count,2)
 
+    def test_signed_and_unsigned_hwnd_share_one_trial_receipt(self):
+        tasks.save_task(self.task, self.directory)
+        hwnd = 0x81234567
+        args = ['--task', self.task['name'], '--set', 'Region=North', '--hwnd']
+        self.assertTrue(self.trial(*args, str(hwnd - 2**32))['input_dispatched'])
+        for alias in (hwnd, 0xffffffff00000000 | hwnd):
+            self.assertTrue(self.trial(*args, str(alias))['previous_trial'])
+        self.worker.assert_called_once()
+        self.assertEqual(self.worker.call_args.kwargs['payload']['hwnd'], hwnd)
+
+    def test_old_signed_trial_receipt_resumes_without_dispatch_after_upgrade(self):
+        tasks.save_task(self.task, self.directory)
+        name = self.task['name']
+        hwnd = 0x81234567
+        args = ['--task', name, '--set', 'Region=North', '--hwnd', str(hwnd)]
+        self.trial(*args)
+        stored = self.directory / 'first-trials'
+        receipt = next(stored.glob('*.json'))
+        doc = tasks.load_task(name, self.directory, allow_review=True)
+        modified = (self.directory / (name + '.json')).stat().st_mtime_ns
+        old_key = recovery._fingerprint([name, modified, recovery._fingerprint(doc),
+                                         {'region': 'North'}, hwnd - (1 << 32), None])
+        receipt.rename(stored / (old_key + '.json'))
+        self.assertTrue(self.trial(*args)['previous_trial'])
+        self.worker.assert_called_once()
+
     def test_session_with_existing_failed_observation_returns_same_evidence(self):
         raw = dict(id='manual', action='manual', label='unresolved',
                    target={'kind':'manual'},recognition={'reason':'capture_target_unavailable'})
@@ -68,6 +157,40 @@ class FirstTrial(unittest.TestCase):
         with patch('recorder_launch.status', return_value=recorded):
             self.assertEqual(self.trial('--session','a'*32),blocked)
         self.worker.assert_not_called()
+
+    def test_processing_timeout_keeps_the_entire_trial_request(self):
+        argv = ['--session','a'*32,'--set','Region=North','--trial-id','explicit-2',
+                '--hwnd','42','--auto-repair-frame','--allow-physical']
+        with patch('recorder_launch.status', return_value=dict(status='recorder_processing',
+                   input_dispatched=False, saved=True, status_args=['recorder', '--session', 'a'*32])) as waiting:
+            report = self.trial(*argv)
+        self.assertEqual(report['host_action'], 'continue_same_trial')
+        self.assertNotIn('status_args', report)
+        self.assertEqual(vars(app.parser().parse_args(report['retry_args'])),
+                         vars(app.parser().parse_args(['try-recording', *argv])))
+        waiting.assert_called_once()
+        self.worker.assert_not_called()
+        with patch('recorder_launch.status', return_value=dict(status='recorder_processing', saved=True)):
+            retry = self.host_receipt('try-recording', *argv, '--summary')['retry_args']
+            self.assertEqual(app.parser().parse_args(retry), app.parser().parse_args(['try-recording', *argv, '--summary']))
+
+    def test_missing_value_and_pointer_permission_are_reported_before_one_retry(self):
+        self.task['steps'].append(dict(action='double-click-result', result_row='first',
+                                       selector=dict(role='table', automation_id='results'), label='Open result'))
+        tasks.save_task(self.task, self.directory)
+        base = ['--task', self.task['name']]
+        consent = self.trial(*base)
+        self.assertEqual(consent['status'], 'needs_consent')
+        self.assertEqual(consent['missing_parameters'], ['Region'])
+        self.assertEqual(consent['required_option'], '--allow-physical')
+        self.assertFalse(consent['input_dispatched'])
+        self.assertEqual(self.trial(*base, '--background-only')['diagnostic'],
+                         'background_requires_desktop_interaction')
+        self.worker.assert_not_called()
+        self.worker.return_value['steps'].append(dict(number=3,receipt=dict(status='verified',input_dispatched=True)))
+        with patch('input_policy._interactive_desktop', return_value=True):
+            self.trial(*base, '--set', 'Region=North', consent['required_option'])
+        self.worker.assert_called_once()
 
     def test_interrupted_delivery_reserves_trial_and_missing_parameter_never_reserves(self):
         tasks.save_task(self.task, self.directory)
@@ -201,8 +324,16 @@ class FirstTrial(unittest.TestCase):
               patch.object(grounding,'_directory',return_value=self.directory),patch.object(app,'worker_receipt',self.worker)):
             original = self.trial('--task', self.task['name'], '--allow-physical')
             key = original['trial_receipt']
+            paused = self.host_receipt('try-recording', '--task', self.task['name'], '--summary')
+            self.assertEqual(paused['steps'], original['steps'])
+            inspect = paused['result_inspection']['args']
+            self.assertEqual(inspect, ['inspect-trial', '--receipt', key, '--summary'])
             pixels = random.Random(243).randbytes(125*125*4)
-            token,_ = grounding.store_frame(self.directory,key.encode('ascii'),grounding._png(125,125,pixels))
+            image = grounding._png(125, 125, pixels)
+            with (patch.object(grounding, '_capture', return_value=([0, 0, 125, 125], image)),
+                  patch.object(app.bridge, 'Binding')):
+                capture = self.host_receipt(*inspect)
+            token = capture['frame']
             def resume(value, token=token, point='24'):
                 args = ['resume-trial','--receipt',key,'--frame',token,'--column','Region',
                         '--value',value,'--point',point,'24','--allow-physical']
@@ -222,8 +353,14 @@ class FirstTrial(unittest.TestCase):
                 dict(number=1,receipt=dict(status='verified',input_dispatched=True)),
                 dict(number=2,receipt=dict(status='observed',value='memo value',input_dispatched=False)),
                 dict(number=3,receipt=dict(status='verified',input_dispatched=True))])
+            replacements = {'<observed exact cell text>': 'North', '<cell text x>': '24', '<cell text y>': '24'}
+            summarized = self.host_receipt(*(replacements.get(arg, arg) for arg in capture['resume_args']))
             result = resume('North')
             self.assertEqual(result['observations'],[dict(source_step=4,field='Note',value='memo value')])
+            self.assertEqual(summarized['observations'], result['observations'])
+            self.assertEqual(summarized['steps'][:2], result['steps'][:2])
+            self.assertNotIn('value', summarized['steps'][3])
+            self.assertFalse(summarized['prior_steps_replayed'])
             payload = self.worker.call_args.kwargs['payload']
             self.assertEqual([s['action'] for s in payload['recipe']['steps']],['visual-click','read-value','invoke'])
             self.assertEqual(payload['result_confirmation']['owner'],identity)
@@ -254,3 +391,31 @@ class FirstTrial(unittest.TestCase):
             payload = runner.call_args.kwargs['payload']
             self.assertEqual(payload['overrides'],{'Region':'North'})
             self.assertEqual(payload['recipe']['steps'][2]['parameter'],'Region')
+
+    def test_replay_key_with_older_recorded_value_and_key_only_scope(self):
+        field = dict(action='fill', match='automation_id', target='code', role='textfield',
+                     label='Region', parameter='Region', value='South', recorded_effect='matched')
+        key = dict(action='press-key', selector=dict(automation_id='code', role='textfield'),
+                   label='Region', keys='Tab')
+        task = dict(self.task, steps=[field, key])
+        tasks.save_task(task, self.directory)
+        argv = ['replay', '--task', task['name'], '--exe', task['exe'], '--window', task['window']]
+        with patch.object(app, 'worker_receipt', return_value=dict(status='verified',steps=[])) as runner:
+            app.run(app.parser().parse_args(argv))
+            payload = runner.call_args.kwargs['payload']
+            self.assertEqual([(s['action'], s.get('value'), s.get('keys')) for s in payload['recipe']['steps']],
+                             [('set-value', 'South', None), ('press-key', None, 'Tab')])
+            app.run(app.parser().parse_args([*argv, '--only', '2']))
+            self.assertEqual(runner.call_args.kwargs['payload']['only'], '2')
+
+    def test_enter_only_uses_the_same_keyboard_executor_as_a_full_trial(self):
+        submit = dict(action='submit', selector=dict(automation_id='code', role='textfield'), label='Region')
+        task = dict(self.task, steps=[submit])
+        tasks.save_task(task, self.directory)
+        args = app.parser().parse_args(['replay', '--task', task['name'], '--exe', task['exe'],
+                                        '--window', task['window'], '--only', '1'])
+        with patch.object(app, 'worker_receipt', return_value=dict(status='completed_unverified', steps=[])) as worker:
+            result = app.run(args)
+        self.assertEqual(result['execution_engine'], 'saved_python_plan')
+        payload = worker.call_args.kwargs['payload']
+        self.assertEqual((payload['only'], payload['recipe']['steps'][0]['action']), ('1', 'submit'))

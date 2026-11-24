@@ -40,6 +40,17 @@ class RegisteredFastRunTests(unittest.TestCase):
         self.assertEqual(report['business_commit'], 'not_verified')
         self.assertEqual(self.cli(self.result)[0], 3)
 
+    def test_first_trial_and_registered_summary_agree_on_a_verified_final_file(self):
+        report = flow.summarize_execution(self.result, list(enumerate(self.recipe['steps'], 1)))
+        trial_args = flow.app.parser().parse_args(['try-recording', '--task', 'Report', '--summary'])
+        with patch.object(flow.app, 'run', return_value=report), redirect_stdout(StringIO()) as stdout:
+            self.assertEqual(flow.app.worker(trial_args), 0)
+        self.assertEqual(json.loads(stdout.getvalue())['verified_outputs'], report['verified_outputs'])
+        self.assertEqual(flow.app.result_code(report), 3)
+        for partial in (dict(report, stopped_at=2), dict(report, status='uncertain'),
+                        dict(report, outcome=None)):
+            self.assertNotEqual(flow.app.result_code(partial, summary=True), 0)
+
     def test_summary_keeps_failures_and_unproven_delivery(self):
         for changes in (dict(status='uncertain'), dict(status='blocked', stopped_at=2), dict(stopped_at=2)):
             code, report = self.cli(dict(self.result, **changes), '--summary')
@@ -59,7 +70,11 @@ class RegisteredFastRunTests(unittest.TestCase):
         self.assertIn('["Example", "우클릭 → Show details"]', guide)
         self.assertIn('["Family"]', guide)
         self.assertIn('--allow-physical', guide)
-        self.assertIn('`' + flow.RUN_COMMAND + ' --summary --set "Family=<값>"`', guide)
+        ordinary = '`' + flow.RUN_COMMAND + ' --summary --set "Family=<값>"`'
+        permitted = '`' + flow.RUN_COMMAND + ' --summary --allow-physical --set "Family=<값>"`'
+        self.assertLess(guide.index(permitted), guide.index(ordinary))
+        self.assertIn('이미 허용했다면', guide[:guide.index(permitted)])
+        self.assertIn('실제 입력 허용이 없으면', guide[guide.index(permitted):guide.index(ordinary)])
         self.assertIn('--allow-physical --remember-physical', guide)
         self.assertIn('화면 확인까지 승인받았으면 `--auto-repair-frame`', guide)
         self.assertIn('verified_outputs', guide)

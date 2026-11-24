@@ -647,11 +647,11 @@ def _suggest(number, rows, detail, observation, name):
     detail['capture_requires_consent'] = True
 
 
-def _recorded_lookups(rows):
+def _recorded_lookups(rows, context=None):
     """Use native lookups for fully identified recordings, including their split popup captions."""
     selectors, captions, through = [], [], 0
     for number, row in enumerate(rows, 1):
-        if row['context']:
+        if row['context'] != context:
             continue
         if row.get('scope_problem'):
             return None
@@ -683,6 +683,18 @@ def _recorded_lookups(rows):
         if selector not in selectors:
             selectors.append(selector)
     return dict(selectors=selectors, captions=captions)
+
+
+def _prepare_lookups(rows, context):
+    lookups = _recorded_lookups(rows, context)
+    fields = (row.get('hint', row['step']) for row in rows if row['context'] == context)
+    scopes = [(step['target'], step['role'], step['within']) for step in fields
+              if step.get('match') in ('name', 'automation_id') and step.get('within')]
+    if scopes:
+        if lookups is None:
+            return dict(scoped_fields=scopes)
+        lookups['fallback_scopes'] = scopes
+    return lookups
 
 
 def _binding_lookups(operations, rows, context):
@@ -761,16 +773,6 @@ def run(app, args):
     _require(only is None or (type(only) is int and 1 <= only <= len(rows)), 'unknown_task_step')
     _require(not args.image or only is not None, 'recovery_image_step_required')
     prepare = getattr(args, 'prepare', False)
-    lookups = _recorded_lookups(rows) if prepare else None
-    if prepare:
-        fields = [row.get('hint', row['step']) for row in rows if not row['context']]
-        scopes = [(step['target'], step['role'], step['within']) for step in fields
-                  if step.get('match') in ('name', 'automation_id') and step.get('within')]
-        if scopes:
-            if lookups is None:
-                lookups = dict(scoped_fields=scopes)
-            else:
-                lookups['fallback_scopes'] = scopes
     _require((not prepare and bool(args.save_as) == bool(args.bindings) and not (args.bindings and (args.image or only)))
              or (prepare and not (args.bindings or args.image or only)), 'invalid_recovery_options')
     destination = args.save_as or (f"{doc['name'][:75]} - {fingerprint[:12]}" if prepare else None)
@@ -856,10 +858,15 @@ def run(app, args):
                     remap[number] = len(revised)
                     detail.update(scope_validation='deferred_until_opener', opener_step=origin)
                     continue
+                # Narrow lookups belong to this recorded opening of the window.
+                # A later opening may use the same HWND with different fields.
+                context = row['context']
                 key = surface.hwnd, surface.pid, surface.created
+                if context and (prepare or args.bindings):
+                    key += tuple(sorted(context.items()))
                 if key not in observations:
-                    scoped_lookups = (_binding_lookups(operations, rows, row['context']) if args.bindings
-                                      else lookups if row['context'] is None else None)
+                    scoped_lookups = (_binding_lookups(operations, rows, context) if args.bindings
+                                      else _prepare_lookups(rows, context) if prepare else None)
                     observation = live_recovery.observe_scope(app, owner, surface, doc['window'],
                                             frame_key=[fingerprint, number] if args.image else None,
                                             **({'bindings_only': True} if args.bindings else {}),

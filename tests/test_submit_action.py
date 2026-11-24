@@ -160,6 +160,75 @@ class SubmitActionTests(unittest.TestCase):
         self.uia.focused.assert_not_called()
         live.win.user32.SendInput.assert_not_called()
 
+    def press(self, keys, role='textfield'):
+        return live.execute(self.binding, self.uia, self.element, {'role': role}, 'press-key', keys, still_valid=self.check)
+
+    def test_chord_is_delivered_in_one_batch_to_existing_focus_including_noneditable_targets(self):
+        self.props.update({30003: 50000, 30043: False, 30046: True})
+        sent = live.win.user32.SendInput
+        sent.side_effect = lambda count, *args: count
+        for keys, events in [('Ctrl+S', [(17, 0), (83, 0), (83, 2), (17, 2)]),
+                             ('Shift+Tab', [(16, 0), (9, 0), (9, 2), (16, 2)]),
+                             ('Right', [(0x27, 1), (0x27, 3)]),
+                             ('F5', [(0x74, 0), (0x74, 2)])]:
+            with self.subTest(keys=keys):
+                sent.reset_mock()
+                receipt = self.press(keys, 'button')
+                self.assertEqual((receipt['diagnostic'], receipt['keys']), ('key_chord_sent', keys))
+                self.assertEqual(receipt['keyboard_events_sent'], len(events))
+                sent.assert_called_once()
+                self.assertEqual([(v.ki.wVk, v.ki.dwFlags) for v in sent.call_args.args[1]], events)
+        self.element.call.assert_not_called()
+
+    def test_partial_chord_only_releases_injected_keys_and_never_repeats_keydown(self):
+        sent = live.win.user32.SendInput
+        for count, remaining in [(0, []), (1, [17]), (2, [83, 17]), (3, [17])]:
+            with self.subTest(count=count):
+                sent.reset_mock()
+                sent.side_effect = [count, len(remaining)]
+                receipt = self.press('Ctrl+S')
+                self.assertEqual(receipt['status'], 'uncertain')
+                self.assertIsNone(receipt['input_dispatched'])
+                self.assertEqual(sent.call_count, 2 if remaining else 1)
+                if remaining:
+                    release = sent.call_args.args[1]
+                    self.assertEqual([(event.ki.wVk, event.ki.dwFlags) for event in release], [(vk, 2) for vk in remaining])
+                    self.assertEqual(receipt['keys_released'], len(remaining))
+
+    def test_key_requires_matching_current_focus_and_rejects_unsupported_chords(self):
+        other = MagicMock()
+        self.uia.focused.return_value = other
+        self.assertFalse(self.press('Tab')['input_dispatched'])
+        self.uia.focused.return_value = self.element
+        self.uia.secure.return_value = True
+        self.assertFalse(self.press('Ctrl+S')['input_dispatched'])
+        for bad in ('S', 'Alt+Tab', 'Win+R', None):
+            with self.subTest(keys=bad):
+                self.assertEqual(self.press(bad)['diagnostic'], 'invalid_key_chord')
+        live.win.user32.SendInput.assert_not_called()
+
+    def test_navigation_preserves_combo_editor_focus_and_rejects_sibling(self):
+        self.props[30003] = 50003
+        editor, sibling = MagicMock(), MagicMock()
+        editor.property.side_effect = {30003: 50004, 30010: True}.get
+        sibling.property.return_value = 50003
+        self.uia.pid.return_value = self.binding.pid
+        self.uia.focused.return_value = editor
+        self.uia.within.return_value = True
+        owner = self.element
+        live.control_lookup.ancestry.side_effect = lambda u, el, root, **kw: ([editor, owner, root]
+                                                                              if el is editor else [el, root])
+        sent = live.win.user32.SendInput
+        sent.side_effect = lambda count, *args: count
+        self.assertEqual(self.press('Down', 'combobox')['diagnostic'], 'key_chord_sent')
+        self.element.call.assert_not_called()
+        sent.reset_mock()
+        owner = sibling
+        result = self.press('Down', 'combobox')
+        self.assertEqual((result['status'], result['input_dispatched']), ('blocked', False))
+        self.element.call.assert_called_once_with(3, ())
+        sent.assert_not_called()
+
     def test_arbitrary_key_or_value_options_are_not_supported(self):
         base = dict(schema=1, name='Submit test', exe='Example.exe', window='Example window', steps=[
             dict(action='submit', selector=dict(name='Filter', role='textfield'))])

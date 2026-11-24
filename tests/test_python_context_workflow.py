@@ -431,6 +431,40 @@ class CompositionTests(unittest.TestCase):
         self.element.call.assert_not_called()
         flow.app.visibility.restore_for_action.assert_not_called()
 
+    def test_key_chord_completes_once_then_continues_and_only_accepts_matching_delivery(self):
+        key = dict(action='press-key', keys='Ctrl+S', selector=dict(name='Filter', role='textfield'))
+        data = recipe(key, dict(action='wait', seconds=0))
+        self.uia.actions.return_value = ['SetFocus']
+        accepted = dict(status='delivered_unverified', diagnostic='key_chord_sent', input_dispatched=True,
+                        keyboard_events_sent=4, keys='Ctrl+S', physical_input=True)
+
+        def send(_surface, _uia, _element, _node, operation, keys, **kwargs):
+            kwargs['still_valid']()
+            self.assertEqual((operation, keys), ('press-key', 'Ctrl+S'))
+            return accepted
+
+        flow.live.execute.side_effect = send
+        result = flow.run(data)
+        self.assertEqual(result['status'], 'completed_unverified')
+        self.assertEqual([row['receipt']['status'] for row in result['steps']], ['delivered_unverified', 'waited'])
+        flow.live.execute.assert_called_once()
+        flow.live.execute.side_effect = None
+        for wrong in (dict(accepted, keys='Ctrl+F'), dict(accepted, keyboard_events_sent=2), dict(accepted, status='uncertain')):
+            with self.subTest(wrong=wrong):
+                flow.live.execute.return_value = wrong
+                self.assertEqual(flow.run(data)['stopped_at'], 1)
+
+    def test_register_chord_observes_focusability_without_focus_or_input(self):
+        key = dict(action='press-key', keys='Shift+Tab', selector=dict(name='Filter', role='textfield'))
+        self.uia.actions.return_value = ['SetFocus']
+        with patch.object(flow.live, 'key_target_ready') as ready, tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / 'keys-skill'
+            self.assertEqual(flow.register(recipe(key), target)['status'], 'registered')
+            self.assertEqual(flow.load(target / 'workflow.json')['steps'], [key])
+            ready.assert_called_once()
+        flow.live.execute.assert_not_called()
+        self.element.call.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

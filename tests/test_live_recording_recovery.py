@@ -147,6 +147,30 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(tasks.TaskError, 'target_missing'):
             recovery._observed_field(dict(role='combobox', match='automation_id', target='missing'), inventory)
 
+    def test_prepare_uses_recorded_selectors_for_open_child_and_shares_them_with_enter(self):
+        child = SimpleNamespace(hwnd=8, pid=2, created=3, exe='Demo.exe')
+        scope = dict(exe=child.exe, title='Detail', mode='existing')
+        main_field = dict(role='textfield', automation_id='equipment')
+        detail_field = dict(role='textfield', automation_id='notes')
+        steps = [
+            dict(action='field-input', label='Equipment', selector=main_field, value='XA'),
+            dict(action='field-input', label='Notes', selector=detail_field, value='AB', window_context=scope),
+            dict(action='submit', label='Enter', selector=detail_field, window_context=scope)]
+        tasks.save_task(dict(name='내 녹화', schema=1, exe=self.owner.exe, window='업무', steps=steps), self.directory)
+
+        def observe(_app, _main, surface, _title, **options):
+            selectors = options['lookups']['selectors']
+            self.assertEqual(selectors, [main_field if surface == self.owner else detail_field])
+            return dict(targets=[dict(selector, recorded_selector=selector, enabled=True, offscreen=False)
+                                 for selector in selectors])
+
+        self.observe.side_effect = observe
+        with patch.object(recovery, '_bind_surface', side_effect=[self.owner, child, child]):
+            report = recovery.run(app, self.args(prepare=True))
+        self.assertEqual(report['status'], 'recorded', report)
+        self.assertEqual(self.observe.call_count, 2)
+        self.assertFalse(report['input_dispatched'])
+
     def test_minimized_window_stops_once_and_only_restores_on_explicit_request(self):
         self.store.save_draft(self.rows, 'instruction_target_mismatch', 1)
         self.observable.side_effect = app.bridge.BridgeError('target_window_minimized')
@@ -598,3 +622,28 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.assertEqual(detail['description'], raw['label'])
         self.assertEqual(detail['reason'], 'right_click_requires_menu_teaching')
         self.assertEqual(detail['menu_anchor']['point'], [.3,.5])
+
+
+class RecoveryScopeInventoryTests(unittest.TestCase):
+    def test_only_scan_popups_for_menu_or_unresolved_recorded_selectors(self):
+        import live_recovery
+        from contextlib import ExitStack
+        surface = SimpleNamespace(hwnd=1, exe='Demo.exe')
+        for captions, failure, expected_scans in (([], False, 0), (['Export'], False, 1), ([], True, 2)):
+            with self.subTest(captions=captions, failure=failure), ExitStack() as stack:
+                for source, name in ((app.bridge, 'UIA'), (app, 'guard'), (app.bridge, 'window_text'),
+                                     (app, 'bind_surface'), (app.visibility, 'require_observable')):
+                    stack.enter_context(patch.object(source, name))
+                popups = stack.enter_context(patch.object(app, 'owned_popups', return_value=[dict(hwnd=2)]))
+                menu = stack.enter_context(patch.object(live_recovery.context_menu, '_native_menu_owner', return_value=False))
+                inventory = stack.enter_context(patch.object(live_recovery, '_targets', return_value=[]))
+                direct = stack.enter_context(patch.object(live_recovery, '_recorded_targets', return_value=[]))
+                if failure:
+                    direct.side_effect = app.bridge.BridgeError('target_missing')
+                result = live_recovery.observe_scope(app, surface, surface, '업무', lookups=dict(
+                    captions=captions, selectors=[dict(automation_id='code', role='textfield')]))
+                direct.assert_called_once()
+                self.assertEqual(inventory.call_count, expected_scans)
+                self.assertEqual(popups.call_count, int(bool(expected_scans)))
+                self.assertEqual(menu.call_count, popups.call_count)
+                self.assertFalse(result['input_dispatched'])

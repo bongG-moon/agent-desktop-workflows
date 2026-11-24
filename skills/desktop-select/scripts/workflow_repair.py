@@ -135,6 +135,12 @@ def identity(binding):
     return [binding.hwnd, binding.pid, binding.created]
 
 
+def matches_identity(binding, saved):
+    from win_bridge import normalize_hwnd
+    return (len(saved) == 3 and binding.hwnd == normalize_hwnd(saved[0])
+            and binding.pid == saved[1] and binding.created == saved[2])
+
+
 INPUT_CHANGED = ('foreground_or_input_changed', 'physical_input_changed')
 
 
@@ -269,10 +275,10 @@ def recorded_surface(flow, recipe, record):
     step = recipe['steps'][index]
     owner_id, surface_id = record['scope']
     owner = flow.bind(recipe['exe'], recipe['window'], owner_id[0])
-    need(identity(owner) == owner_id, 'menu_repair_window_changed')
+    need(matches_identity(owner, owner_id), 'menu_repair_window_changed')
     ctx = step.get('window_context')
     binding = flow.bind(ctx['exe'], ctx['title'], surface_id[0]) if ctx else owner
-    need(identity(binding) == surface_id, 'menu_repair_window_changed')
+    need(matches_identity(binding, surface_id), 'menu_repair_window_changed')
     resolved = None
     if ctx:
         resolved = flow.window_context.WindowRoutes(recipe['steps'], owner, recipe['window'],
@@ -339,10 +345,11 @@ def frame_reply(observed, record, args, overrides):
 
 def reserve_surface(stack, recipe, record):
     """Use the same declared-window and live-handle exclusions for every frame."""
+    from win_bridge import normalize_hwnd
     contexts = coordination.scopes_for(recipe['steps'], recipe['exe'])
-    owner = dict(hwnd=record['scope'][0][0], exe_name=recipe['exe'])
+    owner = dict(hwnd=normalize_hwnd(record['scope'][0][0]), exe_name=recipe['exe'])
     stack.enter_context(coordination.window(owner, recipe['window'], contexts))
-    surface_hwnd = record['scope'][1][0]
+    surface_hwnd = normalize_hwnd(record['scope'][1][0])
     if surface_hwnd != owner['hwnd']:
         stack.enter_context(coordination.handle({'hwnd': surface_hwnd}))
 
@@ -360,6 +367,10 @@ def attach_frame(flow, recipe, args, overrides, session, repair):
             observed = inspect_or_adjust(flow, recipe, record)
         repair.update(frame_reply(observed, record, args, overrides))
         repair['host_action'] = 'inspect_menu_repair_image'
+        if getattr(args, 'summary', False) and repair.get('image') and repair.get('resume_args'):
+            # The host already has the frame. Keep the explicit capture command
+            # for ticket-only replies and callers of the detailed interface.
+            repair.pop('frame_args', None)
     except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
         # The completed run remains authoritative. A failed read-only capture
         # neither consumes its ticket nor replaces its original action receipt.
@@ -391,7 +402,8 @@ def restore_routes(flow, recipe, record, routes):
         title = origin.get('title') or recipe['window']
         parent = flow.bind(origin['exe'], title, row['parent'][0])
         child = flow.bind(spec['exe'], spec['title'], row['child'][0])
-        need(identity(parent) == row['parent'] and identity(child) == row['child'], 'menu_repair_window_changed')
+        need(matches_identity(parent, row['parent']) and matches_identity(child, row['child']),
+             'menu_repair_window_changed')
         routes.openers[opener] = parent
         routes.check(spec, child)
         routes.bindings[flow.window_context._key(spec)] = child
@@ -401,6 +413,9 @@ def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_
                    allow_recorded_selection=False):
     """One worker owns the stored ticket until its checked input has been consumed."""
     import review_drafts
+    if args.hwnd is not None:
+        args.hwnd = flow.app.bridge.normalize_hwnd(args.hwnd)
+        need(args.hwnd, 'invalid_target')
     session = RepairSession(args.recipe)
     resume_input = getattr(args, 'resume_input', None)
     remember = getattr(args, 'remember_physical', False)
@@ -442,7 +457,8 @@ def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_
                         try:
                             prior = session.read(None, current)
                             if (not prior.get('pause') and prior['variables'] == digest(overrides)
-                                    and prior['only'] == args.only and args.hwnd in (None, prior['scope'][0][0])):
+                                    and prior['only'] == args.only and (args.hwnd is None
+                                        or args.hwnd == flow.app.bridge.normalize_hwnd(prior['scope'][0][0]))):
                                 refusal['menu_repair'] = session.describe(prior)
                         except (OSError, ValueError, KeyError, IndexError, TypeError):
                             pass
