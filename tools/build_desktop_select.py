@@ -23,7 +23,7 @@ FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'refe
                                          'scripts/row_vision.py', 'scripts/row_teach.py', 'scripts/row_action.py',
                                          'scripts/row_capture.py', 'scripts/row_intent.py', 'scripts/row_target.py',
                                          'scripts/context_teach.py', 'scripts/context_menu.py', 'scripts/result_cell.py',
-                                         'scripts/grid_provider.py',
+                                         'scripts/grid_provider.py', 'scripts/result_row_adapter.py',
                                          'scripts/result_menu.py', 'scripts/export_evidence.py',
                                          'scripts/provider_visibility.py', 'scripts/provider_values.py',
                                          'scripts/provider_security.py', 'scripts/input_policy.py', 'scripts/coordination.py',

@@ -24,6 +24,19 @@ def recipe():
 
 
 class RecipeTests(unittest.TestCase):
+    def test_result_adapter_requires_a_named_group_and_readable_count_selector(self):
+        counter = dict(role='statictext', automation_id='total')
+        spec = dict(kind='windows-ocr-grid', row_count=counter)
+        row = dict(action='verify-value', result_column='ID', value='A1',
+                   selector=dict(role='group', automation_id='results'), result_adapter=spec)
+        self.assertTrue(flow.validate(dict(recipe(), steps=[row])))
+        for invalid in (dict(row, result_adapter=dict(spec, point=[140,33])),
+                        dict(row, result_adapter=dict(spec, kind='custom_module.py')),
+                        dict(row, selector=dict(role='table')),
+                        dict(row, result_adapter=dict(spec, row_count=dict(role='textfield')))):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                flow.validate(dict(recipe(), steps=[invalid]))
+
     def test_required_parameter_has_no_recorded_default(self):
         result = flow.run(recipe(), {})
         self.assertEqual(result['status'], 'needs_input')
@@ -80,6 +93,60 @@ class RuntimeTests(unittest.TestCase):
         if args[4] == 'select':
             return dict(status='verified', input_dispatched=True)
         return dict(status='delivered_unverified', diagnostic='business_result_not_verified', input_dispatched=True)
+
+    def test_delayed_opaque_grid_waits_for_count_without_repeated_ocr_or_leaking_proof(self):
+        import result_cell
+        import result_row_adapter
+        spec = dict(kind='windows-ocr-grid', row_count=dict(role='statictext', automation_id='total'))
+        step = dict(action='verify-value', result_column='ID', selector=dict(role='group', automation_id='grid'),
+                    value='B', result_adapter=spec)
+        proof = object()
+        matches = []
+        with (patch.object(flow, '_result_target', return_value=(self.element, step['selector'])),
+              patch.object(result_cell, 'find', side_effect=flow.app.bridge.BridgeError('result_column_unavailable')),
+              patch.object(result_cell, 'bare_group', return_value=True),
+              patch.object(flow, 'result_count', side_effect=[0,1,1]),
+              patch.object(flow.time, 'sleep'),
+              patch.object(result_row_adapter, 'observe', return_value=dict(status='verified', proof=proof,
+                  result_observation={}, input_dispatched=False)) as ocr):
+            result = flow.observe_result(self.binding, self.uia, step, 'B', lambda: None, wait_seconds=1,
+                                         on_adapter_match=matches.append)
+        ocr.assert_called_once()
+        self.assertEqual(matches, [(1, proof)])
+        self.assertNotIn('proof', result)
+        self.assertFalse(result['input_dispatched'])
+
+    def test_editable_or_non_numeric_result_count_is_unusable(self):
+        adapter = dict(row_count=dict(automation_id='Rows',role='textfield'))
+        with self.assertRaisesRegex(ValueError, 'result_count_not_readonly'):
+            flow.result_count(self.binding, self.uia, adapter)
+        self.element.property.return_value = True
+        with patch.object(flow, 'observe_field', return_value=dict(value='A142')):
+            with self.assertRaisesRegex(ValueError, 'result_count_unavailable'):
+                flow.result_count(self.binding, self.uia, adapter)
+
+    def test_previous_query_with_same_count_rechecks_only_changed_table_once(self):
+        import result_cell
+        import result_row_adapter
+        step = dict(action='verify-value', value='B', result_column='ID',
+                    selector=dict(role='group', automation_id='grid'),
+                    result_adapter=dict(kind='windows-ocr-grid', row_count=dict(role='statictext', automation_id='n')))
+        for changed in (True, False):
+            miss = dict(status='blocked', diagnostic='result_value_mismatch', result_observation={},
+                        _miss_snapshot=object(), input_dispatched=False)
+            hit = dict(status='verified', proof=object(), result_observation={}, input_dispatched=False)
+            with (self.subTest(changed=changed), patch.object(flow, '_result_target', return_value=(self.element, step['selector'])),
+                  patch.object(result_cell, 'find', side_effect=flow.app.bridge.BridgeError('result_column_unavailable')),
+                  patch.object(result_cell, 'bare_group', return_value=True), patch.object(flow, 'result_count', return_value=1),
+                  patch.object(flow.time, 'sleep') as sleep,
+                  patch.object(result_row_adapter, 'observe', side_effect=[miss, hit]) as ocr,
+                  patch.object(result_row_adapter, 'changed', return_value=changed) as frame):
+                result = flow.observe_result(self.binding, self.uia, step, 'B', lambda: None, wait_seconds=1, after_query=True)
+            self.assertEqual(result['status'], 'verified' if changed else 'blocked')
+            self.assertEqual(ocr.call_count, 2 if changed else 1)
+            self.assertNotIn('_miss_snapshot', result)
+            frame.assert_called_once()
+            sleep.assert_called_once()
 
     def test_single_session_literal_values_and_explicit_wait(self):
         with patch.object(flow.live, 'execute', side_effect=self.execute) as execute:

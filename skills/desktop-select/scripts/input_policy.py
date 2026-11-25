@@ -71,7 +71,7 @@ def blocked(requirements):
                 input_requirements=deepcopy(requirements))
 
 
-def _interactive_desktop(win=None):
+def _interactive_desktop(win=None, *, evidence=None):
     """Read desktop identity only. Never switch, unlock or activate a desktop."""
     if win is None:
         if os.name != 'nt':
@@ -80,6 +80,13 @@ def _interactive_desktop(win=None):
             return True
         import win_bridge as win
     desktop = None
+    def unavailable(reason, error=None):
+        if evidence is not None:
+            evidence['reason'] = reason
+            if error:
+                evidence['win32_error'] = error
+        return False
+
     try:
         user = win.user32
         open_input = win._sig(user, 'OpenInputDesktop', W.HANDLE, W.DWORD, W.BOOL, W.DWORD)
@@ -90,19 +97,21 @@ def _interactive_desktop(win=None):
                         C.c_void_p, W.DWORD, C.POINTER(W.DWORD))
         desktop = open_input(0, False, 1)  # DESKTOP_READOBJECTS, no switching access.
         if not desktop:
-            return False
+            return unavailable('input_desktop_open_failed', C.get_last_error() if os.name == 'nt' else None)
         thread = thread_desktop(current_thread())
         if not thread:
-            return False
+            return unavailable('thread_desktop_unavailable', C.get_last_error() if os.name == 'nt' else None)
         names = []
         for handle in (desktop, thread):
             name, size = C.create_unicode_buffer(256), W.DWORD()
-            if not info(handle, 2, name, C.sizeof(name), C.byref(size)) or not name.value:
-                return False
+            if not info(handle, 2, name, C.sizeof(name), C.byref(size)):
+                return unavailable('desktop_identity_unreadable', C.get_last_error() if os.name == 'nt' else None)
+            if not name.value:
+                return unavailable('desktop_identity_empty')
             names.append(name.value.casefold())  # UOI_NAME; Windows names ignore case.
-        return names[0] == names[1]
-    except (OSError, AttributeError, ValueError):
-        return False
+        return names[0] == names[1] or unavailable('input_and_worker_desktops_differ')
+    except (OSError, AttributeError, ValueError) as error:
+        return unavailable('desktop_check_unavailable', getattr(error, 'winerror', None))
     finally:
         if desktop:
             close(desktop)  # The thread desktop is borrowed and must stay open.
@@ -112,10 +121,11 @@ def interactive_desktop_blocked(requirements):
     """Fail before a mixed workflow starts if its physical steps cannot run."""
     physical = [row['number'] for row in requirements['steps']
                 if row['input_mode'] in ('physical_pointer', 'physical_keyboard')]
-    if not physical or _interactive_desktop():
+    evidence = {}
+    if not physical or _interactive_desktop(evidence=evidence):
         return None
     return dict(status='blocked', diagnostic='no_interactive_desktop',
-                host_action='unlock_desktop_before_retry', input_dispatched=False,
+                host_action='check_interactive_session_before_retry', desktop_check=evidence, input_dispatched=False,
                 physical_input=False, steps=[], blocked_steps=physical,
                 input_requirements=deepcopy(requirements))
 

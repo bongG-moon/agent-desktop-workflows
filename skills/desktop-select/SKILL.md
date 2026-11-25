@@ -32,6 +32,6 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 
 등록 요청에는 성공한 시험의 `effective_task`로 `python_workflow.py register --task "<작업명>" --out "<프로젝트>/.claude/skills/<업무 이름>"`을 실행한다. 등록 업무 호출은 그 업무의 `scripts/run.py --summary`에 이번 `--set` 값을 붙여 바로 실행한다. 로컬 결과 확인과 물리 입력을 허용받았다면 `--local-result-review --allow-physical`을 사용한다. `result_review.resume_args`는 같은 실행기에 전달한다.
 
-실행 결과는 영수증에서 읽는다. `verified`는 기대 상태를 확인했다는 뜻이다. `delivered_unverified`는 입력 전달까지만 확인한 상태이고, `uncertain`은 현재 효과를 확인해야 한다. 불확실한 입력이나 이미 한 조회를 다시 보내지 않는다. 파일 생성은 `verified_outputs`로 보고한다. `no_interactive_desktop`이면 잠금 해제 후 영수증 지시에 따른다.
+실행 결과는 영수증에서 읽는다. `verified`는 기대 상태를 확인했다는 뜻이다. `delivered_unverified`는 입력 전달까지만 확인한 상태이고, `uncertain`은 현재 효과를 확인해야 한다. 불확실한 입력이나 이미 한 조회를 다시 보내지 않는다. 파일 생성은 `verified_outputs`로 보고한다. `no_interactive_desktop`이면 `desktop_check.reason`에 따라 실행 세션과 잠금 상태를 확인한다.
 
 저장 목록은 `tasks`, 단계 조회는 `show --task "<작업명>"`, 편집은 `review --task "<작업명>" --edit`를 쓴다. 등록 없는 직접 조작은 [입력란과 명령](references/host-details.md), 이미지가 필요한 중단은 [관찰 순서](references/host-details.md#관찰-순서), 캡처 보관 위치는 `storage`의 `capture_storage`를 사용한다. 업무 데이터와 화면은 허용된 범위에서만 사용한다.

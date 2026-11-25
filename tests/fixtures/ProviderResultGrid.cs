@@ -47,7 +47,8 @@ public sealed class ProviderResultGrid : Grid {
                 cells[row, column].Visibility = row <= VisibleRows ? Visibility.Visible : Visibility.Collapsed;
                 // The other row has the requested text in a DIFFERENT column.
                 string key = Scenario == "missing" ? "OTHER-" + row :
-                    (row == MatchRow || Scenario == "duplicate" ? expected : "OTHER");
+                    Scenario == "substring" ? (row == MatchRow ? expected + "0" : "A" + expected) :
+                    (row == MatchRow || Scenario == "duplicate" ? expected : expected + "0");
                 cells[row, column].Show(column == KeyColumn
                     ? key
                     : (row == MatchRow ? "requested" : expected));

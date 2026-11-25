@@ -240,6 +240,11 @@ def _in_column(uia, cell, chain, header):
     require(head['x'] <= center < head['x'] + head['width']
             and not any(other['x'] <= center < other['x'] + other['width'] for other in header['others']),
             'result_column_ambiguous')
+    if header['indexed']:
+        owner = next((item for item in chain[:-1] if item.property(30029) is True), None)
+        if owner is not None:
+            logical_column = owner.property(30065)
+            require(logical_column is None or logical_column == header['index'], 'result_column_ambiguous')
     return True
 
 
@@ -291,7 +296,7 @@ def _grid_value(binding, uia, cell):
     return cell, None if observed else name
 
 
-def _grid_match(binding, uia, table, window, header, expected):
+def _grid_match(binding, uia, table, window, header, expected, evidence):
     """Try the provider's two-dimensional API on a bounded result set."""
     rows, columns = table.property(30062), table.property(30063)
     index = header['index']
@@ -303,9 +308,8 @@ def _grid_match(binding, uia, table, window, header, expected):
         if any(_non_data_control(e) for e in chain):
             unreadable = True
             continue
-        if (not uia.same(header['grid'], _surface(chain)) or cell.property(30064) not in (None, number)
-                or cell.property(30065) not in (None, index)):
-            return None
+        require(uia.same(header['grid'], _surface(chain)) and cell.property(30064) in (None, number)
+                and cell.property(30065) in (None, index), 'result_grid_incomplete')
         # The header array order alone does not establish a logical column.
         # GetItem accesses one column across all rows. Verify its identity by an
         # explicit GridItem index on the header, a linked header, or live geometry.
@@ -326,6 +330,13 @@ def _grid_match(binding, uia, table, window, header, expected):
                 found.append(peer)
     if not proved:
         return None
+    require(table.property(30062) == rows and table.property(30063) == columns, 'result_grid_incomplete')
+    if evidence is not None:
+        evidence.update(source='grid_pattern', rows_examined=rows)
+        if not unreadable:
+            evidence['match_count'] = len(found)
+        elif found:
+            evidence['match_count_at_least'] = len(found)
     require(len(found) < 2, 'result_cell_ambiguous')
     require(not unreadable, 'result_grid_incomplete' if readable else 'result_cell_unreadable')
     require(bool(found), 'result_value_not_found')
@@ -346,16 +357,32 @@ def _data_chain(binding, uia, cell, root_element, window, header):
     return chain if _in_column(uia, cell, chain, header) else None
 
 
-def _readable_rows(binding, uia, table, window, header, *, count=None):
-    # Only run this diagnostic after a miss. A named row spanning multiple
-    # columns is not evidence that its cells are readable.
+def _readable_rows(binding, uia, table, window, header, *, count=None, matched=None):
+    # A value search can find one visible ID even when a second row has no
+    # readable cell. Use the cheap row-only query on the common successful
+    # single-row path; inspect cells only when other rows need accounting.
+    scope = header.get('grid', table)
+
+    # A scrolled/virtualized provider can omit whole rows from its children.
+    # Without the logical row count, the mounted viewport cannot prove uniqueness.
+    if count is None and scope.property(30058) is True:
+        return 0
+
+    def own_row(node):
+        chain = lookup.ancestry(uia, node, scope, pid=binding.pid)
+        return uia.same(_surface(chain), scope) and not any(_non_data_control(e) for e in chain)
+
+    if matched is not None and count is None:
+        rows = [row for row in _cells_in(uia, scope, roles=('listitem', 'row')) if own_row(row)]
+        if len(rows) == 1 and uia.within(matched, rows[0]):
+            return 1
     roles = ('listitem', 'row', 'statictext', 'custom', 'textfield')
-    nodes = _cells_in(uia, table, roles=roles)
+    nodes = _cells_in(uia, scope, roles=roles)
     rows, readable, indices = [], [], set()
     for node in nodes:
-        if node.property(30003) in _ROW and visibility.visible(binding, uia, node, window):
+        if node.property(30003) in _ROW and own_row(node):
             rows.append(node)
-        chain = _data_chain(binding, uia, node, table, window, header)
+        chain = _data_chain(binding, uia, node, scope, window, header)
         if chain and _cell_text(node) is not None:
             readable.extend(e for e in chain if e.property(30003) in _ROW)
             if count is not None:
@@ -365,8 +392,10 @@ def _readable_rows(binding, uia, table, window, header, *, count=None):
                         indices.add(index)
                         break
     if count is not None:
-        return len(indices) == count
-    return bool(rows) and all(any(uia.same(row, known) for known in readable) for row in rows)
+        return count if len(indices) == count else 0
+    if all(any(uia.same(row, known) for known in readable) for row in rows):
+        return len(rows)
+    return 0
 
 
 def find(binding, uia, root_element, expected, *, column=None, column_hint=None, evidence=None):
@@ -385,27 +414,30 @@ def find(binding, uia, root_element, expected, *, column=None, column_hint=None,
     if column is not None and bare_group(uia, root_element):
         raise win.BridgeError('result_column_unavailable')
     header = None
-    oversized = None
+    grid_count = None
     if column is not None:
         require(isinstance(column, str) and column.strip(), 'result_column_required')
         header = _column(binding, uia, root_element, window, column, column_hint)
-        if root_element.property(30030) is True and root_element.property(30062) == 0:
-            raise win.BridgeError('result_value_not_found')
+        if root_element.property(30030) is True:
+            count = root_element.property(30062)
+            if type(count) is int and count == 0:
+                if evidence is not None:
+                    evidence.update(source='grid_pattern', rows_examined=0, match_count=0)
+                raise win.BridgeError('result_value_not_found')
+            if type(count) is int and count > 0:
+                grid_count = count
         if evidence is not None and header['hint']:
             evidence['column_hint'] = header['hint']
-        if header['index'] is not None and root_element.property(30030) is True:
-            count = root_element.property(30062)
-            if type(count) is int and count > _MAX_GRID_ROWS:
-                oversized = count
+        if header['index'] is not None and grid_count is not None:
             try:
-                cell = _grid_match(binding, uia, root_element, window, header, expected)
+                cell = _grid_match(binding, uia, root_element, window, header, expected, evidence)
             except win.BridgeError as error:
                 if error.code not in ('accessibility_unavailable', 'result_provider_unavailable'):
                     raise
             else:
                 if cell is not None:
                     if evidence is not None:
-                        evidence['source'] = 'grid_pattern'
+                        evidence['observed'] = expected
                     return cell
 
     matches = []
@@ -422,17 +454,26 @@ def find(binding, uia, root_element, expected, *, column=None, column_hint=None,
             continue
         matches = [existing for existing in matches if not uia.within(cell, existing)]
         matches.append(cell)
-    if len(matches) < 2 and header is not None and (not matches or oversized is not None):
-        complete = _readable_rows(binding, uia, root_element, window, header, count=oversized)
-        if oversized is not None and not complete:
+    if evidence is not None:
+        evidence['source'] = 'cell_element'
+        if len(matches) > 1:
+            evidence['match_count_at_least'] = len(matches)
+    if len(matches) < 2 and header is not None:
+        rows = _readable_rows(binding, uia, root_element, window, header, count=grid_count,
+                              matched=matches[0] if matches else None)
+        if evidence is not None and rows:
+            evidence.update(rows_examined=rows, match_count=len(matches))
+        if not rows and grid_count is not None and grid_count > _MAX_GRID_ROWS:
             raise win.BridgeError('result_grid_scan_limit')
-        if not matches and complete:
+        if not rows and matches:
+            raise win.BridgeError('result_grid_incomplete')
+        if not matches and rows:
             raise win.BridgeError('result_value_not_found')
     if not matches and header and 'relation' in header:
         raise win.BridgeError('result_column_not_found' if header['known_columns'] else 'result_column_unavailable')
     require(len(matches) == 1, 'result_cell_ambiguous' if matches else 'result_cell_missing')
     if evidence is not None:
-        evidence['source'] = 'cell_element'
+        evidence.update(observed=expected, match_count=1)
         if header and header['hint']:
             evidence['column_hint'] = header['hint']
     return matches[0]
@@ -541,6 +582,9 @@ def _execute(binding, uia, guard, find_current, resolution):
         require(uia.same(current, cell) and uia.bounds(current) == box and visibility.visible(binding, uia, current, root)
                 and current.property(30010) is True,
                 'result_cell_changed')
+        chain = lookup.ancestry(uia, current, root, pid=binding.pid)
+        require(not any(peer.property(30003) in _ROW and peer.property(30022) is True for peer in chain),
+                'result_cell_not_clickable')
         require(_point_target(binding, uia, current, point) == native_hit
                 and win.root_window(win.foreground()) == binding.hwnd, 'result_cell_changed')
         require(row_action._input_tick() == tick, 'foreground_or_input_changed')

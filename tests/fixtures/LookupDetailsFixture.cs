@@ -32,7 +32,15 @@ public sealed class PaintedCell : FrameworkElement {
 // No header, row or cell peers. Both hit tests inside this grid reach the same group.
 public sealed class PaintedGroup : FrameworkElement {
     public string Key = "OLD";
-    public bool Oversized, DuplicateColumnValue;
+    public bool Oversized, DuplicateColumnValue, Ruled;
+    public string Scenario = "match";
+    public int VisibleRows { get { return Scenario == "empty" ? 0 : Scenario == "scrolled" ? 1 : 2; } }
+    public string KeyAt(int row) {
+        if (Scenario == "missing") return "OTHER" + row;
+        if (Scenario == "substring") return row == MatchRow ? Key + "0" : "A" + Key;
+        if (Scenario == "duplicate" || row == MatchRow) return Key;
+        return Ruled ? Key + "0" : "OTHER";
+    }
     public int KeyColumn, MatchRow = 2, WrongColumns;
     [StructLayout(LayoutKind.Sequential)] struct NativeRect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
@@ -54,9 +62,16 @@ public sealed class PaintedGroup : FrameworkElement {
     }
     protected override void OnRender(DrawingContext dc) {
         dc.DrawRectangle(Brushes.White, new Pen(Brushes.SteelBlue,1), new Rect(RenderSize));
-        for (int row = 0; row < 3; row++) for (int column = 0; column < 2; column++) {
+        if (Ruled) {
+            var pen = new Pen(Brushes.Black, 1);
+            for (int col=0; col<=2; col++)
+                dc.DrawLine(pen,new Point(4.5+180*col,3.5),new Point(4.5+180*col,3.5+28*(1+VisibleRows)));
+            for (int row=0; row<=1+VisibleRows; row++)
+                dc.DrawLine(pen,new Point(4.5,3.5+28*row),new Point(364.5,3.5+28*row));
+        }
+        for (int row = 0; row <= VisibleRows; row++) for (int column = 0; column < 2; column++) {
             string value = row == 0 ? (column == KeyColumn ? "Equip ID" : "Category") :
-                column == KeyColumn ? (row == MatchRow ? Key : "OTHER") :
+                column == KeyColumn ? KeyAt(row) :
                 (row == MatchRow ? (DuplicateColumnValue ? Key : "requested") : "decoy");
             var label = new FormattedText(value, System.Globalization.CultureInfo.InvariantCulture,
                 FlowDirection.LeftToRight, new Typeface("Segoe UI"), 15, Brushes.Black,
@@ -73,6 +88,7 @@ sealed class LookupDetailsFixture : Window {
     readonly TextBox input = new TextBox { Width=120, Text="OLD" };
     readonly ListView results = new ListView { Height=140, Margin=new Thickness(8) };
     readonly PaintedGroup opaque = new PaintedGroup { Height=140, Margin=new Thickness(8) };
+    readonly TextBox resultCount = new TextBox { IsReadOnly=true, Width=64, HorizontalAlignment=HorizontalAlignment.Left };
     readonly ProviderResultGrid providerGrid = new ProviderResultGrid();
     readonly Button view = new Button { Content="VIEW", Width=70 };
     Window detail, cover;
@@ -107,7 +123,8 @@ sealed class LookupDetailsFixture : Window {
         resultKey=key;
         providerGrid.Fill(key, queries);
         opaque.Key=key;
-        if (opaque.Oversized) { opaque.KeyColumn=queries%2; opaque.MatchRow=queries%2==0?1:2; }
+        if (opaque.Oversized || opaque.Ruled) { opaque.KeyColumn=queries%2; opaque.MatchRow=queries%2==0?1:2; }
+        resultCount.Text=(opaque.Scenario=="scrolled" ? opaque.VisibleRows+1 : opaque.VisibleRows).ToString();
         opaque.InvalidateVisual();
         results.ItemsSource = new [] { new Record { Key="OTHER", Note="decoy" }, new Record { Key=key, Note="requested" } };
     }
@@ -124,11 +141,20 @@ sealed class LookupDetailsFixture : Window {
         AutomationProperties.SetAutomationId(results,"ResultGrid");
         bool groupOnly = Environment.GetCommandLineArgs().Contains("--group-only");
         opaque.Oversized = Environment.GetCommandLineArgs().Contains("--oversized-grid");
+        opaque.Ruled = Environment.GetCommandLineArgs().Contains("--ruled-painted-grid");
+        if (opaque.Ruled) {
+            opaque.Width=392;
+            opaque.HorizontalAlignment=HorizontalAlignment.Left;
+        }
         opaque.DuplicateColumnValue = Environment.GetCommandLineArgs().Contains("--duplicate-column-value");
         AutomationProperties.SetAutomationId(opaque, "PaintedResults");
         bool providerOnly = Environment.GetCommandLineArgs().Contains("--provider-grid");
         providerGrid.OpenResult = OpenDetail;
         main.Children.Add(providerOnly ? (FrameworkElement)providerGrid : groupOnly ? (FrameworkElement)opaque : results);
+        if (opaque.Ruled) {
+            AutomationProperties.SetAutomationId(resultCount, "ResultCount");
+            main.Children.Add(resultCount);
+        }
         Fill(resultKey);
         view.Click+=delegate { queries++; Fill(input.Text); };
         results.MouseDoubleClick+=delegate(object s, MouseButtonEventArgs e) {
@@ -140,7 +166,7 @@ sealed class LookupDetailsFixture : Window {
             Point p=e.GetPosition(opaque);
             if(e.ClickCount==2 && p.Y>=33 && p.Y<89) {
                 if ((p.X < 180 ? 0 : 1) != opaque.KeyColumn) opaque.WrongColumns++;
-                OpenDetail((p.Y<61?1:2)==opaque.MatchRow?resultKey:"OTHER");
+                OpenDetail(opaque.KeyAt(p.Y<61?1:2));
             }
         };
         ContentRendered+=delegate {
@@ -162,7 +188,19 @@ sealed class LookupDetailsFixture : Window {
             AutomationProperties.SetName(comment,"Comment"); AutomationProperties.SetAutomationId(comment,"CommentText");
             exit=new Button {Content="Exit"}; AutomationProperties.SetAutomationId(exit,"btnClose");
             exit.Click+=delegate {closed++; detail.Close();};
-            box.Children.Add(comment); box.Children.Add(exit); detail.Content=box;
+            if (Environment.GetCommandLineArgs().Contains("--scoped-detail")) {
+                detail.Height=330;
+                var decoy=new TextBox { Text="DECOY memo", IsReadOnly=true };
+                AutomationProperties.SetAutomationId(decoy,"CommentText");
+                foreach(var pair in new [] { Tuple.Create("EarlierDetails",(FrameworkElement)decoy),
+                                             Tuple.Create("EquipmentInfo",(FrameworkElement)comment),
+                                             Tuple.Create("DetailActions",(FrameworkElement)exit) }) {
+                    var section=new GroupBox { Header=pair.Item1, Content=pair.Item2 };
+                    AutomationProperties.SetAutomationId(section,pair.Item1);
+                    box.Children.Add(section);
+                }
+            } else { box.Children.Add(comment); box.Children.Add(exit); }
+            detail.Content=box;
             detail.Closed+=delegate {detail=null;}; detail.Show();
     }
     FrameworkElement Cell(DependencyObject root) {
@@ -219,8 +257,15 @@ sealed class LookupDetailsFixture : Window {
                 if(current=="quit"){if(cover!=null)cover.Close();Close();return;}
                 if(current=="focus")Activate();
                 if(current=="reset"){input.Text="OLD";Fill("OLD");}
-                if(current=="missing" || current=="duplicate" || current=="single" || current=="first" || current=="empty")
+                if(current=="resize"){
+                    Width=Width==540?620:540; Height=Height==370?395:370;
+                    if(opaque.Ruled) opaque.Width=414;
+                }
+                if(current=="missing" || current=="duplicate" || current=="single" || current=="first" || current=="empty"
+                        || current=="substring" || current=="scrolled") {
                     providerGrid.Scenario=current;
+                    opaque.Scenario=current;
+                }
                 Emit(current);
             }));
             if(cmd=="quit")break;

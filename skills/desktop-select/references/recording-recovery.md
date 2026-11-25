@@ -45,6 +45,21 @@
 
 아직 열리지 않은 관련 창에는 녹화의 `recorded_selector`와 같은 대상을 연결할 수 있다. 창이 열린 뒤 실제 요소를 검증하므로 보정만 하려고 앞선 업무를 먼저 실행할 필요가 없다. 녹화 단서와 다른 대상을 지정하려면 해당 창의 현재 증거가 필요하다. 여러 창 열기 후보가 남은 경우에는 녹화된 소속과 동작 순서를 확인하며, 단순히 마지막 클릭에 연결하지 않는다.
 
+## 현재 결과의 정확한 값으로 상세 창 열기
+
+업무 정의(`workflow.json`)에서 아래 두 단계는 요청값이 현재 지정 열에서 한 행과 일치할 때 그 행을 엽니다. 예시의 이름들은 실제 앱에서 관찰한 표, 열, 읽기 전용 전체 행 수 요소로 바꿉니다. 숫자만 제공하는 결과 **전체** 행 수가 필요합니다. 현재 페이지 행 수나 검색 입력란을 지정하면 안 됩니다. 앱이 표준 셀을 제공하면 `result_adapter`를 생략할 수 있습니다.
+
+```json
+[
+  {"action":"verify-value","selector":{"role":"group","automation_id":"results"},"result_column":"Equip ID","parameter":"Equipment","result_adapter":{"kind":"windows-ocr-grid","row_count":{"role":"statictext","automation_id":"totalResultRows"}}},
+  {"action":"double-click-result"}
+]
+```
+
+Windows OCR은 분리된 열 제목과 격자선이 보이는 표에서 최대 128개 데이터 행을 처리합니다. 스크롤로 가려진 행, 모호한 열, 중복 일치가 있는 경우 클릭 전에 멈춥니다. OCR에서 비슷하게 생긴 글자를 혼동할 수 있으므로 상세 창이 자체 ID를 제공하는 업무에서는 Comment를 읽기 전에 그 ID도 `verify-value`로 대조할 수 있습니다.
+
+하나의 Win32 소유 팝업에서 읽고 닫으려면 두 단계에 같은 `window_context`를 지정합니다. 예를 들어 `{"exe":"Example.exe","title":"Equipment details","after_step":4,"owned":true}`는 4단계에서 연 실제 소유 팝업에 연결합니다. 읽기 대상과 Exit는 각각 `selector.ancestors`로 관찰한 업무 영역에 한정하고 Exit에 `verify_closed:true`를 지정합니다. 대상과 권한을 실제로 확인한 업무 정의를 `python_workflow.py register --recipe ... --out ...`으로 새 폴더에 등록하면 생성된 `scripts/run.py`가 공용 실행기와 입력 감시를 사용합니다.
+
 ## 초안 수정과 프로젝트 저장
 
 검토창에서 고정값이나 실행 시 받을 변수는 문장 아래 값을 눌러 바꾼다. 다시 시연하거나 순서를 바꾸거나 삭제하려면 단계를 선택하고 **단계 편집**을 연다. 후속 창을 여는 동작은 그 창 안의 동작보다 앞에 둔다. 저장한 작업과 초안 모두 `review --task "<이름>" --edit`으로 편집할 사본을 열 수 있다. 전체를 다시 시연할 때는 원래 업무 창을 열고 `review --task "<이름>" --restart`로 새 사본을 시작한다. 이전 방식으로 같은 편집용 초안을 직접 고치려면 `review --task "<이름>"`을 사용한다.

@@ -200,7 +200,8 @@ def validate(recipe):
             need(type(timeout) in (int, float) and 0 <= timeout <= 120, 'invalid_file_timeout')
             continue
         need(not set(step) - {'action', 'selector', 'value', 'parameter', 'label', 'command_name', 'field_label', 'popup',
-                              'grounding_text', 'allow_option_select', 'verify_closed', 'result_column', 'keys'}, 'unknown_step_field')
+                              'grounding_text', 'allow_option_select', 'verify_closed', 'result_column',
+                              'result_adapter', 'keys'}, 'unknown_step_field')
         observation = step.get('action') in input_policy.VALUE_OBSERVATIONS
         need(observation or step.get('action') in ('set-value', 'invoke', 'submit', 'press-key', 'choose-item'), 'unsupported_workflow_action')
         need('keys' not in step or step['action'] == 'press-key', 'unexpected_key_chord')
@@ -218,6 +219,16 @@ def validate(recipe):
         if 'result_column' in step:
             need(step['action'] == 'verify-value' and text(step['result_column'], 200)
                  and isinstance(selector, dict) and selector.get('role') in RESULT_SURFACES, 'invalid_result_column')
+        if 'result_adapter' in step:
+            adapter = step['result_adapter']
+            need('result_column' in step and selector.get('role') == 'group'
+                 and ('automation_id' in selector or 'name' in selector)
+                 and isinstance(adapter, dict) and set(adapter) == {'kind', 'row_count'}
+                 and adapter['kind'] == 'windows-ocr-grid', 'invalid_result_adapter')
+            counter = adapter['row_count']
+            need(isinstance(counter, dict) and counter.get('role') in ('statictext', 'textfield')
+                 and ('automation_id' in counter or 'name' in counter), 'invalid_result_count_selector')
+            lookup._selector(counter)
         if not ('result_column' in step and selector == {'role': 'table'}):
             validate_selector(selector)
         if observation:
@@ -516,8 +527,22 @@ def _result_target(binding, uia, selector, reviewed_group, *, column=None, eleme
         raise WorkflowError('result_table_missing') from error
 
 
+def result_count(binding, uia, adapter):
+    selector = adapter['row_count']
+    element = lookup.resolve(binding, uia, selector)
+    try:
+        # Editable search/filter values cannot attest to the number of results.
+        need(selector['role'] != 'textfield' or element.property(30046) is True,
+             'result_count_not_readonly')
+        value = observe_field(binding, uia, element, selector['role'], 'read-value')['value'].strip()
+        need(re.fullmatch(r'[0-9]{1,8}', value), 'result_count_unavailable')
+        return int(value)
+    finally:
+        element.close()
+
+
 def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewed_group=None, on_match=None,
-                   column_hint=None, element_hint=False, remember=False):
+                   column_hint=None, element_hint=False, remember=False, on_adapter_match=None, after_query=False):
     """Wait only for the explicitly requested result. Never submit the query again."""
     import result_cell
     started = time.monotonic()
@@ -558,6 +583,55 @@ def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewe
             diagnostic = getattr(error, 'code', None)
             if diagnostic not in RESULT_INSPECTION_ERRORS:
                 raise
+            if (diagnostic == 'result_column_unavailable' and 'result_adapter' in step
+                    and table is not None and result_cell.bare_group(uia, table)):
+                import result_row_adapter
+                try:
+                    count = result_count(binding, uia, step['result_adapter'])
+                    if count == 0 and time.monotonic() < deadline:
+                        # A delayed VIEW may clear the table before populating it.
+                        # Poll its declared count, without capturing pixels or resubmitting.
+                        while count == 0 and (remaining := deadline - time.monotonic()) > 0:
+                            before = time.monotonic()
+                            time.sleep(min(.2, remaining))
+                            waited += time.monotonic() - before
+                            guard()
+                            count = result_count(binding, uia, step['result_adapter'])
+                        if count:
+                            # Rows may have replaced the UIA surface, or added real cells.
+                            continue
+                except (WorkflowError, app.bridge.BridgeError) as count_error:
+                    return dict(status='blocked', input_dispatched=False,
+                                diagnostic='result_count_unavailable',
+                                result_observation=dict(strategy='row_count', reason=count_error.code,
+                                    column=step['result_column'], requested=expected, table_lookup='recorded_element',
+                                    elapsed_seconds=round(time.monotonic()-started, 4)))
+                result = result_row_adapter.observe(binding, uia, table, step['result_column'], expected,
+                                                     guard, row_count=count)
+                proof = result.pop('proof', None)
+                snapshot = result.pop('_miss_snapshot', None)
+                if after_query and snapshot is not None and result.get('diagnostic') == 'result_value_mismatch':
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        # The previous query can still be visible with the same row count.
+                        # Spend the remaining result budget once; only changed pixels warrant new OCR.
+                        before = time.monotonic()
+                        time.sleep(remaining)
+                        waited += time.monotonic() - before
+                        guard()
+                        if result_row_adapter.changed(binding, uia, table, snapshot, guard):
+                            after_query = False
+                            continue
+                if result['status'] == 'verified':
+                    need(proof is not None, 'result_row_proof_unavailable')
+                    if on_match:
+                        on_match(table)
+                    if on_adapter_match:
+                        on_adapter_match((count, proof))
+                result['result_observation'].update(table_lookup='recorded_element', attempts=attempts,
+                    wait_seconds=round(waited, 4),
+                    elapsed_seconds=round(time.monotonic() - started, 4), query_freshness='not_asserted')
+                return result
             retry = diagnostic in RESULT_IMAGE_ERRORS or diagnostic in ('result_value_not_found','result_column_not_found')
             # Empty once is not evidence that delayed headers/rows will never
             # appear. Only short-circuit for a previously visually verified
@@ -599,7 +673,9 @@ def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewe
                  else 'discovery' if step['selector'] == {'role':'table'} else 'recorded_element')
         receipt['result_observation'] = dict(strategy=strategy, attempts=attempts, wait_seconds=round(waited, 4),
             provider_seconds=round(provider_seconds, 4), elapsed_seconds=round(time.monotonic() - started, 4),
-            table_lookup=route)
+            table_lookup=route, column=step['result_column'], requested=expected, query_freshness='not_asserted')
+        receipt['result_observation'].update({k: evidence[k] for k in (
+            'observed', 'rows_examined', 'match_count', 'match_count_at_least', 'scope') if k in evidence})
         return receipt
 
 
@@ -820,6 +896,43 @@ def confirm_opened_window(report, routes, number):
             report['status'] = 'verified'
 
 
+def verified_detail_read(steps, rows):
+    """Scope completion to the current matched row and the observed, closed detail window."""
+    if len(steps) != len(rows) or not steps[-1].get('verify_closed'):
+        return False
+    scope = steps[-1].get('window_context', {})
+    opener = scope.get('after_step', 0)
+    if not 3 <= opener <= len(steps) - 2 or not (scope.get('related') or scope.get('owned')):
+        return False
+    match, open_row = steps[opener-2:opener]
+    receipts = [row['receipt'] for row in rows]
+    checked, opened = receipts[opener-2:opener]
+    unverified = [i for i, receipt in enumerate(receipts) if receipt['status'] == 'delivered_unverified']
+    if len(unverified) != 1 or unverified[0] >= opener-2:
+        return False
+    i = unverified[0]
+    sent = receipts[i]
+    if (not app.tasks.is_query_button(steps[i]) or sent.get('diagnostic') != 'business_result_not_verified'
+            or sent.get('input_dispatched') is not True or sent['status'] != 'delivered_unverified'
+            or steps[i].get('window_context') != match.get('window_context')
+            or any(s['action'] not in ('wait', 'verify-value') for s in steps[i+1:opener-2])
+            or 'result_column' not in match or checked['status'] != 'verified'
+            or checked.get('value_evidence', {}).get('status') != 'observed'
+            or open_row['action'] != 'double-click-result' or 'result_row' in open_row
+            or opened.get('verification_scope') != 'recorded_window_opened' or opened['status'] != 'verified'
+            or receipts[-1].get('diagnostic') != 'recorded_window_closed' or receipts[-1]['status'] != 'verified'):
+        return False
+    if any(s.get('window_context') != scope or 'popup' in s for s in steps[opener:]):
+        return False
+    detail = list(zip(steps[opener:-1], receipts[opener:-1]))
+    return (any(s['action'] == 'read-value' for s, _ in detail)
+            and all(s['action'] in input_policy.VALUE_OBSERVATIONS
+                    and r['status'] == ('observed' if s['action'] == 'read-value' else 'verified')
+                    and r.get('value_evidence', {}).get('status') == 'observed' for s, r in detail)
+            and all(r['status'] in ('verified', 'observed', 'waited') or j == i
+                    for j, r in enumerate(receipts[:opener-2])))
+
+
 _GROUNDING_DIAGNOSTICS = {'target_missing', 'target_ambiguous', 'scope_missing', 'scope_ambiguous',
                           'workflow_pattern_unavailable'}
 
@@ -1033,6 +1146,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     started = time.monotonic()
     result_baselines = {}
     verified_tables = []
+    adapter_matches = []
     number, dispatching = 0, False
     anchor_proof = None
     reservations = ExitStack()
@@ -1213,10 +1327,13 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         expected = values[step['parameter'].casefold()] if 'parameter' in step else step['value']
                         hint = result_hints.get(number, {})
                         verified_tables.clear()
+                        adapter_matches.clear()
                         receipt = observe_result(surface, uia, step, expected, lambda: check_target(surface, popup),
                                                  wait_seconds=RESULT_VISUAL_TIMEOUT, reviewed_group=hint.get('selector'),
                                                  column_hint=hint.get('column_hint'), element_hint=hint.get('source')=='element',
-                                                 on_match=verified_tables.append, remember=remember_result_elements)
+                                                 on_match=verified_tables.append, remember=remember_result_elements,
+                                                 on_adapter_match=adapter_matches.append,
+                                                 after_query=after_query and number-1 in requested)
                         if receipt.get('result_element'):
                             result_hints[number] = receipt['result_element']
                         if receipt['status'] == 'blocked':
@@ -1263,8 +1380,17 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             need(uia.same(current_table(), table), 'result_table_changed')
                         # execute() reports all attempted input as a receipt.
                         # Its lookup/foreground guards can raise before input.
-                        receipt = result_cell.execute(binding, uia, table, expected, result_guard,
-                                                      column=prior['result_column'], column_hint=hint.get('column_hint'))
+                        if adapter_matches:
+                            import result_row_adapter
+                            count, proof = adapter_matches.pop()
+                            def check_count():
+                                need(result_count(binding, uia, prior['result_adapter']) == count,
+                                     'result_count_changed')
+                            receipt = result_row_adapter.execute(binding, uia, table, proof, result_guard,
+                                                                 check_count=check_count)
+                        else:
+                            receipt = result_cell.execute(binding, uia, table, expected, result_guard,
+                                                          column=prior['result_column'], column_hint=hint.get('column_hint'))
                 elif step['action'] == 'conditional-open':
                     if read_only:
                         receipt = dict(status='observed',input_dispatched=False,condition='pending_execution')
@@ -1443,6 +1569,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                 receipt = confirm_closed(binding, title, surface, matches, uia, receipt)
                             else:
                                 def matches():
+                                    if context.get('owned'):
+                                        return routes.matching_windows(context)
                                     return [r for r in app.windows(context['exe']) if r['title'] == title]
                                 receipt = confirm_closed(owner, recipe['window'], surface, matches, uia, receipt)
                         if resolution is not None:
@@ -1568,6 +1696,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 anchor_proof.close()
         finally:
             reservations.close()
+    if (report['status'] == 'completed_unverified' and 'stopped_at' not in report
+            and only is None and not resume and verified_detail_read(recipe['steps'], report['steps'])):
+        report.update(status='verified', outcome='current_result_detail_read_and_closed',
+                      query_freshness='not_asserted')
     report['elapsed_seconds'] = round(time.monotonic() - started, 4)
     return report
 
@@ -2020,7 +2152,7 @@ def summarize_execution(report, entries):
         item = {k: row[k] for k in ('number', 'label', 'elapsed_seconds') if k in row}
         item.update(action=step['action'])
         item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items', 'menu_recovery',
-                                             'verified_path', 'keys') if k in receipt})
+                                             'verified_path', 'verification_scope', 'keys') if k in receipt})
         if step['action'] in input_policy.VALUE_OBSERVATIONS:
             item.update({k: receipt[k] for k in ('value', 'value_evidence', 'result_observation') if k in receipt})
         if step['action'] == 'double-click-result' and 'result_row' in step:

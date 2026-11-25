@@ -26,8 +26,8 @@ def validate_context(spec):
         raise ContextError('invalid_window_context')
     if set(spec) == {'exe', 'title', 'mode'} and spec['mode'] == 'existing':
         return spec
-    if (set(spec) - {'related'} == {'exe', 'title', 'after_step'} and type(spec['after_step']) is int
-            and spec['after_step'] > 0 and ('related' not in spec or spec['related'] is True)):
+    if (set(spec) - {'related', 'owned'} == {'exe', 'title', 'after_step'} and type(spec['after_step']) is int
+            and spec['after_step'] > 0 and all(spec.get(k, True) is True for k in ('related', 'owned'))):
         return spec
     raise ContextError('invalid_window_context')
 
@@ -48,7 +48,8 @@ def validate_sequence(steps, *, allow_unbound_double=False):
 
 
 def _key(spec):
-    return spec['exe'].casefold(), spec['title'], spec.get('after_step'), spec.get('related', False)
+    return (spec['exe'].casefold(), spec['title'], spec.get('after_step'),
+            spec.get('related', False), spec.get('owned', False))
 
 
 def effect_scopes(steps, active):
@@ -94,7 +95,17 @@ class WindowRoutes:
 
     def _rows(self, spec):
         self.app.guard(self.owner, self.owner, self.title)
-        return self.app.windows(spec['exe'])
+        rows = self.app.windows(spec['exe'])
+        if spec.get('owned'):
+            opener = self.openers.get(spec['after_step'])
+            if opener is None:
+                return []
+            return [row for row in rows if row['title'] == spec['title'] and row['pid'] == opener.pid
+                    and self.app.bridge.owned(row['hwnd'], opener.hwnd)]
+        return rows
+
+    def matching_windows(self, spec):
+        return [row for row in self._rows(spec) if row['title'] == spec['title']]
 
     @staticmethod
     def _match(spec, records):
@@ -147,7 +158,11 @@ class WindowRoutes:
         if row is None or _identity(row) != (binding.hwnd, binding.pid, binding.created):
             raise ContextError('recorded_window_lifetime_changed')
         self.app.guard(binding, binding, spec['title'])
-        if spec.get('related'):
+        if spec.get('owned'):
+            opener = self.openers.get(spec['after_step'])
+            if opener is None or binding.pid != opener.pid or not self.app.bridge.owned(binding.hwnd, opener.hwnd):
+                raise ContextError('popup_owner_mismatch')
+        elif spec.get('related'):
             from capture_windows import related
             opener = self.openers.get(spec['after_step'])
             if opener is None or not related(binding, opener):
@@ -161,7 +176,7 @@ class WindowRoutes:
                 self.check(spec, found)
             return found
         source = spec['after_step']
-        if self.read_only and spec.get('related') and source not in self.openers:
+        if self.read_only and (spec.get('related') or spec.get('owned')) and source not in self.openers:
             # The opener may belong to a deferred or unselected nested scope.
             if self.steps[source-1].get('window_context') is not None:
                 return None

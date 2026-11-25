@@ -226,6 +226,68 @@ class ResultCellTests(unittest.TestCase):
         with self.assertRaisesRegex(win.BridgeError, 'result_cell_ambiguous'):
             self.find()
 
+    def test_only_exact_id_from_requested_column_counts_across_distinct_rows(self):
+        for code in ('Q420', 'PRE-Q42'):
+            row = self.node(self.grid, 50007, 'row', 0, 240)
+            self.node(row, 50020, code, 8, 36)
+            self.node(row, 50020, 'Q42', 130, 36)
+        evidence = {}
+        current = result_cell.find(self.binding, self.uia, self.grid, 'Q42', column='Order', evidence=evidence)
+        self.assertIs(current, self.cell)
+        self.assertEqual((evidence['observed'], evidence['match_count'], evidence['rows_examined']), ('Q42', 1, 3))
+        self.cell.values[30005] = 'Q42-old'
+        with self.assertRaisesRegex(win.BridgeError, 'result_value_not_found'):
+            self.find()
+
+    def test_unique_visible_match_cannot_hide_an_unreadable_or_scrolled_row(self):
+        pointer = self.prepare_pointer()
+        second = self.node(self.grid, 50007, 'unreadable row', 0, 240)
+        with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+            self.execute()
+        self.node(second, 50020, 'Q42', 8, 36)
+        second.values[30022] = True
+        with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+            self.execute()
+        pointer.assert_not_called()
+
+    def test_conflicting_griditem_row_is_not_reinterpreted_using_geometry(self):
+        pointer = self.prepare_pointer()
+        self.grid.values.update({30030: True, 30038: True, 30062: 1, 30063: 2})
+        self.cell.values.update({30064: 4, 30065: 0})
+        with patch.object(result_cell.grid_provider, 'headers', return_value=[self.header, self.other_header]), \
+                patch.object(result_cell.grid_provider, 'column_cells', return_value=[self.cell]):
+            with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+                self.execute()
+        pointer.assert_not_called()
+
+    def test_scrolling_tree_with_no_row_count_cannot_guarantee_global_match(self):
+        pointer = self.prepare_pointer()
+        self.grid.values[30058] = True
+        with self.assertRaisesRegex(win.BridgeError, 'result_grid_incomplete'):
+            self.execute()
+        pointer.assert_not_called()
+
+    def test_recorded_column_geometry_does_not_override_current_logical_index(self):
+        self.cell.values.update({30029: True, 30065: 1})
+        self.header.values[30065] = 0
+        pointer = self.prepare_pointer()
+        with self.assertRaisesRegex(win.BridgeError, 'result_column_ambiguous'):
+            self.execute()
+        pointer.assert_not_called()
+
+    def test_logical_grid_match_never_clicks_hidden_ancestor_row(self):
+        pointer = self.prepare_pointer()
+        self.grid.values.update({30030: True, 30038: True, 30062: 1, 30063: 2})
+        self.header.values[30065] = 0
+        self.cell.values.update({30064: 0, 30065: 0})
+        self.row.values[30022] = True
+        with patch.object(result_cell.grid_provider, 'headers', return_value=[self.header, self.other_header]), \
+                patch.object(result_cell.grid_provider, 'column_cells', return_value=[self.cell]):
+            self.assertIs(self.find(), self.cell)
+            with self.assertRaisesRegex(win.BridgeError, 'result_cell_not_clickable'):
+                self.execute()
+        pointer.assert_not_called()
+
     def test_protected_and_edit_subtrees_are_not_result_evidence(self):
         self.cell.values[30005] = 'different'
         edit = self.node(self.row, 50004, 'Edit', 0, 120)

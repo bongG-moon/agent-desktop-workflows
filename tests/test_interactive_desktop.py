@@ -41,7 +41,9 @@ class InteractiveDesktopTests(unittest.TestCase):
 
     def test_denied_input_desktop_does_not_close_borrowed_thread_desktop(self):
         bridge, calls = self.native(opened=0)
-        self.assertFalse(policy._interactive_desktop(bridge))
+        evidence = {}
+        self.assertFalse(policy._interactive_desktop(bridge, evidence=evidence))
+        self.assertEqual(evidence['reason'], 'input_desktop_open_failed')
         calls['GetThreadDesktop'].assert_not_called()
         calls['CloseDesktop'].assert_not_called()
 
@@ -67,9 +69,9 @@ class InteractiveDesktopTests(unittest.TestCase):
         requirements = policy.profile([dict(action=a) for a in ('set-value', 'double-click-result', 'submit')], [1, 4, 6])
         with patch.object(policy, '_interactive_desktop', return_value=False) as check:
             result = policy.interactive_desktop_blocked(requirements)
-        check.assert_called_once_with()
+        check.assert_called_once()
         self.assertEqual(result['diagnostic'], 'no_interactive_desktop')
-        self.assertEqual(result['host_action'], 'unlock_desktop_before_retry')
+        self.assertEqual(result['host_action'], 'check_interactive_session_before_retry')
         self.assertEqual(result['blocked_steps'], [4, 6])
         self.assertIs(result['input_dispatched'], False)
         self.assertEqual(result['steps'], [])
