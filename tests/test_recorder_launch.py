@@ -82,7 +82,7 @@ return 0''') as spawn:
         self.assertEqual(first['host_action'], 'wait_for_user_to_save')
         self.assertLess(first['startup_wait_seconds'], launcher.STARTUP_WAIT_SECONDS)
         spawn.assert_called_once()
-        self.assertEqual(first['status_args'], ['recorder', '--session', first['session'], '--wait', '8'])
+        self.assertEqual(first['status_args'], ['recorder', '--session', first['session'], '--wait', '8', '--summary'])
         active = launcher.status(first['session'])
         self.assertEqual((active['status'], active['host_action']), ('recording', 'wait_for_user_to_save'))
         self.children[0].wait(timeout=5)

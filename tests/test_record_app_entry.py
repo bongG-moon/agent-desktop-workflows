@@ -64,29 +64,29 @@ class AppRecordingEntryTests(unittest.TestCase):
             inventory.assert_called_once_with()
             editor.assert_not_called()
 
-    def test_saved_draft_still_gets_same_live_recovery_receipt(self):
-        receipt = dict(status='recorded', draft=True, input_dispatched=False)
-        with (patch.object(app, 'guard'), patch.object(app, 'task_directory'),
-              patch.object(app.review_drafts, 'ReviewStorage'),
-              patch.object(app, 'edit_recording', return_value=receipt),
-              patch.object(app, 'attach_recovery', return_value=dict(receipt, host_action='use_prepared_task')) as recovery):
-            result = app.record_editor(object(), 'New', 'App.exe', 'Title', report_ready=True)
-            recovery.assert_called_once_with(receipt, 'New', prepare=True)
-            self.assertEqual(result['host_action'], 'use_prepared_task')
-
-    def test_saved_draft_reports_processing_before_recovery_to_avoid_reasking_save(self):
-        receipt = dict(status='recorded', draft=True, input_dispatched=False)
-        with (patch.object(app, 'guard'), patch.object(app, 'task_directory'),
-              patch.object(app.review_drafts, 'ReviewStorage'),
-              patch.object(app, 'edit_recording', return_value=receipt),
-              redirect_stdout(StringIO()) as output):
-            def recover(*_, **__):
-                self.assertEqual(json.loads(output.getvalue()), dict(
-                    status='recorder_processing', task='New', saved=True, input_dispatched=False))
-                return receipt
-            with patch.object(app, 'attach_recovery', side_effect=recover):
-                self.assertEqual(app.record_editor(object(), 'New', 'App.exe', 'Title',
-                                 report_ready=True, report_progress=True), receipt)
+    def test_fresh_incomplete_save_returns_immediately_then_trial_observes_one_live_scope(self):
+        raw = dict(id='demo', action='manual', label='New step',
+                   target={'kind': 'manual'}, recognition={'reason': 'capture_target_unavailable'})
+        row = dict(step=raw, form=dict(alias='', text='Review intent', mode=None, argument=''))
+        diagnostic = 'invalid_step_instruction'
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch.object(app, 'guard'), patch.object(app, 'task_directory', return_value=Path(tmp)),
+              patch('teach_capture.capture', side_effect=lambda owner, **kw: kw['save_draft']([row], diagnostic, 1)),
+              patch.object(app, 'worker_receipt') as worker, redirect_stdout(StringIO()) as events):
+            saved = app.record_editor(object(), 'New', 'App.exe', 'Title', report_ready=True)
+            self.assertTrue(saved['draft'])
+            self.assertEqual(saved['save_diagnostic'], diagnostic)
+            self.assertEqual(saved['host_action'], 'test_saved_recording')
+            self.assertNotIn('recover_args', saved)
+            self.assertNotIn('live_recovery', saved)
+            self.assertEqual(events.getvalue(), '')
+            self.assertTrue((Path(tmp) / 'New.json').is_file())
+            worker.assert_not_called()
+            worker.return_value = dict(status='needs_grounding', input_dispatched=False, step_number=1)
+            trial = app.run(app.parser().parse_args(saved['first_trial_args']))
+            self.assertEqual(trial, worker.return_value)
+            worker.assert_called_once()
+            self.assertEqual(worker.call_args.args[0][:5], ['_worker', 'recover', '--task', 'New', '--prepare'])
 
     def test_public_command_routes_app_and_session_without_request_file(self):
         import recorder_launch as launcher

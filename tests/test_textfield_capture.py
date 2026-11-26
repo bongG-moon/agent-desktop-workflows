@@ -437,6 +437,35 @@ class TextfieldWorkerTests(unittest.TestCase):
         self.assertEqual(recorded['target']['locator'], dict(role='button', name='Finish'))
         self.assertEqual(recorded['action'], 'click')
 
+    def test_completed_linked_button_is_preserved_when_worker_never_saw_release(self):
+        now = time.monotonic()
+        locator = dict(role='button', automation_id='dismiss', name='Exit')
+        self.worker.hovered = dict(window=5, hit_window=17, pointer=(24,29),
+            node=dict(role='button', secure=False, enabled=True, offscreen=False,
+                      available_actions=['Click'], bounds=dict(x=10,y=15,width=30,height=30), locator=locator))
+        self.worker.hover_at = now
+        self.worker._remember_command_hover()
+        event = dict(action='click', window=5, hit_window=17, scope_proven=True, at=now+.05, x=25, y=29)
+        for change in (dict(hit_window=18), dict(window=7), dict(at=now+2), dict(x=31), dict(scope_proven=False)):
+            self.assertIsNone(self.worker.command_at_press(dict(event, **change)))
+        proven = self.worker.command_at_press(event)
+        self.assertEqual(proven['target']['locator'], locator)
+        for release, expected in ((dict(event, command_before_close=proven), 'click'), (None, 'manual'),
+                                  (dict(event, command_before_close=proven, at=now-.5), 'manual')):
+            session = Mock(linked=True, binding=self.binding, notes=capture.CaptureNotes(), notices=queue.Queue())
+            session.pump.last_scoped_down = event['at']
+            session.pump.last_click = release
+            session.notices.put(('fatal', 'target_lifetime_changed'))
+            with patch.object(capture.bridge.user32, 'IsWindow', return_value=False):
+                capture.CaptureSession.poll(session)
+            step, = session.notes.snapshot()
+            self.assertEqual(step['action'], expected)
+            if expected == 'click':
+                self.assertEqual(step['target']['locator'], locator)
+        self.worker.hovered['node']['secure'] = True
+        self.worker._remember_command_hover()
+        self.assertIsNone(self.worker.command_at_press(event))
+
     def test_command_snapshot_never_substitutes_an_unscoped_or_stale_click(self):
         now = time.monotonic()
         self.worker.command_snapshot = (now-5, [(dict(x=0,y=0,width=100,height=100), dict(id='finish'))])

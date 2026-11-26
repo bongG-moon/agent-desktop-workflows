@@ -149,10 +149,11 @@ def same_result_double(step, previous):
     if (not previous or previous['action'] != 'verify-value' or 'result_column' not in previous
             or previous.get('window_context') != step.get('window_context')
             or not (is_double_click_step(step) or is_recoverable(step)
-                    or step.get('action') == 'double-click-result' and step.get('result_row') == 'single')):
+                    or step.get('action') == 'double-click-result' and step.get('result_row') in ('single', 'recorded')
+                    and not step.get('result_column'))):
         return False
-    text = step.get('instruction_draft') or step.get('description') or step.get('label', '')
-    if not double_click_instruction(text):
+    text = _gesture_subject(step.get('instruction_draft') or step.get('description') or step.get('label', ''))
+    if not double_click_instruction(text) or _qualified_result_row(text):
         return False
     subject = re.split(r'더블\s*클릭|두\s*번|double[ -]?click', text, flags=re.I)[0]
     if text.lower().startswith(('double click', 'double-click')):
@@ -164,12 +165,45 @@ def same_result_double(step, previous):
                 or column.casefold() in subject.casefold())
 
 
+def _gesture_subject(sentence):
+    """The recorder caption can prefix a user's parenthesized instruction."""
+    if isinstance(sentence, str):
+        caption = re.fullmatch(r'녹화한\s+항목\s+더블\s*클릭\s*\(([^()]+)\)', sentence.strip())
+        if caption:
+            return caption[1].strip()
+    return sentence
+
+
+def _qualified_result_row(text):
+    """An explicit row predicate needs a value binding before a row can be opened."""
+    return re.search(r'[=≠]|(?:(?<!뿐)인(?:\s+결과)?|포함하는|포함한)\s*(?:행|줄|항목)|'
+                     r'\b(?:where|whose|equals?|contains?|with\s+(?:value|id))\b', text, re.I)
+
+
+def _plain_table_gesture(sentence):
+    # double_click_instruction checks the whole sentence, including any open effect.
+    if not isinstance(sentence, str):
+        return False
+    target = re.split(r'더블\s*클릭|두\s*번', sentence, maxsplit=1)[0].strip()
+    target = re.sub(r'^double[ -]?click\s+', '', target, flags=re.I).rstrip('.!')
+    return bool(re.fullmatch(r'(?:그냥\s*)?(?:(?:이|그|해당|현재|녹화한|시연한)\s*)?'
+                             r'(?:표|목록|리스트|테이블|행|줄|항목|list|grid|table)(?:을|를)?'
+                             r'|(?:(?:this|that|the)(?: recorded)?\s+)?(?:list|grid|table|row|item)', target, re.I))
+
+
 def current_result_intent(raw, sentence):
     """A current-result request selects rows, never recording-time business pixels."""
     if (not isinstance(sentence, str) or not double_click_instruction(sentence) or _comparison_request(sentence)
             or not (is_double_click_step(raw) or is_recoverable(raw) or raw.get('action') == 'double-click-result')):
         return None
-    if not re.search(r'결과|\bresults?\b', sentence, re.I):
+    subject = _gesture_subject(sentence)
+    named_result = re.search(r'결과|\bresults?\b', subject, re.I)
+    if not named_result:
+        if not _plain_table_gesture(subject) or not (is_double_click_step(raw) or raw.get('action') == 'double-click-result'):
+            return None
+        if raw.get('action') == 'visual-click' and not _plain_table_gesture(raw.get('label', '')):
+            return None
+    if _qualified_result_row(subject) or re.search(r'버튼|아이콘|메뉴|\b(?:button|icon|menu)\b', subject, re.I):
         return None
     # Preserve an explicit matching request for the preceding verify-value step.
     if re.search(r'일치|확인한|같은|마지막|다음|두\s*번째|[2-9]\s*번째|\b(?:matched|same|last|next)\b', sentence, re.I):
@@ -179,18 +213,37 @@ def current_result_intent(raw, sentence):
                  r'\b(?:second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|all|every)\b|'
                  r'모든|전부|각각|여러|행들|항목들', sentence, re.I):
         return None
-    first = bool(re.search(r'첫\s*(?:번째\s*)?(?:행|줄|항목|결과)|\bfirst\b', sentence, re.I))
+    first = bool(re.search(r'첫\s*(?:번째\s*)?(?:행|줄|항목|결과)|\bfirst\b', subject, re.I))
+    single = bool(re.search(r'유일한|하나뿐인|한\s*(?:건|행|줄)뿐|\b(?:sole|single|only)\b', subject, re.I))
+    field = r"""(["']?)([\w -]{1,100}?)\1"""
+    column = re.search(r'결과(?:\s*(?:표|목록|행))?(?:에서|의|에)\s*' + field
+                       + r'\s*(?:부분|열|칼럼|컬럼|셀)(?:을|를)?\s*(?:더블|두\s*번)', subject)
+    if not column:
+        column = re.search(r'\b(?:result\s+(?:row|grid|table)|results?)\s+(?:in\s+)?(?:the\s+)?' + field
+                           + r'\s+(?:column|cell)\b', subject, re.I)
+    if not column and re.search(r'(?:부분|칼럼|컬럼|셀|열)(?:을|를)?\s*(?:더블|두\s*번)|\b(?:column|cell)\b', subject, re.I):
+        return None
     target = raw.get('target')
     locator = target.get('locator', {}) if isinstance(target, dict) else _recorded_selector(raw) or {}
+    if not named_result and isinstance(locator, dict) and locator.get('role') in ('button', 'menuitem', 'link', 'checkbox'):
+        return None
     # An already typed host interpretation may identify a provider-backed
     # custom grid or a scoped semantic selector. A wording edit must keep it.
     if raw.get('action') == 'double-click-result' and isinstance(raw.get('selector'), dict):
         _validate_step(raw, set())
         selector = deepcopy(raw['selector'])
     else:
-        selector = recorded_result_surface(locator) or result_surface_hint(raw) or {'role': 'table'}
-    return dict(mode='double-click-result', text=sentence, label=sentence[:200],
-                result_row='first' if first else 'single', selector=selector)
+        selector = recorded_result_surface(locator) or result_surface_hint(raw)
+    if not named_result and (not selector or selector == {'role': 'table'}):
+        return None
+    selector = selector or {'role': 'table'}
+    mode = 'single' if single else 'first' if first or column else 'recorded'
+    intent = dict(mode='double-click-result', text=sentence, label=sentence[:200], result_row=mode, selector=selector)
+    if column:
+        intent['result_column'] = column[2].strip()
+    if mode == 'recorded' and raw.get('result_point') is not None:
+        intent['result_point'] = deepcopy(raw['result_point'])
+    return intent
 
 
 def is_query_button(button):
@@ -243,6 +296,7 @@ def _conditional_sentence(sentence):
 
 def double_click_instruction(sentence):
     """An affirmative gesture, optionally followed by the expected open effect."""
+    sentence = _gesture_subject(sentence)
     if not isinstance(sentence, str) or _conditional_sentence(sentence):
         return False
     if re.search(r'하지\s*마|말고|대신|않|금지|그리고|(?:으|라|다)면|경우에|일\s*때|삭제|닫[고기는아]|종료|취소|'
@@ -427,6 +481,22 @@ def result_surface_hint(raw):
     return None
 
 
+def valid_result_point(point):
+    return (isinstance(point, dict) and set(point) == {'x', 'y', 'width', 'height'}
+            and all(type(value) is int for value in point.values())
+            and 0 <= point['x'] < point['width'] <= 65535 and 0 <= point['y'] < point['height'] <= 65535)
+
+
+def result_location(raw):
+    surface = result_surface_hint(raw)
+    fields = {'result_surface': surface} if surface else {}
+    if 'result_point' in raw:
+        if not surface or not valid_result_point(raw['result_point']):
+            raise TaskError('invalid_result_point')
+        fields['result_point'] = deepcopy(raw['result_point'])
+    return fields
+
+
 def _comparison_request(sentence):
     """Recognize a comparison intent without guessing its subject or expected value."""
     if (isinstance(sentence, str) and click_request(sentence)
@@ -436,6 +506,15 @@ def _comparison_request(sentence):
         r'일치(?:하는지|\s*여부|\s*확인)|같은지|동일한지|맞는지|비교(?:해|하|\s+(?:후|뒤))|'
         r'\bcompare\b(?!\s+(?:button|icon)\b).+\b(?:with|to|against)\b|'
         r'\b(?:check|verify|ensure)\b.+\b(?:matches?|equals?|same)\b', sentence, re.I))
+
+
+def _readable_drag(raw):
+    if raw.get('action') != 'manual' or raw.get('reason', raw.get('recognition', {}).get('reason')) != 'drag_needs_review':
+        return False
+    scope = raw.get('window_context') or raw.get('_capture_window') or {}
+    locator = _recorded_selector(raw) or {}
+    return bool((scope.get('related') and (scope.get('after_step') or scope.get('after_id') or scope.get('_openers')))
+                or locator.get('role') in {'textfield', 'combobox', 'statictext'})
 
 
 def _observed_intent(raw, sentence):
@@ -454,7 +533,8 @@ def _observed_intent(raw, sentence):
             ('secure', 'protected', 'is_protected', 'is_password', 'password')):
         return None
     scoped_popup_hint = scoped and raw.get('reason', raw.get('recognition', {}).get('reason')) == 'popup_needs_live_binding'
-    if raw.get('action') == 'manual' and not (is_recoverable(raw) or scoped_popup_hint):
+    drag_read = _readable_drag(raw)
+    if raw.get('action') == 'manual' and not (is_recoverable(raw) or scoped_popup_hint or drag_read):
         return None
     reason = _convert(raw, allow_point=True).get('reason') if isinstance(target, dict) else None
     if reason == 'target_protected' or (reason == 'popup_needs_live_binding' and not scoped_popup_hint):
@@ -463,14 +543,19 @@ def _observed_intent(raw, sentence):
     text = sentence.strip().rstrip('.!。').strip()
     if re.search(r'[;?!,\n]|(?:말고|하지\s*마|않|대신|하고\s|한\s*뒤|누르고|그리고)|\b(?:not|and|then|or)\b', text, re.I):
         return None
-    text = re.sub(r'^(?:상세\s*)?(?:팝업|창|화면)(?:\s*안)?에서\s+', '', text)
+    scope_prefix = re.match(r'^(?:(\d+)\s*단계에서\s*열린\s*|(?:방금|이전\s*단계에서)\s*열린\s*)?(?:상세\s*)?(?:팝업|창|화면)(?:\s*안)?에서\s+', text)
+    if scope_prefix:
+        opener = (raw.get('window_context') or {}).get('after_step')
+        if scope_prefix[1] and (not scoped or opener is not None and int(scope_prefix[1]) != opener):
+            return None
+        text = text[scope_prefix.end():]
     selector = _recorded_selector(raw)
     click = click_request(text)
     close = re.fullmatch(r'([\w][\w .()-]{0,99}?)\s*(?:버튼)?(?:으로|로|(?:을|를)?\s*(?:눌러(?:서)?|클릭(?:하여|해서)))\s*'
                          r'(?:(?:(?:상세|이|현재)\s*)?(?:팝업|창|대화상자)(?:을|를)?\s*)?닫(?:아\s*(?:줘|주세요)?|기)', text)
     caption = close[1].strip() if close else (click[0] if click and click[1] == 'button'
               and click[0].casefold() in {'exit', 'close', '닫기', '종료'} else None)
-    if scoped and caption:
+    if scoped and caption and not drag_read:
         # A recorded title-bar Close must not stand in for the named business button.
         if not (selector and selector.get('role') == 'button'
                 and (raw.get('command_name') or (target.get('locator', {}).get('name') if isinstance(target, dict) else '')
@@ -480,7 +565,7 @@ def _observed_intent(raw, sentence):
         return dict(mode='close-popup', text=sentence, selector=selector, label=caption)
 
     field = r'([\w][\w .\-/()]{0,99}?)'
-    read = re.fullmatch(field + r'\s*(?:의\s*)?(?:(?:필드|입력란|입력칸)\s*)?(?:값|내용|텍스트)?(?:을|를)?\s*'
+    read = re.fullmatch(field + r'\s*(?:의\s*)?(?:(?:부분|필드|입력란|입력칸)\s*)?(?:값|내용|텍스트)?(?:을|를)?\s*'
                         r'(?:읽(?:어|기)|가져(?:와|오기)|알려|추출(?:해|하기)?)(?:\s*(?:줘|주세요))?', text)
     if not read:
         read = re.fullmatch(r'(?:read|extract)\s+' + field + r'(?:\s+(?:value|text))?', text, re.I)
@@ -491,7 +576,7 @@ def _observed_intent(raw, sentence):
                          + r'\s*(?:값)?(?:이|가|을|를)?\s*' + comparison +
                          r'(?:(?:일치(?:하는지|\s*여부)?|같은지|동일한지|맞는지)\s*확인(?:해)?|비교(?:해)?)'
                          r'(?:\s*(?:줘|주세요))?', text)
-    if not (read or match):
+    if not (read or match) or drag_read and not read:
         return None
     name = (read or match)[1].strip()
     field_check = bool(match and not re.match(r'(?:조회\s*)?결과|(?:표|행)에서', text) and
@@ -545,7 +630,8 @@ def interpret_step(raw_step, sentence, action, selector, *, label=None, result_r
     scoped = raw_step.get('window_context') or raw_step.get('_capture_window')
     if raw_step.get('action') == 'manual':
         popup = scoped and raw_step.get('reason', raw_step.get('recognition', {}).get('reason')) == 'popup_needs_live_binding'
-        if not (is_recoverable(raw_step) or is_double_click_step(raw_step) or popup):
+        if not (is_recoverable(raw_step) or is_double_click_step(raw_step) or popup
+                or action == 'read-value' and _readable_drag(raw_step)):
             raise TaskError('instruction_target_unavailable')
     elif raw_step.get('action') not in {'click', 'teach-target', 'visual-click', 'open', 'row-action', 'row-launch',
                                      *VALUE_ACTIONS, *OBSERVE_ACTIONS, *CAPTURE_COMMANDS, *INTERPRETED_ACTIONS}:
@@ -1087,7 +1173,8 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         observation = _observed_intent(raw_step, sentence)
         if observation is not None:
             return observation
-        if _comparison_request(sentence):
+        if (_comparison_request(sentence) or is_double_click_step(raw_step) and double_click_instruction(sentence)
+                and re.search(r'결과|\bresults?\b', sentence, re.I)):
             # A location hint must not turn an unsupported comparison sentence
             # into a click on recording-time pixels. The host receives the prose.
             return {'mode': 'draft', 'text': sentence}
@@ -1211,8 +1298,8 @@ def instructed_step(raw_step, spec):
         result['recorded_row'] = deepcopy(row)
     if 'row_cue' in raw_step:
         result['row_cue'] = deepcopy(raw_step['row_cue'])
-    if result['action'] in ('manual', 'visual-click') and (surface := result_surface_hint(raw_step)):
-        result['result_surface'] = surface
+    if result['action'] in ('manual', 'visual-click'):
+        result.update(result_location(raw_step))
     return result
 
 
@@ -1226,7 +1313,12 @@ def _apply_instruction(raw_step, spec):
         _validate_step(result, set())
         return result
     if spec.get('mode') == 'double-click-result':
-        if compile_instruction(raw_step, spec.get('text')) != spec:
+        expected = compile_instruction(raw_step, spec.get('text'))
+        # Older drafts recorded "single" for any unqualified row instruction.
+        # Preserve that restriction when reopening the original typed directive.
+        legacy = (expected and expected.get('result_row') == 'recorded'
+                  and spec == raw_step.get('instruction') and spec == dict(expected, result_row='single'))
+        if expected != spec and not legacy:
             raise TaskError('invalid_step_instruction')
         result = {**_annotations(raw_step), 'description': spec['text'], 'action': spec['mode'],
                   **{k: deepcopy(v) for k, v in spec.items() if k not in ('mode', 'text')}}
@@ -1272,7 +1364,11 @@ def _apply_instruction(raw_step, spec):
         return _visual_step(dict(raw_step, visual=marker), spec['text'])
     if raw_step.get('action') == 'visual-click':
         if spec.get('mode') == 'visual-click':
-            if compile_instruction(raw_step, spec.get('text')) != spec:
+            expected = compile_instruction(raw_step, spec.get('text'))
+            if (expected and expected.get('mode') == 'double-click-result' and spec == raw_step.get('instruction')
+                    and set(spec) == {'mode', 'text'}):
+                return _apply_instruction(raw_step, expected)
+            if expected != spec:
                 raise TaskError('invalid_step_instruction')
             return _visual_step(raw_step, spec['text'])
         if spec.get('mode') == 'draft':
@@ -1367,7 +1463,14 @@ def recorded_step(raw):
     if raw.get('action') == 'visual-click':
         if spec is not None:
             return instructed_step(raw, spec)
-        return _visual_step(raw, raw.get('label'))
+        step = _visual_step(raw, raw.get('label'))
+        if step.get('result_point') and is_double_click_step(step):
+            # The demonstrated table and position fully describe a plain row
+            # gesture. Keep pixels only for actions that still depend on them.
+            intent = current_result_intent(step, step.get('description') or step['label'])
+            if intent:
+                return instructed_step(step, intent)
+        return step
     if raw.get('action') == 'result-menu':
         if spec is not None:
             raise TaskError('invalid_step_instruction')
@@ -1389,8 +1492,7 @@ def recorded_step(raw):
     step = _convert(raw)
     step.update(_annotations(raw))
     if step.get('action') == 'manual' and (is_recoverable(step) or is_double_click_step(step)):
-        if surface := result_surface_hint(raw):
-            step['result_surface'] = surface
+        step.update(result_location(raw))
     if 'row_cue' in raw and step.get('reason') == 'row_capture_requires_review':
         step['row_cue'] = deepcopy(raw['row_cue'])
     if 'menu_anchor' in raw:
@@ -1432,8 +1534,7 @@ def _visual_step(raw, label):
         raise TaskError('invalid_visual_label')
     validate_spec(raw.get('visual'))
     result = dict(action='visual-click', label=label, visual=raw['visual'], **_annotations(raw))
-    if surface := result_surface_hint(raw):
-        result['result_surface'] = surface
+    result.update(result_location(raw))
     return result
 
 
@@ -1539,13 +1640,14 @@ def resolve_saved_intents(plan):
             sentence = sentence or step.get('description') or step.get('label')
         if sentence and (step.get('action') in ('open', 'visual-click', *VALUE_ACTIONS, *OBSERVE_ACTIONS,
                                                'close-popup', 'double-click-result')
-                or (step.get('reason') == 'popup_needs_live_binding' and step.get('window_context'))):
+                or (step.get('reason') == 'popup_needs_live_binding' and step.get('window_context'))
+                or _readable_drag(step)):
             observation = _observed_intent(step, sentence)
             if observation is not None:
                 step = instructed_step(step, observation)
             elif _comparison_request(sentence):
                 step = instructed_step(step, {'mode': 'draft', 'text': sentence})
-            elif step.get('action') == 'double-click-result':
+            elif step.get('action') == 'double-click-result' or is_double_click_step(step):
                 intent = current_result_intent(step, sentence)
                 if intent is not None:
                     step = instructed_step(step, intent)
@@ -1629,10 +1731,14 @@ def _validate_typed_draft(step):
 def _validate_current_result(step):
     from python_workflow import RESULT_SURFACES, validate_selector
     selector = step.get('selector')
-    allowed = {'action', 'label', 'description', 'alias', 'window_context', 'selector', 'result_row', 'instruction_draft'}
+    allowed = {'action', 'label', 'description', 'alias', 'window_context', 'selector', 'result_row',
+               'result_point', 'result_column', 'instruction_draft'}
     _validate_typed_draft(step)
-    if (step.get('result_row') not in ('single', 'first') or not _text(step.get('label'), 1000)
+    if (step.get('result_row') not in ('single', 'first', 'recorded') or not _text(step.get('label'), 1000)
             or not isinstance(selector, dict) or selector.get('role') not in RESULT_SURFACES
+            or 'result_point' in step and (step['result_row'] != 'recorded' or selector == {'role': 'table'}
+                                           or not valid_result_point(step['result_point']))
+            or 'result_column' in step and (step['result_row'] == 'recorded' or not _text(step['result_column'], 100))
             or set(step) - allowed):
         raise TaskError('invalid_result_row')
     if selector != {'role': 'table'}:
@@ -1698,11 +1804,10 @@ def _validate_step(s, parameters):
         return
     if s.get('action') == 'manual':
         expected = {'action', 'reason'}
-        if 'result_surface' in s:
+        if 'result_surface' in s or 'result_point' in s:
             if not (is_recoverable(s) or is_double_click_step(s)):
                 raise TaskError('invalid_result_surface_hint')
-            result_surface_hint(s)
-            expected.add('result_surface')
+            expected.update(result_location(s))
         if 'menu_window_point' in s:
             _menu_window_point(s['menu_window_point'], s.get('reason'))
             expected.add('menu_window_point')

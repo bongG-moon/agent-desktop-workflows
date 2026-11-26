@@ -236,9 +236,15 @@ sealed class LookupDetailsFixture : Window {
                 imageSize=new []{window.Right-window.Left,window.Bottom-window.Top}}));
         } else if(command.StartsWith("point:")){
             var key=command.Substring(6);
-            var target= key=="field"?input:key=="view"?view:key=="cell"?Cell(results):key=="note"?(FrameworkElement)comment:exit;
+            var target= key=="field"?input:key=="view"?view:key=="cell"?
+                (opaque.IsVisible?(FrameworkElement)opaque:Cell(results)):
+                (key=="note" || key=="note-end")?(FrameworkElement)comment:exit;
             if(target!=null && target.IsVisible){
-                var p=target.PointToScreen(new Point(target.ActualWidth/2,target.ActualHeight/2));
+                var local = new Point(target.ActualWidth/2,target.ActualHeight/2);
+                if (target==opaque) local=new Point(35+180*opaque.KeyColumn,16+28*opaque.MatchRow);
+                if (key=="note") local.X=8;
+                if (key=="note-end") local.X=65;
+                var p=target.PointToScreen(local);
                 Console.WriteLine(json.Serialize(new {x=(int)p.X,y=(int)p.Y,hwnd=new WindowInteropHelper(Window.GetWindow(target)).Handle.ToInt64()}));
             } else Console.WriteLine("{}");
         } else Console.WriteLine(json.Serialize(new {kind=command,hwnd,pid=Process.GetCurrentProcess().Id,title=Title,

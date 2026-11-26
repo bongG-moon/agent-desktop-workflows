@@ -21,7 +21,7 @@ def reject_image_access(trace):
         if event == 'import' and arguments[0] == 'local_result_review':
             log('local_review_attempted')
             raise RuntimeError('readable_fixture_must_not_open_review')
-    log('worker_guard_enabled' if '--_worker' in sys.argv else 'launcher_guard_enabled')
+    log('worker_guard_enabled' if sys.argv[1:2] in (['--_worker'], ['_plan']) else 'launcher_guard_enabled')
     sys.addaudithook(audit)
 
 
@@ -65,7 +65,6 @@ def drive_review(root, config):
     for widget in descendants:
         descendants.extend(widget.winfo_children())
     canvas, = [widget for widget in descendants if isinstance(widget, tk.Canvas)]
-    entry, = [widget for widget in descendants if isinstance(widget, ttk.Entry)]
     confirm, = [widget for widget in descendants if isinstance(widget, ttk.Button)
                 and widget.cget('text') == '이 행부터 이어서 실행']
     pixels = canvas.itemcget(canvas.find_all()[0], 'image')
@@ -86,6 +85,17 @@ def drive_review(root, config):
         event('<ButtonPress-1>', key)
         event('<ButtonRelease-1>', key)
 
+    if config.get('row_policy') == 'recorded':
+        assert not any(isinstance(w, (ttk.Entry, ttk.Checkbutton)) for w in descendants)
+        assert confirm.instate(['disabled'])
+        click('cell')
+        assert confirm.instate(['!disabled'])
+        with open(config['receipt'], 'x', encoding='utf8') as stream:
+            json.dump(dict(cropped=origin != [0, 0], selected_cell=True), stream)
+        confirm.invoke()
+        return
+
+    entry, = [widget for widget in descendants if isinstance(widget, ttk.Entry)]
     event('<ButtonPress-1>', 'headerLeft')
     event('<B1-Motion>', 'headerRight')
     event('<ButtonRelease-1>', 'headerRight')
@@ -118,7 +128,8 @@ def drive_review(root, config):
     confirm.invoke()
 
 
-if '--_worker' in sys.argv and os.environ.get('DESKTOP_SELECT_SMOKE_UI_REVIEW'):
+if (os.environ.get('DESKTOP_SELECT_SMOKE_UI_REVIEW') and
+        ('--_worker' in sys.argv or 'try-recording' in sys.argv or 'resume-trial' in sys.argv)):
     import tkinter as tk
     original_mainloop = tk.Tk.mainloop
     config = json.loads(os.environ['DESKTOP_SELECT_SMOKE_UI_REVIEW'])

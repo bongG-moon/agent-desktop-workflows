@@ -103,7 +103,7 @@ def _summary(number, row, doc):
     item = dict(number=number, text=row['text'], action=step['action'],
                 window=scope.get('title', doc['window']), exe=scope['exe'])
     for key in ('target', 'reason', 'label', 'role', 'match', 'alias', 'description', 'menu_anchor',
-                'menu_window_point', 'wait_after'):
+                'menu_window_point', 'result_surface', 'wait_after'):
         if key in step:
             item[key] = step[key]
     if location := tasks.row_location(step):

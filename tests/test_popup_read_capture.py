@@ -23,6 +23,87 @@ def field(**changes):
 
 
 class PopupReadCaptureTests(unittest.TestCase):
+    def test_plain_list_double_click_requires_a_demonstrated_table(self):
+        from test_visual_target import image, visual, VisualTargets
+        surface = dict(role='group', automation_id='paintedResults')
+        marker = dict(visual.from_frame(VisualTargets.window, image((35, 42)), (235, 162)), gesture='double-click')
+        default = '녹화한 항목 더블클릭'
+        raw = dict(capture.manual('double_click_needs_review'), result_surface=surface)
+        visual_row = dict(action='visual-click', visual=marker, label=default, result_surface=surface)
+        for text in ('그냥 이 list를 더블클릭', '목록을 더블클릭', 'double-click this table', default):
+            for captured in (raw, visual_row):
+                intent = tasks.compile_instruction(captured, text)
+                self.assertEqual((intent['result_row'], intent['selector']), ('recorded', surface))
+        for text in ('목록의 설정 버튼 더블클릭', '표에서 장비 ID 부분 더블클릭', 'double-click the row where Name equals A',
+                     '결과 표의 실행 버튼 더블클릭'):
+            self.assertIsNone(tasks.current_result_intent(visual_row, text), text)
+        self.assertIsNone(tasks.current_result_intent(dict(visual_row, label='특정 상품 더블클릭'), default))
+        no_surface = dict(visual_row)
+        del no_surface['result_surface']
+        self.assertEqual(tasks.compile_instruction(no_surface, default)['mode'], 'visual-click')
+        old = dict(visual_row, instruction=dict(mode='visual-click', text=default))
+        self.assertEqual(tasks.recorded_step(old)['selector'], surface)
+        saved = tasks.from_recording('목록 열기', 'Demo.exe', 'Main', [visual_row])
+        compiled = recorded_plan.compile_plan(saved)['envelope']['recipe']['steps'][0]
+        self.assertEqual((compiled['action'], compiled['result_row'], compiled['selector']),
+                         ('double-click-result', 'recorded', surface))
+        point = dict(x=23, y=41, width=310, height=150)
+        fresh = dict(visual_row, result_point=point)
+        stored = tasks.from_recording('새 목록', 'Demo.exe', 'Main', [fresh])['steps'][0]
+        self.assertEqual((stored['action'], stored['selector'], stored['result_point']),
+                         ('double-click-result', surface, point))
+        self.assertNotIn('visual', stored)
+        self.assertEqual(tasks.recorded_step(dict(fresh, label='특정 상품 더블클릭'))['visual'], marker)
+
+    def test_old_draft_with_a_table_and_a_drag_defers_the_read_to_its_opener(self):
+        import recovery
+        import review_drafts
+        exe, window = 'Lookup.exe', 'Lookup'
+        surface = dict(role='group', automation_id='paintedResults')
+        double = dict(capture.manual('double_click_needs_review', 'open'), result_surface=surface)
+        drag = dict(capture.manual('drag_needs_review', 'drag'),
+                    _capture_window=dict(exe=exe, title='Details', related=True, after_id='open'))
+        def row(step, sentence):
+            return dict(step=step, form=dict(alias='', text=sentence, mode=None, argument=''))
+        sentence = '녹화한 항목 더블클릭 (조회 결과 행 더블클릭)'
+        doc = dict(schema=1, kind=review_drafts.KIND, name='lookup', exe=exe, window=window,
+                   rows=[row(double, sentence), row(drag, '1단계에서 열린 창에서 comment부분 내용 추출')])
+        prepared = recovery._rows(doc)
+        self.assertFalse(any(r.get('field_problem') or r.get('scope_problem') for r in prepared))
+        task = dict(schema=1, name='lookup', window=window, exe=exe, steps=[r['step'] for r in prepared])
+        recipe = recorded_plan.compile_plan(task)['envelope']['recipe']['steps']
+        self.assertEqual((recipe[0]['result_row'], recipe[0]['selector']), ('recorded', surface))
+        self.assertEqual(recipe[1]['selector'], dict(role='textfield', query='comment'))
+        self.assertEqual(recipe[1]['window_context']['after_step'], 1)
+        self.assertEqual('read-value', recipe[1]['action'])
+        for suffix in ('결과 행 더블클릭 말고 닫기', '결과 행 더블클릭하지 마'):
+            self.assertEqual('draft', tasks.compile_instruction(double, '녹화한 항목 더블클릭 (' + suffix + ')')['mode'])
+
+    def test_column_and_exact_value_are_not_replaced_with_demonstrated_point(self):
+        surface = dict(role='group', automation_id='grid')
+        point = dict(x=30, y=50, width=200, height=300)
+        raw = dict(capture.manual('double_click_needs_review'), result_surface=surface, result_point=point)
+        self.assertEqual(tasks.recorded_step(raw)['result_point'], point)
+        base = tasks.compile_instruction(raw, '조회 결과 행을 더블클릭해줘')
+        self.assertEqual(base['result_point'], point)
+        column = tasks.compile_instruction(raw, '조회 결과에서 장비 ID 부분 더블클릭')
+        self.assertEqual((column['result_row'], column['result_column']), ('first', '장비 ID'))
+        self.assertNotIn('result_point', column)
+        quoted = tasks.compile_instruction(raw, '조회 결과에서 "Asset ID" 열을 더블클릭')
+        self.assertEqual(quoted['result_column'], 'Asset ID')
+        for constrained in ('조회 결과에서 상태가 진행중인 행 더블클릭',
+                            'double-click the result row where Status equals Ready',
+                            '조회 결과에서 완료일/시각 열을 더블클릭'):
+            self.assertEqual('draft', tasks.compile_instruction(raw, constrained)['mode'], constrained)
+        self.assertEqual('single', tasks.compile_instruction(raw, '유일한 결과 행 더블클릭')['result_row'])
+        old_raw = dict(capture.manual('double_click_needs_review'), result_surface=surface)
+        old_spec = dict(tasks.compile_instruction(old_raw, '조회 결과 행 더블클릭'), result_row='single')
+        self.assertEqual('single', tasks.recorded_step(dict(old_raw, instruction=old_spec))['result_row'])
+        self.assertEqual('draft', tasks.compile_instruction(raw, '입력값과 일치하는 결과 행을 더블클릭해줘')['mode'])
+        self.assertEqual(tasks.result_location(raw), dict(result_surface=surface, result_point=point))
+        with self.assertRaises(tasks.TaskError):
+            tasks.recorded_step(dict(raw, result_point=dict(point, x=201)))
+
     def test_default_saved_double_retains_owner_drawn_surface_when_description_changes(self):
         from test_visual_target import image, visual, VisualTargets
         marker = dict(visual.from_frame(VisualTargets.window, image((35, 42)), (235, 162)), gesture='double-click')
@@ -63,6 +144,47 @@ class PopupReadCaptureTests(unittest.TestCase):
         self.assertEqual(step['result_surface'], surface)
         self.assertEqual(tasks.recorded_step(step)['result_surface'], surface)
 
+    def test_double_replacement_uses_only_table_relative_offsets_from_the_first_hit(self):
+        from test_visual_recording import VisualRecordingTests
+        fixture = VisualRecordingTests()
+        fixture.setUp()
+        worker, notes = fixture.worker, fixture.notes
+        surface = dict(role='group', automation_id='results')
+        first = capture.manual('unsupported_recorded_action', 'first')
+        notes.add(first)
+        worker.recent_click = dict(step_id='first', observation=dict(window=501,
+            node=dict(secure=False, role='group', locator=surface, bounds=dict(x=195, y=65, width=220, height=80))))
+        worker._remember_double_target(fixture.event)
+        with patch.object(capture.recorder.CaptureWorker, 'capture_double',
+                          side_effect=lambda *args: (notes.add(capture.manual('double_click_needs_review', 'first')) or True)):
+            worker.capture_double(dict(fixture.event, double=True), None)
+        step = tasks.recorded_step(notes.snapshot()[0])
+        wanted = dict(x=13, y=51, width=220, height=80)
+        self.assertEqual((step['result_surface'], step['result_point']), (surface, wanted))
+        tasks._validate_step(step, set())
+        new = tasks.instructed_step(step, tasks.compile_instruction(step, '나중에 열기'))
+        self.assertEqual(tasks.compile_instruction(new, '조회 결과 행 더블클릭')['result_point'], wanted)
+
+    def test_field_drag_keeps_the_same_readable_field_only(self):
+        from test_visual_recording import VisualRecordingTests
+        fixture = VisualRecordingTests()
+        fixture.setUp()
+        worker = fixture.worker
+        worker.uia.same.side_effect = lambda a, b: a is b
+        worker.uia.pid.return_value = fixture.binding.pid
+        locator = field()['target']['locator']
+        node = dict(role='textfield', locator=locator, semantic_label='Comment', secure=False,
+                    bounds=dict(x=200, y=100, width=220, height=50))
+        observed = dict(fixture.observed, node=node)
+        worker.uia.from_point.return_value = observed['element']
+        up = dict(fixture.event, kind='up', inside=True, x=265)
+        self.assertTrue(worker._capture_field_drag(fixture.event, observed, up))
+        raw, = fixture.notes.snapshot()
+        self.assertEqual(tasks.compile_instruction(raw, 'Comment 내용 추출')['selector']['automation_id'], 'txtComment')
+        self.assertFalse(worker._capture_field_drag(fixture.event, observed, dict(up, x=550)))
+        worker.uia.from_point.return_value = Mock()
+        self.assertFalse(worker._capture_field_drag(fixture.event, observed, up))
+
     def test_current_result_keeps_row_editorial_evidence_but_compiles_only_container(self):
         cue = dict(ordinal=1, point=[14, 4], size=[28, 12], role='row', scope=['controls'])
         row = dict(version=2, role='row', scope=['controls'], size=[28, 12], ordinal=1,
@@ -78,7 +200,7 @@ class PopupReadCaptureTests(unittest.TestCase):
                 self.assertEqual(command[key], evidence)
                 compiled = recorded_plan.compile_plan(plan)['envelope']['recipe']['steps'][0]
                 self.assertEqual((compiled['action'], compiled['result_row'], compiled['selector']),
-                                 ('double-click-result', 'single', surface))
+                                 ('double-click-result', 'recorded', surface))
                 self.assertNotIn(key, compiled)
                 self.assertNotIn('visual', compiled)
 

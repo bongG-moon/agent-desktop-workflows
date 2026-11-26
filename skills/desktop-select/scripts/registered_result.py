@@ -297,8 +297,21 @@ class ResultReview:
             result = flow.run(suffix, hwnd=owner['hwnd'], result_confirmation=confirmation)
             result['local_review_seconds'] = round(local_review_seconds,4)
             learned = dict(number=number, selector=selector) if not row_policy and selector.get('role') == 'group' else None
+            tested_recipe = self.recipe
+            if (row_policy == 'recorded' and result.get('input_dispatched') is True and not result.get('stopped_at')
+                    and result.get('status') in ('verified', 'completed_unverified')):
+                try:
+                    revised = deepcopy(self.recipe)
+                    revised['steps'][number-1].update(selector=selector, result_point=result_cell.body_point(box, point))
+                    flow.validate(revised)
+                    repair.replace_workflow(recipe_path, self.recipe, revised, flow.load)
+                    tested_recipe = revised
+                    result['correction_saved'] = True
+                except (ValueError, OSError, flow.app.bridge.BridgeError) as error:
+                    result.update(correction_saved=False, correction_diagnostic=getattr(error, 'code', 'result_point_save_failed'))
             return self._finish(result, record, recipe_path, number - 1 if row_policy else number,
-                                'local_row_confirmation' if row_policy else 'local_visual_confirmation', learned)
+                                'local_row_confirmation' if row_policy else 'local_visual_confirmation', learned,
+                                tested_recipe=tested_recipe)
         except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
             if geometry:
                 error.result_geometry = dict(geometry, **getattr(error, 'geometry', {}))
@@ -367,7 +380,7 @@ class ResultReview:
             return reply
         return None
 
-    def _finish(self, result, record, path, offset, source, learned):
+    def _finish(self, result, record, path, offset, source, learned, *, tested_recipe=None):
         if result['input_dispatched'] is False:
             self._write(self.pending, record)
             result.update(self.feedback(record, result.get('diagnostic', 'result_resume_unavailable')))
@@ -380,8 +393,8 @@ class ResultReview:
                       resumed_action_seconds=result.get('elapsed_seconds'), result_match_source=source)
         if result.get('status') in ('completed_unverified','verified') and not result.get('stopped_at'):
             result.setdefault('host_action', 'report_execution_receipt')
-            if record.get('remember'):
-                repair.remember_test(path, self.recipe, result, record['approval_before'], offset+1)
+            if record.get('remember') and result.get('correction_saved') is not False:
+                repair.remember_test(path, tested_recipe or self.recipe, result, record['approval_before'], offset+1)
             self.pending.unlink(missing_ok=True)
             if learned:
                 try:

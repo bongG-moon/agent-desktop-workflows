@@ -2,6 +2,8 @@
 from copy import deepcopy
 import struct
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import first_trial
 import grounding
@@ -38,7 +40,8 @@ def supported(recipe, check_number):
     if type(check_number) is not int or not 1 <= check_number <= len(recipe['steps']):
         return False
     check = recipe['steps'][check_number - 1]
-    if check.get('action') == 'double-click-result' and check.get('result_row') in ('single', 'first'):
+    if (check.get('action') == 'double-click-result' and check.get('result_row') in ('single', 'first', 'recorded')
+            and 'result_column' not in check):
         start = check_number
     elif (check.get('action') == 'verify-value' and check.get('result_column')
           and check_number < len(recipe['steps'])
@@ -139,9 +142,93 @@ def prior(directory, key):
     return result
 
 
+def review_locally(app, key, allow_physical):
+    """Pick a missing demonstrated position locally, then resume the already-run query."""
+    import coordination
+    directory = tasks._directory(app.task_directory() / 'first-trials')
+    # Two consumers of the same receipt must never present competing pickers.
+    with coordination.recipe(_path(directory, key).with_suffix('.review')):
+        return _choose_and_resume(app, key, allow_physical)
+
+
+def _choose_and_resume(app, key, allow_physical):
+    import local_result_review
+    directory, original, inspection = first_trial._inspection(app, key)
+    previous = prior(directory, key)
+    if previous and previous.get('resume_dispatched_input') is not False:
+        return previous
+    if inspection.get('result_row') != 'recorded' or not inspection.get('resume_supported'):
+        raise tasks.TaskError('result_resume_unavailable')
+    if not allow_physical:
+        return dict(status='needs_consent', required_option='--allow-physical', input_dispatched=False,
+                    previous_input_dispatched=original.get('input_dispatched'), prior_steps_replayed=False)
+    while True:
+        frame = first_trial.inspect_result(app, key)
+        if 'image' not in frame:
+            return frame
+        path = Path(frame['image'])
+        try:
+            _, _, current = first_trial._inspection(app, key)
+            geometry = current['frame_geometry']
+            if geometry['frame'] != frame['frame']:
+                raise tasks.TaskError('result_frame_changed')
+            rect = geometry['window_rect']
+            visible = visible_table_box(rect, geometry['table_box'])
+            bounds = [visible['x'] - rect[0], visible['y'] - rect[1], visible['width'], visible['height']]
+            choice = local_result_review.choose(path, table_box=bounds, frame_size=rect[2:], row_policy='recorded')
+            if choice is None:
+                return dict(original, host_action='local_result_review_cancelled', prior_steps_replayed=False,
+                            this_call_dispatched_input=False)
+            if choice.get('refresh'):
+                continue
+            if (choice.get('row_policy') != 'recorded'
+                    or not local_result_review.valid_row_choice(choice.get('point'), bounds, choice.get('confirmed'))):
+                raise tasks.TaskError('result_row_not_confirmed')
+            args = SimpleNamespace(receipt=key, frame=frame['frame'], point=choice['point'],
+                                   row_policy='recorded', allow_physical=True, column=None, value=None)
+            return resume(app, args)
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass  # The grounding cache also expires frames if immediate cleanup is unavailable.
+
+
+def _save_recorded_point(app, envelope, number, geometry, screen_point, response):
+    import recorded_plan
+    import result_cell
+    recipe = envelope['recipe']
+    corrected = deepcopy(envelope['source'])
+    source_number = envelope['source_steps'][number - 1]
+    original = corrected['steps'][source_number - 1]
+    step = recipe['steps'][number - 1]
+    target = dict(action='double-click-result', label=step['label'], result_row='recorded',
+                  selector=deepcopy(geometry['selector']), result_point=result_cell.body_point(geometry['table_box'], screen_point))
+    for field in ('window_context', 'alias', 'description'):
+        if field in original:
+            target[field] = deepcopy(original[field])
+    corrected['steps'][source_number - 1] = target
+    corrected['name'] = corrected['name'][:65] + ' - 검증 ' + recovery._fingerprint(corrected)[:10]
+    plan = recorded_plan.compile_plan(corrected)
+    expected = deepcopy(recipe)
+    expected['name'] = corrected['name']
+    expected['steps'][number - 1].update(selector=deepcopy(target['selector']), result_point=target['result_point'])
+    if plan.get('envelope', {}).get('recipe') != expected:
+        raise tasks.TaskError('result_trial_source_mapping_unavailable')
+    directory = app.task_directory()
+    try:
+        tasks.save_task(corrected, directory)
+    except tasks.TaskError as error:
+        if error.code != 'task_already_exists' or tasks.load_task(corrected['name'], directory) != corrected:
+            raise
+    response.update(effective_task=corrected['name'], correction_saved=True,
+                    register_args=['register', '--task', corrected['name'], '--out', '<project skill folder>'])
+
+
 def resume(app, args):
     import coordination
     import python_workflow
+    from win_bridge import BridgeError
     directory, report, inspection = first_trial._inspection(app, args.receipt)
     if not inspection.get('resume_supported'):
         raise tasks.TaskError('result_resume_unavailable')
@@ -224,6 +311,13 @@ def resume(app, args):
                 response['source_stopped_at'] = envelope['source_steps'][response['stopped_at'] - 1]
             if result.get('status') in ('completed_unverified', 'verified') and 'stopped_at' not in result:
                 response['host_action'] = 'report_completed_trial'
+                if row_mode == 'recorded' and result.get('input_dispatched') is True:
+                    geometry = inspection['frame_geometry']
+                    absolute = [axis + pos for axis, pos in zip(geometry['window_rect'][:2], args.point)]
+                    try:
+                        _save_recorded_point(app, envelope, offset + 1, geometry, absolute, response)
+                    except (ValueError, OSError, BridgeError) as error:
+                        response.update(correction_saved=False, correction_diagnostic=getattr(error, 'code', 'result_point_save_failed'))
             elif result.get('input_dispatched') is False:
                 response['host_action'] = 'inspect_current_result_without_replaying'
                 response['result_inspection'] = inspection

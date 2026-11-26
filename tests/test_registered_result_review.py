@@ -165,6 +165,20 @@ class RegisteredResultTests(unittest.TestCase):
                 self.assertFalse(list(self.directory.glob('*.png')))
                 self.hit.assert_not_called()
 
+    def test_confirmed_demonstrated_point_persists_only_on_the_tested_registered_recipe(self):
+        review, record = self.row_review('recorded')
+        self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+        self.choose.return_value = dict(point=[48,51], row_policy='recorded', confirmed=True)
+        self.run.return_value = self.finished()
+        with patch.object(flow, '_result_target', return_value=(MagicMock(), self.group)):
+            report = review.confirm(flow, record, self.path, {})
+        self.assertTrue(report['correction_saved'])
+        self.assertFalse(report['prior_steps_replayed'])
+        expected = deepcopy(self.recipe)
+        expected['steps'][1]['result_point'] = dict(x=43, y=44, width=111, height=101)
+        self.assertEqual(flow.load(self.path), expected)
+        self.assertEqual(workflow_repair.approval_state(self.path), '')
+
     def test_current_row_local_confirmation_keeps_scope_choice_and_frame_guards(self):
         review, record = self.row_review()
         self.uia.return_value.__enter__.return_value.bounds.return_value = self.box

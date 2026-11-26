@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+import weakref
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/desktop-select/scripts'))
@@ -274,6 +275,21 @@ class PickerHarness:
 
 
 class RecorderPickerTests(unittest.TestCase):
+    def test_picker_teardown_releases_its_root_capturing_error_callback(self):
+        ui = PickerHarness()
+        callback_ref = None
+
+        def cancel():
+            nonlocal callback_ref
+            callback = ui.root.report_callback_exception
+            self.assertTrue(any(c.cell_contents is ui.root for c in callback.__closure__))
+            callback_ref = weakref.ref(callback)
+            ui.buttons['취소'].command()
+
+        ui.root.mainloop.side_effect = cancel
+        ui.choose('', [])
+        self.assertIsNone(callback_ref())
+
     def test_ready_requires_mapped_root_and_explicit_selection_preserves_literal_row(self):
         ui, ready = PickerHarness(), Mock()
         rows = [row(42, '업무 "A" '), row(43, '업무 "A" ')]

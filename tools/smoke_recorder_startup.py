@@ -236,7 +236,7 @@ def startup(native, skill, work, name, app, *, baseline=False, hint='FXMENUAGNET
         else:
             assert process.wait(timeout=3) == 0
             exited = time.perf_counter() - started
-            assert receipt['status_args'] == ['recorder', '--session', receipt['session'], '--wait', '8'], receipt
+            assert receipt['status_args'] == ['recorder', '--session', receipt['session'], '--wait', '8', '--summary'], receipt
             assert own['pid'] != process.pid and native.windows({own['pid']}), 'detached_editor_not_visible'
         if shot:
             time.sleep(.15)
@@ -402,11 +402,14 @@ def run(args):
             def normalized_receipt(value, installation):
                 value = json.loads(json.dumps(value))
                 token = value.pop('session', None)
+                trial = ['try-recording', '--task', value['effective_task']]
                 if token:
-                    assert value.pop('status_args') == ['recorder', '--session', token, '--wait', '8']
-                    assert value.pop('first_trial_args') == ['try-recording', '--session', token]
-                    assert value['next_action']['args'] == ['try-recording', '--session', token]
-                    value['next_action']['args'] = ['try-recording', '--task', value['effective_task']]
+                    assert value.pop('status_args') == ['recorder', '--session', token, '--wait', '8', '--summary']
+                    assert value.pop('first_trial_args') == ['try-recording', '--session', token, '--summary']
+                    assert value['next_action']['args'] == ['try-recording', '--session', token, '--summary']
+                else:
+                    assert value['next_action']['args'] in (trial, [*trial, '--summary'])
+                value['next_action']['args'] = trial
                 plan = value.get('execution_plan', {})
                 if 'path' in plan:
                     plan['path'] = str(Path(plan['path']).relative_to(installation))
@@ -417,7 +420,8 @@ def run(args):
                 return value
             assert normalized_receipt(old_saved, baseline) == normalized_receipt(stored, candidate), (old_saved, stored)
             status = cli(candidate, *stored['status_args'])
-            assert status == stored, (status, stored)
+            assert status['status'] == stored['status'] and status['next_action'] == stored['next_action'], status
+            assert cli(candidate, 'recorder', '--session', stored['session']) == stored
             results['synthetic_save'] = dict(schema_unchanged=True, review_receipt_unchanged=True,
                                              saved_receipt_unchanged_except_install_path_and_session=True,
                                              durable_saved_session=status, mode=synthetic['candidate']['mode'])

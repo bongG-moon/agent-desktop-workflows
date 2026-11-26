@@ -38,6 +38,21 @@ def receipts():
 
 
 class DetailOutcomeTests(TestCase):
+    def test_plain_recorded_result_confirms_only_the_opened_read_and_closed_detail(self):
+        spec = recipe()
+        rows = receipts()
+        del spec['steps'][2:4], rows[2:4]
+        spec['steps'][2].update(result_row='recorded', selector=dict(role='group', automation_id='ReportList'))
+        for step in spec['steps'][3:]:
+            step['window_context']['after_step'] = 3
+        flow.validate(spec)
+        rows[2]['receipt'].update(result_row='recorded', value_comparison=False)
+        self.assertTrue(flow.verified_detail_read(spec['steps'], rows))
+        for index, key in ((2, 'verification_scope'), (3, 'value_evidence'), (4, 'diagnostic')):
+            changed = deepcopy(rows)
+            changed[index]['receipt'].pop(key)
+            self.assertFalse(flow.verified_detail_read(spec['steps'], changed))
+
     def test_only_query_delivery_may_be_unverified(self):
         steps, rows = recipe()['steps'], receipts()
         self.assertTrue(flow.verified_detail_read(steps, rows))

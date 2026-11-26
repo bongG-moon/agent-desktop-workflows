@@ -209,6 +209,50 @@ class ResultCellTests(unittest.TestCase):
         self.assertTrue(receipt['input_dispatched'])
         sent.assert_called_once_with(120, 29, 'double-click')
 
+    def test_recorded_body_position_moves_with_painted_table_without_rescaling_to_a_different_row(self):
+        group = self.prepare_painted_group()
+        point = result_cell.body_point(group.box, (85, 32))
+        group.box.update(x=90, y=110, width=240, height=36)
+        sent = self.prepare_pointer()
+        with (patch('row_vision._window_rect', return_value=(10, 10, 700, 400)),
+              patch.object(result_cell, 'find_row', side_effect=AssertionError('no row scan on taught point'))):
+            receipt = result_cell.execute_row(self.binding, self.uia, group, lambda: None, mode='recorded', point=point)
+        self.assertEqual(receipt['target_resolution'], 'recorded_result_position')
+        self.assertEqual(receipt['status'], 'delivered_unverified')
+        sent.assert_called_once_with(155, 122, 'double-click')
+
+    def test_recorded_point_rejects_a_sibling_header_and_a_changed_body_before_input(self):
+        group = self.prepare_painted_group()
+        point = result_cell.body_point(group.box, (85, 32))
+        sent = self.prepare_pointer()
+        self.enterContext(patch('row_vision._window_rect', return_value=(10, 10, 700, 400)))
+        self.uia.from_point = lambda *args: self.header
+        with self.assertRaisesRegex(win.BridgeError, 'target_outside_window'):
+            result_cell.execute_row(self.binding, self.uia, group, lambda: None, mode='recorded', point=point)
+        self.uia.from_point = lambda *args: group
+        guards = iter((lambda: None, lambda: group.box.update(y=70)))
+        with self.assertRaisesRegex(win.BridgeError, 'result_cell_changed'):
+            result_cell.execute_row(self.binding, self.uia, group, lambda: next(guards)(), mode='recorded', point=point)
+        sent.assert_not_called()
+
+    def test_recorded_position_outside_visible_window_requests_position_review(self):
+        group = self.prepare_painted_group()
+        point = result_cell.body_point(group.box, (85, 32))
+        with patch('row_vision._window_rect', return_value=(100, 100, 700, 400)):
+            with self.assertRaisesRegex(win.BridgeError, 'result_row_unavailable'):
+                result_cell.position_in_body(self.binding, self.uia, group, point)
+
+    def test_named_column_opens_its_current_cell_without_reading_or_comparing_business_values(self):
+        target = self.node(self.row, 50020, 'changes', 143, 30)
+        with patch.object(result_cell, '_cell_text', side_effect=AssertionError('no equality requested')):
+            self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid, mode='first', column='Reference'),
+                          target)
+            target.values[30005] = 'different on next run'
+            self.assertIs(result_cell.find_row(self.binding, self.uia, self.grid, mode='first', column='Reference'),
+                          target)
+        with self.assertRaisesRegex(win.BridgeError, 'result_column_unavailable'):
+            result_cell.find_row(self.binding, self.uia, self.grid, mode='first', column='Missing')
+
     def test_nested_grid_same_x_coordinate_is_not_a_match(self):
         inner = self.node(self.row, 50008, 'Other table', 0, 240)
         inner_row = self.node(inner, 50007, 'row', 0, 240)

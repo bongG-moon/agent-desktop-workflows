@@ -204,7 +204,7 @@ class CompilationTests(unittest.TestCase):
         raw = dict(action='manual', target={'kind':'manual'}, recognition={'reason':'double_click_needs_review'})
         draft = tasks.instructed_step(raw, tasks.compile_instruction(raw, sentence))
         self.assertEqual(draft['action'], 'double-click-result')
-        self.assertEqual(draft['result_row'], 'single')
+        self.assertEqual(draft['result_row'], 'recorded')
         self.assertFalse(tasks.has_groundable_draft(draft))
         marker = visual.from_frame(VisualTargets.window, image((35,42)), (235,162))
         hinted = dict(raw, visual_hint=marker)
@@ -219,13 +219,13 @@ class CompilationTests(unittest.TestCase):
                              command_name='VIEW', expand=False), draft]
         envelope = plans.compile_plan(src)['envelope']
         self.assertEqual([row['action'] for row in envelope['recipe']['steps']], ['invoke','double-click-result'])
-        self.assertEqual(envelope['recipe']['steps'][1]['result_row'], 'single')
+        self.assertEqual(envelope['recipe']['steps'][1]['result_row'], 'recorded')
         self.assertNotIn('visual', str(envelope['recipe']))
         self.assertEqual(envelope['notes'][0]['diagnostic'], 'open_current_result')
         first = tasks.compile_instruction(raw, '조회 결과의 첫 행을 더블클릭해줘')
         self.assertEqual(first['result_row'], 'first')
         twice = tasks.compile_instruction(raw, '결과 행을 두 번 눌러 상세 창을 열어줘')
-        self.assertEqual(twice['result_row'], 'single')
+        self.assertEqual(twice['result_row'], 'recorded')
         for caption in ('Delete', 'Apply'):
             src['steps'][0]['command_name'] = caption
             # The preceding command is recorded; current-row readiness is

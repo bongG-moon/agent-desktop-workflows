@@ -16,9 +16,11 @@ import review_drafts
 
 def host_summary(report):
     """Render a trial for the host without changing its durable recovery receipt."""
+    from recording_followup import compact_preparation
+
     def continuation_options(receipt):
         result = dict(receipt)
-        for field in ('args', 'retry_args', 'frame_args', 'resume_args'):
+        for field in ('args', 'retry_args', 'frame_args', 'resume_args', 'local_resume_args'):
             args = receipt.get(field)
             if (isinstance(args, list) and args and args[0] in (
                     'try-recording', 'inspect-trial', 'resume-trial', 'inspect-menu-trial', 'resume-menu-trial')
@@ -26,7 +28,7 @@ def host_summary(report):
                 result[field] = [*args, '--summary']
         return result
 
-    result = continuation_options(report)
+    result = continuation_options(compact_preparation(report))
     for field in ('result_inspection', 'menu_repair', 'input_pause'):
         if isinstance(report.get(field), dict):
             result[field] = continuation_options(report[field])
@@ -89,6 +91,19 @@ def _previous(path):
                 this_call_dispatched_input=False)
 
 
+def _write_receipt(path, result):
+    tasks._deny_redirect(path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False, mode='w', encoding='utf8') as stream:
+            tmp = stream.name
+            json.dump(result, stream, ensure_ascii=False, allow_nan=False)
+        os.replace(tmp, path)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def _inspection(app, receipt_id):
     if not re.fullmatch(r'[0-9a-f]{64}', receipt_id):
         raise tasks.TaskError('invalid_first_trial_receipt')
@@ -140,15 +155,7 @@ def inspect_result(app, receipt_id):
         # Bind the host's later point to this exact table/frame, never an old marker.
         report.pop('previous_trial', None)
         report.pop('this_call_dispatched_input', None)
-        tmp = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=directory, mode='w', encoding='utf8', delete=False) as stream:
-                tmp = stream.name
-                json.dump(report, stream, ensure_ascii=False, allow_nan=False)
-            os.replace(tmp, directory / (receipt_id + '.json'))
-        finally:
-            if tmp and os.path.exists(tmp):
-                os.unlink(tmp)
+        _write_receipt(directory / (receipt_id + '.json'), report)
     result = dict(status='observed', diagnostic='current_result_window_captured', input_dispatched=False,
                 source_step=inspection['source_step'], column=inspection.get('column'),
                 window=identity['title'], frame=token, image=str(path), width=rect[2], height=rect[3],
@@ -159,7 +166,8 @@ def inspect_result(app, receipt_id):
         result['resume_args'] = ['resume-trial','--receipt',receipt_id,'--frame',token]
         if inspection.get('result_row'):
             result.update(result_row=inspection['result_row'], table_box=geometry['table_box'],
-                          row_confirmation='confirm_current_visible_rows_in_this_frame')
+                          row_confirmation=('select_demonstrated_position' if inspection['result_row'] == 'recorded'
+                                            else 'confirm_current_visible_rows_in_this_frame'))
             result['resume_args'] += ['--row-policy', inspection['result_row']]
         else:
             result['resume_args'] += ['--column',inspection['column'],'--value','<observed exact cell text>']
@@ -177,7 +185,6 @@ def _once(directory, key, callback):
             pass
     except FileExistsError:
         return _previous(path)
-    tmp = None
     try:
         result = callback()
     except Exception:
@@ -187,15 +194,9 @@ def _once(directory, key, callback):
         return result
     # A process crash or interrupted write leaves the original reservation intact.
     try:
-        with tempfile.NamedTemporaryFile(dir=folder, delete=False, mode='w', encoding='utf-8') as file:
-            tmp = file.name
-            json.dump(result, file, ensure_ascii=False, allow_nan=False)
-        os.replace(tmp, path)
+        _write_receipt(path, result)
     except (ValueError, OSError):
         result['receipt_diagnostic'] = 'first_trial_receipt_unavailable'
-    finally:
-        if tmp and os.path.exists(tmp):
-            os.unlink(tmp)
     return result
 
 
@@ -221,8 +222,8 @@ def run(app, args):
                 for field in ('hwnd', 'trial_id'):
                     if getattr(args, field) is not None:
                         retry += ['--' + field.replace('_', '-'), str(getattr(args, field))]
-                for flag in ('allow_physical', 'background_only', 'auto_repair_frame'):
-                    if getattr(args, flag):
+                for flag in ('allow_physical', 'background_only', 'auto_repair_frame', 'local_result_review'):
+                    if getattr(args, flag, False):
                         retry.append('--' + flag.replace('_', '-'))
                 pending = dict(event, host_action='continue_same_trial', retry_args=retry)
                 pending.pop('status_args', None)
@@ -260,7 +261,16 @@ def run(app, args):
         saved = {}
     plan = _compiled(doc, directory)
     source_steps = None
+    cold = False
     if not plan.get('envelope'):
+        if not saved:
+            # One pointer per recording, independent of values/consent supplied on retry.
+            handoffs = tasks._directory(folder / 'preparations')
+            pointer = handoffs / (recovery._fingerprint(name.casefold())[:32] + '.json')
+            scope = [source_key, revision, args.hwnd, args.trial_id]
+            pending = _previous(pointer) if pointer.exists() else {}
+            if pending.get('status') == 'prepared' and pending.get('scope') == scope:
+                saved = pending
         if not saved:
             # A cold trial can prepare once. Use the exact saved evidence if the
             # recorder already did that work, including an unresolved binding.
@@ -268,6 +278,7 @@ def run(app, args):
             if not args.background_only:
                 argv.append('--restore-window')
             saved = app.worker_receipt(argv, mutating=False, may_queue=not args.background_only)
+            cold = True
         if saved.get('host_action') != 'use_prepared_task':
             return saved
         if saved.get('source_fingerprint') != source_key:
@@ -288,6 +299,11 @@ def run(app, args):
     profile = input_policy.profile(recipe['steps'])
     if args.background_only and not profile['background_eligible']:
         return input_policy.blocked(profile)
+    if cold and (missing or profile['physical_input_required'] and not args.allow_physical):
+        handoffs.mkdir(parents=True, exist_ok=True)
+        _write_receipt(pointer, dict(status='prepared', scope=scope, host_action='use_prepared_task',
+            source_fingerprint=source_key, task={'name': name}, source_steps=source_steps,
+            execution_plan={'source_fingerprint': envelope['source_fingerprint']}))
     if profile['physical_input_required'] and not args.allow_physical:
         return dict(status='needs_consent', diagnostic='first_trial_physical_input_required', required_option='--allow-physical',
                     missing_parameters=missing, input_requirements=profile, input_dispatched=False)
@@ -365,6 +381,10 @@ def run(app, args):
                     if result_trial.supported(recipe, number):
                         report['result_inspection'].update(resume_supported=True, recipe_hash=recovery._fingerprint(recipe),
                             source_hash=source_key, source_task=doc['name'])
+                        if step['result_row'] == 'recorded':
+                            report['host_action'] = 'confirm_result_locally_without_replaying'
+                            report['result_inspection']['local_resume_args'] = [
+                                'resume-trial', '--receipt', key, '--local-result-review', '--allow-physical', '--summary']
                 else:
                     report['host_action'] = 'report_unmatched_result'
         elif report.get('status') in ('verified', 'completed_unverified'):

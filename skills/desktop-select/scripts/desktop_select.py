@@ -785,6 +785,14 @@ def edit_recording(owner, storage, *, report_ready=False):
             # The task is already on disk. Keep its receipt if deriving the plan fails.
             result['execution_plan'] = dict(status='unavailable',
                                             diagnostic=getattr(error, 'code', 'execution_plan_unavailable'))
+    if (result.get('status') == 'recorded' and
+            (result.get('draft') or result.get('execution_plan', {}).get('status') != 'saved')):
+        # Saving ends the demonstration. Only a requested trial needs to inspect
+        # anything the captured evidence could not resolve.
+        result.update(host_action='test_saved_recording', first_trial_args=[
+            'try-recording', '--task', storage.name, '--summary'])
+        result.pop('recover_args', None)
+        result.pop('resume_args', None)
     return result
 
 
@@ -811,10 +819,10 @@ def record_application(hint, name=None):
     # including whitespace. A stale HWND must not bind to a replacement app.
     owner = bridge.Binding(row)
     name = name or f"녹화 {datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}"
-    return record_editor(owner, name, row['exe_name'], row['title'], report_ready=True, report_progress=True)
+    return record_editor(owner, name, row['exe_name'], row['title'], report_ready=True)
 
 
-def record_editor(owner, name, exe, title, *, report_ready=False, report_progress=False):
+def record_editor(owner, name, exe, title, *, report_ready=False):
     try:
         storage = review_drafts.ReviewStorage(name, exe, title, task_directory())
     except tasks.TaskError as error:
@@ -826,14 +834,7 @@ def record_editor(owner, name, exe, title, *, report_ready=False, report_progres
                     host_action='continue_recording_from_saved_task',
                     continue_args=['continue-recording', '--task', name], input_dispatched=False)
     guard(owner, owner, title)
-    result = edit_recording(owner, storage, report_ready=report_ready)
-    if result.get('status') == 'recorded' and (result.get('draft') or
-            result.get('execution_plan', {}).get('status') == 'not_compatible'):
-        if report_progress:
-            print(json.dumps(dict(status='recorder_processing', task=name, saved=True,
-                                  input_dispatched=False)), flush=True)
-        return attach_recovery(result, name, prepare=True)
-    return result
+    return edit_recording(owner, storage, report_ready=report_ready)
 
 
 def attach_recovery(result, name, *, prepare=False):
@@ -848,7 +849,7 @@ def attach_recovery(result, name, *, prepare=False):
                 info = execution_plan_info(local)
                 ready = dict(result, preparation='ready', effective_task=name,
                              next_action=dict(kind='run_prepared_recording', script=str(Path(__file__).absolute()),
-                                 args=['try-recording', '--task', name], required_parameters=info['required_parameters'],
+                                 args=['try-recording', '--task', name, '--summary'], required_parameters=info['required_parameters'],
                                  physical_input_required=info['physical_input_required']),
                              host_action='test_saved_recording')
                 ready.pop('recover_args', None)
@@ -919,12 +920,25 @@ def recorder_request(path):
 def run(args):
     if args.command == 'try-recording':
         import first_trial
-        return first_trial.run(sys.modules[__name__], args)
+        app = sys.modules[__name__]
+        result = first_trial.run(app, args)
+        if (getattr(args, 'local_result_review', False) and args.allow_physical
+                and result.get('result_inspection', {}).get('local_resume_args')
+                and result.get('host_action') == 'confirm_result_locally_without_replaying'):
+            import result_trial
+            return result_trial.review_locally(app, result['trial_receipt'], True)
+        return result
     if args.command == 'inspect-trial':
         import first_trial
         return first_trial.inspect_result(sys.modules[__name__], args.receipt)
     if args.command == 'resume-trial':
         import result_trial
+        if getattr(args, 'local_result_review', False):
+            if any(v is not None for v in (args.point, args.column, args.value, args.row_policy)):
+                raise SelectionError('invalid_result_review_options')
+            return result_trial.review_locally(sys.modules[__name__], args.receipt, args.allow_physical)
+        if args.point is None:
+            raise SelectionError('result_point_required')
         return result_trial.resume(sys.modules[__name__], args)
     if args.command in ('inspect-menu-trial', 'resume-menu-trial'):
         import trial_menu
@@ -975,11 +989,7 @@ def run(args):
                 guard(owner, owner, doc['window'])
         else:
             storage = review_drafts.ReviewStorage(args.task, doc['exe'], doc['window'], directory, existing=doc)
-        result = edit_recording(owner, storage, report_ready=getattr(args, 'report_ready', False))
-        if result.get('status') == 'recorded' and (result.get('draft') or
-                result.get('execution_plan', {}).get('status') == 'not_compatible'):
-            return attach_recovery(result, storage.name, prepare=True)
-        return result
+        return edit_recording(owner, storage, report_ready=getattr(args, 'report_ready', False))
     bridge.set_dpi_awareness()
     if args.command == 'continue-recording':
         import continue_recording
@@ -1222,6 +1232,7 @@ def parser():
     start.add_argument('--request', type=Path, help='UTF-8 JSON file for record, review or continue-recording (streaming)')
     host.add_argument('--task', help='optional name for a new recording; defaults to a new timestamped name')
     host.add_argument('--wait', type=float, help='with --session, wait up to 30 seconds only for startup or saved-draft processing')
+    host.add_argument('--summary', action='store_true', help='return the recording status and its next action')
     trial = commands.add_parser('try-recording', help='test the saved recording once, without registering a skill')
     source = trial.add_mutually_exclusive_group(required=True)
     source.add_argument('--session', help='recorder session from this project')
@@ -1234,15 +1245,18 @@ def parser():
     trial.add_argument('--trial-id', help='reuse the same ID on interruption; use a new ID for a deliberate repeat')
     trial.add_argument('--auto-repair-frame', action='store_true',
                        help='include an approved local menu-area image only after a before-click position failure')
+    trial.add_argument('--local-result-review', action='store_true', help='pick a missing recorded row position on this PC and continue the same trial')
     inspection = commands.add_parser('inspect-trial', help='capture the still-open result window from a paused trial without sending input')
     inspection.add_argument('--receipt', required=True)
     resume = commands.add_parser('resume-trial', help='continue from a unique result cell confirmed in a scoped trial image')
     resume.add_argument('--receipt', required=True)
-    resume.add_argument('--frame', required=True)
+    selection = resume.add_mutually_exclusive_group(required=True)
+    selection.add_argument('--frame')
+    selection.add_argument('--local-result-review', action='store_true')
     resume.add_argument('--column')
     resume.add_argument('--value')
-    resume.add_argument('--row-policy', choices=('single', 'first'), help='confirm visible rows without a value comparison')
-    resume.add_argument('--point', type=int, nargs=2, required=True)
+    resume.add_argument('--row-policy', choices=('single', 'first', 'recorded'), help='confirm visible rows without a value comparison')
+    resume.add_argument('--point', type=int, nargs=2)
     resume.add_argument('--allow-physical', action='store_true')
     trial_commands = [trial, inspection, resume]
     for verb in ('inspect-menu-trial', 'resume-menu-trial'):
@@ -1255,7 +1269,7 @@ def parser():
             menu_trial.add_argument('--frame')
             menu_trial.add_argument('--point', type=int, nargs=2)
     for command in trial_commands:
-        command.add_argument('--summary', action='store_true', help='return a compact completed trial receipt')
+        command.add_argument('--summary', action='store_true', help='return the trial result or a compact preparation diagnostic')
     commands.add_parser('storage', help='show the project recording and execution-plan directories without creating them')
     commands.add_parser('tasks', help='list local named demonstrations')
     commands.add_parser('show', help='inspect saved steps and notes').add_argument('--task', required=True)

@@ -158,6 +158,27 @@ class FirstTrial(unittest.TestCase):
             self.assertEqual(self.trial('--session','a'*32),blocked)
         self.worker.assert_not_called()
 
+    def test_summary_reads_only_the_blocker_from_the_session_and_keeps_the_full_receipt(self):
+        raw = dict(id='step', action='manual', label='Action',
+                   target={'kind':'manual'}, recognition={'reason':'capture_target_unavailable'})
+        rows = [dict(step=raw, form=dict(alias='', text='Review intent', mode=None, argument=''))]
+        review_drafts.ReviewStorage('초안', 'Demo.exe', 'Main', self.directory).save_draft(rows, 'invalid_step_instruction', 1)
+        doc = tasks.read_document('초안', self.directory)
+        blocked = dict(status='needs_grounding', diagnostic='instruction_requires_structure', input_dispatched=False,
+                       source_task='초안', source_fingerprint=recovery._fingerprint(doc), step_number=1,
+                       steps=[dict(number=1, action='manual', text='Review intent', window='Main', scope_index=0)],
+                       live_scopes=[dict(targets=[dict(role='button', name='Unrelated') for _ in range(104)])],
+                       bindings_template={'steps':[]})
+        event = dict(status='recorded', task={'name':'초안'}, live_recovery=blocked)
+        with patch('recorder_launch.status', return_value=event):
+            short = self.host_receipt('try-recording', '--session', 'a'*32, '--summary')
+            full = self.host_receipt('try-recording', '--session', 'a'*32)
+        self.worker.assert_not_called()
+        self.assertNotIn('Unrelated', json.dumps(short))
+        self.assertEqual(short['step_number'], 1)
+        self.assertEqual(short['next_action']['kind'], 'review_unresolved_instruction')
+        self.assertEqual(len(full['live_scopes'][0]['targets']), 104)
+
     def test_processing_timeout_keeps_the_entire_trial_request(self):
         argv = ['--session','a'*32,'--set','Region=North','--trial-id','explicit-2',
                 '--hwnd','42','--auto-repair-frame','--allow-physical']
@@ -191,6 +212,51 @@ class FirstTrial(unittest.TestCase):
         with patch('input_policy._interactive_desktop', return_value=True):
             self.trial(*base, '--set', 'Region=North', consent['required_option'])
         self.worker.assert_called_once()
+
+    def test_deferred_session_prepares_once_across_consent_value_and_delivery(self):
+        name = '새 녹화'
+        rows = [dict(step=dict(id=str(i), label='step', action='manual', target={'kind': 'manual'},
+                               recognition={'reason': 'capture_target_unavailable'}),
+                     form=dict(alias='', text=label, mode=None, argument=''))
+                for i, label in enumerate(('Region 입력', '조회', '결과 열기'))]
+        review_drafts.ReviewStorage(name, 'A.exe', self.task['window'], self.directory).save_draft(
+            rows, 'invalid_step_instruction', 1)
+        source = tasks.read_document(name, self.directory)
+        digest = recovery._fingerprint(source)
+        prepared = dict(self.task, name=f'{name} - {digest[:12]}', steps=[*self.task['steps'],
+            dict(action='double-click-result', result_row='first', label='Open result',
+                 selector=dict(role='table', automation_id='results'))])
+        tasks.save_task(prepared, self.directory)
+        prepared_receipt = dict(status='recorded', host_action='use_prepared_task', task={'name': prepared['name']},
+            source_fingerprint=digest, source_steps={'1': 1, '2': 2, '3': 3},
+            execution_plan=dict(source_fingerprint=first_trial.recorded_plan.fingerprint(prepared)),
+            live_scopes=[{'private': 'do-not-store-live-evidence'}])
+        self.worker.side_effect = [prepared_receipt, dict(status='uncertain', input_dispatched=None, steps=[])]
+        session = ['--session', 'a' * 32]
+        with (patch('recorder_launch.status', return_value=dict(status='recorded', task={'name': name})),
+              patch('input_policy._interactive_desktop', return_value=True)):
+            self.assertEqual(self.trial(*session)['status'], 'needs_consent')
+            self.assertEqual(self.trial(*session, '--allow-physical')['missing_parameters'], ['Region'])
+            prepared_path = self.directory / (prepared['name'] + '.json')
+            original_bytes = prepared_path.read_bytes()
+            modified = json.loads(original_bytes)
+            modified['steps'][-1]['selector']['automation_id'] = 'different-table'
+            prepared_path.write_text(json.dumps(modified), encoding='utf8')
+            with self.assertRaisesRegex(tasks.TaskError, 'prepared_recording_changed'):
+                self.trial(*session, '--allow-physical', '--set', 'Region=private-test-value')
+            prepared_path.write_bytes(original_bytes)
+            dispatched = self.trial(*session, '--allow-physical', '--set', 'Region=private-test-value')
+            previous = self.trial('--task', name, '--allow-physical', '--set', 'Region=private-test-value')
+        self.assertEqual([call.args[0][0] for call in self.worker.call_args_list], ['_worker', '_plan'])
+        self.assertEqual(dispatched['effective_task'], prepared['name'])
+        self.assertEqual(dispatched['source_steps'], prepared_receipt['source_steps'])
+        self.assertEqual(dispatched['trial_receipt'], previous['trial_receipt'])
+        self.assertTrue(previous['previous_trial'])
+        self.assertIsNone(previous['input_dispatched'])
+        handoff, = (self.directory / 'first-trials/preparations').glob('*.json')
+        text = handoff.read_text(encoding='utf8')
+        self.assertNotIn('private-test-value', text)
+        self.assertNotIn('do-not-store-live-evidence', text)
 
     def test_interrupted_delivery_reserves_trial_and_missing_parameter_never_reserves(self):
         tasks.save_task(self.task, self.directory)

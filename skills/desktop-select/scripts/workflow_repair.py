@@ -185,6 +185,13 @@ def persist(path, original, report, load, replacements=None):
     import context_menu
     for number in changed:
         context_menu.validate_spec(menu(revised['steps'][number - 1]))
+    replace_workflow(path, original, revised, load)
+    report['menu_corrections'] = changed
+    return revised
+
+
+def replace_workflow(path, original, revised, load):
+    """Atomically replace the exact workflow that was tested under its recipe lock."""
     tasks._directory(path.parent)
     tasks._deny_redirect(path)
     temporary = None
@@ -197,11 +204,9 @@ def persist(path, original, report, load, replacements=None):
         need(load(path) == original, 'workflow_changed_during_repair')
         os.replace(temporary, path)
         need(load(path) == revised, 'workflow_changed_during_repair')
-        report['menu_corrections'] = changed
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return revised
 
 
 class RepairSession:

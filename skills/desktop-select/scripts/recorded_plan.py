@@ -153,7 +153,8 @@ def compile_plan(task, *, replacements=None):
         if context is not None and 'after_step' in context:
             context['after_step'] = recipe_numbers[context['after_step']]
         if step['action'] in (*tasks.OBSERVE_ACTIONS, 'close-popup', 'double-click-result'):
-            current = {k: deepcopy(step[k]) for k in ('action', 'label', 'selector', 'result_column', 'result_row') if k in step}
+            current = {k: deepcopy(step[k]) for k in ('action', 'label', 'selector', 'result_column',
+                                                      'result_row', 'result_point') if k in step}
             if context is not None:
                 current['window_context'] = context
             if step['action'] == 'verify-value':

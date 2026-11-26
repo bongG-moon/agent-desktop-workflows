@@ -59,8 +59,7 @@ def capture_step(step):
         from visual_target import validate_spec
         result = dict(id=step['id'], action='visual-click', label=step['label'],
                       visual=copy.deepcopy(validate_spec(step['visual'])))
-        if surface := learned_tasks.result_surface_hint(step):
-            result['result_surface'] = surface
+        result.update(learned_tasks.result_location(step))
         return result
     target = step['target']
     locator = target.get('locator', {})
@@ -105,7 +104,8 @@ def capture_step(step):
         # The click is only a hint. Preserve its containing result surface
         # without saving the clicked cell's business value or authorizing input.
         if (action in ('click', 'select', 'manual') and target.get('kind') in ('element', 'region')
-                and 'window' not in target and learned_tasks.is_recoverable(unknown)):
+                and 'window' not in target and (learned_tasks.is_recoverable(unknown)
+                or reason == 'drag_needs_review' and role in {'textfield', 'statictext', 'combobox'})):
             chain = [locator, *locator.get('ancestors', [])]
             protected = any(isinstance(node, dict) and (node.get('role') == 'password' or any(
                 node.get(key) is True for key in ('secure', 'protected', 'is_password', 'password', 'is_protected')))
@@ -701,6 +701,13 @@ class _RowHookPump(recorder.HookPump):
             self.visual_tracker.invalidate(event.get('at'))
         if event.get('kind') == 'down' and event.get('scope_proven'):
             self.last_scoped_down = event['at']
+            # The application may destroy a linked window before the worker
+            # handles this click. Pin only an already observed control here.
+            if (event.get('action') == 'click' and event.get('window') == self.binding.hwnd
+                    and getattr(self, 'command_at_press', None)):
+                command = self.command_at_press(event)
+                if command:
+                    event['command_before_close'] = command
         if event.get('kind') == 'outside' and getattr(self, 'outside_marker', None):
             # Track only the surface and timestamp of a possible first click.
             # Coordinates, captions, keys and contents from other apps are discarded.
@@ -729,6 +736,37 @@ class _Worker(recorder.CaptureWorker):
     visual_tracker = None
     menu_gesture = None
     command_snapshot = ()
+    command_hover = None
+
+    def _remember_command_hover(self):
+        """Keep plain metadata for the hook, never pass a UIA object across threads."""
+        self.command_hover = None
+        obs = self.hovered
+        if not obs or obs.get('window') != self.binding.hwnd or not obs.get('hit_window') or not obs.get('pointer'):
+            return
+        x, y = obs['pointer']
+        try:
+            obs = self._command_owner(dict(action='click', x=x, y=y), obs)
+        except (bridge.BridgeError, OSError):
+            return
+        node = obs['node']
+        if (node.get('role') == 'button' and node.get('secure') is False and node.get('enabled') is True
+                and node.get('offscreen') is False and 'Click' in node.get('available_actions', ())
+                and recorder._locator_valid(node.get('locator')) and recorder._inside(node.get('bounds'), x, y)):
+            self.command_hover = self.hover_at, obs['hit_window'], (x, y), node['bounds'], node['locator']
+
+    def command_at_press(self, event):
+        sample = self.command_hover
+        if sample is None or not event.get('scope_proven') or event.get('window') != self.binding.hwnd:
+            return None
+        at, hit, point, bounds, locator = sample
+        if (event.get('hit_window') != hit or not 0 <= event['at'] - at < 1.2
+                or max(abs(event['x']-point[0]), abs(event['y']-point[1])) > 4
+                or not recorder._inside(bounds, event['x'], event['y'])):
+            return None
+        return dict(id=uuid.uuid4().hex, action='click', label=locator.get('name') or locator.get('automation_id') or 'button',
+                    target=dict(kind='element', locator=copy.deepcopy(locator)),
+                    recognition=dict(target='identified', action='supported', result='manual'))
 
     def _cache_commands(self):
         """Keep recent button intent while an input may close its containing dialog."""
@@ -797,6 +835,8 @@ class _Worker(recorder.CaptureWorker):
         if (event.get('action') != 'click' or not event.get('scope_proven')
                 or event.get('window') != self.binding.hwnd):
             return None
+        if event.get('command_before_close'):
+            return event['command_before_close']
         for at, observation in reversed(self.hover_history):
             if not 0 <= event['at'] - at <= 1.2 or not observation:
                 continue
@@ -950,6 +990,17 @@ class _Worker(recorder.CaptureWorker):
             return observation
         if 'combo' not in observation and self.combo_for(observation) is not None:
             return observation
+        previous = self.recent_click
+        if (event.get('double') and previous and previous['token'] == event.get('previous_token')
+                and previous.get('result_location', {}).get('result_point') and previous.get('observation')):
+            # The first press already identified the table and body position.
+            # Keep the new hit for capture_double's target check on release.
+            first_hit = previous['observation']['element']
+            try:
+                if first_hit is observation['element'] or self.uia.same(first_hit, observation['element']):
+                    return observation
+            except (bridge.BridgeError, OSError):
+                pass
         # A named native selection is stronger evidence than the generic row
         # image tracker, which also sees ordinary dialog option lists as rows.
         if self._unique_list_selection(observation):
@@ -1028,7 +1079,7 @@ class _Worker(recorder.CaptureWorker):
             self.row_tracker.invalidate(event['at'])
         self.model.event_at = event.get('at')
         if event['kind'] == 'up':
-            down, _ = self.captures.get(event.get('token'), (None, None))
+            down, observation = self.captures.get(event.get('token'), (None, None))
             if down:
                 self.model.event_at = down.get('at', self.model.event_at)
                 if not event['inside'] or abs(event['x'] - down['x']) > 8 or abs(event['y'] - down['y']) > 8:
@@ -1039,12 +1090,44 @@ class _Worker(recorder.CaptureWorker):
                 return
             if event['kind'] == 'enter' and self._capture_submit(event):
                 return
+            if event['kind'] == 'up' and down and self._capture_field_drag(down, observation, event):
+                self.captures.pop(event['token'], None)
+                return
             result = super().handle(event)
             if event['kind'] == 'up' and down and self.recent_click and self.recent_click['token'] == down['token']:
                 self._remember_double_target(down)
             return result
         finally:
             self.model.event_at = None
+
+    def _capture_field_drag(self, down, observation, up):
+        """Keep an identified text-selection field as a read hint, never its contents."""
+        if (not observation or not up['inside'] or down.get('excluded') or down.get('scope_proven') is not True
+                or down.get('action') != 'click' or down.get('window') != self.binding.hwnd
+                or observation.get('window') != self.binding.hwnd
+                or max(abs(up[k] - down[k]) for k in ('x', 'y')) <= 8):
+            return False
+        node = observation['node']
+        if (node.get('secure') is not False or node.get('role') not in {'textfield', 'combobox', 'statictext'}
+                or not _capture_locator_valid(node.get('locator'))
+                or not all(recorder._inside(node.get('bounds'), event['x'], event['y']) for event in (down, up))):
+            return False
+        try:
+            self.binding.check()
+            hit = self.uia.from_point(up['x'], up['y'])
+            if (not hit or not self.uia.same(hit, observation['element']) or self.uia.secure(hit)
+                    or self.uia.pid(hit) != self.binding.pid):
+                return False
+        except (bridge.BridgeError, OSError):
+            return False
+        self.freeze_watch(down.get('at'))
+        step = manual('drag_needs_review')
+        step['target'] = dict(kind='element', locator=copy.deepcopy(node['locator']))
+        if node.get('semantic_label'):
+            step['field_label'] = node['semantic_label']
+        self.model.add(step)
+        self.recent_click = None
+        return True
 
     def _key_target(self, event):
         """Use the pre-key native focus, even when Tab has already moved it."""
@@ -1245,7 +1328,12 @@ class _Worker(recorder.CaptureWorker):
                 if time.monotonic() - min(down['at'] for down, _ in pending.values()) < 2:
                     return
                 pending.clear()
+        last_hover = self.hover_at
         super().tick()
+        if self.hovered is None:
+            self.command_hover = None
+        elif self.hover_at != last_hover and getattr(self.binding, 'is_linked_window', False) is True:
+            self._remember_command_hover()
         if (self.watched and self.watched['node'].get('role') == 'textfield'
                 and time.monotonic() - getattr(self, '_last_command_refresh', 0) >= 1):
             self._refresh_commands()
@@ -1278,6 +1366,35 @@ class _Worker(recorder.CaptureWorker):
                     return
                 self.menu_gesture = None
 
+    def _result_press_point(self, observation, down, surface):
+        node = observation['node']
+        basic = {key: value for key, value in surface.items() if key != 'ancestors'}
+        bounds = node.get('bounds')
+        if not all(node['locator'].get(key) == value for key, value in basic.items()):
+            element = observation.get('element')
+            if element is None:
+                return None
+            try:
+                for _ in range(10):
+                    element = self.uia.parent(element)
+                    if element is None or self.uia.same(element, observation['root']):
+                        return None
+                    parent_identity = self.uia.basic(element)
+                    if all(parent_identity.get(key) == value for key, value in basic.items()):
+                        bounds = self.uia.bounds(element)
+                        break
+                else:
+                    return None
+            except (bridge.BridgeError, OSError):
+                return None
+        if (isinstance(bounds, dict) and type(down.get('x')) is int and type(down.get('y')) is int
+                and recorder._inside(bounds, down['x'], down['y'])):
+            point = dict(x=down['x']-bounds['x'], y=down['y']-bounds['y'],
+                         width=bounds['width'], height=bounds['height'])
+            if learned_tasks.valid_result_point(point):
+                return point
+        return None
+
     def _remember_double_target(self, down):
         # Manual first clicks don't return an ID from the base worker. Keep the actual
         # step and pre-press sample so a paired second click only replaces that step.
@@ -1294,12 +1411,14 @@ class _Worker(recorder.CaptureWorker):
             if (first and not previous['protected'] and down.get('scope_proven') is True
                     and down.get('window') == self.binding.hwnd and obs and obs.get('window') == self.binding.hwnd
                     and obs['node'].get('secure') is False
-                    and obs['node'].get('role') in {'table', 'list', 'group', 'row', 'listitem', 'statictext', 'custom'}
-                    and (first['action'] == 'visual-click' or
-                         (first['action'] == 'manual' and learned_tasks.is_recoverable(first)))):
+                    and obs['node'].get('role') in {'table', 'list', 'group', 'row', 'listitem', 'statictext', 'custom'}):
                 surface = learned_tasks.recorded_result_surface(obs['node'].get('locator'))
                 if surface:
-                    first['target'] = dict(kind='element', locator=surface)
+                    previous['result_location'] = dict(result_surface=surface)
+                    if point := self._result_press_point(obs, down, surface):
+                        previous['result_location']['result_point'] = point
+                    if first['action'] == 'visual-click' or learned_tasks.is_recoverable(first):
+                        first['target'] = dict(kind='element', locator=surface)
         if (down.get('visual') and 'surface' not in down['visual']
                 and down.get('scope_proven') is True and down.get('window') == self.binding.hwnd
                 and not down.get('menu_pick') and not previous['protected']):
@@ -1309,7 +1428,7 @@ class _Worker(recorder.CaptureWorker):
         previous = self.recent_click or {}
         previous_id = previous.get('step_id')
         with self.model.lock:
-            surface = learned_tasks.result_surface_hint(self.model.steps.get(previous_id, {}))
+            location = previous.get('result_location') or learned_tasks.result_location(self.model.steps.get(previous_id, {}))
         result = super().capture_double(down,observation)
         if result:
             with self.model.lock:
@@ -1330,12 +1449,12 @@ class _Worker(recorder.CaptureWorker):
                     if step.get('recognition', {}).get('reason') == 'double_click_needs_review':
                         self.model.add(dict(id=previous_id, action='visual-click', label='녹화한 항목 더블클릭',
                                             visual=dict(spec, gesture='double-click')))
-            if (surface and previous_id and down.get('scope_proven') is True
+            if (location and previous_id and down.get('scope_proven') is True
                     and down.get('window') == self.binding.hwnd):
                 with self.model.lock:
                     step = self.model.steps.get(previous_id, {})
                     if learned_tasks.is_double_click_step(step):
-                        step['result_surface'] = surface
+                        step.update(location)
         return result
 
     def _drop_watch(self):
@@ -1733,6 +1852,8 @@ class CaptureSession:
         if self.started or self.ended:
             raise bridge.BridgeError('recording_already_started')
         self.binding.check()
+        if getattr(self.binding, 'is_linked_window', False) is True:
+            self.pump.command_at_press = self.worker.command_at_press
         self.worker.start()
         try:
             if not self.worker.ready.wait(3) or self.worker.error:
@@ -1767,7 +1888,14 @@ class CaptureSession:
                         and not bridge.user32.IsWindow(self.binding.hwnd)):
                     with self.notes.lock:
                         if getattr(self.pump, 'last_scoped_down', 0) > max(self.notes.times.values(), default=0):
-                            self.notes.manual('', 'capture_target_unavailable')
+                            press = getattr(self.pump, 'last_click', None) or {}
+                            # last_click is set by the hook only after the
+                            # matching release inside its capture scope.
+                            if (press.get('at') == self.pump.last_scoped_down and press.get('command_before_close')
+                                    and not press.get('double')):
+                                self.notes.add(press['command_before_close'])
+                            else:
+                                self.notes.manual('', 'capture_target_unavailable')
                         self.notes.closed = True
                         self.notes.set_state('closed')
                     self.rows.stop()

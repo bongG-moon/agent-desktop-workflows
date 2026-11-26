@@ -479,17 +479,20 @@ def find(binding, uia, root_element, expected, *, column=None, column_hint=None,
     return matches[0]
 
 
-def find_row(binding, uia, table, *, mode='single'):
+def find_row(binding, uia, table, *, mode='single', column=None):
     """Read an actual current row without comparing text to the recording.
 
     A Grid provider establishes logical row zero. Otherwise select the single
     uppermost visible row of this exact table; a bare drawing is not a row.
     """
     binding.check()
-    require(mode in ('single', 'first'), 'invalid_result_row_mode')
+    require(mode in ('single', 'first', 'recorded'), 'invalid_result_row_mode')
     window = uia.from_handle(binding.hwnd)
     lookup.ancestry(uia, table, window, pid=binding.pid)
     require(readable_surface(binding, uia, table, window), 'result_container_not_visible')
+    if bare_group(uia, table):
+        raise win.BridgeError('result_column_unavailable' if column else 'result_row_unavailable')
+    header = _column(binding, uia, table, window, column, None) if column else None
     if table.property(30030) is True:
         rows, columns = table.property(30062), table.property(30063)
         require(type(rows) is int and rows >= 0 and type(columns) is int and columns > 0,
@@ -499,21 +502,26 @@ def find_row(binding, uia, table, *, mode='single'):
         # The first column may be hidden or contain a checkbox. Keep logical
         # row zero fixed and try a bounded number of data cells, without text
         # reads, scrolling or virtual-item realization. Ordinary grids use one.
-        for column in range(min(columns, _MAX_ROW_COLUMNS)):
-            cell = next(grid_provider.column_cells(table, column, 1))
+        # A named column can be after the scan bound. Use a provider index
+        # if available, but corroborate it against the actual cell/header.
+        indices = range(min(columns, _MAX_ROW_COLUMNS))
+        if header and header.get('indexed'):
+            index = header['index']
+            require(type(index) is int and 0 <= index < columns, 'result_column_unavailable')
+            indices = (index,)
+        for index in indices:
+            cell = next(grid_provider.column_cells(table, index, 1))
             chain = lookup.ancestry(uia, cell, table, pid=binding.pid)
             require(uia.same(_surface(chain), table)
-                    and cell.property(30064) in (None, 0) and cell.property(30065) in (None, column),
+                    and cell.property(30064) in (None, 0) and cell.property(30065) in (None, index),
                     'result_grid_incomplete')
             if any(_non_data_control(e) for e in chain):
                 continue
             require(not any(e.property(30003) in _ROW and e.property(30022) is True for e in chain),
                     'result_grid_incomplete')
-            if visibility.visible(binding, uia, cell, window):
+            if visibility.visible(binding, uia, cell, window) and _in_column(uia, cell, chain, header):
                 return cell
-        raise win.BridgeError('result_row_not_visible')
-    if bare_group(uia, table):
-        raise win.BridgeError('result_row_unavailable')
+        raise win.BridgeError('result_column_unavailable' if column else 'result_row_not_visible')
     rows = []
     for row in _cells_in(uia, table, roles=('row', 'listitem')):
         chain = lookup.ancestry(uia, row, table, pid=binding.pid)
@@ -529,16 +537,34 @@ def find_row(binding, uia, table, *, mode='single'):
     require(mode != 'single' or len(rows) == 1, 'result_row_ambiguous')
     # A sole visible row is not a sole result when other row peers are offscreen.
     # Without Grid row indices their relative order is also unknown.
-    require(all(visibility.visible(binding, uia, row, window) for row in rows), 'result_row_not_visible')
+    if mode == 'recorded':
+        rows = [row for row in rows if visibility.visible(binding, uia, row, window)]
+        require(rows, 'result_row_not_visible')
+    else:
+        require(all(visibility.visible(binding, uia, row, window) for row in rows), 'result_row_not_visible')
     rows.sort(key=lambda item: (uia.bounds(item)['y'], uia.bounds(item)['x']))
     first = rows[0]
     top = uia.bounds(first)
     require(not any(uia.bounds(other)['y'] < top['y'] + top['height'] for other in rows[1:]),
             'result_row_ambiguous')
-    return first
+    if not header:
+        return first
+    # A tree provider may expose both a cell wrapper and its text child.
+    # Nested matches have one target; two sibling cells remain ambiguous.
+    candidates = []
+    for peer in [first, *_cells_in(uia, first, roles=('statictext', 'custom', 'textfield', 'listitem', 'row'))]:
+        chain = lookup.ancestry(uia, peer, table, pid=binding.pid)
+        if (any(_non_data_control(e) for e in chain) or not uia.same(_surface(chain), table)
+                or not visibility.visible(binding, uia, peer, window) or not _in_column(uia, peer, chain, header)):
+            continue
+        if any(uia.within(prior, peer) for prior in candidates):
+            continue
+        candidates = [prior for prior in candidates if not uia.within(peer, prior)] + [peer]
+    require(len(candidates) == 1, 'result_column_ambiguous' if candidates else 'result_column_unavailable')
+    return candidates[0]
 
 
-def _point_target(binding, uia, cell, point):
+def _point_target(binding, uia, cell, point, *, body=False):
     native = win.window_from_point(*point)
     require(native and win.root_window(native) == binding.hwnd and win.hwnd_pid(native) == binding.pid,
             'result_cell_occluded')
@@ -546,6 +572,15 @@ def _point_target(binding, uia, cell, point):
     chain = lookup.ancestry(uia, hit, cell, pid=binding.pid)
     require(all(not _non_data_control(e) and e.property(30022) is not True for e in chain),
             'result_cell_occluded')
+    if body:
+        data_roles = {50006, 50007, 50008, 50020, 50025, 50026, 50028, 50029, 50033, 50036}
+        require(all(e.property(30003) in data_roles and e.property(30010) is True
+                    and e.property(30149) is not True and (e.property(30043) is not True or e.property(30046) is True)
+                    for e in chain) and uia.same(_surface(chain), cell), 'result_point_not_data')
+        if not any(e.property(30003) in _ROW or e.property(30029) is True for e in chain):
+            # Only a demonstrated point may stand in for a row on a painted
+            # surface. A provider that exposes rows must actually hit one.
+            require(uia.same(hit, cell) and bare_group(uia, cell), 'result_point_not_data')
     return native
 
 
@@ -556,13 +591,44 @@ def execute(binding, uia, root_element, expected, guard, *, column=None, column_
                     'current_result_value')
 
 
-def execute_row(binding, uia, table, guard, *, mode='single'):
-    """Open the requested current first row with the same final point checks."""
-    return _execute(binding, uia, guard, lambda: find_row(binding, uia, table, mode=mode),
-                    'current_first_result' if mode == 'first' else 'current_single_result')
+def body_point(box, screen_point):
+    """Keep a gesture relative to the surface origin, not to a transient screen/window."""
+    from learned_tasks import valid_result_point
+    require(visibility.valid(box), 'result_point_outside_table')
+    point = dict(x=screen_point[0] - box['x'], y=screen_point[1] - box['y'],
+                 width=box['width'], height=box['height'])
+    require(valid_result_point(point), 'result_point_outside_table')
+    return point
 
 
-def _execute(binding, uia, guard, find_current, resolution):
+def position_in_body(binding, uia, table, anchor):
+    """Keep the demonstrated offset when the panel moves or resizes; never stretch it to a new row."""
+    root = uia.from_handle(binding.hwnd)
+    lookup.ancestry(uia, table, root, pid=binding.pid)
+    require(not uia.same(table, root) and table.property(30010) is True
+            and readable_surface(binding, uia, table, root), 'result_container_not_visible')
+    if table.property(30030) is True:
+        count = table.property(30062)
+        require(type(count) is int and count >= 0, 'result_grid_incomplete')
+        require(count > 0, 'result_row_missing')
+    box = uia.bounds(table)
+    require(0 <= anchor['x'] < box['width'] and 0 <= anchor['y'] < box['height'], 'result_row_unavailable')
+    point = (box['x'] + anchor['x'], box['y'] + anchor['y'])
+    from row_vision import _window_rect
+    x, y, width, height = _window_rect(binding)
+    require(x <= point[0] < x + width and y <= point[1] < y + height, 'result_row_unavailable')
+    return point
+
+
+def execute_row(binding, uia, table, guard, *, mode='single', point=None, column=None):
+    if point is not None:
+        require(mode == 'recorded' and column is None, 'invalid_result_row')
+        return _execute(binding, uia, guard, lambda: table, 'recorded_result_position', anchor=point)
+    resolution = 'current_single_result' if mode == 'single' else 'current_first_result'
+    return _execute(binding, uia, guard, lambda: find_row(binding, uia, table, mode=mode, column=column), resolution)
+
+
+def _execute(binding, uia, guard, find_current, resolution, *, anchor=None):
     with coordination.desktop_input():
         guard()
         row_action.foreground(binding)
@@ -570,22 +636,28 @@ def _execute(binding, uia, guard, find_current, resolution):
         tick = row_action._input_tick()
         cell = find_current()
         root = uia.from_handle(binding.hwnd)
-        require(visibility.visible(binding, uia, cell, root), 'result_cell_not_clickable')
         box = uia.bounds(cell)
-        point = (int(box['x'] + box['width'] / 2), int(box['y'] + box['height'] / 2))
-        native_hit = _point_target(binding, uia, cell, point)
+        if anchor is None:
+            require(visibility.visible(binding, uia, cell, root), 'result_cell_not_clickable')
+            point = (int(box['x'] + box['width'] / 2), int(box['y'] + box['height'] / 2))
+        else:
+            point = position_in_body(binding, uia, cell, anchor)
+        native_hit = _point_target(binding, uia, cell, point, body=anchor is not None)
         guard()
         win._combo_surface(binding)
         # Refresh the column, uniqueness and UIA hit after the final guard. Virtualized
         # rows and in-grid overlays can change without changing the native window.
         current = find_current()
-        require(uia.same(current, cell) and uia.bounds(current) == box and visibility.visible(binding, uia, current, root)
-                and current.property(30010) is True,
+        require(uia.same(current, cell) and uia.bounds(current) == box and current.property(30010) is True,
                 'result_cell_changed')
+        if anchor is None:
+            require(visibility.visible(binding, uia, current, root), 'result_cell_changed')
+        else:
+            require(position_in_body(binding, uia, current, anchor) == point, 'result_cell_changed')
         chain = lookup.ancestry(uia, current, root, pid=binding.pid)
         require(not any(peer.property(30003) in _ROW and peer.property(30022) is True for peer in chain),
                 'result_cell_not_clickable')
-        require(_point_target(binding, uia, current, point) == native_hit
+        require(_point_target(binding, uia, current, point, body=anchor is not None) == native_hit
                 and win.root_window(win.foreground()) == binding.hwnd, 'result_cell_changed')
         require(row_action._input_tick() == tick, 'foreground_or_input_changed')
         try:

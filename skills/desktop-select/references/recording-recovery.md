@@ -10,17 +10,19 @@
 
 ## 저장 영수증에 미확정 대상이 있을 때
 
-저장 후 첫 시험은 `try-recording --summary --session <세션 번호>` 또는 `try-recording --summary --task "<작업명>"`에서 시작한다. 사용자에게 받은 변수는 같은 호출에 넘긴다. 시험이 끝나면 `observations`에서 녹화 단계별로 읽은 값을 확인한다. 값 비교를 요청한 경우에만 지정한 열의 현재 셀을 이번 입력값과 비교한다. `report_unmatched_result`이면 불일치나 중복 등 실제 판정 사유를 보고한다.
+미확정 단계도 시연 내용과 함께 바로 저장한다. 첫 시험 요청에는 같은 세션의 `first_trial_args`에 이번 변수와 허용 옵션을 붙인다. 실행기는 저장한 정보로 준비하고, 부족한 단계가 있을 때 현재 창을 관찰한다. 작업명만 있으면 `try-recording --summary --task "<작업명>"`을 쓴다. 준비가 막히면 시험 응답의 단계와 `next_action`을 따르고, 시험이 끝나면 `observations`에서 읽은 값을 확인한다.
 
-`inspect_current_result_without_replaying`이면 캡처가 허용된 경우에만 `result_inspection.args`로 방금 조회한 창을 확인한다. 값 비교 방식에서는 요청한 열에 정확히 한 건이 보이고 `resume_args`가 있으면 해당 글자와 이미지 좌표를 넣어 후속 단계부터 이어간다. `--row-policy`가 있는 현재 행 방식은 글자 입력 없이 확인한 행 좌표로 이어간다. `single`은 한 행인 경우만, `first`는 사용자가 첫 행을 지정한 경우만 사용한다. 현재 행의 존재를 확인한 것은 조회 최신성이나 값 일치를 확인한 것이 아니다.
+일반 결과 행의 시연 위치가 필요하고 PC 화면 확인과 실제 입력을 허용받았다면 첫 시험에 `--local-result-review --allow-physical`을 붙인다. 이미 조회를 보냈다면 `result_inspection.local_resume_args`가 있을 때 그 인자로 같은 시험을 재개한다. 사용자가 PC에서 행을 지정하고 보정이 저장되면 `effective_task`로 등록한다.
+
+값이나 행 수 확인을 요청한 경우에는 해당 조건을 유지한다. 캡처가 허용됐으면 `result_inspection.args`로 이번 표를 확인하고, 응답의 `resume_args`에 필요한 근거를 넣는다. 값 비교 단계는 지정한 열의 정확한 한 건, `--row-policy single`은 한 행, `--row-policy first`는 첫 행이 확인돼야 한다. `report_unmatched_result`이면 불일치나 중복 등 실제 사유를 보고한다.
 
 `image_unchanged=true`이면 같은 이미지 해시를 이미 검토했는지 확인하고, 이미 봤다면 다시 읽지 않는다. 엔진은 현재 화면을 계속 검증하므로 이전 사진만 믿고 입력하는 방식은 아니다. 새 캡처나 재개를 위해 같은 조회를 반복하지 않는다.
 
-이전 녹화에 `double_click_needs_review`가 남아 있고 조회 결과가 이미 보이면 해당 단계부터 이어간다. 영수증의 `ground_args` 또는 `ground --task <원본> --only <단계>`로 현재 창을 확인하고, 요청한 행이나 항목을 식별한 뒤 `bind_args`에 그 이미지의 지점을 넣어 실행용 사본을 만든다. `test_step_args`는 사본에서 보정한 동작 하나를 시험한다. 같은 모양의 행이 여러 개이고 어느 행인지 설명과 화면만으로 구별할 수 없으면 행 이름이나 식별값을 묻는다. [더블클릭과 상세 창](rows-and-windows.md#더블클릭으로-상세-창을-열-때)
+이미지 보정이 필요한 더블클릭 단계에 `ground_args`가 있으면 그 창만 확인하고 `bind_args`에 확인한 지점을 넣는다. `test_step_args`는 보정한 동작만 시험한다. 어느 대상을 눌러야 할지 구별할 수 없으면 그 단계만 묻는다. [더블클릭과 상세 창](rows-and-windows.md#더블클릭으로-상세-창을-열-때)
 
 필드와 값은 각 단계의 설명 및 현재 창에서 식별한다. 특정 앱에서 사용했던 필드 이름이나 메뉴 경로를 다른 업무에 가져오지 않는다. 문장에 예시 값과 “실행 전에 값을 물어봐줘”가 함께 있으면 그 필드를 실행 때 받을 변수로 연결한다. 이번 실행값을 주지 않았을 때만 묻는다. `menu_binding_hint`와 `menu_preview.point_observed=true`가 함께 있으면 해당 메뉴 연결에는 힌트의 원래 키와 녹화 위치를 사용한다. 바인딩 JSON에는 단계 요약이나 화면 관찰 결과를 통째로 복사하지 않는다. 같은 단계에서 형식 오류가 반복되면 응답의 `unsupported_fields`와 `menu_binding_hint`로 해당 바인딩만 고친다.
 
-- `next_action.kind=bind_existing_observation`이면 먼저 이번 영수증의 `next_action.evidence`가 가리키는 `live_scopes`, 단계 원문과 `bindings_template`을 사용한다. 현재 창에서 식별한 라벨, ID, 역할, 소유 관계를 연결하고 `source_fingerprint`, 고정값, 필수 변수를 보존한다. 반환된 `script`, `args`에 `--bindings <JSON> --save-as "<실행용 사본>"`을 붙인다. 기록한 지시대로 값, Enter, 목록 선택과 새 대화상자를 유지하고, 대화상자는 여는 단계 뒤에 소유 관계를 확인한다. 기존 증거가 부족한 단계만 새 화면을 읽는다. [바인딩 예시](../사용가이드.md#자동-준비에-남은-단계가-있을-때)
+- `bind_existing_observation`이면 이번 영수증의 `bindings_template`과 미해결 단계의 원문을 사용한다. `source_fingerprint`, 고정값과 필수 변수를 유지해 안내된 `--bindings`와 `--save-as`로 연결한다. `review_unresolved_instruction`이면 반환된 단계에서 빠진 내용만 확인한다. [바인딩 예시](../사용가이드.md#자동-준비에-남은-단계가-있을-때)
 - `next_action.kind=continue_preparation`은 준비를 중단했던 상태다. 예를 들어 최소화한 창을 복원하도록 허용받았으면 같은 영수증의 재개 인자를 사용한다. 이전 초안에 준비 결과가 없으면 `desktop_select.py recover --task "<원본>" --prepare`를 사용하고, 창 복원이 허용된 경우에만 `--restore-window`를 붙인다.
 - 실제 앱에서 확인한 유일한 대상만 조작한다. 사용자가 특정 행이나 셀을 지정한 경우 그 대상이 식별될 때만 우클릭 위치를 보정한다. 이미 입력이 전달됐으면 같은 조회나 메뉴를 재실행하기 전에 현재 열린 창과 산출물을 확인한다. [우클릭 위치 보정](../사용가이드.md#첫-시험에서-우클릭-위치를-보정할-때)
 
@@ -41,7 +43,7 @@
 }
 ```
 
-`read-value`는 값을 읽고, `double-click-result`는 명시한 `single` 또는 `first` 정책으로 현재 행을 열며, `close-popup`은 기록된 후속 창의 닫힘까지 확인한다. 이 예의 ID와 순서를 다른 업무에 그대로 넣지 않는다. 값 입력과 변수는 기존 `fixed|required`, 일반 버튼은 `recorded`, 조건 분기는 기존 `interpret` 형식을 사용한다.
+위 예시의 `single`은 결과가 한 행일 때만 연다. `read-value`는 상세 값을 읽고, `close-popup`은 그 창의 닫힘을 확인한다. 사용자 지시에 맞는 동작과 해당 앱에서 확인된 ID를 사용한다. 값 입력과 변수는 `fixed|required`, 일반 버튼은 `recorded`, 조건 분기는 `interpret` 형식을 사용한다.
 
 아직 열리지 않은 관련 창에는 녹화의 `recorded_selector`와 같은 대상을 연결할 수 있다. 창이 열린 뒤 실제 요소를 검증하므로 보정만 하려고 앞선 업무를 먼저 실행할 필요가 없다. 녹화 단서와 다른 대상을 지정하려면 해당 창의 현재 증거가 필요하다. 여러 창 열기 후보가 남은 경우에는 녹화된 소속과 동작 순서를 확인하며, 단순히 마지막 클릭에 연결하지 않는다.
 

@@ -134,14 +134,20 @@ def validate(recipe):
         need(isinstance(step, dict), 'invalid_workflow_step')
         if step.get('action') == 'double-click-result':
             if 'result_row' in step:
-                need(set(step) <= {'action', 'label', 'result_row', 'selector'}
-                     and step['result_row'] in ('single', 'first') and text(step.get('label', 'step'), 200),
+                need(set(step) <= {'action', 'label', 'result_row', 'selector', 'result_point', 'result_column'}
+                     and step['result_row'] in ('single', 'first', 'recorded') and text(step.get('label', 'step'), 200),
                      'invalid_result_row')
                 selector = step.get('selector')
                 need(isinstance(selector, dict) and selector.get('role') in RESULT_SURFACES,
                      'result_container_required')
                 if selector != {'role': 'table'}:
                     validate_selector(selector)
+                if 'result_point' in step:
+                    need(step['result_row'] == 'recorded' and selector != {'role': 'table'}
+                         and app.tasks.valid_result_point(step['result_point']), 'invalid_result_point')
+                if 'result_column' in step:
+                    need(step['result_row'] in ('single', 'first') and text(step['result_column'], 100),
+                         'invalid_result_column')
                 continue
             previous = steps[index - 1] if index else {}
             need(set(step) <= {'action', 'label'} and text(step.get('label', 'step'), 200)
@@ -693,12 +699,18 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
         table = None
         try:
             table, selector = _result_target(binding, uia, step['selector'], retry_selector,
-                                            element_hint=bool(retry_selector))
-            result_cell.find_row(binding, uia, table, mode=step['result_row'])
+                                            column=step.get('result_column'), element_hint=bool(retry_selector))
+            if 'result_point' in step:
+                result_cell.position_in_body(binding, uia, table, step['result_point'])
+            elif 'result_column' in step:
+                result_cell.find_row(binding, uia, table, mode=step['result_row'], column=step['result_column'])
+            else:
+                result_cell.find_row(binding, uia, table, mode=step['result_row'])
         except (ValueError, app.bridge.BridgeError) as error:
             diagnostic = getattr(error, 'code', None)
             if diagnostic not in ('result_row_missing', 'result_row_unavailable', 'result_row_not_visible',
-                                  'result_row_ambiguous', 'result_table_missing', 'target_missing'):
+                                  'result_row_ambiguous', 'result_table_missing', 'target_missing',
+                                  'result_column_ambiguous', 'result_column_unavailable', 'result_column_not_found'):
                 raise
             provider_seconds += time.monotonic() - began
             remaining = deadline - time.monotonic()
@@ -721,8 +733,10 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
             provider_seconds += time.monotonic() - began
             if on_match is not None:
                 on_match(table)
-            strategy = 'uia_row_found'
-            receipt = dict(status='observed', input_dispatched=False, diagnostic='current_result_row_found',
+            anchor = 'result_point' in step
+            strategy = 'recorded_position' if anchor else 'uia_row_found'
+            receipt = dict(status='observed', input_dispatched=False,
+                           diagnostic='recorded_position_located' if anchor else 'current_result_row_found',
                            result_row=step['result_row'], query_freshness='not_asserted', value_comparison=False)
         receipt['result_observation'] = dict(strategy=strategy, attempts=attempts, wait_seconds=round(waited, 4),
             provider_seconds=round(provider_seconds, 4), elapsed_seconds=round(time.monotonic()-started, 4),
@@ -897,28 +911,39 @@ def confirm_opened_window(report, routes, number):
 
 
 def verified_detail_read(steps, rows):
-    """Scope completion to the current matched row and the observed, closed detail window."""
-    if len(steps) != len(rows) or not steps[-1].get('verify_closed'):
+    """Verify the requested detail read and close, without asserting query freshness."""
+    if not steps or len(steps) != len(rows) or not steps[-1].get('verify_closed'):
         return False
     scope = steps[-1].get('window_context', {})
     opener = scope.get('after_step', 0)
-    if not 3 <= opener <= len(steps) - 2 or not (scope.get('related') or scope.get('owned')):
+    if not 2 <= opener <= len(steps) - 2 or not (scope.get('related') or scope.get('owned')):
         return False
-    match, open_row = steps[opener-2:opener]
+    open_row = steps[opener-1]
     receipts = [row['receipt'] for row in rows]
-    checked, opened = receipts[opener-2:opener]
+    opened = receipts[opener-1]
+    if open_row['action'] != 'double-click-result':
+        return False
+    if 'result_row' in open_row:
+        if opened.get('value_comparison') is not False or opened.get('result_row') != open_row['result_row']:
+            return False
+        before_row = opener-1
+    else:
+        if opener < 3:
+            return False
+        match, checked = steps[opener-2], receipts[opener-2]
+        if (match['action'] != 'verify-value' or 'result_column' not in match or checked['status'] != 'verified'
+                or checked.get('value_evidence', {}).get('status') != 'observed'):
+            return False
+        before_row = opener-2
     unverified = [i for i, receipt in enumerate(receipts) if receipt['status'] == 'delivered_unverified']
-    if len(unverified) != 1 or unverified[0] >= opener-2:
+    if len(unverified) != 1 or unverified[0] >= before_row:
         return False
     i = unverified[0]
     sent = receipts[i]
     if (not app.tasks.is_query_button(steps[i]) or sent.get('diagnostic') != 'business_result_not_verified'
             or sent.get('input_dispatched') is not True or sent['status'] != 'delivered_unverified'
-            or steps[i].get('window_context') != match.get('window_context')
-            or any(s['action'] not in ('wait', 'verify-value') for s in steps[i+1:opener-2])
-            or 'result_column' not in match or checked['status'] != 'verified'
-            or checked.get('value_evidence', {}).get('status') != 'observed'
-            or open_row['action'] != 'double-click-result' or 'result_row' in open_row
+            or steps[i].get('window_context') != open_row.get('window_context')
+            or any(s['action'] not in ('wait', 'verify-value') for s in steps[i+1:before_row])
             or opened.get('verification_scope') != 'recorded_window_opened' or opened['status'] != 'verified'
             or receipts[-1].get('diagnostic') != 'recorded_window_closed' or receipts[-1]['status'] != 'verified'):
         return False
@@ -930,7 +955,7 @@ def verified_detail_read(steps, rows):
                     and r['status'] == ('observed' if s['action'] == 'read-value' else 'verified')
                     and r.get('value_evidence', {}).get('status') == 'observed' for s, r in detail)
             and all(r['status'] in ('verified', 'observed', 'waited') or j == i
-                    for j, r in enumerate(receipts[:opener-2])))
+                    for j, r in enumerate(receipts[:before_row])))
 
 
 _GROUNDING_DIAGNOSTICS = {'target_missing', 'target_ambiguous', 'scope_missing', 'scope_ambiguous',
@@ -1315,7 +1340,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                        business_commit='not_verified')
                         if ok and getattr(baselines[number], 'verified_path', None):
                             receipt['verified_path'] = baselines[number].verified_path
-                elif 'result_column' in step or (read_only and after_query):
+                elif (step['action'] == 'verify-value' and 'result_column' in step) or (read_only and after_query):
                     popup = step.get('popup')
                     if read_only:
                         # Registration cannot inspect the result of a query it never sent.
@@ -1353,10 +1378,15 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             table = tables[0]
                             def row_guard():
                                 check_target(binding, mutate=True)
-                                need(uia.same(result_surface(binding, uia, step['selector']), table),
+                                current, _ = _result_target(binding, uia, step['selector'], None,
+                                                            column=step.get('result_column'))
+                                need(uia.same(current, table),
                                      'result_table_changed')
                             observed = receipt
-                            receipt = result_cell.execute_row(binding, uia, table, row_guard, mode=step['result_row'])
+                            row_options = {name: step[key] for key, name in (
+                                ('result_point', 'point'), ('result_column', 'column')) if key in step}
+                            receipt = result_cell.execute_row(binding, uia, table, row_guard,
+                                                              mode=step['result_row'], **row_options)
                             receipt.update(result_observation=observed['result_observation'],
                                            result_row=step['result_row'], query_freshness='not_asserted',
                                            value_comparison=False)

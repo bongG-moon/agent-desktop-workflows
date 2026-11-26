@@ -32,7 +32,7 @@ def valid_row_choice(point, bounds, confirmed):
 
 class ResultReview:
     def __init__(self, root, image_path, column, table_box, expected=None, *, frame_size=None, row_policy=None):
-        if row_policy is not None and (row_policy not in ('single', 'first') or table_box is None):
+        if row_policy is not None and (row_policy not in ('single', 'first', 'recorded') or table_box is None):
             raise ResultReviewError('result_row_review_scope_required')
         self.root = root
         self.expected = expected
@@ -52,6 +52,7 @@ class ResultReview:
         first_instruction = ttk.Label(
             body, text=('현재 표에 데이터 행이 한 개만 있으면 그 행의 셀을 클릭하세요.' if row_policy == 'single' else
                         '현재 표의 첫 번째 데이터 행에서 셀을 클릭하세요.' if row_policy == 'first' else
+                        '조회된 표에서 더블클릭할 위치를 한 곳 선택하세요.' if row_policy == 'recorded' else
                         f'1  「{column}」 열에서 열 제목의 왼쪽부터 오른쪽 끝까지 드래그하세요.'),
             wraplength=px(760))
         first_instruction.pack(anchor='w')
@@ -109,7 +110,9 @@ class ResultReview:
         self.value = tk.StringVar(master=root)
         self.confirmed = tk.BooleanVar(master=root, value=False)
         self.entry = None
-        if row_policy:
+        if row_policy == 'recorded':
+            ttk.Label(value_card, text='선택한 위치는 다음 실행에도 사용합니다.', style='Card.Muted.TLabel').grid(row=1, column=0, sticky='w')
+        elif row_policy:
             self.row_check = ttk.Checkbutton(value_card, variable=self.confirmed, command=self.update_button,
                 text='데이터 행이 한 개만 있고, 그 행을 선택했습니다.' if row_policy == 'single' else
                      '현재 표의 첫 번째 데이터 행을 선택했습니다.')
@@ -117,7 +120,8 @@ class ResultReview:
         else:
             self.entry = ttk.Entry(value_card, textvariable=self.value)
             self.entry.grid(row=1, column=0, columnspan=2, sticky='ew')
-        self.hint = tk.StringVar(master=root, value=('선택한 행을 확인하고 체크하세요. 입력값과의 비교는 하지 않습니다.'
+        self.hint = tk.StringVar(master=root, value=('표에서 위치를 고른 뒤 이어서 실행하세요.' if row_policy == 'recorded' else
+                                '선택한 행을 확인하고 체크하세요. 입력값과의 비교는 하지 않습니다.'
                                 if row_policy else '화면에서 값을 구별하기 어렵거나 같은 값이 여러 행에 있으면 취소하세요.'))
         hint_label = ttk.Label(value_card, textvariable=self.hint, style='Card.Muted.TLabel',
                                wraplength=px(740))
@@ -182,6 +186,8 @@ class ResultReview:
             point = [ox+px, oy+py]
             if abs(px-sx) < 4 and abs(py-sy) < 4 and valid_row_choice(point, self.bounds, True):
                 self.point = point
+                if self.row_policy == 'recorded':
+                    self.confirmed.set(True)
                 self.canvas.create_oval(px-6,py-6,px+6,py+6,outline=self.theme['accent'],width=2,tags='cell')
             self.update_button()
             return

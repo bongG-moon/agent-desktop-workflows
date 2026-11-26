@@ -126,7 +126,7 @@ def _events(folder):
 
 
 def _receipt(result, token):
-    receipt = dict(result, session=token, status_args=['recorder', '--session', token, '--wait', '8'])
+    receipt = dict(result, session=token, status_args=['recorder', '--session', token, '--wait', '8', '--summary'])
     state = result['status']
     if state in ('recorder_ready', 'recording'):
         receipt['host_action'] = 'wait_for_user_to_save'
@@ -135,7 +135,7 @@ def _receipt(result, token):
     elif state == 'cancelled':
         receipt['host_action'] = 'report_recording_cancelled'
     elif state == 'recorded':
-        receipt['first_trial_args'] = ['try-recording', '--session', token]
+        receipt['first_trial_args'] = ['try-recording', '--session', token, '--summary']
         if result.get('next_action', {}).get('kind') == 'run_prepared_recording':
             receipt['next_action'] = dict(result['next_action'], args=receipt['first_trial_args'])
     return receipt

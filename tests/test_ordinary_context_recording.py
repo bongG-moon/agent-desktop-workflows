@@ -155,6 +155,7 @@ class OrdinaryContext(unittest.TestCase):
 
     def test_owned_native_menu_inventory_precedes_generic_field_and_command_polling(self):
         worker = object.__new__(capture._Worker)
+        worker.hovered, worker.hover_at = None, 0
         worker.binding = Mock(hwnd=1,pid=7)
         worker.menu_gesture = object()
         worker.watched = worker.row_tracker = worker.hovered = None

@@ -1,8 +1,10 @@
-"""Make a new six-step demonstration, then test with a different ID in a disposable Windows fixture."""
+"""Record a new lookup, then test it with a different ID in a disposable Windows fixture."""
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +15,8 @@ from smoke_native import Fixture
 ROOT = Path(__file__).resolve().parents[1]
 INSTRUCTIONS = ['입력받은 변수를 Equip ID 입력란에 입력해줘', 'VIEW 버튼을 눌러줘', 'Equip ID 일치 확인',
                 '해당 결과 행을 더블클릭해 상세 창을 열어줘', 'Comment 값을 읽어줘', 'Exit 버튼을 눌러 상세 창을 닫아줘']
+DEMONSTRATED_STEPS = [*INSTRUCTIONS[:2], '녹화한 항목 더블클릭 (조회 결과 행 더블클릭)',
+                      '3단계에서 열린 창에서 comment부분 내용 추출', INSTRUCTIONS[-1]]
 
 
 def build_lookup_fixture(work):
@@ -26,7 +30,7 @@ def build_lookup_fixture(work):
     return exe
 
 
-def exercise(package, work, painted=False, external_host=False):
+def exercise(package, work, painted=False, external_host=False, demonstrated=False, legacy_point=False):
     work.mkdir(parents=True, exist_ok=False)
     with ZipFile(package) as archive:
         archive.extractall(work / '.claude/skills')
@@ -43,7 +47,12 @@ def exercise(package, work, painted=False, external_host=False):
     exe = build_lookup_fixture(work)
     win = app.bridge
     win.set_dpi_awareness()
-    fixture = Fixture(exe, *(['--painted'] if painted else []))
+    fixture = Fixture(exe, *(['--group-only', '--scoped-detail'] if demonstrated else ['--painted'] if painted else []))
+    instructions = DEMONSTRATED_STEPS if demonstrated else INSTRUCTIONS
+    if demonstrated and not legacy_point:
+        # Keep the recorder's own defaults for every demonstrated gesture.
+        # Only the parameter and the requested read require user intent.
+        instructions = [instructions[0], None, None, instructions[3], None]
     title = fixture.ready['title']
     binding = win.Binding(dict(pid=fixture.ready['pid'], hwnd=fixture.ready['hwnd'], exe_name=exe.name))
     trail = CaptureTrail(binding, title)
@@ -58,17 +67,36 @@ def exercise(package, work, painted=False, external_host=False):
     def demonstrate(key, gesture='click'):
         spot = fixture.command('point:'+key)
         x, y, hwnd = spot['x'], spot['y'], spot['hwnd']
-        def check():
-            hit = win.window_from_point(x, y)
+        def check_window(point):
+            hit = win.window_from_point(*point)
             assert win.hwnd_pid(hit) == binding.pid and win.root_window(hit) == hwnd, 'fixture_point_covered'
-            assert win.root_window(win.foreground()) == hwnd and not win.pointer_keys_down(), 'foreground_changed'
-        check()
+            assert win.root_window(win.foreground()) == hwnd, 'foreground_changed'
+        check_window((x,y))
+        assert not win.pointer_keys_down(), 'input_busy'
         assert win.user32.SetCursorPos(x, y)
         settle(.5)
-        check()
+        check_window((x,y))
+        assert not win.pointer_keys_down(), 'input_busy'
         assert win.cursor() == (x,y), 'pointer_moved_before_demonstration'
-        delivered = win._send_point(x, y, gesture)
-        assert delivered['ok'], delivered
+        if gesture == 'drag':
+            end = fixture.command('point:note-end')
+            assert end['hwnd'] == hwnd
+            destination = end['x'], end['y']
+            check_window(destination)
+            def button(flags):
+                event = win._mouse(flags=flags)
+                assert win.user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1, 'drag_send_failed'
+            button(0x0002)
+            try:
+                settle(.2)
+                check_window(destination)
+                assert win.user32.SetCursorPos(*destination)
+                settle(.2)
+            finally:
+                button(0x0004)
+        else:
+            delivered = win._send_point(x, y, gesture)
+            assert delivered['ok'], delivered
         settle(.75)
 
     try:
@@ -82,46 +110,86 @@ def exercise(package, work, painted=False, external_host=False):
             live_action._call(field,'SetValue','DEMO',binding.check,lambda _:None)
         settle(.45)
         demonstrate('view')
-        demonstrate('cell')
+        if not demonstrated:
+            demonstrate('cell')
         demonstrate('cell','double-click')
         assert fixture.command('state')['detailOpen']
         settle(.7)
-        demonstrate('note')
+        demonstrate('note','drag' if demonstrated else 'click')
         demonstrate('exit')
         raw = trail.finish()['steps']
         durations['demonstration'] = round(time.monotonic()-start,3)
         (work/'captured.json').write_text(json.dumps(raw,ensure_ascii=False),encoding='utf8')
-        assert len(raw) == len(INSTRUCTIONS), [(s['action'],s['label']) for s in raw]
+        assert len(raw) == len(instructions), [(s['action'],s['label']) for s in raw]
+        if demonstrated:
+            location = app.tasks.result_location(raw[2])
+            assert location['result_surface']['automation_id'] == 'PaintedResults' and location.get('result_point'), raw[2]
+            assert raw[3]['recognition']['reason'] == 'drag_needs_review', raw[3]
+            assert raw[3]['target']['locator'].get('automation_id') == 'CommentText', raw[3]
+            if not legacy_point:
+                assert raw[-1]['action'] == 'click' and raw[-1]['target']['locator'].get('automation_id') == 'btnClose', raw[-1]
+            if legacy_point:
+                # Emulate the earlier recorder's actual output after verifying what the
+                # current recorder collected. Preserve related window and opener evidence.
+                for step, reason in zip(raw[2:4], ('double_click_needs_review', 'drag_needs_review')):
+                    old = {k:step[k] for k in ('id','_capture_window','window_context') if k in step}
+                    old.update(label='직접 확인할 단계',action='manual',target={'kind':'manual','locator':{}},
+                               recognition={'action':'manual','result':'manual','reason':reason})
+                    if reason == 'double_click_needs_review':
+                        old['result_surface'] = location['result_surface']
+                    step.clear()
+                    step.update(old)
 
         start = time.monotonic()
         directory = work/'tasks'
         store = ReviewStorage('New lookup',exe.name,title,directory)
         edits = StepEdits()
-        for step, text in zip(raw, INSTRUCTIONS):
-            edits.store(step,'',text)
+        for step, text in zip(raw, instructions):
+            if text is not None:
+                edits.store(step,'',text)
         saved = store.save_recording(finalize_contexts(edits.apply(raw)))
         assert saved['status'] == 'recorded'
+        if demonstrated and not legacy_point:
+            body = store.saved_plan['steps'][2]
+            assert body['action'] == 'double-click-result' and body.get('result_point') and 'visual' not in body
         durations['review_save'] = round(time.monotonic()-start,3)
         before = fixture.command('reset')
         assert before['last']=='DEMO' and before['closed']==1 and before['queries']==1
         env = dict(os.environ,DESKTOP_SELECT_TASK_DIR=str(directory))
-        launcher = [sys.executable,'-X','utf8','-B',str(scripts/'desktop_select.py')]
         trial_args = ['try-recording', '--task',store.name,'--set','Equip ID=LAB-42','--allow-physical']
-        def call_cli(arguments):
+        review_env = {}
+        if demonstrated:
+            driver = work/'fixture-driver'
+            driver.mkdir()
+            shutil.copyfile(ROOT/'tests/fixtures/registered_result_ui_driver.py', driver/'sitecustomize.py')
+            if legacy_point:
+                picker_receipt = work/'local-picker.json'
+                review_env = dict(PYTHONPATH=str(driver), DESKTOP_SELECT_SMOKE_UI_REVIEW=json.dumps(dict(
+                    layout=fixture.command('review-layout'), row_policy='recorded', receipt=str(picker_receipt))))
+                trial_args.append('--local-result-review')
+            elif not external_host:
+                first_trace = work/'first-trial-element-trace.txt'
+                review_env = dict(PYTHONPATH=str(driver), DESKTOP_SELECT_SMOKE_ELEMENT_TRACE=str(first_trace))
+        def call_cli(arguments, entry=scripts/'desktop_select.py', extra_env=None):
             start = time.monotonic()
-            call = subprocess.run(launcher + arguments,capture_output=True,encoding='utf8',cwd=work,env=env,timeout=90)
+            call = subprocess.run([sys.executable,'-X','utf8','-B',str(entry), *arguments],
+                                  capture_output=True,encoding='utf8',cwd=work,env={**env, **(extra_env or {})},timeout=90)
             if not call.stdout.strip():
                 raise RuntimeError(call.stderr)
             return json.loads(call.stdout), round(time.monotonic()-start,3)
         if external_host:
             print(json.dumps(dict(status='saved_waiting_for_first_trial', task=store.name, task_directory=str(directory),
-                                  timings=durations)), flush=True)
+                                  timings=durations, **({'fixture_review_env':review_env} if legacy_point else {}))), flush=True)
             input()  # The host performs the first trial. Verify its evidence and fixture counters below.
-            receipts = list((directory/'first-trials').glob('*.json'))
-            assert len(receipts) == 1, 'expected one first-trial receipt'
-            report = json.loads(receipts[0].read_text(encoding='utf8'))
+            receipts = [json.loads(path.read_text(encoding='utf8')) for path in (directory/'first-trials').glob('*.json')]
+            if legacy_point:
+                report, = [item for item in receipts if item.get('correction_saved')]
+            else:
+                report, = receipts
         else:
-            report, durations['first_trial'] = call_cli(trial_args)
+            report, durations['first_trial'] = call_cli(trial_args, extra_env=review_env)
+            if demonstrated and not legacy_point:
+                assert set(first_trace.read_text(encoding='utf8').splitlines()) == {'launcher_guard_enabled', 'worker_guard_enabled'}
         (work/'trial.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf8')
         if painted:
             assert report.get('host_action') == 'inspect_current_result_without_replaying', report
@@ -143,8 +211,33 @@ def exercise(package, work, painted=False, external_host=False):
         assert 'Note for LAB-42' in json.dumps(report), report
         repeat, durations['same_request'] = call_cli(trial_args)
         assert fixture.command('state')==after and repeat.get('previous_trial') and 'Note for LAB-42' in json.dumps(repeat), repeat
-        print(json.dumps(dict(status='passed',timings=durations,trial_calls=3 if painted else 1,query_delta=1,double_click_delta=1,
-                              exit_delta=1,observed='Note for LAB-42',repeat_dispatched=False)))
+        summary = dict(status='passed',timings=durations,trial_calls=3 if painted else 1,query_delta=1,double_click_delta=1,
+                       exit_delta=1,observed='Note for LAB-42',repeat_dispatched=False)
+        if demonstrated:
+            if legacy_point:
+                assert report.get('correction_saved') and report.get('prior_steps_replayed') is False, report
+                assert report['effective_task'] != store.name and json.loads(picker_receipt.read_text())['selected_cell']
+                assert report['status'] in ('verified', 'completed_unverified') and 'stopped_at' not in report, report
+            else:
+                assert report['status'] == 'verified', report
+            registered = work/'.claude/skills/lookup-note'
+            registration, durations['register'] = call_cli(
+                ['register','--task',report['effective_task'],'--out',str(registered)], scripts/'python_workflow.py')
+            assert registration['status'] == 'registered', registration
+            no_image_trace = work/'registered-element-trace.txt'
+            run, durations['registered_run'] = call_cli(
+                ['--set','Equip ID=LAB-77','--allow-physical','--summary'],registered/'scripts/run.py',
+                dict(PYTHONPATH=str(driver), DESKTOP_SELECT_SMOKE_ELEMENT_TRACE=str(no_image_trace)))
+            (work/'registered-run.json').write_text(json.dumps(run,indent=2,ensure_ascii=False),encoding='utf8')
+            final = fixture.command('state')
+            assert (final['last'],final['queries'],final['opened'],final['closed'],final['archiveClicks'],final['wrongRows'],
+                    final['detailOpen']) == ('LAB-77',3,3,3,0,0,False), (final,run)
+            assert run.get('status') == 'verified' and 'Note for LAB-77' in json.dumps(run), run
+            trace = no_image_trace.read_text(encoding='utf8').splitlines()
+            assert 'worker_guard_enabled' in trace and set(trace) <= {'launcher_guard_enabled','worker_guard_enabled'}, trace
+            summary.update(registered_observed='Note for LAB-77', total_queries=3, wrong_rows=final['wrongRows'],
+                           registered_image_capture=False, local_picker=legacy_point)
+        print(json.dumps(summary))
     finally:
         if trail.started and not trail.ended:
             trail.cancel()
@@ -155,7 +248,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('package',type=Path)
     parser.add_argument('work',type=Path)
-    parser.add_argument('--painted',action='store_true',help='draw result cell text as pixels and read a window-image point on stdin')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--painted',action='store_true',help='draw result cell text as pixels and read a window-image point on stdin')
+    mode.add_argument('--demonstrated',action='store_true',help='record a body double-click and text drag on an owner-drawn grid, then register and run again')
+    parser.add_argument('--legacy-point',action='store_true',help='omit the old recording position and field locator and select the position once in the local review window')
     parser.add_argument('--external-host',action='store_true',help='pause after saving so a separate host can run the first trial')
     args=parser.parse_args()
-    exercise(args.package.resolve(strict=True),args.work.resolve(),args.painted,args.external_host)
+    if args.legacy_point and not args.demonstrated:
+        parser.error('--legacy-point requires --demonstrated')
+    exercise(args.package.resolve(strict=True),args.work.resolve(),args.painted,args.external_host,args.demonstrated,args.legacy_point)

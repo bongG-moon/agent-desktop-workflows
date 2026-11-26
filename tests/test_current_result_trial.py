@@ -106,6 +106,72 @@ class CurrentResultTrial(unittest.TestCase):
         self.assertEqual(resumed['host_action'],'report_completed_trial')
         self.assertEqual(again['observations'][0]['value'],'current memo')
 
+    def test_old_draft_local_pick_resumes_once_and_saves_the_next_run(self):
+        import grounding
+        import local_result_review
+        import python_workflow as flow
+        import recorded_plan
+        import review_drafts
+        import teach_capture as capture
+        from test_recorded_plan import button
+        from test_visual_target import VisualTargets, image
+
+        surface = dict(role='group', automation_id='results')
+        child = dict(exe='A.exe', title='Details', related=True, _openers=['query', 'row'])
+        query = dict(button(), id='query', label='조회')
+        row = dict(capture.manual('double_click_needs_review', 'row'), result_surface=surface)
+        drag = dict(capture.manual('drag_needs_review', 'memo'), _capture_window=child)
+        close = dict(id='exit', label='닫기', action='click', _capture_window=child,
+                     target=dict(kind='element', locator=dict(role='button', name='닫기')),
+                     recognition=dict(target='identified', action='supported', result='manual'))
+        raw = [(dict(self.raw, id='field', label='Region'), self.raw['instruction']['text']),
+               (query, query['instruction']['text']), (row, '녹화한 항목 더블클릭 (조회 결과 행 더블클릭)'),
+               (drag, '3단계에서 열린 창에서 memo부분 내용 추출'), (close, '닫기 버튼을 눌러줘')]
+        name = '기존 녹화'
+        review_drafts.ReviewStorage(name, 'A.exe', '업무 창', self.directory).save_draft(
+            [dict(step=step, form=dict(alias='', text=sentence, mode=None, argument=''))
+             for step, sentence in raw], 'instruction_target_unavailable', 4)
+        original = (self.directory / (name + '.json')).read_bytes()
+        rect = list(VisualTargets.window)
+        box = dict(x=rect[0]+10, y=rect[1]+6, width=rect[2]+10, height=rect[3]-6)
+        png = grounding._png(*rect[2:], image((35, 42)))
+        frames = self.directory / 'frames'
+        frames.mkdir()
+        self.worker.side_effect = [self.worker.return_value, dict(status='verified', input_dispatched=True, steps=[
+            dict(number=1, receipt=dict(status='delivered_unverified', input_dispatched=True)),
+            dict(number=2, receipt=dict(status='observed', input_dispatched=False, value='current memo')),
+            dict(number=3, receipt=dict(status='verified', input_dispatched=True, diagnostic='recorded_window_closed'))])]
+        args = ['--task', name, '--set', 'Region=North', '--local-result-review', '--allow-physical', '--summary']
+        with patch.object(app.bridge, 'Binding'), patch.object(app.bridge, 'UIA') as uia, \
+             patch.object(flow, '_result_target', return_value=(object(), surface)), \
+             patch.object(grounding, '_capture', return_value=(rect, png)) as capture_frame, \
+             patch.object(grounding, '_directory', return_value=frames), \
+             patch.object(local_result_review, 'choose', return_value=dict(point=[35, 42], row_policy='recorded',
+                                                                           confirmed=True)) as picker:
+            uia.return_value.__enter__.return_value.bounds.return_value = box
+            report = self.trial(*args)
+            again = self.trial(*args)
+        self.assertTrue(report.get('correction_saved'), report)
+        self.assertFalse(report['prior_steps_replayed'])
+        self.assertEqual(report['effective_task'], again['effective_task'])
+        self.assertTrue(again['previous_trial'])
+        self.assertFalse(again['this_call_dispatched_input'])
+        self.assertEqual([s['source_step'] for s in report['steps']], [1, 2, 3, 4, 5])
+        self.assertEqual(report['observations'][0]['value'], 'current memo')
+        picker.assert_called_once()
+        capture_frame.assert_called_once()
+        self.assertEqual(self.worker.call_count, 2)
+        suffix = self.worker.call_args.kwargs['payload']['recipe']['steps']
+        self.assertEqual([s['action'] for s in suffix], ['visual-click', 'read-value', 'invoke'])
+        self.assertEqual([s['window_context']['after_step'] for s in suffix[1:]], [1, 1])
+        corrected = tasks.load_task(report['effective_task'], self.directory)
+        recipe = recorded_plan.get_plan(corrected, self.directory)['envelope']['recipe']
+        self.assertEqual(recipe['steps'][2]['result_point'], dict(x=25, y=36, width=180, height=114))
+        self.assertEqual((recipe['steps'][2]['selector'], recipe['steps'][2]['result_row']), (surface, 'recorded'))
+        self.assertEqual([s['window_context']['after_step'] for s in recipe['steps'][3:]], [3, 3])
+        self.assertEqual((self.directory / (name + '.json')).read_bytes(), original)
+        self.assertFalse(list(frames.glob('*.png')))
+
 
 class ResultRowSuffix(unittest.TestCase):
     def test_row_suffix_remaps_detail_opener_and_preserves_source(self):

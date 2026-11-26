@@ -420,6 +420,32 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(flow.WorkflowError):
                 flow.validate(dict(recipe(), steps=[dict(step, **change)]))
 
+    def test_recorded_position_is_valid_only_for_plain_gesture_with_a_named_surface(self):
+        selector = dict(role='group', automation_id='ReportList')
+        point = dict(x=45, y=39, width=800, height=600)
+        row = dict(action='double-click-result', result_row='recorded', selector=selector, result_point=point)
+        self.assertEqual(flow.validate(dict(recipe(), steps=[row]))['steps'], [row])
+        for changes in (dict(result_row='single'), dict(result_row='first'), dict(result_column='Item'),
+                        dict(selector={'role':'table'}), dict(result_point=dict(point, y=600)),
+                        dict(result_point=dict(point, x=True))):
+            with self.subTest(changes=changes), self.assertRaises(flow.WorkflowError):
+                flow.validate(dict(recipe(), steps=[dict(row, **changes)]))
+
+    def test_column_directed_row_click_runs_through_position_path_without_an_expected_value(self):
+        import result_cell
+        row = dict(action='double-click-result', result_row='first', result_column='Code',
+                   selector=dict(role='table', automation_id='Report'))
+        sent = dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched',
+                    input_dispatched=True, physical_input=True)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'find_row', return_value=self.element) as find,
+              patch.object(result_cell, 'execute_row', return_value=sent) as click,
+              patch.object(flow, 'observe_result', side_effect=AssertionError('no value comparison'))):
+            report = flow.run(dict(recipe(), steps=[row]))
+        self.assertEqual(report['status'], 'completed_unverified', report)
+        self.assertEqual(find.call_args.kwargs, dict(mode='first', column='Code'))
+        self.assertEqual(click.call_args.kwargs, dict(mode='first', column='Code'))
+
     def test_waiting_for_result_reuses_only_unique_table_locator_not_value(self):
         import result_cell
         selector = dict(role='table', automation_id='CurrentResults')

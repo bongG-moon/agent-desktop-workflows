@@ -30,6 +30,27 @@ class VisualRecordingTests(TestCase):
         self.event = dict(kind='down', token=42, window=501, hit_window=600,
                           scope_proven=True, at=2., x=208, y=116, action='click')
 
+    def test_paired_table_press_reuses_its_body_point_without_a_second_row_scan(self):
+        table = dict(self.observed, node=dict(self.observed['node'], role='table'))
+        prior = dict(token=41, observation=table,
+                     result_location=dict(result_surface=dict(role='table', automation_id='items'),
+                                          result_point=dict(x=12, y=35, width=480, height=100)))
+        self.worker.row_tracker = mock.Mock()
+        self.worker.row_tracker.before.return_value = None
+        self.worker.recent_click = prior
+        with (mock.patch.object(capture.recorder.CaptureWorker, 'observe_down', return_value=table) as hit,
+              mock.patch('row_vision._row_layout', side_effect=capture.bridge.BridgeError('row_layout_unavailable')) as layout):
+            second = dict(self.event, double=True, previous_token=41)
+            self.assertIs(self.worker.observe_down(second), table)
+            hit.assert_called_once_with(second)
+            layout.assert_not_called()
+            self.worker.observe_down(dict(second, previous_token=40))
+            layout.assert_called_once()
+            self.worker.recent_click = dict(prior, observation=dict(table, element=mock.Mock()))
+            self.worker.uia.same.return_value = False
+            self.worker.observe_down(second)
+            self.assertEqual(layout.call_count, 2)
+
     def test_first_visual_click_keeps_image_prose_and_linked_window_through_review(self):
         with mock.patch.object(capture.recorder.CaptureWorker,'observe_down',return_value=self.observed):
             observed = self.worker.observe_down(self.event)
@@ -109,7 +130,7 @@ class VisualRecordingTests(TestCase):
                      '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘'):
             with self.subTest(text=text):
                 spec = tasks.compile_instruction(recorded,text)
-                self.assertEqual((spec['mode'],spec['result_row']), ('double-click-result','single'))
+                self.assertEqual((spec['mode'],spec['result_row']), ('double-click-result','recorded'))
                 self.assertNotIn('visual',spec)
         for text in ('이 행을 한 번만 클릭해줘','더블 클릭하지 말고 이 행을 삭제해줘','열렸으면 이 행을 더블 클릭해줘',
                      '팝업을 닫고 이 행을 두 번 눌러줘','이 행을 두 번 눌러 상세를 삭제해줘'):

@@ -356,9 +356,14 @@ def _choose_window(tk, ttk, hint, rows, on_ready):
     root.bind('<Map>', report_ready, add='+')
     root.protocol('WM_DELETE_WINDOW', cancel)
     root.report_callback_exception = callback_failed
-    show()
-    report_ready()
-    root.mainloop()
+    try:
+        show()
+        report_ready()
+        root.mainloop()
+    finally:
+        # Tk.destroy() releases widget callbacks but leaves this Python
+        # attribute pointing back to its interpreter when the recorder starts.
+        del root.report_callback_exception
     if failed:
         raise bridge.BridgeError('recording_ui_failed')
     return selected

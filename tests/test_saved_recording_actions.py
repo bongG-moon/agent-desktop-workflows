@@ -43,7 +43,7 @@ class SavedRecordingActions(unittest.TestCase):
             for state in (during_exit, latest):
                 self.assertEqual(state['status'], 'recorded')
                 self.assertEqual(state['task']['name'], name)
-                self.assertEqual(state['first_trial_args'], ['try-recording', '--session', token])
+                self.assertEqual(state['first_trial_args'], ['try-recording', '--session', token, '--summary'])
                 self.assertTrue(state['draft'])
                 self.assertEqual(state['resume_args'], ['review', '--task', name])
                 self.assertEqual(state['edit_args'], ['review', '--task', name, '--edit'])
