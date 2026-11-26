@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from runtime_integrity import checked_path
 from provider_security import install as install_security_compatibility
@@ -1393,6 +1394,7 @@ def result_code(result, *, summary=False):
 def worker_receipt(argv, mutating, payload=None, *, may_queue=False):
     # A third-party accessibility provider can hang inside a COM call. Terminate
     # our helper only; never assume a timed-out mutation failed or repeat it.
+    started = time.monotonic()
     try:
         kind = (payload or {}).get('step', {}).get('action')
         timeout = {'row-action': 120, 'row-launch': 120, 'result-menu': 160}.get(kind, 90)
@@ -1406,16 +1408,16 @@ def worker_receipt(argv, mutating, payload=None, *, may_queue=False):
         receipt = json.loads(child.stdout)
         if not isinstance(receipt, dict) or 'status' not in receipt or child.returncode not in (0, 2, 3):
             raise ValueError()
-        queue_seconds = getattr(child, 'queue_seconds', 0)
-        if isinstance(queue_seconds, (int, float)) and queue_seconds > 0:
-            receipt['queue_seconds'] = round(queue_seconds, 3)
+        coordination.worker_timings(receipt, started, getattr(child, 'queue_seconds', 0))
         return receipt
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         diagnostic = 'provider_timeout_or_interrupted'
     except (OSError, ValueError):
         diagnostic = 'provider_unavailable'
-    return {'status': 'uncertain' if mutating else 'blocked', 'diagnostic': diagnostic,
-            'input_dispatched': None if mutating else False}
+    failure = {'status': 'uncertain' if mutating else 'blocked', 'diagnostic': diagnostic,
+               'input_dispatched': None if mutating else False}
+    coordination.worker_timings(failure, started)
+    return failure
 
 
 def supervise(args, argv):
@@ -1430,6 +1432,7 @@ def main():
     sys.stdout.reconfigure(encoding='utf-8')
     argv = sys.argv[1:]
     if argv == ['_plan']:
+        entered = time.monotonic()
         import python_workflow
         try:
             payload = json.load(sys.stdin)
@@ -1445,6 +1448,7 @@ def main():
         except Exception as error:
             result = dict(status='uncertain', diagnostic=getattr(error, 'code', 'execution_plan_unavailable'),
                           input_dispatched=None)
+        result['_worker_entered'] = entered
         print(json.dumps(result, ensure_ascii=False))
         return result_code(result)
     if argv == ['_step']:

@@ -29,6 +29,9 @@ def host_summary(report):
         return result
 
     result = continuation_options(compact_preparation(report))
+    if result.get('host_action') == 'inspect_current_state_without_replaying':
+        from workflow_repair import compact_stop
+        return compact_stop(result)
     for field in ('result_inspection', 'menu_repair', 'input_pause'):
         if isinstance(report.get(field), dict):
             result[field] = continuation_options(report[field])
@@ -104,12 +107,14 @@ def _write_receipt(path, result):
             os.unlink(tmp)
 
 
-def _inspection(app, receipt_id):
+def _inspection(app, receipt_id, *, allow_state=False):
     if not re.fullmatch(r'[0-9a-f]{64}', receipt_id):
         raise tasks.TaskError('invalid_first_trial_receipt')
     directory = tasks._directory(app.task_directory() / 'first-trials')
     report = _previous(directory / (receipt_id + '.json'))
     inspection = report.get('result_inspection')
+    if allow_state and report.get('state_inspection'):
+        inspection = report['state_inspection']
     if not inspection or report.get('trial_receipt') != receipt_id:
         raise tasks.TaskError('result_inspection_unavailable')
     return directory, report, inspection
@@ -119,7 +124,19 @@ def inspect_result(app, receipt_id):
     """Read only the exact, recently failed result surface; never replay the query."""
     import grounding
     import result_trial
-    directory, report, inspection = _inspection(app, receipt_id)
+    directory, report, inspection = _inspection(app, receipt_id, allow_state=True)
+    if report.get('state_inspection'):
+        import python_workflow
+        if not 0 <= time.time() - inspection['observed_at'] <= grounding.TTL:
+            raise tasks.TaskError('result_inspection_expired')
+        task = tasks.load_task(report['effective_task'], app.task_directory(), allow_review=True)
+        recipe = _compiled(task, app.task_directory()).get('envelope', {}).get('recipe')
+        if recipe is None or recovery._fingerprint(recipe) != inspection['recipe_hash']:
+            raise tasks.TaskError('recording_draft_changed')
+        owner = report['inspection_owner']
+        observed = python_workflow.run(recipe, read_only=True, only=str(report['stopped_at']),
+                                       hwnd=owner['hwnd'], result_owner=owner)
+        return dict(observed, previous_input_dispatched=report['input_dispatched'], prior_steps_replayed=False)
     resumed = result_trial.prior(directory, receipt_id)
     if resumed and resumed.get('resume_dispatched_input') is not False:
         return resumed
@@ -349,7 +366,11 @@ def run(app, args):
                 and report.get('input_dispatched') is not False
                 and not (report.get('menu_repair') or report.get('input_pause', {}).get('ticket'))):
             report['host_action'] = 'check_current_effect_before_continuing'
-        if report.get('source_stopped_at') and report.get('steps'):
+        if python_workflow.workflow_repair.header_stop(report, recipe) and report.get('inspection_owner'):
+            report.update(host_action='inspect_current_state_without_replaying',
+                          inspect_args=['inspect-trial', '--receipt', key, '--summary'],
+                          state_inspection=dict(observed_at=time.time(), recipe_hash=recovery._fingerprint(recipe)))
+        elif report.get('source_stopped_at') and report.get('steps'):
             last = report['steps'][-1]
             receipt = last.get('receipt', {})
             window = receipt.get('result_window')

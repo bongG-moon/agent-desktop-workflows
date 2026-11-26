@@ -75,6 +75,7 @@ class WindowRoutes:
         self.steps, self.owner, self.title, self.read_only = steps, owner, title, read_only
         self.origins = defaultdict(dict)
         self.baselines, self.outcomes, self.bindings, self.openers = {}, {}, {}, {}
+        self.observed_windows = {}
         validate_sequence(steps, allow_unbound_double=True)
         for number in (range(1, len(steps)+1) if active is None else active):
             spec = steps[number-1].get('window_context')
@@ -96,6 +97,8 @@ class WindowRoutes:
     def _rows(self, spec):
         self.app.guard(self.owner, self.owner, self.title)
         rows = self.app.windows(spec['exe'])
+        if self.read_only:
+            self.observed_windows[_key(spec)] = rows
         if spec.get('owned'):
             opener = self.openers.get(spec['after_step'])
             if opener is None:
@@ -103,6 +106,19 @@ class WindowRoutes:
             return [row for row in rows if row['title'] == spec['title'] and row['pid'] == opener.pid
                     and self.app.bridge.owned(row['hwnd'], opener.hwnd)]
         return rows
+
+    def describe_current(self, spec, found):
+        """Describe the scoped lookup without another enumeration or reading field values."""
+        opener = self.openers.get(spec.get('after_step'), self.owner)
+        evidence = dict(expected=spec['title'], state='present' if found is not None else 'unresolved')
+        if found is not None:
+            evidence['relation'] = ('owned' if self.app.bridge.owned(found.hwnd, opener.hwnd) else
+                                    'same_process' if found.pid == opener.pid else
+                                    'related' if spec.get('related') else 'recorded_window')
+        else:
+            evidence['same_process_windows'] = [row['title'] for row in self.observed_windows.get(_key(spec), [])
+                                                if row['pid'] == opener.pid and row['hwnd'] != opener.hwnd][:8]
+        return evidence
 
     def matching_windows(self, spec):
         return [row for row in self._rows(spec) if row['title'] == spec['title']]

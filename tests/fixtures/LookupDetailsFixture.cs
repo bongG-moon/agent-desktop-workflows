@@ -91,8 +91,9 @@ sealed class LookupDetailsFixture : Window {
     readonly TextBox resultCount = new TextBox { IsReadOnly=true, Width=64, HorizontalAlignment=HorizontalAlignment.Left };
     readonly ProviderResultGrid providerGrid = new ProviderResultGrid();
     readonly Button view = new Button { Content="VIEW", Width=70 };
+    readonly GridViewColumnHeader idHeader = new GridViewColumnHeader { Content="Equip ID" };
     Window detail, cover;
-    TextBox comment;
+    TextBox comment, detailId;
     Button exit;
     int queries, opened, closed, archiveClicks;
     int wrongRows;
@@ -137,6 +138,13 @@ sealed class LookupDetailsFixture : Window {
         FormRow("Archive",new TextBox { Width=120, Text="DECOY" },spare);
         var grid=new GridView();
         grid.Columns.Add(Column("Equip ID","Key",190)); grid.Columns.Add(Column("Category","Note",145));
+        if (Environment.GetCommandLineArgs().Contains("--header-detail")) {
+            grid.Columns[0].Header = idHeader;
+            AutomationProperties.SetName(idHeader, "Equip ID");
+            idHeader.PreviewMouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e) {
+                if (e.ClickCount == 2) { e.Handled = true; OpenDetail(resultKey); }
+            };
+        }
         results.View=grid;
         AutomationProperties.SetAutomationId(results,"ResultGrid");
         bool groupOnly = Environment.GetCommandLineArgs().Contains("--group-only");
@@ -184,6 +192,12 @@ sealed class LookupDetailsFixture : Window {
             opened++; last=key;
             detail=new Window {Title="Item details",Width=320,Height=170,Owner=this,WindowStartupLocation=WindowStartupLocation.CenterOwner};
             var box=new StackPanel {Margin=new Thickness(12)};
+            if (Environment.GetCommandLineArgs().Contains("--header-detail")) {
+                detailId=new TextBox { Text=key, IsReadOnly=true };
+                AutomationProperties.SetName(detailId,"Equip ID");
+                AutomationProperties.SetAutomationId(detailId,"detailId");
+                box.Children.Add(detailId);
+            }
             comment=new TextBox {Text="Note for "+last,IsReadOnly=true};
             AutomationProperties.SetName(comment,"Comment"); AutomationProperties.SetAutomationId(comment,"CommentText");
             exit=new Button {Content="Exit"}; AutomationProperties.SetAutomationId(exit,"btnClose");
@@ -236,7 +250,7 @@ sealed class LookupDetailsFixture : Window {
                 imageSize=new []{window.Right-window.Left,window.Bottom-window.Top}}));
         } else if(command.StartsWith("point:")){
             var key=command.Substring(6);
-            var target= key=="field"?input:key=="view"?view:key=="cell"?
+            var target= key=="field"?input:key=="view"?view:key=="header"?(FrameworkElement)idHeader:key=="detail-id"?detailId:key=="cell"?
                 (opaque.IsVisible?(FrameworkElement)opaque:Cell(results)):
                 (key=="note" || key=="note-end")?(FrameworkElement)comment:exit;
             if(target!=null && target.IsVisible){

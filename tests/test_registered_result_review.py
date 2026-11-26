@@ -7,6 +7,7 @@ from pathlib import Path
 import random
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -125,6 +126,49 @@ class RegisteredResultTests(unittest.TestCase):
         for diagnostic in ('result_row_missing', 'result_row_ambiguous', 'result_table_missing'):
             self.blocked['steps'][-1]['receipt']['diagnostic'] = diagnostic
             self.assertIsNone(review.offer(flow, self.blocked, {}))
+
+    def test_header_stop_reuses_no_query_and_never_offers_cell_review(self):
+        self.recipe['steps'][1:3] = [dict(action='double-click-result', result_row='header',
+            selector=self.group, result_column='Part', result_point=dict(x=10,y=8,width=80,height=40))]
+        for step in self.recipe['steps'][2:]:
+            step['window_context']['after_step'] = 2
+        self.path.write_text(json.dumps(self.recipe), encoding='utf8')
+        self.blocked['diagnostic'] = self.blocked['steps'][-1]['receipt']['diagnostic'] = 'result_header_point_mismatch'
+        self.blocked['inspection_owner'] = self.owner
+        with patch.object(registered_result, 'ResultReview', side_effect=AssertionError('header used cell review')):
+            _, consent = self.call()
+            self.assertEqual(consent['status'], 'needs_consent')
+            self.run.assert_not_called()
+            _, failed = self.call('--allow-physical', '--local-result-review')
+            self.assertTrue(failed['input_dispatched'])
+            self.assertEqual(failed['inspect_args'], ['--read-only', '--only', '2', '--summary'])
+            with patch('time.time', return_value=time.time() + 3600):
+                _, repeated = self.call('--allow-physical', '--local-result-review', '--hwnd', str(self.owner['hwnd']))
+            self.assertFalse(repeated['input_dispatched'])
+            self.assertTrue(repeated['previous_input_dispatched'])
+            self.assertEqual(self.run.call_count, 1)
+            _, retry = self.call('--allow-physical', '--new-attempt')
+            self.assertTrue(retry['input_dispatched'])
+        self.assertEqual(self.run.call_count, 2)
+        self.capture.assert_not_called()
+
+    def test_plain_recipe_header_requires_consent_before_query(self):
+        self.path = self.directory / 'trial.json'
+        header = dict(action='double-click-result', result_row='header', selector=self.group,
+                      result_column='Part', result_point=dict(x=10, y=8, width=80, height=40))
+        self.path.write_text(json.dumps(dict(self.recipe, steps=[self.recipe['steps'][0], header])), encoding='utf8')
+        code, report = self.call()
+        self.assertEqual((code, report['status'], report['input_dispatched']), (2, 'needs_consent', False))
+        self.run.assert_not_called()
+
+    def test_worker_rejects_a_changed_recipe_before_dispatch(self):
+        digest = workflow_repair.digest(self.recipe)
+        self.recipe['steps'][0]['label'] = 'Updated after the requested run'
+        self.path.write_text(json.dumps(self.recipe), encoding='utf8')
+        _, refused = self.call('--allow-physical', '--_recipe-sha', digest)
+        self.assertEqual(refused['diagnostic'], 'workflow_changed_before_worker')
+        self.assertFalse(refused['input_dispatched'])
+        self.run.assert_not_called()
 
     def test_window_aliases_recover_the_existing_pending_review(self):
         hwnd = 0x81aa0011

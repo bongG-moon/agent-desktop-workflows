@@ -153,7 +153,7 @@ def same_result_double(step, previous):
                     and not step.get('result_column'))):
         return False
     text = _gesture_subject(step.get('instruction_draft') or step.get('description') or step.get('label', ''))
-    if not double_click_instruction(text) or _qualified_result_row(text):
+    if not double_click_instruction(text) or _qualified_result_row(text) or _HEADER_WORD.search(text):
         return False
     subject = re.split(r'더블\s*클릭|두\s*번|double[ -]?click', text, flags=re.I)[0]
     if text.lower().startswith(('double click', 'double-click')):
@@ -191,12 +191,41 @@ def _plain_table_gesture(sentence):
                              r'|(?:(?:this|that|the)(?: recorded)?\s+)?(?:list|grid|table|row|item)', target, re.I))
 
 
+_HEADER_WORD = re.compile(r'열\s*머리(?:글)?|헤더|\bheader\b', re.I)
+
+
+def _header_intent(raw, sentence, subject):
+    """An explicitly named header uses the demonstrated table and point as joint evidence."""
+    target = re.split(r'더블\s*클릭|두\s*번', subject, maxsplit=1)[0].strip()
+    target = re.sub(r'^double[ -]?click\s+(?:the\s+)?', '', target, flags=re.I).rstrip('.!')
+    name = re.fullmatch(r'(?:(?:조회\s*)?결과\s*(?:표|목록)?(?:의|에서)\s*)?'
+                        r'(.+?)\s*(?:열\s*머리(?:글)?|(?:열\s*)?헤더|\s+(?:column\s+)?header)(?:을|를)?', target, re.I)
+    if not name:
+        return None
+    column = name[1].strip()
+    column = _quoted_literal(column) or column
+    observed = raw.get('result_header') or (raw.get('result_column') if raw.get('result_row') == 'header' else None)
+    if not _text(column, 100) or not valid_result_point(raw.get('result_point')):
+        return None
+    if observed is not None and (not _text(observed, 100) or observed.casefold() != column.casefold()):
+        return None
+    selector = raw.get('selector') if raw.get('action') == 'double-click-result' else result_surface_hint(raw)
+    if not selector or not any(key in selector for key in ('automation_id', 'name')):
+        return None
+    return dict(mode='double-click-result', text=sentence, label=sentence[:200], result_row='header',
+                result_column=observed or column, selector=deepcopy(selector), result_point=deepcopy(raw['result_point']))
+
+
 def current_result_intent(raw, sentence):
     """A current-result request selects rows, never recording-time business pixels."""
     if (not isinstance(sentence, str) or not double_click_instruction(sentence) or _comparison_request(sentence)
             or not (is_double_click_step(raw) or is_recoverable(raw) or raw.get('action') == 'double-click-result')):
         return None
     subject = _gesture_subject(sentence)
+    if _HEADER_WORD.search(subject):
+        if is_double_click_step(raw) or raw.get('action') == 'double-click-result':
+            return _header_intent(raw, sentence, subject)
+        return None
     named_result = re.search(r'결과|\bresults?\b', subject, re.I)
     if not named_result:
         if not _plain_table_gesture(subject) or not (is_double_click_step(raw) or raw.get('action') == 'double-click-result'):
@@ -447,11 +476,11 @@ def recorded_result_surface(locator):
             break
     else:
         # Some result providers expose a group containing data rows instead of a table.
-        saw_row = False
+        saw_table_item = False
         for index, item in enumerate(chain):
-            if item.get('role') in {'row', 'listitem'}:
-                saw_row = True
-            if (index == 0 or saw_row) and item.get('role') == 'group' and (surface := _selector(item)):
+            if item.get('role') in {'row', 'listitem', 'headeritem'}:
+                saw_table_item = True
+            if (index == 0 or saw_table_item) and item.get('role') == 'group' and (surface := _selector(item)):
                 break
         else:
             return None
@@ -494,6 +523,10 @@ def result_location(raw):
         if not surface or not valid_result_point(raw['result_point']):
             raise TaskError('invalid_result_point')
         fields['result_point'] = deepcopy(raw['result_point'])
+    if 'result_header' in raw:
+        if 'result_point' not in fields or not _text(raw['result_header'], 100):
+            raise TaskError('invalid_recorded_header')
+        fields['result_header'] = raw['result_header']
     return fields
 
 
@@ -576,19 +609,23 @@ def _observed_intent(raw, sentence):
                          + r'\s*(?:값)?(?:이|가|을|를)?\s*' + comparison +
                          r'(?:(?:일치(?:하는지|\s*여부)?|같은지|동일한지|맞는지)\s*확인(?:해)?|비교(?:해)?)'
                          r'(?:\s*(?:줘|주세요))?', text)
-    if not (read or match) or drag_read and not read:
+    if not (read or match):
         return None
     name = (read or match)[1].strip()
     field_check = bool(match and not re.match(r'(?:조회\s*)?결과|(?:표|행)에서', text) and
-                       re.search(r'\s*(?:입력란|입력칸)$', name))
+                       (re.search(r'\s*(?:입력란|입력칸)$', name)
+                        or scoped and selector and selector.get('role') in {'textfield', 'combobox'}))
+    if drag_read and not (read or field_check):
+        return None
     if field_check:
         name = re.sub(r'\s*(?:입력란|입력칸)$', '', name).strip()
     if not _text(name, 100) or name in {'값', '내용', '이', '현재', '해당'} or re.search(r'클릭해서|눌러서|하고|읽고', name):
         return None
     same = lambda a: isinstance(a, str) and ''.join(a.split()).casefold() == ''.join(name.split()).casefold()
     if read or field_check:
+        caption = target.get('locator', {}).get('name') if isinstance(target, dict) else None
         if not (selector and selector['role'] in {'textfield', 'combobox', 'statictext', 'listitem', 'row'}
-                and any(same(v) for v in (raw.get('field_label'), raw.get('label'), raw.get('alias'),
+                and any(same(v) for v in (caption, raw.get('field_label'), raw.get('label'), raw.get('alias'),
                         selector.get('name'), selector.get('automation_id'), selector.get('query')))):
             selector = dict(role='textfield', query=name)
         if read:
@@ -645,6 +682,11 @@ def interpret_step(raw_step, sentence, action, selector, *, label=None, result_r
                 description=sentence, label=caption)
     if action == 'double-click-result':
         step['result_row'] = result_row
+        if result_row == 'header':
+            header = current_result_intent(raw_step, sentence)
+            if not header or header.get('result_row') != 'header' or header['selector'] != selector:
+                raise TaskError('recorded_header_required')
+            step.update(result_column=header['result_column'], result_point=header['result_point'])
         _validate_current_result(step)
     else:
         if result_row is not None:
@@ -1174,7 +1216,7 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         if observation is not None:
             return observation
         if (_comparison_request(sentence) or is_double_click_step(raw_step) and double_click_instruction(sentence)
-                and re.search(r'결과|\bresults?\b', sentence, re.I)):
+                and (_HEADER_WORD.search(sentence) or re.search(r'결과|\bresults?\b', sentence, re.I))):
             # A location hint must not turn an unsupported comparison sentence
             # into a click on recording-time pixels. The host receives the prose.
             return {'mode': 'draft', 'text': sentence}
@@ -1734,9 +1776,12 @@ def _validate_current_result(step):
     allowed = {'action', 'label', 'description', 'alias', 'window_context', 'selector', 'result_row',
                'result_point', 'result_column', 'instruction_draft'}
     _validate_typed_draft(step)
-    if (step.get('result_row') not in ('single', 'first', 'recorded') or not _text(step.get('label'), 1000)
+    mode = step.get('result_row')
+    if (mode not in ('single', 'first', 'recorded', 'header') or not _text(step.get('label'), 1000)
             or not isinstance(selector, dict) or selector.get('role') not in RESULT_SURFACES
-            or 'result_point' in step and (step['result_row'] != 'recorded' or selector == {'role': 'table'}
+            or mode == 'header' and (not {'result_point', 'result_column'} <= step.keys()
+                                     or not any(k in selector for k in ('name', 'automation_id')))
+            or 'result_point' in step and (mode not in ('recorded', 'header') or selector == {'role': 'table'}
                                            or not valid_result_point(step['result_point']))
             or 'result_column' in step and (step['result_row'] == 'recorded' or not _text(step['result_column'], 100))
             or set(step) - allowed):
@@ -1804,7 +1849,7 @@ def _validate_step(s, parameters):
         return
     if s.get('action') == 'manual':
         expected = {'action', 'reason'}
-        if 'result_surface' in s or 'result_point' in s:
+        if 'result_surface' in s or 'result_point' in s or 'result_header' in s:
             if not (is_recoverable(s) or is_double_click_step(s)):
                 raise TaskError('invalid_result_surface_hint')
             expected.update(result_location(s))

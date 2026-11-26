@@ -109,6 +109,8 @@ def _interactive_desktop(win=None, *, evidence=None):
             if not name.value:
                 return unavailable('desktop_identity_empty')
             names.append(name.value.casefold())  # UOI_NAME; Windows names ignore case.
+        if names[0] != names[1] and evidence is not None:
+            evidence.update(input_desktop=names[0], thread_desktop=names[1])
         return names[0] == names[1] or unavailable('input_and_worker_desktops_differ')
     except (OSError, AttributeError, ValueError) as error:
         return unavailable('desktop_check_unavailable', getattr(error, 'winerror', None))
@@ -124,6 +126,16 @@ def interactive_desktop_blocked(requirements):
     evidence = {}
     if not physical or _interactive_desktop(evidence=evidence):
         return None
+    # Diagnose the process that actually checked the desktop, only on refusal.
+    evidence.update(pid=os.getpid(), parent_pid=os.getppid())
+    if os.name == 'nt':
+        try:
+            session = W.DWORD()
+            if C.windll.kernel32.ProcessIdToSessionId(evidence['pid'], C.byref(session)):
+                evidence['session_id'] = session.value
+            evidence['effective_admin'] = bool(C.windll.shell32.IsUserAnAdmin())
+        except (OSError, AttributeError):
+            pass  # Preserve the original desktop refusal even on a restricted host.
     return dict(status='blocked', diagnostic='no_interactive_desktop',
                 host_action='check_interactive_session_before_retry', desktop_check=evidence, input_dispatched=False,
                 physical_input=False, steps=[], blocked_steps=physical,

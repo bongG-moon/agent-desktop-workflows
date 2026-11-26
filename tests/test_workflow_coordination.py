@@ -8,11 +8,20 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills/desktop-select/scripts'
 sys.path.insert(0, str(SCRIPTS))
 import coordination as c
+
+
+class WorkerTimingTests(unittest.TestCase):
+    def test_run_includes_startup_queue_and_receipt_without_exporting_absolute_clock(self):
+        receipt = {'_worker_entered': 11}
+        with patch.object(c.time, 'monotonic', return_value=15):
+            c.worker_timings(receipt, 10, 2)
+        self.assertEqual(receipt, dict(worker_startup_seconds=1, worker_wall_seconds=5, queue_seconds=2))
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows named mutexes')

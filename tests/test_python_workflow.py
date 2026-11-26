@@ -464,6 +464,38 @@ class RuntimeTests(unittest.TestCase):
         stable.assert_called_once()
         self.assertEqual(read.call_count, 2)
 
+    def test_explicit_header_uses_verified_selector_and_point_in_readonly_and_replay(self):
+        import result_cell
+        selector = dict(role='table', automation_id='Results')
+        anchor = dict(x=10, y=4, width=50, height=25)
+        step = dict(action='double-click-result', result_row='header', selector=selector,
+                    result_point=anchor, result_column='Code')
+        for changed in (dict(selector={'role':'table'}), dict(selector={'role':'table','query':'Results'}),
+                        dict(result_point=None), dict(result_column='')):
+            with self.assertRaisesRegex(flow.WorkflowError, 'invalid_result_header'):
+                flow.validate(dict(recipe(), steps=[dict(step, **changed)]))
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'position_in_header') as resolve,
+              patch.object(result_cell, 'find_row', side_effect=AssertionError('row lookup')),
+              patch.object(result_cell, 'execute_row', return_value=dict(status='delivered_unverified',
+                    diagnostic='visual_double_click_dispatched', input_dispatched=True)) as click,
+              patch.object(flow.time, 'sleep', side_effect=AssertionError('header polling'))):
+            data = dict(recipe(), steps=[step])
+            readonly = flow.run(data, read_only=True)
+            self.assertEqual(readonly['steps'][0]['receipt']['diagnostic'], 'result_header_located')
+            self.assertFalse(readonly['input_dispatched'])
+            click.assert_not_called()
+            live = flow.run(data)
+            self.assertTrue(live['input_dispatched'])
+            self.assertEqual(click.call_args.kwargs, dict(mode='header', point=anchor, column='Code'))
+            resolve.side_effect = flow.app.bridge.BridgeError('result_header_point_mismatch')
+            blocked = flow.run(data, read_only=True)
+            self.assertEqual(blocked['status'], 'blocked')
+            self.assertEqual(blocked['diagnostic'], 'result_header_point_mismatch')
+            self.assertFalse(blocked['input_dispatched'])
+            self.assertEqual(resolve.call_count, 3)
+            click.assert_called_once()
+
     def test_row_only_waits_for_empty_grid_but_does_not_retry_ambiguous_rows(self):
         import result_cell
         step = dict(action='double-click-result', result_row='single', selector=dict(role='table'))

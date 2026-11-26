@@ -86,6 +86,34 @@ class FirstTrial(unittest.TestCase):
             interrupted = dict(report, status=status, stopped_at=2, host_action='check_current_effect_before_continuing')
             self.assertEqual(first_trial.host_summary(interrupted), interrupted)
 
+    def test_failed_header_can_be_reinspected_without_requerying_or_capturing(self):
+        import grounding
+        import python_workflow as flow
+        tasks.save_task(self.task, self.directory)
+        recipe = dict(self.task, steps=[
+            dict(action='invoke', selector=dict(role='button', name='VIEW')),
+            dict(action='double-click-result', result_row='header', selector=dict(role='group', automation_id='Grid'),
+                 result_column='Code', result_point=dict(x=10, y=4, width=50, height=25))])
+        plan = dict(envelope=dict(recipe=recipe, source_steps=[1, 2]))
+        owner = dict(hwnd=7, pid=19, exe_name=recipe['exe'], title=recipe['window'], process_started_utc_ticks=11)
+        self.worker.return_value = dict(status='blocked', input_dispatched=True, stopped_at=2,
+            diagnostic='result_header_point_mismatch', inspection_owner=owner,
+            steps=[dict(number=1, receipt=dict(status='delivered_unverified', input_dispatched=True)),
+                   dict(number=2, receipt=dict(status='blocked', input_dispatched=False))])
+        args = ['--task', self.task['name'], '--allow-physical']
+        with (patch.object(first_trial, '_compiled', return_value=plan),
+              patch.object(flow.input_policy, 'interactive_desktop_blocked', return_value=None),
+              patch.object(flow, 'run', return_value=dict(status='observed', input_dispatched=False)) as observe,
+              patch.object(grounding, '_capture', side_effect=AssertionError('image used'))):
+            report = self.trial(*args)
+            self.assertEqual(report['host_action'], 'inspect_current_state_without_replaying')
+            self.assertEqual(self.trial(*args)['this_call_dispatched_input'], False)
+            state = first_trial.inspect_result(app, report['trial_receipt'])
+            self.assertFalse(state['input_dispatched'])
+            self.assertFalse(state['prior_steps_replayed'])
+            self.assertEqual(observe.call_args.kwargs, dict(read_only=True, only='2', hwnd=7, result_owner=owner))
+            self.worker.assert_called_once()
+
     def test_wrong_parameter_name_returns_the_recorded_names_before_any_input(self):
         from contextlib import redirect_stdout
         from io import StringIO

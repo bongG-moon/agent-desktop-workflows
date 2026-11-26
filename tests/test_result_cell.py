@@ -242,6 +242,84 @@ class ResultCellTests(unittest.TestCase):
             with self.assertRaisesRegex(win.BridgeError, 'result_row_unavailable'):
                 result_cell.position_in_body(self.binding, self.uia, group, point)
 
+    def open_header(self, *, name='Order', point=None, guard=lambda: None):
+        return result_cell.execute_row(self.binding, self.uia, self.grid, guard, mode='header',
+                                       point=point or result_cell.body_point(self.grid.box, (42, 25)), column=name)
+
+    def test_named_header_reproves_the_recorded_point_and_sends_only_one_double_click(self):
+        self.grid.values[30003] = 50026  # A painted result surface with no row pattern.
+        self.hit = self.node(self.header, 50020, 'Order', 20, 40)
+        pointer = self.prepare_pointer()
+        self.enterContext(patch('row_vision._window_rect', return_value=(0, 0, 800, 600)))
+        point = result_cell.body_point(self.grid.box, (42, 25))
+        # Translate the whole window between runs: keep the exact offset from the table.
+        self.grid.box['x'] += 100
+        self.header.box['x'] += 100
+        self.assertEqual(result_cell.position_in_header(self.binding, self.uia, self.grid, point, 'Order'), (142, 25))
+        pointer.assert_not_called()
+        with patch.object(result_cell, 'find_row', side_effect=AssertionError('header must not search for rows')):
+            receipt = self.open_header(point=point)
+        self.assertEqual(receipt['target_resolution'], 'recorded_column_header')
+        self.assertEqual(receipt['status'], 'delivered_unverified')
+        pointer.assert_called_once_with(142, 25, 'double-click')
+
+    def test_header_requires_unique_exact_name_and_recorded_point_in_it(self):
+        self.hit = self.header
+        pointer = self.prepare_pointer()
+        self.enterContext(patch('row_vision._window_rect', return_value=(0, 0, 800, 600)))
+        for name, error in (('Ord', 'result_header_unavailable'), ('Reference', 'result_header_point_mismatch')):
+            with self.subTest(name=name), self.assertRaisesRegex(win.BridgeError, error):
+                self.open_header(name=name)
+        self.other_header.values[30005] = 'Order'
+        self.other_header.values[30022] = True
+        with self.assertRaisesRegex(win.BridgeError, 'result_header_ambiguous'):
+            self.open_header()
+        pointer.assert_not_called()
+
+    def test_other_header_data_overlay_disabled_header_or_changed_point_never_receives_header_click(self):
+        self.hit = self.header
+        pointer = self.prepare_pointer()
+        self.enterContext(patch('row_vision._window_rect', return_value=(0, 0, 800, 600)))
+        for wrong in (self.other_header, self.cell, self.node(self.header, 50000, 'Filter', 20, 40)):
+            with self.subTest(hit=wrong.values[30005]), self.assertRaises(win.BridgeError):
+                self.hit = wrong
+                self.open_header()
+        self.hit = self.header
+        for prop, value in ((30010, False), (30022, True), (30019, True)):
+            with self.subTest(prop=prop), patch.dict(self.header.values, {prop: value}), self.assertRaises(win.BridgeError):
+                self.open_header()
+        count = iter((None, 'changed'))
+        def move_header():
+            if next(count):
+                self.header.box = dict(self.header.box, x=self.header.box['x'] + 10)
+        with self.assertRaisesRegex(win.BridgeError, 'result_cell_changed'):
+            self.open_header(guard=move_header)
+        with patch.object(win, 'window_from_point', return_value=0), self.assertRaisesRegex(win.BridgeError, 'occluded'):
+            self.open_header()
+        pointer.assert_not_called()
+
+    def test_header_dispatch_failure_is_reported_once_as_uncertain(self):
+        self.hit = self.header
+        pointer = self.prepare_pointer()
+        pointer.side_effect = RuntimeError('disconnected after dispatch')
+        self.enterContext(patch('row_vision._window_rect', return_value=(0, 0, 800, 600)))
+        receipt = self.open_header()
+        self.assertEqual(receipt['status'], 'uncertain')
+        self.assertIsNone(receipt['input_dispatched'])
+        pointer.assert_called_once()
+
+    def test_popup_which_appears_during_header_resolution_prevents_dispatch(self):
+        self.hit = self.header
+        pointer = self.prepare_pointer()
+        self.enterContext(patch('row_vision._window_rect', return_value=(0, 0, 800, 600)))
+        def expect_absent():
+            raise win.BridgeError('expected_new_window_already_open')
+        with self.assertRaisesRegex(win.BridgeError, 'expected_new_window_already_open'):
+            result_cell.execute_row(self.binding, self.uia, self.grid, lambda: None, mode='header',
+                                    point=result_cell.body_point(self.grid.box, (42, 25)),
+                                    column='Order', before_header_dispatch=expect_absent)
+        pointer.assert_not_called()
+
     def test_named_column_opens_its_current_cell_without_reading_or_comparing_business_values(self):
         target = self.node(self.row, 50020, 'changes', 143, 30)
         with patch.object(result_cell, '_cell_text', side_effect=AssertionError('no equality requested')):

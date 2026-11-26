@@ -414,6 +414,30 @@ def restore_routes(flow, recipe, record, routes):
         routes.bindings[flow.window_context._key(spec)] = child
 
 
+def header_stop(report, recipe):
+    """Inspect the failed header or its dependent detail without resending a query."""
+    number = report.get('stopped_at')
+    if (report.get('status') not in ('blocked', 'uncertain', 'mismatch') or report.get('input_dispatched') is False
+            or type(number) is not int or not 1 <= number <= len(recipe['steps'])):
+        return None
+    step = recipe['steps'][number - 1]
+    opener = step.get('window_context', {}).get('after_step', number)
+    if recipe['steps'][opener - 1].get('result_row') == 'header':
+        return dict(host_action='inspect_current_state_without_replaying',
+                    inspect_args=['--read-only', '--only', str(number), '--summary'])
+
+
+def compact_stop(report):
+    if report.get('host_action') != 'inspect_current_state_without_replaying':
+        return report
+    result = {k: v for k, v in report.items() if k not in ('input_requirements', 'inspection_owner', 'state_inspection')}
+    result['steps'] = [dict({k: v for k, v in row.items() if k != 'receipt'},
+                            **{k: v for k, v in row.get('receipt', {}).items()
+                               if k in ('status', 'diagnostic', 'input_dispatched', 'verification_scope')})
+                       for row in report.get('steps', [])]
+    return result
+
+
 def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_result_review=True,
                    allow_recorded_selection=False):
     """One worker owns the stored ticket until its checked input has been consumed."""
@@ -472,8 +496,21 @@ def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_
             recipe = run_recipe = current
             result_ticket = getattr(args, 'confirm_result_locally', None)
             local_review = getattr(args, 'local_result_review', False)
+            header_run = not args.only and any(s.get('result_row') == 'header' for s in recipe['steps'])
+            if header_run:
+                import first_trial
+                stop_path = session.directory / 'header-stop.json'
+                stop_key = digest([recipe, {k.casefold(): v for k, v in overrides.items()}])
+                if stop_path.exists() and not getattr(args, 'new_attempt', False):
+                    previous = first_trial._previous(stop_path)
+                    need('key' in previous and isinstance(previous.get('stop'), dict), 'header_stop_unreadable')
+                    if (previous.get('key') == stop_key and
+                            (args.hwnd is None or previous.get('hwnd') in (None, args.hwnd))):
+                        return dict(previous['stop'], status='blocked', input_dispatched=False, steps=[],
+                                    previous_input_dispatched=previous['prior_input'], prior_steps_replayed=False)
             if (enable_result_review and not args.only and not args.repair_frame and not args.resume_menu and not resume_input
-                    and any('result_column' in s or 'result_row' in s for s in recipe['steps'])):
+                    and any(('result_column' in s or 'result_row' in s) and s.get('result_row') != 'header'
+                            for s in recipe['steps'])):
                 import registered_result
                 result_review = registered_result.ResultReview(session, recipe, args.recipe)
                 if registered_result.eligible(recipe):
@@ -521,6 +558,20 @@ def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_
         report = flow.run(run_recipe, overrides, hwnd=resume['scope'][0][0] if resume else args.hwnd,
                           only=resume['only'] if resume else args.only, track_menu=True, resume=resume,
                           scene_session=scene_session, allow_recorded_selection=allow_recorded_selection, **surface_options)
+        if header_run:
+            stop = header_stop(report, recipe)
+            if stop:
+                report.update(stop)
+                try:
+                    hwnd = report.get('inspection_owner', {}).get('hwnd', args.hwnd)
+                    first_trial._write_receipt(stop_path, dict(status='blocked', key=stop_key, hwnd=hwnd,
+                        stop=dict(stop, diagnostic=report.get('diagnostic'), stopped_at=report['stopped_at']),
+                        prior_input=report['input_dispatched']))
+                except (OSError, ValueError):
+                    report['repair_storage'] = dict(status='not_saved', diagnostic='header_stop_not_saved')
+                return report
+            if report.get('status') in ('completed_unverified', 'verified') and not report.get('stopped_at'):
+                stop_path.unlink(missing_ok=True)
         if result_review and not resume:
             learned = [dict(row['receipt']['result_element'], number=row['number']) for row in report.get('steps',[])
                        if row.get('receipt',{}).get('result_element') and row['receipt']['status'] == 'verified']

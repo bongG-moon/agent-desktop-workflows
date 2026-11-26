@@ -73,6 +73,7 @@ class InteractiveDesktopTests(unittest.TestCase):
         self.assertEqual(result['diagnostic'], 'no_interactive_desktop')
         self.assertEqual(result['host_action'], 'check_interactive_session_before_retry')
         self.assertEqual(result['blocked_steps'], [4, 6])
+        self.assertGreater(result['desktop_check']['pid'], 0)
         self.assertIs(result['input_dispatched'], False)
         self.assertEqual(result['steps'], [])
 

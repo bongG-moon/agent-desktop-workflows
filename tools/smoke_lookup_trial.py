@@ -30,7 +30,7 @@ def build_lookup_fixture(work):
     return exe
 
 
-def exercise(package, work, painted=False, external_host=False, demonstrated=False, legacy_point=False):
+def exercise(package, work, painted=False, external_host=False, demonstrated=False, legacy_point=False, header=False):
     work.mkdir(parents=True, exist_ok=False)
     with ZipFile(package) as archive:
         archive.extractall(work / '.claude/skills')
@@ -47,12 +47,17 @@ def exercise(package, work, painted=False, external_host=False, demonstrated=Fal
     exe = build_lookup_fixture(work)
     win = app.bridge
     win.set_dpi_awareness()
-    fixture = Fixture(exe, *(['--group-only', '--scoped-detail'] if demonstrated else ['--painted'] if painted else []))
+    fixture = Fixture(exe, *(['--header-detail', '--scoped-detail'] if header else
+                             ['--group-only', '--scoped-detail'] if demonstrated else ['--painted'] if painted else []))
+    demonstrated = demonstrated or header
     instructions = DEMONSTRATED_STEPS if demonstrated else INSTRUCTIONS
     if demonstrated and not legacy_point:
         # Keep the recorder's own defaults for every demonstrated gesture.
         # Only the parameter and the requested read require user intent.
         instructions = [instructions[0], None, None, instructions[3], None]
+    if header:
+        instructions = [instructions[0], None, 'Equip ID 열 머리를 더블클릭해줘',
+                        '상세 창에서 Equip ID 입력란이 {Equip ID}와 일치하는지 확인해줘', 'Comment 값을 읽어줘', INSTRUCTIONS[-1]]
     title = fixture.ready['title']
     binding = win.Binding(dict(pid=fixture.ready['pid'], hwnd=fixture.ready['hwnd'], exe_name=exe.name))
     trail = CaptureTrail(binding, title)
@@ -100,6 +105,8 @@ def exercise(package, work, painted=False, external_host=False, demonstrated=Fal
         settle(.75)
 
     try:
+        from smoke_registered_result import wait_for_idle
+        wait_for_idle()
         foreground(binding)
         start = time.monotonic()
         trail.start()
@@ -112,16 +119,18 @@ def exercise(package, work, painted=False, external_host=False, demonstrated=Fal
         demonstrate('view')
         if not demonstrated:
             demonstrate('cell')
-        demonstrate('cell','double-click')
+        demonstrate('header' if header else 'cell','double-click')
         assert fixture.command('state')['detailOpen']
         settle(.7)
+        if header:
+            demonstrate('detail-id')
         demonstrate('note','drag' if demonstrated else 'click')
         demonstrate('exit')
         raw = trail.finish()['steps']
         durations['demonstration'] = round(time.monotonic()-start,3)
         (work/'captured.json').write_text(json.dumps(raw,ensure_ascii=False),encoding='utf8')
         assert len(raw) == len(instructions), [(s['action'],s['label']) for s in raw]
-        if demonstrated:
+        if demonstrated and not header:
             location = app.tasks.result_location(raw[2])
             assert location['result_surface']['automation_id'] == 'PaintedResults' and location.get('result_point'), raw[2]
             assert raw[3]['recognition']['reason'] == 'drag_needs_review', raw[3]
@@ -152,6 +161,8 @@ def exercise(package, work, painted=False, external_host=False, demonstrated=Fal
         if demonstrated and not legacy_point:
             body = store.saved_plan['steps'][2]
             assert body['action'] == 'double-click-result' and body.get('result_point') and 'visual' not in body
+            if header:
+                assert body['result_row'] == 'header' and body['result_column'] == 'Equip ID', body
         durations['review_save'] = round(time.monotonic()-start,3)
         before = fixture.command('reset')
         assert before['last']=='DEMO' and before['closed']==1 and before['queries']==1
@@ -188,9 +199,10 @@ def exercise(package, work, painted=False, external_host=False, demonstrated=Fal
                 report, = receipts
         else:
             report, durations['first_trial'] = call_cli(trial_args, extra_env=review_env)
-            if demonstrated and not legacy_point:
-                assert set(first_trace.read_text(encoding='utf8').splitlines()) == {'launcher_guard_enabled', 'worker_guard_enabled'}
         (work/'trial.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf8')
+        if demonstrated and not legacy_point and not external_host:
+            assert report.get('status') == 'verified', (report.get('status'), report.get('diagnostic'), report.get('stopped_at'))
+            assert set(first_trace.read_text(encoding='utf8').splitlines()) == {'launcher_guard_enabled', 'worker_guard_enabled'}
         if painted:
             assert report.get('host_action') == 'inspect_current_result_without_replaying', report
             intermediate = fixture.command('state')
@@ -233,6 +245,10 @@ def exercise(package, work, painted=False, external_host=False, demonstrated=Fal
             assert (final['last'],final['queries'],final['opened'],final['closed'],final['archiveClicks'],final['wrongRows'],
                     final['detailOpen']) == ('LAB-77',3,3,3,0,0,False), (final,run)
             assert run.get('status') == 'verified' and 'Note for LAB-77' in json.dumps(run), run
+            if header:
+                rows = run['steps']
+                assert rows[3]['status'] == 'verified' and rows[3]['value'] == 'LAB-77', run
+                assert run['query_freshness'] == 'not_asserted' and rows[-1]['diagnostic'] == 'recorded_window_closed', run
             trace = no_image_trace.read_text(encoding='utf8').splitlines()
             assert 'worker_guard_enabled' in trace and set(trace) <= {'launcher_guard_enabled','worker_guard_enabled'}, trace
             summary.update(registered_observed='Note for LAB-77', total_queries=3, wrong_rows=final['wrongRows'],
@@ -251,9 +267,11 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--painted',action='store_true',help='draw result cell text as pixels and read a window-image point on stdin')
     mode.add_argument('--demonstrated',action='store_true',help='record a body double-click and text drag on an owner-drawn grid, then register and run again')
+    mode.add_argument('--header', action='store_true', help='record a named column header, verify the detail ID, then register and rerun')
     parser.add_argument('--legacy-point',action='store_true',help='omit the old recording position and field locator and select the position once in the local review window')
     parser.add_argument('--external-host',action='store_true',help='pause after saving so a separate host can run the first trial')
     args=parser.parse_args()
     if args.legacy_point and not args.demonstrated:
         parser.error('--legacy-point requires --demonstrated')
-    exercise(args.package.resolve(strict=True),args.work.resolve(),args.painted,args.external_host,args.demonstrated,args.legacy_point)
+    exercise(args.package.resolve(strict=True),args.work.resolve(),args.painted,args.external_host,args.demonstrated,
+             args.legacy_point, header=args.header)

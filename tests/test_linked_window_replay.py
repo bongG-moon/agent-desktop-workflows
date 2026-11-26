@@ -50,6 +50,22 @@ class LinkedWindowTests(TestCase):
         self.recipe = dict(schema=1, name='Two windows', exe='Manager.exe', window='Manager',
                            steps=[self.command, self.child, deepcopy(self.command)])
 
+    def test_inspect_detail_only_reports_related_windows_without_rerunning_opener(self):
+        self.child['window_context'] = dict(exe='Manager.exe', title='Instance A', after_step=1, related=True)
+        self.records.extend([dict(window(7, 'Other detail'), pid=self.owner.pid),
+                             window(9, 'Unrelated process')])
+        with mock.patch.object(flow.live, 'execute') as send:
+            missing = flow.run(self.recipe, read_only=True, only=2)
+            self.assertFalse(missing['input_dispatched'])
+            self.assertEqual(missing['window_observation'], dict(expected='Instance A', state='unresolved',
+                                                                 same_process_windows=['Other detail']))
+            self.records.append(dict(window(8), pid=self.owner.pid))
+            current = flow.run(self.recipe, read_only=True, only=2)
+            self.assertEqual(current['window_observation']['state'], 'present')
+            self.assertIn(current['window_observation']['relation'], ('owned', 'same_process'))
+            self.assertFalse(current['input_dispatched'])
+            send.assert_not_called()
+
     def test_verified_child_scope_and_return_to_root(self):
         sent = []
         def execute(bound, *args, **kwargs):

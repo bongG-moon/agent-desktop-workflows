@@ -466,6 +466,26 @@ class TextfieldWorkerTests(unittest.TestCase):
         self.worker._remember_command_hover()
         self.assertIsNone(self.worker.command_at_press(event))
 
+    def test_worker_proof_survives_dialog_dismissal_before_queued_release(self):
+        now = time.monotonic()
+        locator = dict(role='button', name='Done')
+        raw = dict(id='old', action='click', label='Done', target=dict(kind='element', locator=locator),
+                   recognition=dict(target='identified', action='supported', result='manual'))
+        self.worker.command_snapshot = now-.1, [(dict(x=0, y=0, width=80, height=40), raw)]
+        self.binding.check.side_effect = capture.bridge.BridgeError('target_lifetime_changed')
+        press = dict(kind='down', token=12, action='click', window=5, hit_window=5,
+                     scope_proven=True, at=now, x=30, y=20)
+        self.worker.handle(press)
+        self.assertEqual(self.notes.snapshot(), [])
+        # The hook saw the matching release but the worker still has it queued.
+        session = Mock(linked=True, binding=self.binding, notes=self.notes, notices=queue.Queue())
+        session.pump.last_scoped_down, session.pump.last_click = now, press
+        session.notices.put(('fatal', 'target_lifetime_changed'))
+        with patch.object(capture.bridge.user32, 'IsWindow', return_value=False):
+            capture.CaptureSession.poll(session)
+        recorded, = self.notes.snapshot()
+        self.assertEqual((recorded['action'], recorded['target']['locator']), ('click', locator))
+
     def test_command_snapshot_never_substitutes_an_unscoped_or_stale_click(self):
         now = time.monotonic()
         self.worker.command_snapshot = (now-5, [(dict(x=0,y=0,width=100,height=100), dict(id='finish'))])

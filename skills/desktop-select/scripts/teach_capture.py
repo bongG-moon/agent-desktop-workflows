@@ -235,6 +235,8 @@ def default_text(step):
     if step['action'] == 'saved-step':
         from review_drafts import saved_form
         return saved_form(step['saved'])['text']
+    if step.get('result_header') and learned_tasks.is_double_click_step(step):
+        return step['result_header'] + ' 열 머리 더블클릭'
     if step['action'] in ('row-action', 'result-menu', 'visual-click'):
         return step['label']
     if step.get('recognition', {}).get('reason') == 'double_click_needs_review':
@@ -1044,6 +1046,9 @@ class _Worker(recorder.CaptureWorker):
         if pending is None:
             pending = self._pending_commands = {}
         if event['kind'] == 'down' and (raw := self._command_before(event)):
+            # The hook keeps this same press until its matching release. Preserve
+            # the worker's pre-press evidence if the dialog closes before up is read.
+            event['command_before_close'] = raw
             pending[event['token']] = event, raw
             try:
                 self.binding.check()
@@ -1411,12 +1416,17 @@ class _Worker(recorder.CaptureWorker):
             if (first and not previous['protected'] and down.get('scope_proven') is True
                     and down.get('window') == self.binding.hwnd and obs and obs.get('window') == self.binding.hwnd
                     and obs['node'].get('secure') is False
-                    and obs['node'].get('role') in {'table', 'list', 'group', 'row', 'listitem', 'statictext', 'custom'}):
-                surface = learned_tasks.recorded_result_surface(obs['node'].get('locator'))
+                    and obs['node'].get('role') in {'table', 'list', 'group', 'row', 'listitem', 'statictext', 'custom', 'headeritem'}):
+                locator = obs['node'].get('locator') or {}
+                surface = learned_tasks.recorded_result_surface(locator)
                 if surface:
                     previous['result_location'] = dict(result_surface=surface)
                     if point := self._result_press_point(obs, down, surface):
                         previous['result_location']['result_point'] = point
+                        header = next((entry for entry in [locator, *locator.get('ancestors', [])]
+                                       if entry.get('role') == 'headeritem'), None)
+                        if header and learned_tasks._text(header.get('name'), 100):
+                            previous['result_location']['result_header'] = header['name']
                     if first['action'] == 'visual-click' or learned_tasks.is_recoverable(first):
                         first['target'] = dict(kind='element', locator=surface)
         if (down.get('visual') and 'surface' not in down['visual']
@@ -1442,7 +1452,7 @@ class _Worker(recorder.CaptureWorker):
                                 (observation and observation['node'].get('secure') is not False)):
                 self.model.add(manual('protected_input_not_recorded', previous_id))
                 return result
-            if (spec and previous_id and down.get('scope_proven') is True and down.get('window') == self.binding.hwnd
+            if (spec and not location.get('result_header') and previous_id and down.get('scope_proven') is True and down.get('window') == self.binding.hwnd
                     and not down.get('menu_pick') and (observation is None or observation['node'].get('secure') is False)):
                 with self.model.lock:
                     step = self.model.steps.get(previous_id, {})

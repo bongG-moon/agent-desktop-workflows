@@ -38,6 +38,28 @@ def receipts():
 
 
 class DetailOutcomeTests(TestCase):
+    def test_named_header_and_verified_detail_field_do_not_assert_a_fresh_query(self):
+        spec, rows = recipe(), receipts()
+        del spec['steps'][2:4], rows[2:4]
+        header = spec['steps'][2]
+        header.update(result_row='header', result_column='Identifier', selector=dict(role='group', automation_id='ReportList'),
+                      result_point=dict(x=10, y=8, width=80, height=30))
+        scope = dict(spec['steps'][3]['window_context'], after_step=3)
+        for step in spec['steps'][3:]:
+            step['window_context'] = scope
+        spec['steps'].insert(3, dict(action='verify-value', selector=dict(role='textfield', automation_id='actualIdentifier'),
+                                     parameter='ID', window_context=scope))
+        rows[2]['receipt'].update(result_row='header', value_comparison=False,
+            target_resolution='recorded_column_header', result_observation=dict(strategy='uia_header', column='Identifier'))
+        rows.insert(3, dict(number=4, receipt=dict(status='verified', value='B', value_evidence=dict(status='observed'))))
+        flow.validate(spec)
+        self.assertTrue(flow.verified_detail_read(spec['steps'], rows))
+        rows[2]['receipt']['result_observation']['column'] = 'Other column'
+        self.assertFalse(flow.verified_detail_read(spec['steps'], rows))
+        rows[2]['receipt']['result_observation']['column'] = 'Identifier'
+        rows[3]['receipt']['status'] = 'mismatch'
+        self.assertFalse(flow.verified_detail_read(spec['steps'], rows))
+
     def test_plain_recorded_result_confirms_only_the_opened_read_and_closed_detail(self):
         spec = recipe()
         rows = receipts()

@@ -241,7 +241,9 @@ class RegisterFirstRunTests(unittest.TestCase):
         from test_conditional_action import ConditionalExecutionTests
         from test_python_context_workflow import context
         import scene_session
-        self.recipe['steps'].extend([context(), deepcopy(ConditionalExecutionTests.step)])
+        header = dict(action='double-click-result', selector=dict(role='group', automation_id='Report'),
+                      result_row='header', result_column='Part', result_point=dict(x=7,y=5,width=100,height=80))
+        self.recipe['steps'].extend([context(), deepcopy(ConditionalExecutionTests.step), header])
         self.write_source()
         waiting = dict(status='needs_scene', input_dispatched=True, ticket='active-worker', steps=[])
         with self.workers() as (registration, execution, engine), patch.object(
@@ -255,7 +257,18 @@ class RegisterFirstRunTests(unittest.TestCase):
         self.assertTrue(session['auto_repair_frame'])
         self.assertTrue(session['allow_physical'])
         self.assertFalse(session['background_only'])
+        self.assertFalse(session['new_attempt'])
         self.assertEqual(start.call_args.args[2]['overrides'], {'Family': 'Hybrid'})
+        packet = start.call_args.args
+        self.assertEqual(packet[1]['steps'][-1], header)
+        with patch.object(flow.workflow_repair, 'run_registered') as registered:
+            flow.run(packet[1], **packet[2], scene_session='live')
+            self.assertEqual(registered.call_args.args[1]['steps'][-1], header)
+            self.assertEqual(registered.call_args.args[2].recipe, self.destination / 'workflow.json')
+            self.assertEqual(registered.call_args.args[-1], 'live')
+            for wrong in ([session], dict(session, skip_input_guards=True), dict(session, recipe=None)):
+                with self.assertRaisesRegex(flow.WorkflowError, 'invalid_registered_session'):
+                    flow.run(packet[1], registered_session=wrong, scene_session='live')
         engine.assert_called_once()
         execution.assert_called_once()
 

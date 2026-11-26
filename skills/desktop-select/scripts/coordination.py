@@ -98,6 +98,17 @@ class ActiveDeadline:
         return self.end - time.monotonic() + paused
 
 
+def worker_timings(receipt, started, queue_seconds=0):
+    """Parent elapsed time includes process startup, queueing and result delivery."""
+    finished = time.monotonic()
+    receipt['worker_wall_seconds'] = round(finished - started, 4)
+    entered = receipt.pop('_worker_entered', None)
+    if isinstance(entered, (int, float)) and started <= entered <= finished:
+        receipt['worker_startup_seconds'] = round(entered - started, 4)
+    if isinstance(queue_seconds, (int, float)) and queue_seconds > 0:
+        receipt['queue_seconds'] = round(queue_seconds, 3)
+
+
 def run_worker(argv, *, timeout, input=None, capture_output=True, **kwargs):
     """Keep the provider watchdog running except for time actually queued.
 

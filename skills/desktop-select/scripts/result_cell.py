@@ -564,12 +564,20 @@ def find_row(binding, uia, table, *, mode='single', column=None):
     return candidates[0]
 
 
-def _point_target(binding, uia, cell, point, *, body=False):
+def _point_target(binding, uia, cell, point, *, body=False, header=False):
     native = win.window_from_point(*point)
     require(native and win.root_window(native) == binding.hwnd and win.hwnd_pid(native) == binding.pid,
             'result_cell_occluded')
     hit = uia.from_point(*point)
     chain = lookup.ancestry(uia, hit, cell, pid=binding.pid)
+    if header:
+        # Plain text within the named header is fine. A filter button, splitter,
+        # embedded editor or another header is a different gesture.
+        require(cell.property(30003) == 50035 and all(e.property(30010) is True
+                and e.property(30022) is not True for e in chain)
+                and all(e.property(30003) == 50020 and not any(e.property(p) is True
+                    for p in (30028, 30031, 30036, 30041)) for e in chain[:-1]), 'result_header_hit_changed')
+        return native
     require(all(not _non_data_control(e) and e.property(30022) is not True for e in chain),
             'result_cell_occluded')
     if body:
@@ -601,16 +609,12 @@ def body_point(box, screen_point):
     return point
 
 
-def position_in_body(binding, uia, table, anchor):
-    """Keep the demonstrated offset when the panel moves or resizes; never stretch it to a new row."""
+def _surface_point(binding, uia, table, anchor):
+    """Keep the demonstrated offset inside the current surface and window."""
     root = uia.from_handle(binding.hwnd)
     lookup.ancestry(uia, table, root, pid=binding.pid)
     require(not uia.same(table, root) and table.property(30010) is True
             and readable_surface(binding, uia, table, root), 'result_container_not_visible')
-    if table.property(30030) is True:
-        count = table.property(30062)
-        require(type(count) is int and count >= 0, 'result_grid_incomplete')
-        require(count > 0, 'result_row_missing')
     box = uia.bounds(table)
     require(0 <= anchor['x'] < box['width'] and 0 <= anchor['y'] < box['height'], 'result_row_unavailable')
     point = (box['x'] + anchor['x'], box['y'] + anchor['y'])
@@ -620,7 +624,53 @@ def position_in_body(binding, uia, table, anchor):
     return point
 
 
-def execute_row(binding, uia, table, guard, *, mode='single', point=None, column=None):
+def position_in_body(binding, uia, table, anchor):
+    point = _surface_point(binding, uia, table, anchor)
+    if table.property(30030) is True:
+        count = table.property(30062)
+        require(type(count) is int and count >= 0, 'result_grid_incomplete')
+        require(count > 0, 'result_row_missing')
+    return point
+
+
+def _named_header(binding, uia, table, column):
+    try:
+        header = lookup.resolve(binding, uia, {'role': 'headeritem', 'name': column}, table)
+    except win.BridgeError as error:
+        if error.code in ('target_missing', 'target_ambiguous'):
+            raise win.BridgeError('result_header_ambiguous' if error.code == 'target_ambiguous'
+                                  else 'result_header_unavailable') from error
+        raise
+    chain = lookup.ancestry(uia, header, table, pid=binding.pid)
+    require(uia.same(_surface(chain), table)
+            and not any(e.property(30003) in _FORM_CONTROLS | _ROW | {50035}
+                        or e.property(30030) is True for e in chain[1:-1])
+            and header.property(30010) is True
+            and visibility.visible(binding, uia, header, uia.from_handle(binding.hwnd)),
+            'result_header_unavailable')
+    return header
+
+
+def _header_point(binding, uia, table, header, anchor):
+    point = _surface_point(binding, uia, table, anchor)
+    box = uia.bounds(header)
+    require(visibility.valid(box) and box['x'] <= point[0] < box['x'] + box['width']
+            and box['y'] <= point[1] < box['y'] + box['height'], 'result_header_point_mismatch')
+    return point
+
+
+def position_in_header(binding, uia, table, anchor, column):
+    """Observe a recorded point in one named header without foregrounding the window."""
+    return _header_point(binding, uia, table, _named_header(binding, uia, table, column), anchor)
+
+
+def execute_row(binding, uia, table, guard, *, mode='single', point=None, column=None, before_header_dispatch=None):
+    if mode == 'header':
+        require(point is not None and bool(column), 'invalid_result_row')
+        return _execute(binding, uia, guard, lambda: _named_header(binding, uia, table, column),
+                        'recorded_column_header',
+                        header_point=lambda header: _header_point(binding, uia, table, header, point),
+                        before_dispatch=before_header_dispatch)
     if point is not None:
         require(mode == 'recorded' and column is None, 'invalid_result_row')
         return _execute(binding, uia, guard, lambda: table, 'recorded_result_position', anchor=point)
@@ -628,7 +678,18 @@ def execute_row(binding, uia, table, guard, *, mode='single', point=None, column
     return _execute(binding, uia, guard, lambda: find_row(binding, uia, table, mode=mode, column=column), resolution)
 
 
-def _execute(binding, uia, guard, find_current, resolution, *, anchor=None):
+def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, header_point=None, before_dispatch=None):
+    def point_for(element, box):
+        if header_point is not None:
+            return header_point(element)
+        if anchor is not None:
+            return position_in_body(binding, uia, element, anchor)
+        require(visibility.visible(binding, uia, element, root), 'result_cell_not_clickable')
+        return (int(box['x'] + box['width'] / 2), int(box['y'] + box['height'] / 2))
+
+    def hit_at(element, point):
+        return _point_target(binding, uia, element, point, body=anchor is not None, header=header_point is not None)
+
     with coordination.desktop_input():
         guard()
         row_action.foreground(binding)
@@ -637,28 +698,23 @@ def _execute(binding, uia, guard, find_current, resolution, *, anchor=None):
         cell = find_current()
         root = uia.from_handle(binding.hwnd)
         box = uia.bounds(cell)
-        if anchor is None:
-            require(visibility.visible(binding, uia, cell, root), 'result_cell_not_clickable')
-            point = (int(box['x'] + box['width'] / 2), int(box['y'] + box['height'] / 2))
-        else:
-            point = position_in_body(binding, uia, cell, anchor)
-        native_hit = _point_target(binding, uia, cell, point, body=anchor is not None)
+        point = point_for(cell, box)
+        native_hit = hit_at(cell, point)
         guard()
+        if before_dispatch is not None:
+            before_dispatch()
         win._combo_surface(binding)
         # Refresh the column, uniqueness and UIA hit after the final guard. Virtualized
         # rows and in-grid overlays can change without changing the native window.
         current = find_current()
         require(uia.same(current, cell) and uia.bounds(current) == box and current.property(30010) is True,
                 'result_cell_changed')
-        if anchor is None:
-            require(visibility.visible(binding, uia, current, root), 'result_cell_changed')
-        else:
-            require(position_in_body(binding, uia, current, anchor) == point, 'result_cell_changed')
+        require(point_for(current, box) == point, 'result_cell_changed')
         chain = lookup.ancestry(uia, current, root, pid=binding.pid)
         require(not any(peer.property(30003) in _ROW and peer.property(30022) is True for peer in chain),
                 'result_cell_not_clickable')
-        require(_point_target(binding, uia, current, point, body=anchor is not None) == native_hit
-                and win.root_window(win.foreground()) == binding.hwnd, 'result_cell_changed')
+        require(hit_at(current, point) == native_hit and win.root_window(win.foreground()) == binding.hwnd,
+                'result_cell_changed')
         require(row_action._input_tick() == tick, 'foreground_or_input_changed')
         try:
             sent = win._send_point(*point, 'double-click')

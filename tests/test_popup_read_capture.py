@@ -23,6 +23,69 @@ def field(**changes):
 
 
 class PopupReadCaptureTests(unittest.TestCase):
+    def test_header_demonstration_generates_a_named_instruction_from_the_first_press(self):
+        from test_visual_recording import VisualRecordingTests
+        fixture = VisualRecordingTests()
+        fixture.setUp()
+        worker, notes = fixture.worker, fixture.notes
+        table = dict(role='group', automation_id='inventory')
+        header = dict(role='headeritem', name='Part ID', ancestors=[table])
+        observed = dict(fixture.observed, node=dict(role='headeritem', secure=False, locator=header))
+        worker.uia.basic.return_value = table
+        worker.uia.bounds.return_value = dict(x=195, y=65, width=220, height=80)
+        worker.uia.same.side_effect = lambda a, b: a is b
+        notes.add(capture.manual('unsupported_recorded_action', 'first'))
+        worker.recent_click = dict(token=41, step_id='first', observation=observed)
+        worker._remember_double_target(fixture.event)
+        worker.capture_double(dict(fixture.event, double=True, previous_token=41), observed)
+        raw, = notes.snapshot()
+        sentence = capture.default_text(raw)
+        self.assertEqual(sentence, 'Part ID 열 머리 더블클릭')
+        edits = capture.StepEdits()
+        edits.store(raw, '', sentence)
+        saved = tasks.from_recording('Open header', 'Orders.exe', 'Orders', edits.apply([raw]))
+        step, = saved['steps']
+        self.assertEqual(step['selector'], table)
+        self.assertEqual(step['result_point'], dict(x=13, y=51, width=220, height=80))
+        self.assertEqual((step['action'], step['result_row'], step['result_column']),
+                         ('double-click-result', 'header', 'Part ID'))
+        self.assertNotIn('visual', step)
+        recipe = recorded_plan.compile_plan(saved)['envelope']['recipe']
+        self.assertEqual(recipe['steps'][0]['result_row'], 'header')
+        self.assertEqual(recipe['steps'][0]['result_point'], step['result_point'])
+
+    def test_header_requires_named_instruction_and_recorded_table_and_point(self):
+        table = dict(role='table', automation_id='inventory')
+        point = dict(x=31, y=12, width=124, height=64)
+        raw = dict(capture.manual('double_click_needs_review'), result_surface=table, result_point=point)
+        for sentence in ('Part ID 열 머리 더블클릭', 'double-click the Part ID column header'):
+            spec = tasks.compile_instruction(raw, sentence)
+            self.assertEqual((spec['result_column'], spec['result_row']), ('Part ID', 'header'))
+            self.assertEqual(tasks.interpret_step(raw, sentence, 'double-click-result', table,
+                                                 result_row='header')['result_point'], point)
+        sentence = 'Part ID 열 머리 더블클릭'
+        self.assertEqual(tasks.compile_instruction(dict(raw, result_header='Other'), sentence)['mode'], 'draft')
+        self.assertEqual(tasks.compile_instruction(capture.manual('double_click_needs_review'), sentence)['mode'], 'draft')
+        different = dict(table, automation_id='other')
+        with self.assertRaisesRegex(tasks.TaskError, 'recorded_header_required'):
+            tasks.interpret_step(raw, sentence, 'double-click-result', different, result_row='header')
+        self.assertEqual(tasks.compile_instruction(dict(raw, result_header='Part ID'),
+                                                  '조회 결과 행 더블클릭')['result_row'], 'recorded')
+
+    def test_related_field_check_after_drag_uses_the_runtime_value(self):
+        row = dict(capture.manual('drag_needs_review'),
+                   window_context=dict(exe='Orders.exe', title='Details', related=True, after_step=2),
+                   target=dict(kind='element', locator=dict(role='textfield', automation_id='identifier',
+                                                            name='Part ID', ancestors=[dict(role='group', name='Info')])))
+        spec = tasks.compile_instruction(row, '상세 창에서 Part ID가 입력한 값과 같은지 확인해줘')
+        self.assertEqual((spec['mode'], spec['parameter'], spec['selector']),
+                         ('verify-value', 'Part ID', dict(role='textfield', automation_id='identifier',
+                                                         ancestors=[dict(role='group', name='Info')])))
+        self.assertNotIn('result_column', spec)
+        self.assertEqual(tasks.instructed_step(row, spec)['selector'], spec['selector'])
+        self.assertNotEqual(tasks.compile_instruction(row, '조회 결과 표에서 Part ID가 일치하는지 확인해줘')['mode'],
+                            'verify-value')
+
     def test_plain_list_double_click_requires_a_demonstrated_table(self):
         from test_visual_target import image, visual, VisualTargets
         surface = dict(role='group', automation_id='paintedResults')
