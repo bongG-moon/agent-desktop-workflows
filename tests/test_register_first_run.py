@@ -264,7 +264,7 @@ class RegisterFirstRunTests(unittest.TestCase):
         with patch.object(flow.workflow_repair, 'run_registered') as registered:
             flow.run(packet[1], **packet[2], scene_session='live')
             self.assertEqual(registered.call_args.args[1]['steps'][-1], header)
-            self.assertEqual(registered.call_args.args[2].recipe, self.destination / 'workflow.json')
+            self.assertEqual(registered.call_args.args[2].recipe, self.destination.resolve() / 'workflow.json')
             self.assertEqual(registered.call_args.args[-1], 'live')
             for wrong in ([session], dict(session, skip_input_guards=True), dict(session, recipe=None)):
                 with self.assertRaisesRegex(flow.WorkflowError, 'invalid_registered_session'):
