@@ -599,6 +599,21 @@ def double_click_handoff(name, number):
                 capture_requires_consent=True)
 
 
+def missing_coordinate(name, number, source, sentence):
+    """A missing taught position cannot be recovered by observing pixels in a different frame."""
+    if not tasks.is_double_click_step(source) or not tasks.coordinate_request(sentence):
+        return None
+    missing = []
+    if not tasks.result_surface_hint(source):
+        missing.append('selector')
+    if not tasks.valid_result_point(source.get('result_point')):
+        missing.append('result_point')
+    if missing:
+        return dict(status='needs_grounding', diagnostic='recorded_coordinate_required',
+                    host_action='review_recorded_position', source_task=name, step_number=number,
+                    required_fields=missing, edit_args=['review', '--task', name, '--edit'], input_dispatched=False)
+
+
 def missing_double_target(report, plan):
     """A changed visual after earlier steps needs one new observation of this step only."""
     if report.get('diagnostic') not in ('visual_target_not_found','visual_target_ambiguous','visual_target_too_common',
@@ -782,6 +797,9 @@ def run(app, args):
     if prepare:
         for number, row in enumerate(rows, 1):
             if row.get('scope_problem') or row.get('field_problem') or row['step']['action'] == 'manual':
+                source = row.get('interpretation_source', row['step'])
+                if handoff := missing_coordinate(doc['name'], number, source, row['text']):
+                    return dict(handoff, source_fingerprint=fingerprint)
                 context = row.get('context') or {}
                 if number > 1 and context.get('related') and context.get('after_step'):
                     import recorded_plan

@@ -57,6 +57,10 @@ def _device(monitor):
     return ''
 
 
+def window_dpi(hwnd):
+    return _user().GetDpiForWindow(hwnd)
+
+
 def capture(hwnd, *, expected_rect=None):
     """Record only visible geometry; callers may tie it to a particular frame."""
     if type(hwnd) is not int or hwnd <= 0:

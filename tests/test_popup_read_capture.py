@@ -23,6 +23,90 @@ def field(**changes):
 
 
 class PopupReadCaptureTests(unittest.TestCase):
+    def test_recorded_button_point_read_and_close_compile_in_one_window_route(self):
+        query = button()
+        query.update(id='query', field_label='VIEW')
+        query['target']['locator']['name'] = 'VIEW'
+        table = dict(role='group', automation_id='records')
+        point = dict(x=37, y=29, width=600, height=250)
+        opener = dict(capture.manual('double_click_needs_review', 'point'), result_surface=table, result_point=point)
+        scope = dict(exe='Orders.exe', title='Details', related=True, _openers=('query', 'point'))
+        read = dict(capture.capture_step(field()), _capture_window=scope)
+        close = dict(id='close', action='click', _capture_window=scope,
+                     target=dict(kind='element', locator=dict(role='button', automation_id='leave', name='Exit')),
+                     recognition=dict(target='identified', action='supported', result='manual'))
+        raw = [query, opener, read, close]
+        edits = capture.StepEdits()
+        for step, text in zip(raw, ('VIEW버튼을 눌러서 조회', '표에서 녹화한 좌표를 더블클릭',
+                                    '열린 창에서 Comment내용 추출', '닫기 버튼을 눌러줘')):
+            edits.store(step, '', text)
+        task = tasks.from_recording('Open detail', 'Orders.exe', 'Orders',
+                                    capture_trail.finalize_contexts(edits.apply(raw)))
+        compiled = recorded_plan.compile_plan(task)
+        self.assertEqual(compiled['status'], 'compiled', compiled)
+        steps = compiled['envelope']['recipe']['steps']
+        self.assertEqual([step['action'] for step in steps], ['invoke', 'double-click-result', 'read-value', 'invoke'])
+        self.assertEqual(steps[0]['selector']['automation_id'], query['target']['locator']['automation_id'])
+        self.assertEqual((steps[1]['result_row'], steps[1]['selector'], steps[1]['result_point']), ('coordinate', table, point))
+        self.assertNotIn('result_column', steps[1])
+        self.assertEqual(steps[2]['selector']['ancestors'], [dict(role='group', automation_id='Information')])
+        self.assertEqual(steps[2]['label'], 'Comment')
+        self.assertEqual(steps[3]['selector'], dict(role='button', automation_id='leave'))
+        self.assertTrue(steps[3]['verify_closed'])
+        for step in steps[2:]:
+            self.assertEqual(step['window_context'], dict(exe='Orders.exe', title='Details', related=True, after_step=2))
+        # Exercise the public trial and registration entry points with a counted, input-free worker.
+        import python_workflow as workflow
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            tasks.save_task(task, directory)
+            args = desktop_select.parser().parse_args(['try-recording', '--task', task['name']])
+            with (patch.object(desktop_select, 'task_directory', return_value=directory),
+                  patch.object(workflow.input_policy, 'interactive_desktop_blocked', return_value=None),
+                  patch.object(desktop_select, 'worker_receipt', return_value=dict(
+                      status='blocked', diagnostic='fixture_stop', steps=[], input_dispatched=False)) as worker):
+                self.assertEqual(desktop_select.run(args)['status'], 'needs_consent')
+                worker.assert_not_called()
+                args.allow_physical = True
+                self.assertEqual(desktop_select.run(args)['diagnostic'], 'fixture_stop')
+                worker.assert_called_once()
+                forwarded = worker.call_args.kwargs['payload']['recipe']
+                self.assertEqual(forwarded['steps'], steps)
+                destination = directory / 'lookup-detail'
+                self.assertEqual(workflow.register(forwarded, destination, source_task=task, first_trial=True)['status'],
+                                 'registered')
+                registered = workflow.load(destination / 'workflow.json')['steps']
+                self.assertEqual(registered[1:], steps[1:])
+
+    def test_explicit_coordinate_and_plain_row_are_separate(self):
+        table = dict(role='group', automation_id='records')
+        point = dict(x=31, y=22, width=140, height=82)
+        raw = dict(capture.manual('double_click_needs_review'), result_surface=table, result_point=point)
+        self.assertEqual(tasks.compile_instruction(raw, '녹화한 항목(조회 행) 더블클릭')['result_row'], 'recorded')
+        for text in ('표 상대 좌표로 더블클릭', '결과 표의 지정한 위치를 더블클릭', 'double-click the recorded table point'):
+            step = tasks.interpret_step(raw, text, 'double-click-result', table, result_row='coordinate')
+            self.assertEqual(step['result_point'], point)
+        for key in ('result_surface', 'result_point'):
+            missing = dict(raw)
+            missing.pop(key)
+            self.assertEqual(tasks.compile_instruction(missing, '표에서 녹화한 좌표를 더블클릭')['mode'], 'draft')
+        for text in ('두 번째 결과 행의 좌표를 더블클릭', 'ID가 일치한 결과 행의 지정한 위치를 더블클릭',
+                     '결과 좌표 (19, 16)을 더블클릭', '결과 좌표를 더블클릭하지 마'):
+            self.assertIsNone(tasks.current_result_intent(raw, text), text)
+        with self.assertRaisesRegex(tasks.TaskError, 'recorded_coordinate_required'):
+            tasks.interpret_step(raw, '표 상대 좌표로 더블클릭', 'double-click-result',
+                                 dict(table, automation_id='other'), result_row='coordinate')
+
+    def test_query_purpose_and_field_read_do_not_infer_extra_actions(self):
+        raw = capture.manual('unsupported_recorded_action')
+        self.assertEqual(tasks.compile_instruction(raw, 'VIEW버튼을 눌러서 조회')['query'], 'VIEW')
+        self.assertIsNone(tasks.click_request('VIEW 버튼을 눌러서 조회하고 닫기'))
+        detail = dict(raw, window_context=dict(exe='Orders.exe', title='Details', related=True, after_step=2))
+        self.assertEqual(tasks.compile_instruction(detail, '열린 창에서 Comment내용 추출')['selector'],
+                         dict(role='textfield', query='Comment'))
+        self.assertIsNone(tasks._observed_intent(raw, '열린 창에서 Comment내용 추출'))
+        self.assertIsNone(tasks._observed_intent(detail, '3단계에서 열린 창에서 Comment내용 추출'))
+
     def test_header_demonstration_generates_a_named_instruction_from_the_first_press(self):
         from test_visual_recording import VisualRecordingTests
         fixture = VisualRecordingTests()

@@ -1,5 +1,6 @@
 """Exercise current single/first result rows on an isolated native Windows grid."""
 import argparse
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -14,19 +15,89 @@ from smoke_native import Fixture
 from smoke_registered_result import wait_for_idle
 
 
-def exercise(package, work):
+def check_coordinate_stops(fixture, recipe, runner, scripts, run, work):
+    """Exercise an actual owned popup, interrupted results and recorded placement on Windows."""
+    sys.path.insert(0, str(scripts))
+    import win_bridge
+    import window_placement
+    win_bridge.set_dpi_awareness()
+    original = window_placement.capture(fixture.ready['hwnd'])
+    assert original and original['dpi'] > 0, original
+
+    def call(args, case, runner=runner):
+        wait_for_idle()
+        before = fixture.command('state')
+        trace = work / (case + '.txt')
+        result, elapsed = run([runner, *args], case, trace)
+        after = fixture.command('state')
+        delta = tuple(after[key] - before[key] for key in ('queries', 'opened', 'closed'))
+        lines = trace.read_text(encoding='utf8').splitlines() if trace.exists() else []
+        assert not any('attempted' in line for line in lines), lines
+        print(json.dumps(dict(case=case, elapsed=elapsed, status=result['status'], diagnostic=result.get('diagnostic'),
+                              queries=delta[0], opens=delta[1], closes=delta[2])), flush=True)
+        return result, delta
+
+    # One positively identified opener, then a new process to read/close that exact HWND.
+    opener, counts = call(['--only','4','--allow-physical','--summary'], 'scoped-opener')
+    assert counts == (0, 1, 0) and opener['next_action']['kind'] == 'resume_detail', opener
+    ticket = opener['next_action']['args']
+    resumed, counts = call(ticket, 'detail-suffix')
+    assert counts == (0, 0, 1) and resumed['run_id'] == opener['run_id'], resumed
+    assert resumed['status'] == 'verified' and resumed['prior_steps_replayed'] is False, resumed
+    assert 'Note for ' in json.dumps(resumed) and 'recorded_window_closed' in json.dumps(resumed), resumed
+    spent, counts = call(ticket, 'spent-ticket')
+    assert counts == (0, 0, 0) and spent['input_dispatched'] is False, spent
+
+    # A click on an empty coordinate cannot verify a result. Missing popup blocks the suffix.
+    fixture.command('empty')
+    args = ['--set','Part=EMPTY','--allow-physical','--summary']
+    empty, counts = call(args, 'empty-no-popup')
+    assert counts == (1, 0, 0) and empty['status'] == 'blocked', empty
+    assert 'result_review' not in empty and 'observations' not in empty, empty
+    assert any(row.get('receipt',row).get('target_resolution') == 'explicit_table_coordinate'
+               and row.get('receipt',row).get('input_dispatched') is True for row in empty['steps']), empty
+    repeat, counts = call(args, 'empty-no-repeat')
+    assert counts == (0, 0, 0) and repeat['input_dispatched'] is False and repeat['run_id'] == empty['run_id'], repeat
+    cancelled, counts = call(repeat['cancel_args'], 'cancel-empty')
+    assert counts == (0, 0, 0) and cancelled['input_dispatched'] is False, cancelled
+
+    # A manually authored point has no placement to restore. An actual resize must block.
+    fixture.command('single')
+    fixture.command('resize')
+    resized, counts = call(['--only','4','--allow-physical','--summary'], 'resized-coordinate')
+    assert counts == (0, 0, 0) and resized.get('diagnostic') == 'recorded_result_surface_resized', resized
+    assert resized['input_dispatched'] is False and 'result_review' not in resized, resized
+
+    saved = deepcopy(recipe)
+    saved['steps'][3]['result_point']['window_placement'] = original
+    spec = work/'coordinate-with-placement.json'
+    spec.write_text(json.dumps(saved), encoding='utf8')
+    dest = runner.parents[2]/'current-placement'
+    registered, _ = run([scripts/'python_workflow.py','register','--recipe',spec,'--out',dest],
+                          'register-placement', work/'register-placement.txt')
+    assert registered['status'] == 'registered', registered
+    restored, counts = call(['--set','Part=RESTORED','--allow-physical','--summary'], 'restored-placement',
+                            dest/'scripts/run.py')
+    assert counts == (1, 1, 1) and restored['status'] == 'verified', restored
+    assert restored['steps'][3]['recorded_placement_restored'] is True, restored
+    current = window_placement.capture(fixture.ready['hwnd'])
+    assert all(current[key] == original[key] for key in ('rect','dpi','monitor','maximized')), (original,current)
+
+
+def exercise(package, work, *, coordinate=False, check_stops=False):
     work.mkdir(parents=True, exist_ok=False)
-    skills = work / '.claude/skills'
+    skills = work / ('.agents/skills' if coordinate else '.claude/skills')
     with ZipFile(package) as archive:
-        archive.extractall(skills)
-    scripts = skills / 'desktop-select/scripts'
+        archive.extractall(work if coordinate else skills)
+    scripts = (work if coordinate else skills) / 'desktop-select/scripts'
     driver = work / 'guard'
     driver.mkdir()
     shutil.copyfile(Path(__file__).resolve().parents[1] / 'tests/fixtures/registered_result_ui_driver.py',
                     driver / 'sitecustomize.py')
     env = dict(os.environ, DESKTOP_SELECT_TASK_DIR=str(work/'tasks'), LOCALAPPDATA=str(work/'local'),
                PYTHONPATH=str(driver))
-    fixture = Fixture(build_lookup_fixture(work), '--provider-grid', '--row-only')
+    options = ('--group-only', '--scroll-pane', '--scoped-detail') if coordinate else ('--provider-grid', '--row-only')
+    fixture = Fixture(build_lookup_fixture(work), *options)
     exe = 'LookupDetailsFixture.exe'
     scope = dict(exe=exe, title='Item details', related=True, after_step=3)
     def field(role, key):
@@ -51,8 +122,20 @@ def exercise(package, work):
         return report, round(time.monotonic()-started,3)
     try:
         fixture.command('focus')
-        for mode in ('single','first'):
-            base['steps'][2]['result_row'] = mode
+        row_index = 2
+        if coordinate:
+            layout = fixture.command('review-layout')
+            left, top = layout['groupOrigin']
+            right, bottom = layout['groupEnd']
+            x, y = layout['cell']
+            base['steps'][2].update(selector=dict(role='group', automation_id='PaintedResults'),
+                                    result_point=dict(x=x-left, y=y-top, width=right-left, height=bottom-top))
+            base['steps'][3]['selector']['ancestors'] = [dict(role='group', automation_id='EquipmentInfo')]
+            base['steps'].insert(2, dict(action='wait', seconds=5))
+            scope.update(after_step=4, timeout=3)
+            row_index = 3
+        for mode in (('coordinate',) if coordinate else ('single', 'first')):
+            base['steps'][row_index]['result_row'] = mode
             spec = work/(mode+'.json')
             spec.write_text(json.dumps(base),encoding='utf8')
             dest = skills/('current-'+mode)
@@ -60,8 +143,13 @@ def exercise(package, work):
                              'register-'+mode,work/('register-'+mode+'.txt'))
             assert result['status']=='registered',result
             runner = dest/'scripts/run.py'
-            for number, value in enumerate(('LAB-42','LAB-73','PART-A'),1):
-                fixture.command(mode)
+            if check_stops:
+                check_coordinate_stops(fixture, base, runner, scripts, run, work)
+                return
+            values = ('D124','D083','D124','D083','D124') if coordinate else ('LAB-42','LAB-73','PART-A')
+            for number, value in enumerate(values,1):
+                if not coordinate:
+                    fixture.command(mode)
                 fixture.command('reset')
                 before = fixture.command('state')
                 trace = work/(mode+'-'+str(number)+'.txt')
@@ -75,17 +163,23 @@ def exercise(package, work):
                 assert 'Note for '+value in json.dumps(result),result
                 lines = trace.read_text(encoding='utf8').splitlines()
                 assert 'worker_guard_enabled' in lines and not any('attempted' in line for line in lines),lines
-                row = result['steps'][2]
+                row = result['steps'][row_index]
                 receipt = row.get('receipt',row)
-                assert receipt['result_observation']['strategy']=='uia_row_found',result
+                if coordinate:
+                    assert receipt['target_resolution']=='explicit_table_coordinate' and receipt['value_comparison'] is False,result
+                    assert result['status']=='verified',result
+                else:
+                    assert receipt['result_observation']['strategy']=='uia_row_found',result
                 assert after['ValueReads']==before['ValueReads'],after
                 measurement = dict(mode=mode,value=value,wall_seconds=elapsed,status=result['status'],
                     queries=1,opened=1,closed=1,image_calls=0,value_reads=0,key_column=after['keyColumn'],
                     wrong_rows=after['wrongRows'],wrong_columns=after['wrongColumns'],
-                    observation=receipt['result_observation'])
+                    observation=receipt.get('result_observation'), engine_seconds=result.get('elapsed_seconds'))
                 measurements.append(measurement)
                 print(json.dumps(measurement),flush=True)
                 (work/'measurements.json').write_text(json.dumps(measurements,indent=2),encoding='utf8')
+        if coordinate:
+            return
         runner = skills/'current-single/scripts/run.py'
         for scenario, diagnostic in (('empty','result_row_missing'),('duplicate','result_row_ambiguous')):
             fixture.command(scenario)
@@ -111,5 +205,8 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('package',type=Path)
     parser.add_argument('work',type=Path)
+    parser.add_argument('--coordinate',action='store_true')
+    parser.add_argument('--check-stops',action='store_true',help='test coordinate interruption, resume and placement on Windows')
     args=parser.parse_args()
-    exercise(args.package.resolve(strict=True),args.work.resolve())
+    exercise(args.package.resolve(strict=True),args.work.resolve(),coordinate=args.coordinate or args.check_stops,
+             check_stops=args.check_stops)

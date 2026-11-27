@@ -253,6 +253,19 @@ class FirstTrial(unittest.TestCase):
             self.trial(*base, '--set', 'Region=North', consent['required_option'])
         self.worker.assert_called_once()
 
+    def test_coordinate_layout_change_stops_trial_without_offering_an_image_or_resending_the_query(self):
+        self.task['steps'].append(dict(action='double-click-result', result_row='coordinate', label='Open point',
+            selector=dict(role='group', automation_id='Results'), result_point=dict(x=30, y=20, width=500, height=100)))
+        tasks.save_task(self.task, self.directory)
+        self.worker.return_value = dict(status='blocked', stopped_at=3, input_dispatched=True,
+            steps=[dict(number=3, receipt=dict(status='blocked', diagnostic='recorded_result_surface_resized',
+                result_window=dict(hwnd=1), input_dispatched=False))])
+        with patch('input_policy._interactive_desktop', return_value=True):
+            report = self.trial('--task', self.task['name'], '--set', 'Region=North', '--allow-physical')
+        self.assertEqual(report['host_action'], 'check_named_table_and_chosen_position')
+        self.assertNotIn('result_inspection', report)
+        self.worker.assert_called_once()
+
     def test_deferred_session_prepares_once_across_consent_value_and_delivery(self):
         name = '새 녹화'
         rows = [dict(step=dict(id=str(i), label='step', action='manual', target={'kind': 'manual'},

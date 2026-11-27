@@ -1,5 +1,6 @@
 """Continue an existing registered lookup after its operator identifies a locally drawn cell."""
 from copy import deepcopy
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,191 @@ def eligible(recipe):
 
 def _variables(overrides):
     return repair.digest({name.casefold(): value for name, value in overrides.items()})
+
+
+def _clear_result_state(directory):
+    for name in ('result-review.json', 'header-stop.json', 'pending.json'):
+        path = directory / name
+        tasks._deny_redirect(path)
+        if name == 'result-review.json' and path.is_file():
+            try:
+                _discard_preview(ResultReview._read(path))
+            except (ValueError, OSError):
+                pass  # Explicit restart discards an unreadable pending result as well.
+        path.unlink(missing_ok=True)
+
+
+def _discard_preview(record):
+    token = record.get('preview')
+    if isinstance(token, str) and re.fullmatch('[a-f0-9]{64}', token):
+        try:
+            path = grounding._directory() / (token + '.png')
+            tasks._deny_redirect(path)
+            path.unlink(missing_ok=True)
+        except (OSError, tasks.TaskError):
+            pass  # A viewer may still hold the file. Normal frame expiry cleans it up later.
+
+
+def cancel_run(path, run_id):
+    """Cancel local waiting state only. An old ID cannot cancel its replacement."""
+    import first_trial
+    with repair.coordination.recipe(path):
+        directory = repair.RepairSession(path).directory
+        state_path = directory / 'result-attempt.json'
+        state = first_trial._previous(state_path)
+        if state.get('run_id') != run_id or state['status'] in ('finished', 'cancelled'):
+            return dict(status='blocked', diagnostic='result_run_not_pending', input_dispatched=False)
+        _clear_result_state(directory)
+        first_trial._write_receipt(state_path, dict(status='cancelled', run_id=run_id, recipe=state['recipe'],
+                                                    finished=time.time()))
+        return dict(status='cancelled', run_id=run_id, input_dispatched=False)
+
+
+def run_attempt(flow, recipe, args, overrides, execute):
+    """Keep only the latest registered result attempt. Claim it before entering the worker action."""
+    import first_trial
+    entered = getattr(args, '_requested_at', None) or time.time()
+    params = repair.parameter_args(args, overrides)
+    new_args = ['--new-attempt', '--summary', *params]
+    if getattr(args, 'background_only', False):
+        new_args.append('--background-only')
+    if args.hwnd is not None:
+        new_args.extend(['--hwnd', str(args.hwnd)])
+    fingerprint = repair.digest(recipe)
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(repair.coordination.recipe(args.recipe))
+            session = repair.RepairSession(args.recipe)
+        except (OSError, ValueError) as error:
+            return dict(status='blocked', diagnostic=getattr(error, 'code', 'result_attempt_unavailable'),
+                        input_dispatched=False)
+        directory = session.directory
+        path = directory / 'result-attempt.json'
+        state = first_trial._previous(path) if path.exists() else {}
+        restart = getattr(args, 'new_attempt', False)
+        if not state and not restart and (directory / 'result-review.json').exists():
+            legacy = ResultReview._read(directory / 'result-review.json')
+            state = dict(status='review', run_id=secrets.token_hex(16), recipe=legacy['recipe'],
+                         variables=legacy['variables'], hwnd=legacy['window']['hwnd'], expires=legacy['expires'])
+            first_trial._write_receipt(path, state)
+        run_id = state.get('run_id')
+        active = bool(run_id and state['status'] not in ('cancelled', 'finished'))
+        detail_token = getattr(args, 'resume_detail', None)
+        review_token = getattr(args, 'confirm_result_locally', None)
+        menu_token = getattr(args, 'resume_menu', None) or getattr(args, 'resume_input', None)
+
+        def recovery():
+            return dict(cancel_args=['--cancel-run', run_id], new_attempt_args=new_args)
+
+        def blocked(diagnostic):
+            return dict(status='blocked', run_id=run_id, diagnostic=diagnostic, steps=[],
+                        input_dispatched=False, prior_steps_replayed=False, **recovery())
+
+        if state and not run_id and not restart:
+            return dict(status='blocked', diagnostic='result_attempt_state_unreadable',
+                        input_dispatched=False, new_attempt_args=new_args)
+        if (state.get('finished', 0) >= entered and state.get('recipe') == fingerprint
+                and state.get('variables') == _variables(overrides) and state.get('only') == args.only
+                and not (detail_token or review_token or menu_token)):
+            return dict(status='blocked', diagnostic='concurrent_result_run_finished', run_id=run_id,
+                        input_dispatched=False, prior_steps_replayed=False, steps=[])
+        if restart:
+            _clear_result_state(directory)
+            active = False
+        if active and state['recipe'] != fingerprint:
+            return blocked('pending_result_workflow_changed')
+        hwnd = flow.app.bridge.normalize_hwnd(args.hwnd) if args.hwnd is not None else None
+        repair.need(args.hwnd is None or hwnd, 'invalid_target')
+        if active and (hwnd is not None and state.get('hwnd') not in (None, hwnd)
+                       or not detail_token and overrides and state['variables'] != _variables(overrides)):
+            return blocked('pending_result_parameters_or_window_changed')
+        detail = state.get('detail') if active else None
+        if detail_token and not (detail and detail['ticket'] == detail_token):
+            return dict(status='blocked', diagnostic='detail_resume_expired', input_dispatched=False, steps=[])
+        if detail:
+            notice = blocked('detail_read_or_close_pending')
+            if time.time() >= detail['expires']:
+                return dict(notice, diagnostic='detail_resume_expired')
+            if not detail_token:
+                notice['next_action'] = dict(kind='resume_detail', args=['--resume-detail', detail['ticket'], '--summary'])
+                return notice
+        elif active and state['status'] == 'menu':
+            if not menu_token:
+                notice = blocked('result_menu_continuation_pending')
+                try:
+                    prior = session.read(None, recipe)
+                except (ValueError, OSError):
+                    return notice
+                follow = repair.frame_reply(session.describe(prior), prior, args, overrides)
+                return dict(notice, host_action=follow['host_action'],
+                            **{('input_pause' if prior.get('pause') else 'menu_repair'): follow})
+        elif active and state['status'] != 'review':
+            return dict(blocked(state.get('diagnostic') or 'result_run_interrupted'),
+                        previous_input_dispatched=state.get('prior_input'),
+                        **state.get('handoff', {}))
+        if active and state['status'] == 'review':
+            if time.time() >= state.get('expires', 0) or not (directory / 'result-review.json').is_file():
+                return blocked('result_review_expired')
+            if args.only is not None or menu_token:
+                return blocked('result_review_pending')
+        if not active and review_token:
+            # May be a ticket issued by an earlier installation. The review reader
+            # verifies the ticket before it can enter the action path.
+            if not (directory / 'result-review.json').is_file():
+                return dict(status='blocked', diagnostic='result_review_expired', input_dispatched=False)
+        if not active:
+            run_id = secrets.token_hex(16)
+            state = dict(run_id=run_id, recipe=fingerprint, variables=_variables(overrides), hwnd=hwnd, only=args.only)
+        core = {k: state.get(k) for k in ('run_id', 'recipe', 'variables', 'hwnd', 'only')}
+        if detail_token or not active:
+            first_trial._write_receipt(path, dict(core, status='running'))
+        if detail_token:
+            # Only a proven read/close suffix is resumable. Never run an opener
+            # or accept parameters for its already-executed prefix on this path.
+            repair.need(flow.load(args.recipe) == recipe, 'registered_workflow_changed')
+            suffix = recipe['steps'][detail['number']-1:]
+            repair.need(suffix and all('popup' not in s and s.get('window_context') == detail['routes'][0]['spec']
+                       and (s['action'] == 'read-value' or s['action'] == 'invoke' and s.get('verify_closed'))
+                       for s in suffix), 'invalid_detail_continuation')
+            report = flow.run(recipe, {}, hwnd=detail['scope'][0][0], resume=detail)
+            report.update(resumed_at=detail['number'], prior_steps_replayed=False, opener_step=detail['opener_step'],
+                          opener_receipt=dict(status='verified', input_dispatched=True,
+                                              verification_scope=detail['verification_scope']))
+        else:
+            report = execute(session)
+        report['run_id'] = run_id
+        checkpoint = report.pop('_detail_checkpoint', None)
+        review = report.get('result_review')
+        if checkpoint:
+            checkpoint.update(ticket=secrets.token_hex(32), expires=time.time() + grounding.TTL)
+            report.update(next_action=dict(kind='resume_detail', args=['--resume-detail', checkpoint['ticket'], '--summary']),
+                          **recovery())
+            saved = dict(status='detail', detail=checkpoint)
+        elif session.pending.exists() and (report.get('menu_repair') or report.get('input_pause')
+                or active and state['status'] == 'menu'):
+            saved = dict(status='menu')
+            if report.get('menu_corrections'):
+                core['recipe'] = repair.digest(flow.load(args.recipe))
+            report.update(**recovery())
+        elif review:
+            # A failed/mistyped resume must never discard a live review ticket.
+            pending = ResultReview._read(directory / 'result-review.json')
+            saved = dict(status='review', expires=pending['expires'])
+            if getattr(args, 'include_result_frame', False):
+                review['frame'] = ResultReview(session, recipe, args.recipe).preview(flow, pending)
+            report.update(next_action=dict(kind='confirm_result', args=review['resume_args']), **recovery())
+        elif active and state['status'] == 'review' and (directory / 'result-review.json').is_file():
+            saved = dict(status='review', expires=state['expires'])
+            report.update(**recovery())
+        elif report.get('status') == 'uncertain' or (detail_token and report.get('status') != 'verified'
+                or report.get('stopped_at') and report.get('input_dispatched') is not False):
+            saved = dict(status='stopped', diagnostic=report.get('diagnostic'), prior_input=report.get('input_dispatched'),
+                         handoff={k: report[k] for k in ('host_action','inspect_args','stopped_at') if k in report})
+            report.update(**recovery())
+        else:
+            saved = dict(status='finished')
+        first_trial._write_receipt(path, dict(core, **saved, finished=time.time()))
+        return report
 
 
 class ResultReview:
@@ -76,10 +262,12 @@ class ResultReview:
         if hwnd is not None:
             hwnd = normalize_hwnd(hwnd)
             repair.need(hwnd, 'invalid_target')
-        if active and record['variables'] == _variables(overrides) and (
-                hwnd is None or hwnd == normalize_hwnd(record['window']['hwnd'])):
+        if record:
+            repair.need(active, 'result_review_expired')
+            repair.need(record['variables'] == _variables(overrides) and (
+                        hwnd is None or hwnd == normalize_hwnd(record['window']['hwnd'])),
+                        'pending_result_parameters_or_window_changed')
             return record
-        self.pending.unlink(missing_ok=True)
         return None
 
     def hint(self):
@@ -157,6 +345,42 @@ class ResultReview:
                     previous_input_dispatched=record['prior_input'], prior_steps_replayed=False,
                     result_review=dict(step=record['number'], expires_seconds=max(0, int(record['expires'] - time.time())),
                                        resume_args=args))
+
+    def preview(self, flow, record):
+        """Expose only a masked crop of an identified result surface. It never grants click authority."""
+        owner = record['window']
+        step = self.recipe['steps'][record['number']-1]
+        try:
+            repair.need(record.get('recipe') == self.fingerprint and not record.get('claimed'), 'result_review_unavailable')
+            flow.app.bridge.set_dpi_awareness()
+            binding = flow.app.bridge.Binding(owner)
+            def guard():
+                repair.need(time.time() < record['expires'], 'result_review_expired')
+                flow.app.guard(binding, binding, owner['title'])
+                flow.app.visibility.require_observable(binding)
+                repair.need(owner.get('window_cookie') and
+                            flow.window_context.window_cookie(flow.app.bridge, binding.hwnd) == owner['window_cookie'],
+                            'result_window_lifetime_unconfirmed')
+            with flow.coordination.window(owner, owner['title'], []), flow.app.bridge.UIA() as uia:
+                guard()
+                table, selector = flow._result_target(binding, uia, step['selector'], record.get('selector'),
+                                                       column=step.get('result_column'))
+                bounds = dict(uia.bounds(table))
+                frame, png = grounding._capture(flow.app, binding, guard, table_box=bounds)
+                current, _ = flow._result_target(binding, uia, selector, None, column=step.get('result_column'))
+                repair.need(uia.same(current, table) and uia.bounds(table) == bounds, 'result_table_changed')
+                guard()
+            scope = ('registered-result-preview/' + record['ticket']).encode('ascii')
+            token, path = grounding.store_frame(grounding._directory(), scope, png)
+            if record.get('preview') != token:
+                _discard_preview(record)
+                self._write(self.pending, dict(record, preview=token))
+            return dict(status='observed', scope='visible_result_table', image=str(path), frame=token,
+                        width=frame[2], height=frame[3], expires_seconds=max(0, int(record['expires'] - time.time())),
+                        input_dispatched=False)
+        except (OSError, ValueError, flow.app.bridge.BridgeError, flow.app.SelectionError) as error:
+            return dict(status='unavailable', diagnostic=getattr(error, 'code', 'result_frame_unavailable'),
+                        input_dispatched=False)
 
     def confirm(self, flow, record, recipe_path, overrides, *, try_elements=False):
         """Keep an uncertain click claimed even if the worker or the provider failed."""
@@ -400,6 +624,7 @@ class ResultReview:
             result.setdefault('host_action', 'report_execution_receipt')
             if record.get('remember') and result.get('correction_saved') is not False:
                 repair.remember_test(path, tested_recipe or self.recipe, result, record['approval_before'], offset+1)
+            _discard_preview(record)
             self.pending.unlink(missing_ok=True)
             if learned:
                 try:

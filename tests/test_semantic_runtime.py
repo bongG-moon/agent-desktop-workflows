@@ -64,6 +64,15 @@ class ResolutionTests(unittest.TestCase):
         flow.app.resolve.assert_called_once_with(self.nodes, 'MES Setup', role='combobox', within=None)
         flow.lookup.ancestry.assert_called_once_with(self.uia, self.element, self.root, pid=self.binding.pid)
 
+    def test_unique_read_label_is_not_replaced_with_an_ambiguous_recorded_id(self):
+        flow.lookup.resolve.side_effect = app.bridge.BridgeError('target_ambiguous')
+        element, stable, _ = flow.resolve_step(self.binding, self.uia, self.root, self.selector,
+                                               observation_label=self.selector['query'])
+        self.assertIs(element, self.element)
+        self.assertIsNone(stable)
+        with self.assertRaisesRegex(app.bridge.BridgeError, 'target_ambiguous'):
+            flow.resolve_step(self.binding, self.uia, self.root, self.selector)
+
     def test_revalidation_uses_current_native_identity_without_scanning_again(self):
         proof = dict(semantic_label='MES Setup')
         with patch.object(flow.app, 'field_label', return_value=proof):

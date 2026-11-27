@@ -13,6 +13,38 @@ import python_workflow as flow
 
 
 class RegisteredFastRunTests(unittest.TestCase):
+    def test_codex_registration_points_to_running_runtime_and_preserves_custom_runner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            skill = Path(temp) / '.agents/skills' / 'results'
+            recipe = dict(self.recipe, steps=[dict(action='wait', seconds=1)])
+            with patch.object(flow, 'run', return_value=dict(status='observed', steps=[])):
+                report = flow.register(recipe, skill)
+            self.assertEqual((report['host'], report['layout'], report['execution_validation']),
+                             ('codex', 'project', 'not_run'))
+            paths = {key: Path(value) for key, value in report['active_paths'].items()}
+            self.assertEqual(paths['runtime'], Path(flow.__file__).resolve())
+            for guide in (paths['skill'], skill / 'workflow-guide.md'):
+                self.assertNotIn('CLAUDE_SKILL_DIR', guide.read_text(encoding='utf8'))
+            self.assertIn('.agents/skills/results/scripts/run.py', paths['skill'].read_text(encoding='utf8'))
+            result = flow.subprocess.run([sys.executable, '-B', str(paths['runner']), '--input-plan'],
+                                         cwd=temp, capture_output=True, encoding='utf8', check=True)
+            self.assertFalse(json.loads(result.stdout)['input_dispatched'])
+            self.assertEqual(flow.refresh_guide(skill)['status'], 'guide_current')
+            paths['runner'].write_text('# custom runner', encoding='utf8')
+            with self.assertRaisesRegex(flow.WorkflowError, 'registered_skill_required'):
+                flow.refresh_guide(skill)
+            with self.assertRaisesRegex(flow.WorkflowError, 'workflow_destination_exists'):
+                flow.register(recipe, skill)
+            self.assertEqual(paths['runner'].read_text(encoding='utf8'), '# custom runner')
+
+    def test_fixed_template_is_identified_even_when_parameter_value_changes(self):
+        steps = [dict(action='set-value', parameter='Code'),
+                 dict(action='visual-click', visual={'rgb': 'sample'}),
+                 dict(action='double-click-result', result_row='coordinate')]
+        recipe = dict(self.recipe, steps=steps)
+        self.assertEqual(flow._parameterized_visual_steps(recipe), [2])
+        self.assertIn('단계 2', flow.guide_reference(recipe, ''))
+
     def setUp(self):
         self.recipe = dict(schema=1, name='Report', exe='Example.exe', window='Example', steps=[
             dict(action='invoke', selector=dict(role='button', name='Export')),
@@ -35,10 +67,18 @@ class RegisteredFastRunTests(unittest.TestCase):
         code, report = self.cli(self.result, '--summary')
         self.assertEqual(code, 0)
         self.assertEqual(report['outcome'], 'workbook_verified')
+        self.assertEqual(report['execution_validation'], 'full_run_verified')
         self.assertEqual(report['verified_outputs'][0]['path'], r'C:\Reports\example.xlsx')
         self.assertEqual(report['steps'][0]['status'], 'delivered_unverified')
         self.assertEqual(report['business_commit'], 'not_verified')
         self.assertEqual(self.cli(self.result)[0], 3)
+
+    def test_first_unsent_or_uncertain_step_does_not_count_as_partially_tested(self):
+        for status, sent, level in [('blocked', False, 'not_run'), ('uncertain', None, 'unknown')]:
+            with self.subTest(status=status):
+                result = dict(status=status, stopped_at=1, input_dispatched=sent,
+                              steps=[dict(number=1, receipt=dict(status=status, input_dispatched=sent))])
+                self.assertEqual(self.cli(result, '--summary')[1]['execution_validation'], level)
 
     def test_first_trial_and_registered_summary_agree_on_a_verified_final_file(self):
         report = flow.summarize_execution(self.result, list(enumerate(self.recipe['steps'], 1)))

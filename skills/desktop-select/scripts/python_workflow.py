@@ -42,7 +42,8 @@ KEY_INTERVAL_SECONDS = 0.8
 _KEY_ACTIONS = ('submit', 'press-key')
 _REGISTERED_SESSION_OPTIONS = ('repair_frame', 'resume_menu', 'resume_input', 'frame', 'confirm_result_locally',
                                'local_result_review', 'point', 'only', 'hwnd', 'auto_repair_frame',
-                               'allow_physical', 'background_only', 'new_attempt', 'set')
+                               'allow_physical', 'background_only', 'new_attempt', 'resume_detail', 'cancel_run',
+                               'include_result_frame', '_requested_at', 'set')
 RESULT_SURFACES = {'table', 'list', 'group', 'custom'}
 OBSERVABLE_FIELDS = {'textfield', 'combobox', 'statictext', 'row', 'listitem'}
 RESULT_IMAGE_ERRORS = {
@@ -80,7 +81,7 @@ def validate_selector(selector):
         lookup._selector(selector)
 
 
-def semantic_match(binding, uia, root, selector):
+def semantic_match(binding, uia, root, selector, *, observation=False):
     """Use the same current-window label/name resolver as a direct command."""
     nodes, elements = app.observe(binding, uia)
     need(bool(elements) and uia.same(root, elements[0]), 'target_window_changed')
@@ -90,8 +91,15 @@ def semantic_match(binding, uia, root, selector):
     # Promote only an identity witnessed in this live read, never old coordinates.
     stable = app._stable_selector(nodes, index)
     if stable is not None:
-        current = lookup.resolve(binding, uia, stable, root=root)
-        need(uia.same(element, current), 'target_changed')
+        try:
+            current = lookup.resolve(binding, uia, stable, root=root)
+        except app.bridge.BridgeError as error:
+            if not observation or error.code != 'target_ambiguous':
+                raise
+            # The live semantic query was unique; the ID alone cannot be registered.
+            stable = None
+        else:
+            need(uia.same(element, current), 'target_changed')
     observed_label = app.field_labels(nodes).get(index, {})
     proof = dict(matched_by=basis, query=selector['query'], role=node['role'])
     if node.get('automation_id'):
@@ -102,9 +110,16 @@ def semantic_match(binding, uia, root, selector):
     return element, stable, proof
 
 
-def resolve_step(binding, uia, root, selector):
+def resolve_step(binding, uia, root, selector, *, observation_label=None):
     if 'query' in selector:
+        if observation_label:
+            return semantic_match(binding, uia, root, selector, observation=True)
         return semantic_match(binding, uia, root, selector)
+    if observation_label and selector.get('automation_id') and selector['role'] in ('textfield', 'combobox'):
+        def matches_label(element):
+            observed = app.field_label(binding, uia, element, root)
+            return (observed.get('semantic_label') or '').casefold().split() == observation_label.casefold().split()
+        return lookup.resolve(binding, uia, selector, root=root, distinguish=matches_label), selector, None
     return lookup.resolve(binding, uia, selector, root=root), selector, None
 
 
@@ -138,20 +153,24 @@ def validate(recipe):
         if step.get('action') == 'double-click-result':
             if 'result_row' in step:
                 need(set(step) <= {'action', 'label', 'result_row', 'selector', 'result_point', 'result_column'}
-                     and step['result_row'] in ('single', 'first', 'recorded', 'header') and text(step.get('label', 'step'), 200),
+                     and step['result_row'] in ('single', 'first', 'recorded', 'header', 'coordinate')
+                     and text(step.get('label', 'step'), 200),
                      'invalid_result_row')
                 selector = step.get('selector')
                 need(isinstance(selector, dict) and selector.get('role') in RESULT_SURFACES,
                      'result_container_required')
                 if selector != {'role': 'table'}:
                     validate_selector(selector)
+                if step['result_row'] == 'coordinate':
+                    need(('automation_id' in selector or 'name' in selector) and 'result_point' in step,
+                         'named_result_coordinate_required')
                 if step['result_row'] == 'header':
                     need(('automation_id' in selector or 'name' in selector)
                          and app.tasks.valid_result_point(step.get('result_point'))
                          and text(step.get('result_column'), 100), 'invalid_result_header')
                     continue
                 if 'result_point' in step:
-                    need(step['result_row'] == 'recorded' and selector != {'role': 'table'}
+                    need(step['result_row'] in ('recorded', 'coordinate') and selector != {'role': 'table'}
                          and app.tasks.valid_result_point(step['result_point']), 'invalid_result_point')
                 if 'result_column' in step:
                     need(step['result_row'] in ('single', 'first') and text(step['result_column'], 100),
@@ -650,8 +669,13 @@ def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewe
             # Empty once is not evidence that delayed headers/rows will never
             # appear. Only short-circuit for a previously visually verified
             # group, still unambiguously live and still exposing no table data.
-            painted = (diagnostic == 'result_column_unavailable' and reviewed_group == selector
-                       and table is not None and result_cell.bare_group(uia, table))
+            no_provider = evidence.get('table_capability') == 'no_cell_provider_observed'
+            # A stand-alone check samples the current surface. Only a query dispatched
+            # by this execution can justify waiting for a new provider to appear.
+            if no_provider and not after_query:
+                retry = False
+            painted = (diagnostic == 'result_column_unavailable' and not element_hint and reviewed_group == selector
+                       and table is not None and (no_provider or result_cell.bare_group(uia, table)))
             provider_seconds += time.monotonic() - began
             remaining = deadline - time.monotonic()
             if retry and not painted and remaining > 0:
@@ -662,7 +686,10 @@ def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewe
                     retry_selector = (_stable_result_selector(binding, uia, table)
                                       if selector == {'role': 'table'} else selector)
                 before = time.monotonic()
-                time.sleep(min(.2, remaining))
+                # A provider can appear after VIEW. Back off only on positive
+                # structural evidence and always re-read at the deadline.
+                interval = min(.2 * attempts, 1.) if no_provider else .2
+                time.sleep(min(interval, remaining))
                 waited += time.monotonic() - before
                 continue
             strategy = 'reviewed_group_pixels' if painted else 'uia_timeout' if retry else 'uia_inconclusive'
@@ -689,7 +716,8 @@ def observe_result(binding, uia, step, expected, guard, *, wait_seconds, reviewe
             provider_seconds=round(provider_seconds, 4), elapsed_seconds=round(time.monotonic() - started, 4),
             table_lookup=route, column=step['result_column'], requested=expected, query_freshness='not_asserted')
         receipt['result_observation'].update({k: evidence[k] for k in (
-            'observed', 'rows_examined', 'match_count', 'match_count_at_least', 'scope') if k in evidence})
+            'observed', 'rows_examined', 'match_count', 'match_count_at_least', 'scope',
+            'table_capability', 'raw_control_type', 'role') if k in evidence})
         return receipt
 
 
@@ -701,6 +729,7 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
     deadline = started + wait_seconds
     retry_selector, hint_attempted = None, False
     layout_evidence = {}
+    coordinate = step['result_row'] == 'coordinate'
     while True:
         guard()
         attempts += 1
@@ -711,6 +740,8 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
                                             column=step.get('result_column'), element_hint=bool(retry_selector))
             if step['result_row'] == 'header':
                 result_cell.position_in_header(binding, uia, table, step['result_point'], step['result_column'])
+            elif coordinate:
+                result_cell.position_at_coordinate(binding, uia, table, step['result_point'])
             elif 'result_point' in step:
                 result_cell.position_in_body(binding, uia, table, step['result_point'])
             elif 'result_column' in step:
@@ -722,7 +753,7 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
             if isinstance(error, result_cell.RecordedSurfaceResized):
                 layout_evidence = error.observation
             header = step['result_row'] == 'header'
-            if not header and diagnostic not in ('result_row_missing', 'result_row_unavailable', 'result_row_not_visible',
+            if not (header or coordinate) and diagnostic not in ('result_row_missing', 'result_row_unavailable', 'result_row_not_visible',
                                   'recorded_result_surface_resized',
                                   'result_row_ambiguous', 'result_table_missing', 'target_missing',
                                   'result_column_ambiguous', 'result_column_unavailable', 'result_column_not_found'):
@@ -755,6 +786,14 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
             receipt = dict(status='observed', input_dispatched=False,
                            diagnostic='result_header_located' if header else 'recorded_position_located' if anchor else 'current_result_row_found',
                            result_row=step['result_row'], query_freshness='not_asserted', value_comparison=False)
+        if coordinate:
+            strategy = 'explicit_table_coordinate'
+            receipt.update(value_comparison=False, result_identity_verified=False, query_completion_verified=False)
+            if receipt['status'] == 'observed':
+                receipt['diagnostic'] = 'table_coordinate_located'
+        if table is not None and (coordinate or 'result_point' in step):
+            raw_type = table.property(30003)
+            layout_evidence.update(raw_control_type=raw_type, role=app.bridge.ROLES.get(raw_type))
         receipt['result_observation'] = dict(strategy=strategy, attempts=attempts, wait_seconds=round(waited, 4),
             provider_seconds=round(provider_seconds, 4), elapsed_seconds=round(time.monotonic()-started, 4),
             table_lookup='discovery' if step['selector'] == {'role': 'table'} else 'recorded_element')
@@ -795,7 +834,8 @@ def lookup_observation(binding, uia, step, expected, guard, *, read_only, wait_s
         guard()
         try:
             root = uia.from_handle(binding.hwnd)
-            element, stable, resolution = resolve_step(binding, uia, root, selector)
+            element, stable, resolution = resolve_step(binding, uia, root, selector,
+                                                       observation_label=step.get('field_label') or step.get('label') or selector.get('query'))
             if step.get('field_label'):
                 app.tasks.check_display({'label': step['field_label']}, app.field_label(binding, uia, element, root))
             receipt = observe_field(binding, uia, element, selector['role'],
@@ -1163,7 +1203,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         refusal = input_policy.blocked(requirements)
         if refusal:
             return refusal
-    values, missing = values_for(dict(recipe, steps=requested), overrides or {})
+    values, missing = values_for(dict(recipe, steps=active if resume and resume.get('detail') else requested), overrides or {})
     if missing and not read_only:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     if not read_only:
@@ -1202,6 +1242,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     adapter_matches = []
     number, dispatching = 0, False
     anchor_proof = None
+    routes = None
     reservations = ExitStack()
     stage_started = started
     try:
@@ -1342,9 +1383,13 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     check_surface(binding, surface, title, popup, mutate=mutate)
                     if mutate and not background_only and number not in foreground_steps:
                         need(not app.bridge.user32.IsIconic(surface.hwnd), 'target_window_minimized')
-                after_query = (step['action'] == 'verify-value' and number > 1 and
-                               app.tasks.is_query_button(recipe['steps'][number-2]) and
-                               recipe['steps'][number-2].get('window_context') == context)
+                query_number = number - 1
+                if step['action'] == 'verify-value':
+                    while query_number > 0 and recipe['steps'][query_number-1]['action'] == 'wait':
+                        query_number -= 1
+                after_query = (step['action'] == 'verify-value' and query_number > 0 and
+                               app.tasks.is_query_button(recipe['steps'][query_number-1]) and
+                               recipe['steps'][query_number-1].get('window_context') == context)
                 # A popup may disable its owner. Only actions on that owner
                 # require it to be enabled/restored; missing popups never do.
                 if 'popup' not in step and step['action'] in input_policy.VALUE_OBSERVATIONS:
@@ -1400,7 +1445,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                                  column_hint=hint.get('column_hint'), element_hint=hint.get('source')=='element',
                                                  on_match=verified_tables.append, remember=remember_result_elements,
                                                  on_adapter_match=adapter_matches.append,
-                                                 after_query=after_query and number-1 in requested)
+                                                 after_query=after_query and query_number in requested)
                         if receipt.get('result_element'):
                             result_hints[number] = receipt['result_element']
                         if receipt['status'] == 'blocked':
@@ -1408,7 +1453,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             receipt['result_window'] = dict(hwnd=surface.hwnd, pid=surface.pid, exe_name=surface.exe,
                                 title=popup['title'] if popup else title, process_started_utc_ticks=surface.created)
                 elif step['action'] == 'double-click-result':
-                    if read_only and step.get('result_row') != 'header':
+                    inspect_coordinate = step.get('result_row') == 'coordinate' and only is not None
+                    if read_only and step.get('result_row') != 'header' and not inspect_coordinate:
                         receipt = dict(status='deferred', input_dispatched=False, verification='pending_execution',
                                        diagnostic='validate_result_on_execution')
                     elif 'result_row' in step:
@@ -1422,7 +1468,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                 report['window_restored'] = True
                         tables = []
                         receipt = observe_result_row(binding, uia, step, lambda: check_target(binding),
-                                                     wait_seconds=RESULT_VISUAL_TIMEOUT, on_match=tables.append)
+                                                     wait_seconds=0 if read_only else RESULT_VISUAL_TIMEOUT,
+                                                     on_match=tables.append)
                         if receipt['status'] == 'observed' and not read_only:
                             table = tables[0]
                             def row_guard():
@@ -1434,7 +1481,11 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             observed = receipt
                             row_options = {name: step[key] for key, name in (
                                 ('result_point', 'point'), ('result_column', 'column')) if key in step}
-                            if step['result_row'] == 'header' and routes.origins.get(number):
+                            if step['result_row'] == 'coordinate':
+                                # The table was just resolved. Re-resolve its locator once, under the
+                                # pointer reservation immediately before dispatch, after foregrounding.
+                                row_options['entry_guard'] = lambda: check_target(binding, mutate=True)
+                            if step['result_row'] in ('header', 'coordinate') and routes.origins.get(number):
                                 def check_header_opener():
                                     need(not any(routes.matching_windows(spec) for spec in routes.origins[number].values()),
                                          'expected_new_window_already_open')
@@ -1446,9 +1497,17 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                 observed['result_observation'].update(error.observation)
                                 receipt = dict(status='blocked', diagnostic=error.code, input_dispatched=False,
                                                result_surface_selector=step['selector'])
+                            except (app.bridge.BridgeError, WorkflowError) as error:
+                                # execute_row converts every attempted send into a receipt. Here the pointer
+                                # guards failed before dispatch; retain the already-observed table diagnostics.
+                                if step['result_row'] != 'coordinate' and error.code != 'result_point_not_data':
+                                    raise
+                                receipt = dict(status='blocked', diagnostic=error.code, input_dispatched=False)
                             receipt.update(result_observation=observed['result_observation'],
                                            result_row=step['result_row'], query_freshness='not_asserted',
                                            value_comparison=False)
+                            if step['result_row'] == 'coordinate':
+                                receipt.update(result_identity_verified=False, query_completion_verified=False)
                         if restored:
                             receipt['recorded_placement_restored'] = True
                         if receipt['status'] == 'blocked':
@@ -1671,6 +1730,10 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     receipt['lookup_seconds'] = lookup_elapsed
                     if popup:
                         receipt['popup'] = dict(title=popup['title'])
+                if track_menu and receipt.get('result_window') and step.get('result_row') not in ('coordinate', 'header'):
+                    marker = window_context.window_cookie(app.bridge, receipt['result_window']['hwnd'], create=True)
+                    if marker:
+                        receipt['result_window']['window_cookie'] = marker
                 routes.after(number, receipt)
                 if track_menu and workflow_repair.menu(step) and (workflow_repair.point_failed(receipt)
                                                                   or workflow_repair.input_paused(receipt)):
@@ -1698,8 +1761,13 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                and receipt.get('diagnostic')=='visual_double_click_dispatched'
                                and receipt['input_dispatched'] is True)
                 if not read_only and (row_opened or delivered_row_click or double_sent) and routes.origins.get(number):
-                    for expected in routes.origins[number].values():
-                        routes.resolve(expected)
+                    popup_started = time.monotonic()
+                    try:
+                        for expected in routes.origins[number].values():
+                            routes.resolve(expected)
+                    finally:
+                        receipt['popup_wait_seconds'] = round(time.monotonic() - popup_started, 4)
+                        report['steps'][-1]['elapsed_seconds'] = round(time.monotonic() - stage_started, 4)
                     confirm_opened_window(report,routes,number)
                 if (read_only and (step['action'] in ('visual-click','row-open') or step.get('result_row') == 'header')
                         and receipt['status'] != 'observed'):
@@ -1786,14 +1854,23 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             report = _grounding_report(report, [_grounding_step(recipe, number, step, diagnostic)])
     finally:
         try:
-            if anchor_proof is not None:
-                anchor_proof.close()
+            try:
+                if track_menu and routes is not None and (only is not None or report.get('stopped_at')):
+                    checkpoint = workflow_repair.detail_checkpoint(routes, owner, report, only)
+                    if checkpoint:
+                        report['_detail_checkpoint'] = checkpoint
+            finally:
+                if anchor_proof is not None:
+                    anchor_proof.close()
         finally:
             reservations.close()
     if (report['status'] == 'completed_unverified' and 'stopped_at' not in report
             and only is None and not resume and verified_detail_read(recipe['steps'], report['steps'])):
         report.update(status='verified', outcome='current_result_detail_read_and_closed',
                       query_freshness='not_asserted')
+        opener = recipe['steps'][-1]['window_context']['after_step']
+        if recipe['steps'][opener - 1].get('result_row') == 'coordinate':
+            report.update(result_identity_verified=False, query_completion_verified=False)
         report['observations'] = [
             dict(number=row['number'], field=step.get('label') or step['selector'].get('query') or
                  step['selector'].get('name') or step['selector'].get('automation_id'), value=row['receipt']['value'])
@@ -1852,16 +1929,38 @@ raise SystemExit(python_workflow.main(["run", "--recipe", str(HERE.parents[1] / 
 
 
 def _registered_runner(destination):
-    skill_root = destination.parent
-    # Installed Claude skills are siblings. In the Windows ZIP layout the
-    # engine remains in <project>/desktop-select, outside .claude/skills.
-    relative_parent = 2
-    if skill_root.name == 'skills' and skill_root.parent.name == '.claude':
-        portable = skill_root.parent.parent / 'desktop-select/scripts'
-        sibling = skill_root / 'desktop-select/scripts/python_workflow.py'
-        if portable == Path(__file__).resolve().parent or (not sibling.is_file() and (portable / 'python_workflow.py').is_file()):
-            relative_parent = 4
-    return RUNNER.replace('RUNTIME_PARENT', str(relative_parent))
+    # Bind to the runtime doing the registration. Keep the link relocatable
+    # when a project and its installed runtime move together.
+    runtime = Path(__file__).resolve().parent
+    runner = destination / 'scripts/run.py'
+    for index in (2, 4):
+        if len(runner.parents) > index and runner.parents[index] / 'desktop-select/scripts' == runtime:
+            return RUNNER.replace('RUNTIME_PARENT', str(index))
+    try:
+        relative = Path(os.path.relpath(runtime, destination)).as_posix()
+        expression = f'(HERE.parents[1] / {relative!r}).resolve()'
+    except ValueError:  # Windows drives have no common relative path.
+        expression = f'Path({runtime.as_posix()!r})'
+    return RUNNER.replace('HERE.parents[RUNTIME_PARENT] / "desktop-select" / "scripts"', expression)
+
+
+def _project_skill(destination):
+    return (destination.parent.name.casefold() == 'skills'
+            and destination.parent.parent.name.casefold() in ('.agents', '.claude', '.codex'))
+
+
+def _guide_host(destination, host):
+    return host or ('codex' if _project_skill(destination) and destination.parent.parent.name.casefold() != '.claude' else 'claude')
+
+
+def _run_command(destination, host):
+    if host == 'claude':
+        return RUN_COMMAND
+    # PowerShell literal path, including spaces and single quotes.
+    runner = destination / 'scripts/run.py'
+    path = (runner.relative_to(destination.parents[2]).as_posix()
+            if _project_skill(destination) and destination.parents[2] != Path.home() else runner.as_posix())
+    return "python -X utf8 -B '" + path.replace("'", "''") + "'"
 
 
 REGISTERED_HEADING = '# 등록된 업무 실행\n\n'
@@ -1871,7 +1970,7 @@ GUIDE_BEGIN = '<!-- desktop-select:run -->\n'
 GUIDE_END = '<!-- /desktop-select:run -->\n\n'
 
 
-def run_instructions(recipe, skill_name):
+def run_instructions(recipe, skill_name, *, host='claude', command=RUN_COMMAND):
     parameters = list(dict.fromkeys(s['parameter'] for s in recipe['steps'] if 'parameter' in s))
     # Only put plain names in executable examples. The literal names are listed
     # separately for recipes with quotes, shell expansion characters, etc.
@@ -1906,7 +2005,7 @@ def run_instructions(recipe, skill_name):
             arguments += ' --allow-physical'
         else:
             note += ('이번 요청에서 이 범위의 마우스 또는 키보드 사용을 이미 허용했다면 첫 호출은 다음 명령이다.\n\n'
-                     '`' + RUN_COMMAND + ' --summary --allow-physical' + arguments + '`\n\n'
+                     '`' + command + ' --summary --allow-physical' + arguments + '`\n\n'
                      '같은 업무의 이후 실행까지 명시적으로 허용했을 때만 `--allow-physical --remember-physical`을 사용한다. '
                      '반복 승인은 `--forget-physical`로 취소한다.\n\n'
                      '이번 요청에 실제 입력 허용이 없으면 아래 명령을 쓴다. 저장된 승인이 있으면 바로 실행되며, '
@@ -1918,9 +2017,10 @@ def run_instructions(recipe, skill_name):
                    '저장된 반복 승인은 보정 이미지를 볼 권한을 포함하지 않는다.\n\n')
     if any(step['action'] == 'double-click-result' for step in recipe['steps']):
         import result_trial
+        repair += ('중단되면 이번 영수증의 재개 인자를 그대로 쓴다. 사용자가 처음부터 다시 실행하라고 한 경우에만 '
+                   '`--new-attempt`로 새 실행을 시작한다.\n\n')
         if any(s.get('result_row') == 'header' for s in recipe['steps']):
-            repair += ('녹화한 열 머리글이나 상세 창에서 멈추면 `inspect_args`로 현재 상태를 확인한다. '
-                       '사용자가 같은 값으로 처음부터 다시 실행해 달라고 요청한 경우에만 `--new-attempt`를 붙인다.\n\n')
+            repair += '녹화한 열 머리글이나 상세 창에서 멈추면 `inspect_args`로 현재 상태를 확인한다.\n\n'
         if any(result_trial.supported(recipe, n) for n in range(1, len(recipe['steps']) + 1)):
             if any(s['action'] == 'verify-value' and s.get('result_column') for s in recipe['steps']):
                 repair += '값 비교 단계는 기록된 열의 현재 값과 이번 요청값을 비교한다. '
@@ -1930,14 +2030,16 @@ def run_instructions(recipe, skill_name):
                        '`result_review.resume_args`에는 이번 입력값이 들어 있다. 같은 실행기에 인자 그대로 전달한다. '
                        '앞선 조회는 반복하지 않는다.\n\n')
     return (GUIDE_BEGIN
-            + f'Claude Code에서 사용자가 `/{skill_name}`으로 직접 호출했고 Company Agent가 이번 턴의 기본 Skill 도구 호출을 '
-            f'요구하며 이 업무의 Skill 호출이 아직 성공하지 않은 경우에만 `Skill(skill="{skill_name}")`을 한 번 먼저 호출한다.\n\n'
-            '실행 요청이면 다음 명령을 첫 셸 명령으로 한 번 실행한다. '
+            + (f'Claude Code에서 사용자가 `/{skill_name}`으로 직접 호출했고 Company Agent가 이번 턴의 기본 Skill 도구 호출을 '
+               f'요구하며 이 업무의 Skill 호출이 아직 성공하지 않은 경우에만 `Skill(skill="{skill_name}")`을 한 번 먼저 호출한다.\n\n'
+               if host == 'claude' else '<!-- desktop-select-host: codex -->\n'
+               '프로젝트 루트에서 실행한다. 작업 폴더가 다르면 이 SKILL.md 옆 scripts/run.py의 절대 경로를 사용한다.\n\n')
+            + '실행 요청이면 다음 명령을 첫 셸 명령으로 한 번 실행한다. '
             + ('필수 변수 ' + json.dumps(parameters, ensure_ascii=False) + '에 요청값을 넣고 빠진 값만 묻는다. '
                if parameters else '')
             + ('빠진 변수와 실제 입력 승인이 함께 필요하면 한 번에 묻는다. ' if parameters and physical else '')
             + '실행기가 대상 창을 확인한다.\n\n' + note
-            + '`' + RUN_COMMAND + ' --summary' + arguments + '`\n\n' + repair +
+            + '`' + command + ' --summary' + arguments + '`\n\n' + repair +
             '현재 상태만 요청하면 실행 인자 대신 `--read-only`, 입력 방식만 요청하면 `--input-plan`을 쓴다. '
             '백그라운드 전용 요청은 실행 변수와 `--background-only`로 호출한다.\n\n'
             'JSON의 상태를 보고하고 workbook_verified이면 verified_outputs의 파일 경로를 전달한다. '
@@ -1951,17 +2053,19 @@ def run_instructions(recipe, skill_name):
             f'[업무 상세 안내]({GUIDE_REFERENCE})를 읽는다.\n' + GUIDE_END)
 
 
-def refresh_guide(destination):
+def refresh_guide(destination, host=None):
     """Add the quick-run instructions to an existing generated skill without re-registering it."""
     destination = Path(destination).resolve()
     path = destination / 'SKILL.md'
     runner = destination / 'scripts/run.py'
     need(not path.is_symlink() and path.is_file() and path.stat().st_size <= app.tasks.MAX_FILE_BYTES
          and runner.is_file() and runner.stat().st_size <= 16384, 'registered_skill_required')
-    need(runner.read_text(encoding='utf8') in (RUNNER.replace('RUNTIME_PARENT', '2'),
+    need(runner.read_text(encoding='utf8') in (_registered_runner(destination), RUNNER.replace('RUNTIME_PARENT', '2'),
                                                 RUNNER.replace('RUNTIME_PARENT', '4')), 'registered_skill_required')
     recipe = load(destination / 'workflow.json')
     original = path.read_bytes()
+    host = _guide_host(destination, host or ('codex' if b'<!-- desktop-select-host: codex -->' in original else None))
+    command = _run_command(destination, host)
     eol = b'\r\n' if b'\r\n' in original else b'\n'
     heading = REGISTERED_HEADING.encode().replace(b'\n', eol)
     prefix = ('---\nname: ' + destination.name + '\n').encode().replace(b'\n', eol)
@@ -1988,7 +2092,7 @@ def refresh_guide(destination):
         # Registration-time popup availability is not stored in workflow.json.
         # Move only an exactly recognized old notes block, preserving custom text.
         for pending_popup in (True, False):
-            notes = workflow_notes(recipe, source_task, pending_popup)
+            notes = workflow_notes(recipe, source_task, pending_popup, command=command)
             legacy = notes.encode().replace(b'\n', eol)
             if following.startswith(legacy):
                 following = following[len(legacy):]
@@ -2000,7 +2104,7 @@ def refresh_guide(destination):
         except FileExistsError:
             need(reference.stat().st_size == len(contents) and reference.read_bytes() == contents,
                  'guide_reference_conflict')
-    updated = original[:split] + run_instructions(recipe, destination.name).encode().replace(b'\n', eol) + following
+    updated = original[:split] + run_instructions(recipe, destination.name, host=host, command=command).encode().replace(b'\n', eol) + following
     if updated == original:
         return dict(status='guide_current', input_dispatched=False)
     with tempfile.NamedTemporaryFile(dir=destination, delete=False) as stream:
@@ -2059,12 +2163,15 @@ def _recorded_targets(recipe, source_task, *, first_trial=False):
     return True
 
 
-def register(recipe, destination, hwnd=None, *, source_task=None, first_trial=False):
+def register(recipe, destination, hwnd=None, *, source_task=None, first_trial=False, host=None):
     """Register demonstrated targets offline, or resolve other selectors read-only."""
     recipe = deepcopy(validate(recipe))
     if source_task is not None:
         app.tasks._validate(source_task)
     destination = Path(destination).resolve()
+    host = _guide_host(destination, host)
+    need(host in ('claude', 'codex'), 'unknown_registration_host')
+    command = _run_command(destination, host)
     need(not destination.exists(), 'workflow_destination_exists')
     need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', destination.name), 'workflow_folder_name_required')
     recorded = _recorded_targets(recipe, source_task, first_trial=first_trial)
@@ -2119,14 +2226,23 @@ def register(recipe, destination, hwnd=None, *, source_task=None, first_trial=Fa
                                                      encoding='utf8')
     description = json.dumps(recipe['name'] + ' 녹화 순서를 Windows에서 실행한다.', ensure_ascii=False)
     guide = ('---\nname: ' + destination.name + '\ndescription: ' + description + '\n---\n\n'
-             + REGISTERED_HEADING + run_instructions(recipe, destination.name))
+             + REGISTERED_HEADING + run_instructions(recipe, destination.name, host=host, command=command))
     pending_popup = any('popup' in item for item in observed.get('pending_scopes', []))
-    notes = workflow_notes(recipe, source_task, pending_popup)
+    notes = workflow_notes(recipe, source_task, pending_popup, command=command)
     (destination / GUIDE_REFERENCE).write_text(guide_reference(recipe, notes), encoding='utf8')
     (destination / 'SKILL.md').write_text(guide, encoding='utf8')
+    paths = dict(skill=destination / 'SKILL.md', runner=destination / 'scripts/run.py',
+                 workflow=destination / 'workflow.json', runtime=Path(__file__).resolve())
+    need(all(path.is_file() for path in paths.values()), 'registration_file_missing')
+    layout = ('user' if destination.parents[2] == Path.home() else 'project') if _project_skill(destination) else 'portable'
     result = dict(status='registered', path=str(destination), required_parameters=required, input_dispatched=False,
+                  host=host, layout=layout,
+                  active_paths={name: str(path) for name, path in paths.items()}, execution_validation='not_run',
                   input_requirements=input_policy.profile(active),
                   run_args=[str(destination / 'scripts/run.py'), '--summary'])
+    fixed = _parameterized_visual_steps(recipe)
+    if fixed:
+        result['fixed_visual_steps'] = fixed
     menu_checks = [dict(number=r['number'], **{k: v for k, v in r['receipt'].items()
                        if k in ('region_observed', 'point_observed', 'proposed_point', 'point_diagnostic',
                                 'menu_verification')}) for r in observed['steps']
@@ -2151,13 +2267,24 @@ def guide_reference(recipe, notes):
                      '해당 표의 보정용 화면 확인 승인을 확인하고, 없으면 한 번 물은 뒤 `frame_args`로 확인한다. '
                      '`resume_script` 또는 이 스킬의 `scripts/run.py`에 `resume_args`와 '
                      '원본 이미지의 픽셀 좌표를 주어 같은 실행을 이어간다.\n\n')
+    fixed = _parameterized_visual_steps(recipe)
+    if fixed:
+        recovery += (f'단계 {", ".join(map(str, fixed))}은 녹화 시점의 화면 표식을 사용합니다. '
+                     '실행 변수가 바뀌면 같은 표식이 다른 결과를 가리킬 수 있습니다.\n\n')
     return '# 등록 업무 상세 안내\n\n' + recovery + notes
 
 
-def workflow_notes(recipe, source_task, pending_popup):
+def _parameterized_visual_steps(recipe):
+    if not any('parameter' in step for step in recipe['steps']):
+        return []
+    return [n for n, step in enumerate(recipe['steps'], 1)
+            if step['action'] in ('row-action', 'row-open') or 'row_hint' in step
+            or step['action'] == 'visual-click' and 'rgb' in step['visual']]
+
+
+def workflow_notes(recipe, source_task, pending_popup, *, command=RUN_COMMAND):
     # Keep these generated paragraphs recognizable when upgrading older
     # guides. User-authored text outside them stays in the active SKILL.md.
-    command = RUN_COMMAND
     active = [s for s in recipe['steps'] if s['action'] != 'wait']
     required = list(dict.fromkeys(s['parameter'] for s in active if 'parameter' in s))
     guide = ('업무명, 대상 창과 순서는 `workflow.json`에 있다. '
@@ -2257,7 +2384,8 @@ def summarize_execution(report, entries):
         item.update(action=step['action'])
         item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items', 'menu_recovery',
                                              'verified_path', 'verification_scope', 'keys', 'screen_point',
-                                             'attempted_screen_point') if k in receipt})
+                                             'attempted_screen_point', 'lookup_seconds', 'popup_wait_seconds',
+                                             'seconds') if k in receipt})
         if step['action'] in input_policy.VALUE_OBSERVATIONS:
             item.update({k: receipt[k] for k in ('value', 'value_evidence', 'result_observation') if k in receipt})
             if step['action'] == 'read-value' and any(
@@ -2266,7 +2394,9 @@ def summarize_execution(report, entries):
                 item.pop('value', None)
         if step['action'] == 'double-click-result' and 'result_row' in step:
             item.update({k: receipt[k] for k in ('result_row', 'result_observation', 'query_freshness',
-                                               'value_comparison', 'target_resolution', 'recorded_placement_restored') if k in receipt})
+                                               'value_comparison', 'target_resolution', 'recorded_placement_restored',
+                                               'result_identity_verified', 'query_completion_verified',
+                                               'pointer_preparation_seconds', 'input_delivery_seconds') if k in receipt})
         summary['steps'].append(item)
         if (receipt['status'] == 'verified' and receipt.get('diagnostic') == 'export_workbook_verified'
                 and (receipt.get('file_verified') is True or receipt.get('workbook_verified') is True)
@@ -2314,9 +2444,12 @@ def register_first_run(recipe, args, source_task=None):
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     if source_task and (_literal_recorded_targets(recipe)
                         or any(s['action'] in input_policy.VALUE_OBSERVATIONS for s in recipe['steps'])):
-        registration = register(recipe, destination, args.hwnd, source_task=source_task, first_trial=True)
+        registration = register(recipe, destination, args.hwnd, source_task=source_task, first_trial=True,
+                                host=getattr(args, 'host', None))
     else:
         register_args = ['register', '--out', str(destination)]
+        if getattr(args, 'host', None):
+            register_args += ['--host', args.host]
         register_args += ['--task', args.task] if args.task else ['--recipe', str(args.recipe.resolve())]
         if args.hwnd is not None:
             register_args += ['--hwnd', str(args.hwnd)]
@@ -2342,6 +2475,7 @@ def register_first_run(recipe, args, source_task=None):
 
 def main(argv=None):
     entered = time.monotonic()
+    requested_at = time.time()
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == '_scene_worker':
         from scene_session import worker
@@ -2372,9 +2506,12 @@ def main(argv=None):
         else:
             p.add_argument('--recipe', type=Path, required=True)
             p.add_argument('--_recipe-sha', help=argparse.SUPPRESS)
+            p.add_argument('--_requested-at', type=float, help=argparse.SUPPRESS)
         p.add_argument('--hwnd', type=int)
         if command == 'register':
             p.add_argument('--out', type=Path, required=True)
+            p.add_argument('--host', choices=('claude', 'codex'),
+                           help='generate instructions for this host (inferred for project skills)')
             p.add_argument('--run', action='store_true', help='register once and perform the requested first run')
         else:
             p.add_argument('--only', help='run or inspect one workflow step by number or label')
@@ -2385,10 +2522,14 @@ def main(argv=None):
             repair.add_argument('--resume-menu', metavar='TICKET', help='resume a before-click failure from the approved frame')
             repair.add_argument('--resume-input', metavar='TICKET', help='after the user pauses, continue at the unsent menu')
             repair.add_argument('--confirm-result-locally', metavar='TICKET', help='review the current result cell on this PC and continue from it')
+            repair.add_argument('--resume-detail', metavar='TICKET', help='finish the pending read and close on the same opened detail window')
+            repair.add_argument('--cancel-run', metavar='RUN_ID', help='discard a pending registered result run without sending input')
             repair.add_argument('--new-attempt', action='store_true',
-                                help='explicitly start a new full run after a previously blocked header or detail')
+                                help='discard an outstanding registered result run and start a fresh full run')
             p.add_argument('--local-result-review', action='store_true',
                            help='if needed, open a local confirmation window for an unreadable result cell during this run')
+            p.add_argument('--include-result-frame', action='store_true',
+                           help='include a masked preview of the current result table if a running lookup needs review')
             p.add_argument('--forget-physical', action='store_true', help='remove the repeat permission for this registration')
             p.add_argument('--frame', metavar='TOKEN')
             p.add_argument('--point', nargs=2, type=int, metavar=('X', 'Y'))
@@ -2455,9 +2596,34 @@ def main(argv=None):
         overrides = {}
         if args.command == 'run':
             registered = workflow_repair.registered(args.recipe)
-            need(not args.new_attempt or (registered and not args.read_only and not args.input_plan and
-                 not args.forget_physical and args.only is None and not args.background_only and
-                 any(s.get('result_row') == 'header' for s in recipe['steps'])), 'invalid_new_attempt')
+            need(args._requested_at is None or args._worker, 'invalid_worker_request_time')
+            result_workflow = any(s['action'] == 'double-click-result' or 'result_column' in s for s in recipe['steps'])
+            if args.include_result_frame:
+                need(registered and result_workflow and args.only is None and not any((args.input_plan, args.read_only,
+                     args.local_result_review, args.confirm_result_locally, args.resume_detail, args.cancel_run,
+                     args.resume_input, args.resume_menu, args.repair_frame, args.forget_physical)),
+                     'result_frame_requires_registered_lookup')
+            if args.new_attempt or args.cancel_run or args.resume_detail:
+                if not (registered and result_workflow) or args.read_only or args.input_plan or args.forget_physical or args.only is not None:
+                    diagnostic = ('full_registered_result_run_required' if registered and result_workflow
+                                  else 'registered_result_workflow_required')
+                    result = dict(status='blocked', diagnostic=diagnostic, input_dispatched=False,
+                                  next_action=dict(kind='inspect_workflow', args=['--input-plan']))
+                    if registered and result_workflow and args.new_attempt:
+                        result['new_attempt_args'] = ['--new-attempt', '--summary',
+                                                      *[part for item in args.set for part in ('--set', item)]]
+                    print(json.dumps(result, ensure_ascii=False))
+                    return 2
+            if args.resume_detail:
+                need(not (args.set or args.local_result_review or args.auto_repair_frame),
+                     'detail_resume_only_requires_ticket')
+            if args.cancel_run:
+                need(not (args.allow_physical or args.remember_physical or args.hwnd or args.set or args.point or args.frame
+                          or args.background_only or args.local_result_review or args.auto_repair_frame), 'cancel_only_requires_run_id')
+                import registered_result
+                result = registered_result.cancel_run(args.recipe, args.cancel_run)
+                print(json.dumps(result, ensure_ascii=False))
+                return 0 if result['status'] == 'cancelled' else 2
             if args.forget_physical:
                 need(registered and not any((args.only, args.hwnd, args.resume_input, args.resume_menu, args.repair_frame,
                      args.confirm_result_locally, args.local_result_review,
@@ -2466,7 +2632,7 @@ def main(argv=None):
                 workflow_repair.forget_approval(args.recipe)
                 print(json.dumps(dict(status='forgotten', input_dispatched=False)))
                 return 0
-            repairing = bool(args.repair_frame or args.resume_menu or args.resume_input or args.confirm_result_locally)
+            repairing = bool(args.repair_frame or args.resume_menu or args.resume_input or args.confirm_result_locally or args.resume_detail)
             need(not repairing or (registered and not args.read_only and not args.input_plan and
                                    not args.background_only and args.only is None and args.hwnd is None),
                  'invalid_registered_repair_arguments')
@@ -2510,7 +2676,7 @@ def main(argv=None):
                 args.set = list(supplied.values())
             overrides = app.tasks.parse_overrides(args.set)
             _, missing = values_for(active, overrides)
-            if ((registered or header_requested) and not args.allow_physical and not args.repeat_approval_used and not args.resume_input and
+            if ((registered or header_requested) and not args.allow_physical and not args.repeat_approval_used and not args.resume_input and not args.resume_detail and
                     (repairing or (mutating and requirements['physical_input_required']))):
                 diagnostic = 'registered_physical_consent_required' if registered else 'physical_consent_required'
                 print(json.dumps(dict(status='needs_consent', diagnostic=diagnostic,
@@ -2525,7 +2691,7 @@ def main(argv=None):
         if args.command == 'register' and source_task is not None and _literal_recorded_targets(recipe):
             # A literal recording can be registered entirely from its validated
             # source; a UIA worker would only reload and compile the same task.
-            result = register(recipe, args.out, args.hwnd, source_task=source_task)
+            result = register(recipe, args.out, args.hwnd, source_task=source_task, host=args.host)
         elif args._worker:
             if args.command == 'discover':
                 result = discover(args.exe, args.window, args.hwnd)
@@ -2533,9 +2699,9 @@ def main(argv=None):
                 owner = bind(args.exe, args.window, args.hwnd)
                 result = export_evidence.discover_directories(owner)
             elif args.command == 'register':
-                result = register(recipe, args.out, args.hwnd, source_task=source_task)
+                result = register(recipe, args.out, args.hwnd, source_task=source_task, host=args.host)
             elif registered and not args.read_only and (repairing or any(workflow_repair.menu(s) for _, s in entries)
-                                                       or (args.only is None and any('result_column' in s or 'result_row' in s for _, s in entries))):
+                                                       or result_workflow):
                 executing = mutating
                 if not args.repair_frame and any(s['action'] == 'conditional-open' for _, s in entries):
                     from scene_session import start
@@ -2565,7 +2731,8 @@ def main(argv=None):
             launched = True
             supervise = coordination.run_worker if mutating or getattr(args, 'repair_frame', None) else subprocess.run
             worker_started = time.monotonic()
-            worker_args = [*argv, '--_recipe-sha', workflow_repair.digest(recipe)] if args.command == 'run' else argv
+            worker_args = [*argv, '--_recipe-sha', workflow_repair.digest(recipe),
+                           '--_requested-at', str(requested_at)] if args.command == 'run' else argv
             child = supervise([sys.executable, '-X', 'utf8', '-B', str(Path(__file__).resolve()),
                                '--_worker', *worker_args], capture_output=True, encoding='utf8', timeout=timeout)
             result = json.loads(child.stdout)
@@ -2591,6 +2758,21 @@ def main(argv=None):
             result['required_parameters'] = error.required_parameters
         if worker_started is not None:
             coordination.worker_timings(result, worker_started)
+    if mutating and recipe and 'steps' in result:
+        rows = result['steps']
+        complete = (not args.only and not result.get('stopped_at') and
+                    [r.get('number') for r in rows] == list(range(1, len(recipe['steps']) + 1)))
+        if complete and (result['status'] == 'verified' or result.get('outcome') == 'workbook_verified'):
+            result['execution_validation'] = 'full_run_verified'
+        elif complete and result['status'] == 'completed_unverified':
+            result['execution_validation'] = 'full_run_unverified'
+        else:
+            progressed = any(r.get('receipt', r).get('status') in
+                             ('verified', 'observed', 'waited', 'delivered_unverified') for r in rows)
+            if progressed or result.get('input_dispatched') is True:
+                result['execution_validation'] = 'partial'
+            else:
+                result['execution_validation'] = 'unknown' if result.get('input_dispatched') is None else 'not_run'
     if args._worker:
         result = dict(result, _worker_entered=entered)
     print(json.dumps(result, ensure_ascii=False))

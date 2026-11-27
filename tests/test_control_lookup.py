@@ -212,6 +212,28 @@ class NativeTargetsTests(unittest.TestCase):
         self.assertIs(native.resolve(self.binding, self.uia,
                                     dict(automation_id='Field', role='combobox'), root=group), wanted)
 
+    def test_observation_disambiguates_only_duplicate_fields_inside_the_recorded_scope(self):
+        import python_workflow as flow
+        group, elsewhere = self.node('Form', 50026), self.node('Elsewhere', 50026)
+        first, second = self.node(parent=group), self.node(parent=group)
+        unrelated = self.node(parent=elsewhere)
+        labels = {first: 'Old note', second: 'Comment', unrelated: 'Comment'}
+        selector = dict(automation_id='Field', role='combobox', ancestors=[dict(role='group', automation_id='Form')])
+        with patch.object(flow.app, 'field_label', side_effect=lambda b, u, e, r: {'semantic_label': labels[e]}) as label:
+            found, _, _ = flow.resolve_step(self.binding, self.uia, self.root, selector, observation_label='Comment')
+            self.assertIs(found, second)
+            self.assertEqual([call.args[2] for call in label.call_args_list], [first, second])
+            labels[first] = 'Comment'
+            with self.assertRaisesRegex(win.BridgeError, 'target_ambiguous'):
+                flow.resolve_step(self.binding, self.uia, self.root, selector, observation_label='Comment')
+            with self.assertRaisesRegex(win.BridgeError, 'target_ambiguous'):
+                flow.resolve_step(self.binding, self.uia, self.root, selector, observation_label='Unknown')
+            self.uia.query_rows = [second]
+            label.reset_mock()
+            found, _, _ = flow.resolve_step(self.binding, self.uia, self.root, selector, observation_label='Comment')
+            self.assertIs(found, second)
+            label.assert_not_called()
+
     def test_nearest_first_ancestors_support_id_or_name(self):
         form = self.node('Form', 50026)
         group = self.node('Row', 50026, parent=form, name='Conditions')

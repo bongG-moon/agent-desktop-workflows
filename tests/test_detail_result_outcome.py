@@ -110,6 +110,14 @@ class DetailOutcomeTests(TestCase):
 
 
 class OwnedWindowTests(TestCase):
+    def test_linked_window_wait_accepts_only_a_bounded_seconds_value(self):
+        spec = dict(exe='Example.exe', title='Detail', related=True, after_step=2)
+        for seconds in (0, .25, 3, 30):
+            self.assertEqual(window_context.validate_context(dict(spec, timeout=seconds))['timeout'], seconds)
+        for seconds in (-1, 31, True, float('nan')):
+            with self.assertRaisesRegex(window_context.ContextError, 'invalid_window_context'):
+                window_context.validate_context(dict(spec, timeout=seconds))
+
     def setUp(self):
         self.task = recipe()
         self.owner = binding(window(101, title='Search'))
@@ -123,6 +131,104 @@ class OwnedWindowTests(TestCase):
 
     def detail(self, hwnd):
         return dict(window(hwnd, title='Detail'), pid=self.owner.pid)
+
+    def test_registered_opener_ticket_continues_on_exact_window_and_cannot_replay(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+        import tempfile
+        import workflow_repair
+
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(workflow_repair.tempfile, 'gettempdir', return_value=str(directory)))
+        path = directory / 'workflow.json'
+        (directory / 'scripts').mkdir()
+        (directory / 'scripts/run.py').touch()
+        scope = dict(exe=self.task['exe'], title='Detail', after_step=2, owned=True)
+        self.task['steps'] = [self.task['steps'][1], dict(action='double-click-result', result_row='first',
+                             selector=dict(role='group', automation_id='results')),
+                             *[dict(s, window_context=scope) for s in self.task['steps'][-2:]]]
+        path.write_text(json.dumps(self.task), encoding='utf8')
+        detail = self.detail(111)
+        self.owned.add((111, self.owner.hwnd))
+        cookies = {self.owner.hwnd: 114, 111: 115}
+        actions = []
+        memo_ready = True
+        element = Mock()
+        uia = self.enterContext(patch.object(flow.app.bridge, 'UIA')).return_value.__enter__.return_value
+        uia.pid.return_value = self.owner.pid
+
+        def run(*args):
+            with redirect_stdout(StringIO()) as stream:
+                flow.main(['--_worker', 'run', '--recipe', str(path), *args])
+            return json.loads(stream.getvalue())
+
+        def observe(*args, on_match, **kwargs):
+            on_match(element)
+            return dict(status='observed', result_observation=dict(strategy='uia'), input_dispatched=False)
+
+        def open_row(*args, **kwargs):
+            self.rows.append(detail)
+            actions.append('double-click')
+            return dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched', input_dispatched=True)
+
+        def read_note(*args, **kwargs):
+            if not memo_ready:
+                raise flow.WorkflowError('target_missing')
+            actions.append('read')
+            return dict(status='observed', value='note', value_evidence=dict(status='observed'), input_dispatched=False)
+
+        def close(bound, *args, **kwargs):
+            if bound.hwnd == self.owner.hwnd:
+                actions.append('query')
+                return dict(status='delivered_unverified', input_dispatched=True, diagnostic='business_result_not_verified')
+            self.assertEqual(bound.hwnd, detail['hwnd'])
+            self.rows.remove(detail)
+            actions.append('close')
+            return dict(status='delivered_unverified', diagnostic='business_result_not_verified', input_dispatched=True)
+
+        for module, name, options in (
+                (flow, 'bind', dict(side_effect=lambda exe,title,hwnd=None: self.owner if title=='Search' else binding(detail))),
+                (flow.app.visibility, 'restore_for_action', dict(return_value=False)),
+                (flow.app.bridge.user32, 'IsIconic', dict(return_value=False)),
+                (flow.app.bridge.user32, 'IsWindowVisible', dict(side_effect=lambda hwnd: hwnd in [r['hwnd'] for r in self.rows])),
+                (flow.input_policy, 'interactive_desktop_blocked', dict(return_value=None)),
+                (flow, 'resolve_step', dict(return_value=(element, {}, None))),
+                (flow, 'observe_result_row', dict(side_effect=observe)), (result_cell, 'execute_row', dict(side_effect=open_row)),
+                (window_context, 'window_cookie', dict(side_effect=lambda bridge,hwnd,**kw: cookies[hwnd])),
+                (flow, 'lookup_observation', dict(side_effect=read_note)), (flow.live,'execute',dict(side_effect=close))):
+            self.enterContext(patch.object(module, name, **options))
+
+        opened = run('--allow-physical', '--only', '2')
+        self.assertIn('next_action', opened, opened)
+        args = opened['next_action']['args']
+        self.assertEqual(run('--only', '3')['next_action']['args'], args)
+        resumed = run(*args)
+        self.assertEqual(resumed['status'], 'verified', resumed)
+        self.assertEqual(resumed['run_id'], opened['run_id'])
+        self.assertEqual([r['number'] for r in resumed['steps']], [3,4])
+        self.assertEqual(resumed['steps'][1]['receipt']['diagnostic'], 'recorded_window_closed')
+        self.assertFalse(resumed['prior_steps_replayed'])
+        self.assertEqual(run(*args)['diagnostic'], 'detail_resume_expired')
+        self.assertEqual(actions, ['double-click', 'read', 'close'])
+
+        reopened = run('--allow-physical', '--only', '2')
+        cookies[111] += 1  # The process and numeric HWND were reused for a replacement window.
+        stale = run(*reopened['next_action']['args'])
+        self.assertEqual(stale['diagnostic'], 'detail_window_lifetime_changed', stale)
+        self.assertFalse(stale['input_dispatched'])
+        self.assertEqual(actions, ['double-click', 'read', 'close', 'double-click'])
+
+        self.rows.clear()
+        memo_ready = False
+        paused = run('--allow-physical', '--new-attempt')
+        self.assertEqual(paused.get('stopped_at'), 3, paused)
+        self.assertTrue(paused['input_dispatched'])
+        memo_ready = True
+        resumed = run(*paused['next_action']['args'])
+        self.assertEqual([r['number'] for r in resumed['steps']], [3,4])
+        self.assertEqual(actions[-4:], ['query', 'double-click', 'read', 'close'])
+        self.assertEqual(resumed['run_id'], paused['run_id'])
 
     def test_same_title_without_owner_cannot_satisfy_the_opener(self):
         routes = window_context.WindowRoutes(self.task['steps'], self.owner, self.task['window'])

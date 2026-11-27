@@ -85,6 +85,119 @@ class RegisteredResultTests(unittest.TestCase):
         self.assertEqual(self.capture.call_count, 0)
         return report['result_review']['resume_args']
 
+    def test_cancel_and_restart_general_result_waits_without_consuming_another_attempt(self):
+        cmd = ['--set', 'Part=D27', '--allow-physical']
+        _, first = self.call(*cmd)
+        ticket = first['next_action']['args']
+        _, changed = self.call('--set', 'Part=Other', '--allow-physical')
+        self.assertFalse(changed['input_dispatched'])
+        self.assertEqual(changed['diagnostic'], 'pending_result_parameters_or_window_changed')
+        self.assertEqual(self.call(*changed['new_attempt_args'])[1]['status'], 'needs_consent')
+        _, second = self.call(*changed['new_attempt_args'], '--allow-physical')
+        self.assertNotEqual(first['run_id'], second['run_id'])
+        self.assertEqual(self.run.call_count, 2)
+        self.assertEqual(self.call(*ticket)[1]['input_dispatched'], False)
+        self.assertEqual(self.call(*first['cancel_args'])[1]['diagnostic'], 'result_run_not_pending')
+        code, cancelled = self.call(*second['cancel_args'])
+        self.assertEqual((code, cancelled['status'], cancelled['input_dispatched']), (0, 'cancelled', False))
+        self.assertEqual(self.call(*second['result_review']['resume_args'])[1]['diagnostic'], 'result_review_expired')
+        self.assertEqual(self.run.call_count, 2)
+
+    def test_expired_pending_never_resends_query_on_an_ordinary_call(self):
+        cmd = ['--set', 'Part=D27', '--allow-physical']
+        _, first = self.call(*cmd)
+        with patch('time.time', return_value=time.time() + grounding.TTL + 10):
+            _, expired = self.call(*cmd)
+        self.assertEqual(expired['diagnostic'], 'result_review_expired')
+        self.assertEqual(expired['run_id'], first['run_id'])
+        self.assertFalse(expired['input_dispatched'])
+        self.assertEqual(self.run.call_count, 1)
+
+    def test_old_local_review_ticket_cannot_claim_a_new_run_with_identical_values(self):
+        cmd = ['--set', 'Part=D27', '--allow-physical']
+        _, first = self.call(*cmd)
+        _, second = self.call(*cmd, '--new-attempt')
+        _, stale = self.call(*first['result_review']['resume_args'])
+        self.assertEqual(stale['diagnostic'], 'result_review_expired')
+        self.assertFalse(stale['input_dispatched'])
+        _, still_pending = self.call(*cmd)
+        self.assertEqual(still_pending['run_id'], second['run_id'])
+        self.assertEqual(still_pending['result_review']['resume_args'], second['result_review']['resume_args'])
+        self.assertEqual(self.run.call_count, 2)
+
+    def test_opt_in_cropped_frame_and_resume_args_share_one_receipt_and_cancel_removes_it(self):
+        self.owner.update(window_cookie=191)
+        table = MagicMock()
+        self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
+        def cropped(app, binding, guard, *, table_box):
+            guard()
+            self.assertEqual(table_box, self.box)
+            return [105,107,111,101], grounding._png(111,101,bytes(111*101*4))
+        self.capture.side_effect = cropped
+        with (patch.object(flow.window_context, 'window_cookie', return_value=191),
+              patch.object(flow, '_result_target', return_value=(table, self.group))):
+            _, receipt = self.call('--set','Part=D27','--allow-physical','--include-result-frame')
+        review = receipt['result_review']
+        frame = review['frame']
+        self.assertEqual((frame['scope'],frame['width'],frame['height']), ('visible_result_table',111,101))
+        self.assertTrue(Path(frame['image']).is_file())
+        self.assertEqual(receipt['next_action']['args'],review['resume_args'])
+        self.assertNotIn(frame['frame'],review['resume_args'])
+        self.assertEqual(self.run.call_count, 1)
+        self.choose.assert_not_called()
+        self.capture.assert_called_once()
+        with patch.object(flow.window_context, 'window_cookie', return_value=192):
+            _, changed = self.call('--set','Part=D27','--allow-physical','--include-result-frame')
+        self.assertEqual(changed['result_review']['frame']['diagnostic'], 'result_window_lifetime_unconfirmed')
+        self.capture.assert_called_once()
+        self.assertEqual(self.call(*receipt['cancel_args'])[1]['status'], 'cancelled')
+        self.assertFalse(Path(frame['image']).exists())
+
+    def test_cannot_share_whole_window_for_missing_result_table(self):
+        self.owner.update(window_cookie=91)
+        with patch.object(flow.window_context, 'window_cookie', return_value=91):
+            _, report = self.call('--set','Part=D27','--allow-physical','--include-result-frame')
+        self.assertEqual(report['result_review']['frame']['status'], 'unavailable')
+        self.assertNotIn('image', report['result_review']['frame'])
+        self.assertIn('resume_args', report['result_review'])
+        self.capture.assert_not_called()
+
+    def test_coordinate_mode_never_enters_image_review_even_with_preview_option(self):
+        self.row_review('coordinate', point=dict(x=20,y=30,width=500,height=100))
+        _, failed = self.call('--include-result-frame','--allow-physical')
+        self.assertNotIn('result_review', failed)
+        self.capture.assert_not_called()
+        self.choose.assert_not_called()
+
+    def test_concurrent_requests_for_same_values_execute_one_full_run(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from types import SimpleNamespace
+        started, finish = Event(), Event()
+        delivered = []
+        args = SimpleNamespace(recipe=self.path, only=None, hwnd=None, set=['Part=D27'],
+                               allow_physical=True, _requested_at=time.time())
+        def execute(session):
+            delivered.append(True)
+            started.set()
+            self.assertTrue(finish.wait(4))
+            return dict(status='verified', input_dispatched=True, steps=[])
+        def request(value):
+            return registered_result.run_attempt(flow, self.recipe, args, {'Part':value}, execute)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(request, 'D27')
+            self.assertTrue(started.wait(4))
+            duplicate = pool.submit(request, 'D27')
+            finish.set()
+            first, duplicate = first.result(), duplicate.result()
+        self.assertEqual(duplicate['run_id'], first['run_id'])
+        self.assertEqual(duplicate['diagnostic'], 'concurrent_result_run_finished')
+        self.assertFalse(duplicate['input_dispatched'])
+        self.assertEqual(len(delivered), 1)
+        other = request('Different')
+        self.assertNotEqual(other['run_id'], first['run_id'])
+        self.assertEqual(len(delivered), 2)
+
     def finished(self):
         return dict(status='completed_unverified', input_dispatched=True, steps=[
             dict(number=1, receipt=dict(status='delivered_unverified', input_dispatched=True)),

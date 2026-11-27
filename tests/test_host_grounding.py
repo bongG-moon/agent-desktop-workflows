@@ -12,6 +12,24 @@ import learned_tasks as tasks
 
 
 class HostGroundingTests(TestCase):
+    def test_visible_table_crop_rebases_mask_before_writing_pixels(self):
+        window = [100,200,8,6]
+        table = dict(x=104,y=202,width=10,height=10)
+        native = mock.MagicMock()
+        native.bridge._sig.return_value = lambda *args: 0
+        secret = bytes([17,58,91,0])
+        with (mock.patch.object(grounding.row_vision, '_window_rect', return_value=window),
+              mock.patch.object(grounding, '_protected', side_effect=[{(5,3,7,5)}, {(7,5,8,6)}]),
+              mock.patch.object(grounding.row_vision, '_frame', return_value=secret*16) as grab):
+            frame, png = grounding._capture(native, mock.Mock(), lambda: None, table_box=table)
+        self.assertEqual(frame,[104,202,4,4])
+        self.assertEqual(grab.call_args.kwargs['crop'],frame)
+        dims,pixels = grounding._pixels(png)
+        self.assertEqual(dims,[0,0,4,4])
+        for index in range(16):
+            expected = bytes(4) if index in (5,6,9,10,15) else secret
+            self.assertEqual(pixels[index*4:index*4+4], expected)
+
     def test_draft_double_click_binds_in_place_in_new_copy_and_leaves_following_actions_manual(self):
         import random
         import review_drafts

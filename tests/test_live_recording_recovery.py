@@ -83,6 +83,26 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         self.inputs.write_text(json.dumps(dict(source_fingerprint=fingerprint, steps=patches)), encoding='utf8')
         return recovery.run(app, self.args(bindings=self.inputs, save_as='실행용', **args))
 
+    def test_missing_explicit_point_requests_only_this_step_without_inventory_or_picture(self):
+        from recording_followup import followup, compact_preparation
+        import grounding
+        source = dict(teach_capture.manual('double_click_needs_review'), result_surface={'role':'group', 'automation_id':'grid'})
+        sentence = '표에서 녹화한 좌표를 더블클릭'
+        self.store.save_draft([dict(step=source, form=dict(alias='', text=sentence, mode=None, argument=''))],
+                              'instruction_target_unavailable', 1)
+        with patch.object(grounding, '_capture', side_effect=AssertionError('unexpected image')):
+            report = compact_preparation(followup(recovery.run(app, self.args(prepare=True))))
+            self.assertEqual(report['next_action']['required_fields'], ['result_point'])
+            self.assertEqual(report['next_action']['step_number'], 1)
+            self.assertEqual(report['next_action']['args'], ['review', '--task', '내 녹화', '--edit'])
+            response = app.save_instruction(self.args(only='1', text=sentence, save_as='실행용'))
+            self.assertEqual(response['required_fields'], ['result_point'])
+            grounded = grounding.run(app, self.args(only='1', command='ground'))
+            self.assertEqual(grounded['required_fields'], ['result_point'])
+            self.assertNotIn('live_scopes', report)
+            self.assertNotIn('image_args', report)
+            self.observe.assert_not_called()
+
     def patches(self):
         return [dict(number=1, target='c_status', role='combobox', mode='fixed', argument='N'),
                 dict(number=2, target='Family', role='combobox', mode='required', argument='제품군'),

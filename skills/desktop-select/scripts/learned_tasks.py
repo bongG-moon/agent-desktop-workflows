@@ -153,7 +153,8 @@ def same_result_double(step, previous):
                     and not step.get('result_column'))):
         return False
     text = _gesture_subject(step.get('instruction_draft') or step.get('description') or step.get('label', ''))
-    if not double_click_instruction(text) or _qualified_result_row(text) or _HEADER_WORD.search(text):
+    if (not double_click_instruction(text) or _qualified_result_row(text)
+            or _HEADER_WORD.search(text) or _POINT_WORD.search(text)):
         return False
     subject = re.split(r'더블\s*클릭|두\s*번|double[ -]?click', text, flags=re.I)[0]
     if text.lower().startswith(('double click', 'double-click')):
@@ -171,6 +172,9 @@ def _gesture_subject(sentence):
         caption = re.fullmatch(r'녹화한\s+항목\s+더블\s*클릭\s*\(([^()]+)\)', sentence.strip())
         if caption:
             return caption[1].strip()
+        caption = re.fullmatch(r'녹화한\s+항목\s*\(([^()]+)\)\s*(더블\s*클릭.*)', sentence.strip())
+        if caption:
+            return caption[1].strip() + ' ' + caption[2]
     return sentence
 
 
@@ -192,6 +196,31 @@ def _plain_table_gesture(sentence):
 
 
 _HEADER_WORD = re.compile(r'열\s*머리(?:글)?|헤더|\bheader\b', re.I)
+_POINT_WORD = re.compile(r'좌표|(?:녹화한|시연한|지정한|선택한)\s*위치|\bcoordinates?\b|'
+                         r'\b(?:recorded|selected|specified)\s+(?:table\s+)?(?:point|position)\b', re.I)
+
+
+def coordinate_request(sentence):
+    """The user explicitly chose a position within the demonstrated table."""
+    subject = _gesture_subject(sentence)
+    if not isinstance(subject, str) or not _POINT_WORD.search(subject) or not double_click_instruction(subject):
+        return False
+    target = re.split(r'더블\s*클릭|두\s*번', subject, maxsplit=1)[0].strip()
+    return bool(re.fullmatch(
+        r'(?:(?:조회\s*)?결과\s*)?(?:(?:표|목록|리스트|테이블)(?:의|에서)?\s*)?'
+        r'(?:(?:녹화한|시연한|지정한|선택한)\s*)?(?:표\s*)?(?:상대\s*)?(?:좌표|위치)(?:을|를|에서|로)?'
+        r'|double[ -]?click\s+(?:the\s+)?(?:recorded|selected|specified)\s+(?:table\s+)?'
+        r'(?:point|position|coordinates?)[.!]?', target, re.I))
+
+
+def _coordinate_intent(raw, sentence):
+    if not coordinate_request(sentence) or not valid_result_point(raw.get('result_point')):
+        return None
+    selector = raw.get('selector') if raw.get('action') == 'double-click-result' else result_surface_hint(raw)
+    if not selector or not any(k in selector for k in ('automation_id', 'name')):
+        return None
+    return dict(mode='double-click-result', text=sentence, label=sentence[:200],
+                result_row='coordinate', selector=deepcopy(selector), result_point=deepcopy(raw['result_point']))
 
 
 def _header_intent(raw, sentence, subject):
@@ -226,7 +255,11 @@ def current_result_intent(raw, sentence):
         if is_double_click_step(raw) or raw.get('action') == 'double-click-result':
             return _header_intent(raw, sentence, subject)
         return None
-    named_result = re.search(r'결과|\bresults?\b', subject, re.I)
+    if _POINT_WORD.search(subject):
+        if is_double_click_step(raw) or raw.get('action') == 'double-click-result':
+            return _coordinate_intent(raw, sentence)
+        return None
+    named_result = re.search(r'결과|조회\s*(?:행|줄|항목)|\bresults?\b', subject, re.I)
     if not named_result:
         if not _plain_table_gesture(subject) or not (is_double_click_step(raw) or raw.get('action') == 'double-click-result'):
             return None
@@ -351,7 +384,8 @@ def click_request(sentence):
     alias = re.search(r'\s*[（(]([^()（）]{1,120})[)）]$', text)
     if alias:
         text = text[:alias.start()].rstrip()
-    verb = (r'(?:눌러(?:서?\s*(?:시행|실행|시작|열어|열기))?|누르기|클릭(?:해서\s*(?:시행|실행|시작|열어|열기))?'
+    purpose = r'(?:시행|실행|시작|열어|열기|조회|검색)'
+    verb = (rf'(?:눌러(?:서?\s*{purpose})?|누르기|클릭(?:해서\s*{purpose})?'
             r'|선택해서\s*(?:시행|실행|시작)|실행|시행|열어|열기)')
     match = re.fullmatch(r'(.+?)\s*(?:을|를)?\s*' + verb + r'(?:해)?\s*(?:줘|주세요)?', text)
     if match:
@@ -512,13 +546,15 @@ def result_surface_hint(raw):
 
 def valid_result_point(point):
     fields = {'x', 'y', 'width', 'height'}
-    if (not isinstance(point, dict) or point.keys() - {'window_placement'} != fields
+    if (not isinstance(point, dict) or point.keys() - {'window_placement', 'dpi'} != fields
             or not all(type(point[key]) is int for key in fields)
+            or ('dpi' in point and (type(point['dpi']) is not int or not 48 <= point['dpi'] <= 960))
             or not (0 <= point['x'] < point['width'] <= 65535 and 0 <= point['y'] < point['height'] <= 65535)):
         return False
     if 'window_placement' in point:
         import window_placement
-        return window_placement.valid(point['window_placement'])
+        return (window_placement.valid(point['window_placement'])
+                and point.get('dpi', point['window_placement']['dpi']) == point['window_placement']['dpi'])
     return True
 
 
@@ -582,10 +618,12 @@ def _observed_intent(raw, sentence):
     text = sentence.strip().rstrip('.!。').strip()
     if re.search(r'[;?!,\n]|(?:말고|하지\s*마|않|대신|하고\s|한\s*뒤|누르고|그리고)|\b(?:not|and|then|or)\b', text, re.I):
         return None
-    scope_prefix = re.match(r'^(?:(\d+)\s*단계에서\s*열린\s*|(?:방금|이전\s*단계에서)\s*열린\s*)?(?:상세\s*)?(?:팝업|창|화면)(?:\s*안)?에서\s+', text)
+    scope_prefix = re.match(r'^(?:(?:(\d+)\s*단계에서\s*|방금\s*|이전\s*단계에서\s*)?열린\s*)?'
+                            r'(?:상세\s*)?(?:팝업|창|화면)(?:\s*안)?에서\s+', text)
     if scope_prefix:
         opener = (raw.get('window_context') or {}).get('after_step')
-        if scope_prefix[1] and (not scoped or opener is not None and int(scope_prefix[1]) != opener):
+        if ('열린' in scope_prefix[0] and not scoped
+                or scope_prefix[1] and opener is not None and int(scope_prefix[1]) != opener):
             return None
         text = text[scope_prefix.end():]
     selector = _recorded_selector(raw)
@@ -596,11 +634,17 @@ def _observed_intent(raw, sentence):
               and click[0].casefold() in {'exit', 'close', '닫기', '종료'} else None)
     if scoped and caption and not drag_read:
         # A recorded title-bar Close must not stand in for the named business button.
+        locator = target.get('locator', {}) if isinstance(target, dict) else {}
+        recorded_caption = (raw.get('command_name') or locator.get('name')
+                            or (selector or {}).get('name', ''))
+        matches_caption = (recorded_caption.casefold() == caption.casefold()
+                           or caption == '닫기' and recorded_caption.casefold() in {'close', 'exit'})
         if not (selector and selector.get('role') == 'button'
-                and (raw.get('command_name') or (target.get('locator', {}).get('name') if isinstance(target, dict) else '')
-                     or selector.get('name', '')).casefold() == caption.casefold()
-                and not any(a['role'] == 'titlebar' for a in selector.get('ancestors', []))):
+                and matches_caption
+                and not any(a.get('role') == 'titlebar' for a in locator.get('ancestors', selector.get('ancestors', [])))):
             selector = {'role': 'button', 'query': caption}
+        elif caption.casefold() != recorded_caption.casefold():
+            caption = recorded_caption
         return dict(mode='close-popup', text=sentence, selector=selector, label=caption)
 
     field = r'([\w][\w .\-/()]{0,99}?)'
@@ -693,6 +737,11 @@ def interpret_step(raw_step, sentence, action, selector, *, label=None, result_r
             if not header or header.get('result_row') != 'header' or header['selector'] != selector:
                 raise TaskError('recorded_header_required')
             step.update(result_column=header['result_column'], result_point=header['result_point'])
+        elif result_row == 'coordinate':
+            point = current_result_intent(raw_step, sentence)
+            if not point or point['result_row'] != 'coordinate' or point['selector'] != selector:
+                raise TaskError('recorded_coordinate_required')
+            step['result_point'] = point['result_point']
         _validate_current_result(step)
     else:
         if result_row is not None:
@@ -1222,7 +1271,7 @@ def compile_instruction(raw_step, sentence, *, mode=None, argument=None, target=
         if observation is not None:
             return observation
         if (_comparison_request(sentence) or is_double_click_step(raw_step) and double_click_instruction(sentence)
-                and (_HEADER_WORD.search(sentence) or re.search(r'결과|\bresults?\b', sentence, re.I))):
+                and (_HEADER_WORD.search(sentence) or _POINT_WORD.search(sentence) or re.search(r'결과|\bresults?\b', sentence, re.I))):
             # A location hint must not turn an unsupported comparison sentence
             # into a click on recording-time pixels. The host receives the prose.
             return {'mode': 'draft', 'text': sentence}
@@ -1783,13 +1832,14 @@ def _validate_current_result(step):
                'result_point', 'result_column', 'instruction_draft'}
     _validate_typed_draft(step)
     mode = step.get('result_row')
-    if (mode not in ('single', 'first', 'recorded', 'header') or not _text(step.get('label'), 1000)
+    if (mode not in ('single', 'first', 'recorded', 'header', 'coordinate') or not _text(step.get('label'), 1000)
             or not isinstance(selector, dict) or selector.get('role') not in RESULT_SURFACES
+            or mode == 'coordinate' and ('result_point' not in step or not ('automation_id' in selector or 'name' in selector))
             or mode == 'header' and (not {'result_point', 'result_column'} <= step.keys()
                                      or not any(k in selector for k in ('name', 'automation_id')))
-            or 'result_point' in step and (mode not in ('recorded', 'header') or selector == {'role': 'table'}
+            or 'result_point' in step and (mode not in ('recorded', 'header', 'coordinate') or selector == {'role': 'table'}
                                            or not valid_result_point(step['result_point']))
-            or 'result_column' in step and (step['result_row'] == 'recorded' or not _text(step['result_column'], 100))
+            or 'result_column' in step and (mode in ('recorded', 'coordinate') or not _text(step['result_column'], 100))
             or set(step) - allowed):
         raise TaskError('invalid_result_row')
     if selector != {'role': 'table'}:

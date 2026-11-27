@@ -232,7 +232,7 @@ def _selector(selector):
     return parents
 
 
-def resolve(binding, uia, selector, root=None):
+def resolve(binding, uia, selector, root=None, *, distinguish=None):
     """Resolve an exact ID/name+role and nearest-first ancestor identities uniquely."""
     parents = _selector(selector)
     if 'anchor' in selector:
@@ -257,6 +257,10 @@ def resolve(binding, uia, selector, root=None):
             remaining = iter(chain[1:])
             if all(any(_matches(ancestor, expected) for ancestor in remaining) for expected in parents):
                 chosen.append(element)
+        if len(chosen) > 1 and distinguish is not None:
+            matching = [element for element in chosen if distinguish(element)]
+            _need(len(matching) == 1, 'target_ambiguous')
+            chosen = matching
         _need(len(chosen) == 1, 'target_ambiguous' if chosen else 'target_missing')
         binding.check()
         returned = chosen[0]

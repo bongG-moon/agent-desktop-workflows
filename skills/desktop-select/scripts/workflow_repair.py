@@ -409,9 +409,56 @@ def restore_routes(flow, recipe, record, routes):
         child = flow.bind(spec['exe'], spec['title'], row['child'][0])
         need(matches_identity(parent, row['parent']) and matches_identity(child, row['child']),
              'menu_repair_window_changed')
+        if record.get('detail'):
+            need(child.pid == parent.pid and flow.app.bridge.owned(child.hwnd, parent.hwnd),
+                 'detail_window_owner_changed')
+            cookies = record['window_cookies']
+            need(len(cookies) == 2 and all(type(v) is int and v > 0 for v in cookies), 'invalid_detail_continuation')
+            routes.detail_lifetimes.update(zip((parent.hwnd, child.hwnd), cookies))
         routes.openers[opener] = parent
         routes.check(spec, child)
         routes.bindings[flow.window_context._key(spec)] = child
+
+
+def detail_checkpoint(routes, owner, report, only):
+    """Offer only a confirmed opened window and its still-unsent detail suffix."""
+    rows = report.get('steps', [])
+    if not rows:
+        return None
+    last = rows[-1]
+    number = report.get('stopped_at')
+    if number is None:
+        if only is None or last['receipt'].get('verification_scope') != 'recorded_window_opened':
+            return None
+        number = last['number'] + 1
+    elif (last['number'] != number or last['receipt'].get('input_dispatched') is not False
+          or report['status'] == 'uncertain'):
+        return None
+    remaining = routes.steps[number-1:]
+    if not remaining:
+        return None
+    spec = remaining[0].get('window_context') or {}
+    opener = spec.get('after_step')
+    if not opener or any('popup' in step or step.get('window_context') != spec or
+            not (step['action'] == 'read-value' or step['action'] == 'invoke' and step.get('verify_closed'))
+            for step in remaining):
+        return None
+    proof = routes.outcomes.get(opener, {})
+    if (routes.steps[opener-1]['action'] != 'double-click-result' or
+            proof.get('verification_scope') != 'recorded_window_opened' or proof.get('input_dispatched') is not True):
+        return None
+    saved = saved_routes(routes, number)
+    if len(saved) != 1:
+        return None
+    child, parent = saved[0]['child'], saved[0]['parent']
+    if child[1] != parent[1] or not routes.app.bridge.owned(child[0], parent[0]):
+        return None
+    import window_context
+    cookies = [window_context.window_cookie(routes.app.bridge, hwnd, create=True) for hwnd in (parent[0], child[0])]
+    if not all(cookies):
+        return None
+    return dict(detail=True, number=number, scope=[identity(owner), child], routes=saved, checked_fields=[], window_cookies=cookies,
+                only=None, query_sent=False, opener_step=opener, verification_scope='recorded_window_opened')
 
 
 def header_stop(report, recipe):
@@ -440,17 +487,29 @@ def compact_stop(report):
 
 def run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_result_review=True,
                    allow_recorded_selection=False):
+    if (enable_result_review and not args.repair_frame
+            and any(s['action'] == 'double-click-result' or 'result_column' in s for s in recipe['steps'])):
+        import registered_result
+        return registered_result.run_attempt(flow, recipe, args, overrides,
+                    lambda session: _run_registered(flow, recipe, args, overrides, scene_session, locked_session=session))
+    return _run_registered(flow, recipe, args, overrides, scene_session,
+                           enable_result_review=enable_result_review, allow_recorded_selection=allow_recorded_selection)
+
+
+def _run_registered(flow, recipe, args, overrides, scene_session=None, *, enable_result_review=True,
+                    allow_recorded_selection=False, locked_session=None):
     """One worker owns the stored ticket until its checked input has been consumed."""
     import review_drafts
     if args.hwnd is not None:
         args.hwnd = flow.app.bridge.normalize_hwnd(args.hwnd)
         need(args.hwnd, 'invalid_target')
-    session = RepairSession(args.recipe)
+    session = locked_session or RepairSession(args.recipe)
     resume_input = getattr(args, 'resume_input', None)
     remember = getattr(args, 'remember_physical', False)
     with ExitStack() as stack:
         try:
-            stack.enter_context(coordination.recipe(args.recipe))
+            if locked_session is None:
+                stack.enter_context(coordination.recipe(args.recipe))
             # Retain exclusion with older installations using this ticket directory.
             stack.enter_context(review_drafts._edit_lock(session.directory))
         except coordination.CoordinationError as error:

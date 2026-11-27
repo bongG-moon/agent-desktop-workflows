@@ -396,7 +396,9 @@ def run(app, args):
             elif (last['number'] == number and step['action'] == 'double-click-result' and step.get('result_row')
                   and receipt.get('input_dispatched') is False and window):
                 import result_trial
-                if receipt.get('diagnostic') in result_trial.ROW_REVIEW_ERRORS:
+                if step['result_row'] == 'coordinate':
+                    report['host_action'] = 'check_named_table_and_chosen_position'
+                elif receipt.get('diagnostic') in result_trial.ROW_REVIEW_ERRORS:
                     report.update(host_action='inspect_current_result_without_replaying',
                         result_inspection=dict(source_step=report['source_stopped_at'], result_row=step['result_row'],
                             selector=receipt.get('result_surface_selector') or step['selector'],

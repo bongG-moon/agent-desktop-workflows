@@ -5,7 +5,7 @@ description: Windows 업무 창의 작업을 녹화하고 저장한 녹화를 �
 
 # Desktop Select
 
-사용자가 요청한 명령을 첫 셸 호출로 실행한다. 실행기가 창과 입력 가능 여부를 확인하므로 일반 실행 전후에 도움말, 소스, 파일 목록이나 `inspect`를 따로 조회하지 않는다. Claude Code에서는 `${CLAUDE_SKILL_DIR}`, AX Workspace에서는 이 파일이 있는 폴더를 사용한다. 아래 명령과 응답의 스크립트는 `python -X utf8 -B`로 실행한다.
+요청한 명령을 첫 셸 호출로 실행한다. 창과 입력 가능 여부는 실행기가 확인한다. 일반 실행 전후에 도움말, 소스, 파일 목록이나 `inspect`를 따로 조회하지 않는다. 아래 `${CLAUDE_SKILL_DIR}`는 이 파일이 있는 폴더다. Codex와 AX Workspace는 해당 경로를 직접 넣는다. 스크립트는 `python -X utf8 -B`로 실행한다.
 
 ## 녹화 시작
 
@@ -30,7 +30,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 
 ## 등록과 반복 실행
 
-등록 요청에는 성공한 시험의 `effective_task`로 `python_workflow.py register --task "<작업명>" --out "<프로젝트>/.claude/skills/<업무 이름>"`을 실행한다. 등록 업무 호출은 그 업무의 `scripts/run.py --summary`에 이번 `--set` 값을 붙여 바로 실행한다. 로컬 결과 확인과 물리 입력을 허용받았다면 `--local-result-review --allow-physical`을 사용한다. `result_review.resume_args`는 같은 실행기에 전달한다.
+등록은 성공한 시험의 `effective_task`로 `python_workflow.py register --task "<작업명>" --out "<업무 폴더>"`를 실행한다. 프로젝트 업무 폴더는 Claude Code의 `.claude/skills/<이름>`, Codex의 `.agents/skills/<이름>`이다. 이후 그 업무의 `scripts/run.py --summary`에 이번 `--set` 값을 붙인다. 중단되면 같은 실행기에 영수증의 재개 인자를 전달한다.
 
 실행 결과는 영수증에서 읽는다. `verified`는 기대 상태를 확인했다는 뜻이다. `delivered_unverified`는 입력 전달까지만 확인한 상태이고, `uncertain`은 현재 효과를 확인해야 한다. 불확실한 입력이나 이미 한 조회를 다시 보내지 않는다. 파일 생성은 `verified_outputs`로 보고한다. `no_interactive_desktop`이면 `desktop_check.reason`에 따라 실행 세션과 잠금 상태를 확인한다.
 

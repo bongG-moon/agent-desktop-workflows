@@ -30,7 +30,7 @@ public sealed class PaintedCell : FrameworkElement {
 }
 
 // No header, row or cell peers. Both hit tests inside this grid reach the same group.
-public sealed class PaintedGroup : FrameworkElement {
+public sealed class PaintedGroup : Canvas {
     public string Key = "OLD";
     public bool Oversized, DuplicateColumnValue, Ruled;
     public string Scenario = "match";
@@ -47,7 +47,9 @@ public sealed class PaintedGroup : FrameworkElement {
     protected override AutomationPeer OnCreateAutomationPeer() { return new GroupPeer(this); }
     sealed class GroupPeer : FrameworkElementAutomationPeer {
         public GroupPeer(FrameworkElement owner) : base(owner) {}
-        protected override AutomationControlType GetAutomationControlTypeCore() { return AutomationControlType.Group; }
+        protected override AutomationControlType GetAutomationControlTypeCore() {
+            return ((PaintedGroup)Owner).Children.Count == 0 ? AutomationControlType.Group : AutomationControlType.Pane;
+        }
         protected override bool IsControlElementCore() { return true; }
         protected override bool IsContentElementCore() { return true; }
         protected override Rect GetBoundingRectangleCore() {
@@ -156,6 +158,11 @@ sealed class LookupDetailsFixture : Window {
         }
         opaque.DuplicateColumnValue = Environment.GetCommandLineArgs().Contains("--duplicate-column-value");
         AutomationProperties.SetAutomationId(opaque, "PaintedResults");
+        if (Environment.GetCommandLineArgs().Contains("--scroll-pane")) {
+            var scroll = new System.Windows.Controls.Primitives.ScrollBar {
+                Orientation=Orientation.Horizontal, Width=230, Height=16 };
+            Canvas.SetBottom(scroll, 0); opaque.Children.Add(scroll);
+        }
         bool providerOnly = Environment.GetCommandLineArgs().Contains("--provider-grid");
         providerGrid.OpenResult = OpenDetail;
         main.Children.Add(providerOnly ? (FrameworkElement)providerGrid : groupOnly ? (FrameworkElement)opaque : results);
@@ -172,7 +179,7 @@ sealed class LookupDetailsFixture : Window {
         };
         opaque.MouseLeftButtonDown+=delegate(object sender, MouseButtonEventArgs e) {
             Point p=e.GetPosition(opaque);
-            if(e.ClickCount==2 && p.Y>=33 && p.Y<89) {
+            if(e.ClickCount==2 && p.Y>=33 && p.Y<89 && (p.Y<61?1:2)<=opaque.VisibleRows) {
                 if ((p.X < 180 ? 0 : 1) != opaque.KeyColumn) opaque.WrongColumns++;
                 OpenDetail(opaque.KeyAt(p.Y<61?1:2));
             }

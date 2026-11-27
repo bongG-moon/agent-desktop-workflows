@@ -36,7 +36,7 @@ def recipe(title, exe, painted):
              command_name='Exit', verify_closed=True, window_context=detail)])
 
 
-def exercise(package, work, painted):
+def exercise(package, work, painted, *, opaque_probe=False):
     work.mkdir(parents=True, exist_ok=False)
     skills = work / '.claude/skills'
     with ZipFile(package) as z:
@@ -90,6 +90,9 @@ def exercise(package, work, painted):
             # to any installation or task outside this synthetic project.
             consent = {'first': ['--allow-physical', '--remember-physical'], 'resized': []}.get(
                 case, ['--allow-physical'])
+            if measurements and measurements[-1]['status'] != 'verified':
+                # Each case is a new test with deliberately different application state.
+                consent.append('--new-attempt')
             report, wall = run([runner, '--set', 'Equipment=' + value, '--summary', *consent], case)
             after = fixture.command('state')
             assert after['queries'] == before['queries'] + 1 and after['archiveClicks'] == 0, (after, report)
@@ -101,7 +104,8 @@ def exercise(package, work, painted):
                 assert steps[3]['status'] == 'verified' and steps[3]['value'] == value, report
                 assert steps[4]['input_dispatched'] and steps[5]['status'] == 'observed', report
                 assert steps[6]['diagnostic'] == 'recorded_window_closed' and steps[6]['status'] == 'verified', report
-                assert steps[5]['value'] == 'Note for ' + value, report
+                assert any(item['number'] == 5 and item['value'] == 'Note for ' + value
+                           for item in report['observations']), report
                 assert after['opened'] == before['opened'] + 1 and after['closed'] == before['closed'] + 1, (after, report)
                 assert after['last'] == value and not after['detailOpen'], (after, report)
             else:
@@ -128,12 +132,38 @@ def exercise(package, work, painted):
             assert 'worker_guard_enabled' in audit and not any('attempted' in line for line in audit), audit
     finally:
         fixture.close()
+    if opaque_probe:
+        fixture = Fixture(exe, '--group-only', '--scroll-pane', '--scoped-detail')
+        try:
+            fixture.command('focus')
+            spec = recipe(fixture.ready['title'], exe.name, painted=False)
+            spec['steps'][2]['selector']['automation_id'] = 'PaintedResults'
+            path = work / 'opaque-exact.json'
+            path.write_text(json.dumps(spec), encoding='utf8')
+            dest = skills / 'opaque-exact'
+            registered, _ = run([skills/'desktop-select/scripts/python_workflow.py', 'register',
+                                 '--recipe',path,'--out',dest], 'register-opaque')
+            assert registered['status'] == 'registered', registered
+            before = fixture.command('state')
+            probe, _ = run([dest/'scripts/run.py','--only','3','--set','Equipment=OLD','--summary'], 'opaque-probe')
+            after = fixture.command('state')
+            last = probe['steps'][-1]['receipt']
+            observation = last['result_observation']
+            assert probe['status'] == 'blocked' and probe['input_dispatched'] is False, probe
+            assert last['diagnostic'] == 'result_column_unavailable' and observation['attempts'] == 1, probe
+            assert (before['queries'],before['opened']) == (after['queries'],after['opened']), after
+            assert not any('attempted' in line for line in (work/'element-trace.txt').read_text().splitlines())
+            print(json.dumps(dict(case='opaque-pane', blocked=last['diagnostic'], observation=observation)), flush=True)
+        finally:
+            fixture.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('package', type=Path)
     parser.add_argument('work', type=Path)
-    parser.add_argument('--painted', action='store_true', help='use a painted grid with no accessible cells')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--painted', action='store_true', help='use a painted grid with no accessible cells')
+    mode.add_argument('--opaque-probe', action='store_true', help='also reject unreadable results on a pane with a scrollbar')
     args = parser.parse_args()
-    exercise(args.package.resolve(strict=True), args.work.resolve(), args.painted)
+    exercise(args.package.resolve(strict=True), args.work.resolve(), args.painted, opaque_probe=args.opaque_probe)

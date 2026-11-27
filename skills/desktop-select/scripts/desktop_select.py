@@ -444,12 +444,16 @@ def save_instruction(args):
         number = tasks._step_number({'steps': [row['form'] for row in rows]}, args.only)
         row = rows[number-1]
         stored_text = row['form']['text'].strip()
-        if (tasks.is_double_click_step(row['step'].get('saved',row['step'])) and tasks.double_click_instruction(stored_text)
+        captured = row['step'].get('saved', row['step'])
+        if (tasks.is_double_click_step(captured) and tasks.double_click_instruction(stored_text)
                 and args.text.strip() == stored_text):
-            from recovery import double_click_handoff
-            return dict(status='needs_grounding', diagnostic='double_click_target_requires_grounding',
-                        source_task=source['name'], step=number, input_dispatched=False,
-                        **double_click_handoff(source['name'],number))
+            from recovery import double_click_handoff, missing_coordinate
+            if handoff := missing_coordinate(source['name'], number, captured, stored_text):
+                return handoff
+            if not tasks.coordinate_request(stored_text):
+                return dict(status='needs_grounding', diagnostic='double_click_target_requires_grounding',
+                            source_task=source['name'], step=number, input_dispatched=False,
+                            **double_click_handoff(source['name'],number))
         result = review_drafts.receipt(source, 'needs_review')
         result['save_as'] = args.save_as
         return attach_recovery(result, args.task)
@@ -460,7 +464,9 @@ def save_instruction(args):
     if (tasks.is_double_click_step(step) and step.get('action') == 'manual'
             and tasks.double_click_instruction(args.text) and args.text.strip() == step.get('instruction_draft')
             and any(value is not None for value in (args.target,args.role,getattr(args,'row',None)))):
-        from recovery import double_click_handoff
+        from recovery import double_click_handoff, missing_coordinate
+        if handoff := missing_coordinate(source['name'], number, step, args.text):
+            return handoff
         return dict(status='needs_grounding',diagnostic='double_click_target_requires_grounding',
                     source_task=source['name'],step=number,input_dispatched=False,
                     **double_click_handoff(source['name'],number))

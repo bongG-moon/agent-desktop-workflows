@@ -29,7 +29,7 @@ def followup(result):
     recovered = result.get('live_recovery')
     nested = isinstance(recovered, dict)
     if not nested and result.get('status') == 'needs_grounding' and (
-            'live_scopes' in result or result.get('host_action') == 'ground_recorded_double_click'):
+            'live_scopes' in result or result.get('host_action') in ('ground_recorded_double_click', 'review_recorded_position')):
         recovered = result
     ready = (recovered if isinstance(recovered, dict)
              and recovered.get('host_action') == 'use_prepared_task' else result)
@@ -54,7 +54,12 @@ def followup(result):
     if not isinstance(recovered, dict):
         return result
     result['preparation'] = 'needs_grounding'
-    if recovered.get('retry_args'):
+    if recovered.get('host_action') == 'review_recorded_position':
+        result['next_action'] = dict(kind='review_recorded_position', script=str(scripts / 'desktop_select.py'),
+                                     args=recovered['edit_args'], step_number=recovered['step_number'],
+                                     required_fields=recovered['required_fields'])
+        result.pop('recover_args', None)
+    elif recovered.get('retry_args'):
         kind = 'continue_preparation'
         if recovered.get('diagnostic') == 'target_window_minimized':
             kind = 'show_recorded_window_then_retry'

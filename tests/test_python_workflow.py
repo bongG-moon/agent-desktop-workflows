@@ -553,6 +553,28 @@ class RuntimeTests(unittest.TestCase):
         stable.assert_called_once()
         self.assertEqual(read.call_count, 2)
 
+    def test_chosen_coordinate_requires_an_exact_table_and_pixel_and_can_be_checked_without_input(self):
+        import result_cell
+        selector = dict(role='group', automation_id='Results')
+        anchor = dict(x=20, y=33, width=350, height=240)
+        step = dict(action='double-click-result', result_row='coordinate', selector=selector, result_point=anchor)
+        for change in (dict(selector={'role':'table'}), dict(selector={'role':'group', 'query':'Results'}),
+                       dict(result_point=None), dict(result_point=dict(anchor, x=350)), dict(result_column='Code')):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                flow.validate(dict(recipe(), steps=[dict(step, **change)]))
+        data = dict(recipe(), steps=[step])
+        self.element.property.side_effect = lambda key: 50033 if key == 30003 else None
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'position_at_coordinate', return_value=(100, 250)) as locate,
+              patch.object(result_cell, 'find_row', side_effect=AssertionError('row inspection')),
+              patch.object(result_cell, 'execute_row', side_effect=AssertionError('input on inspection'))):
+            self.assertEqual(flow.run(data, read_only=True)['steps'][0]['receipt']['status'], 'deferred')
+            current = flow.run(data, only=1, read_only=True)['steps'][0]['receipt']
+        self.assertEqual((current['diagnostic'], current['result_observation']['raw_control_type']),
+                         ('table_coordinate_located', 50033))
+        self.assertFalse(current['input_dispatched'])
+        locate.assert_called_once()
+
     def test_explicit_header_uses_verified_selector_and_point_in_readonly_and_replay(self):
         import result_cell
         selector = dict(role='table', automation_id='Results')

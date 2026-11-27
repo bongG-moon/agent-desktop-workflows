@@ -7,6 +7,20 @@ import time
 OPEN_TIMEOUT = 30
 
 
+def window_cookie(bridge, hwnd, *, create=False):
+    """A window property disappears on destruction, even if Windows reuses its HWND."""
+    from ctypes import wintypes as W
+    import secrets
+    key = 'DesktopSelect.DetailContinuation.v1'
+    get = bridge._sig(bridge.user32, 'GetPropW', W.HANDLE, W.HWND, W.LPCWSTR)
+    current = get(hwnd, key)
+    if not current and create:
+        put = bridge._sig(bridge.user32, 'SetPropW', W.BOOL, W.HWND, W.LPCWSTR, W.HANDLE)
+        value = secrets.randbits(31) + 1
+        current = get(hwnd, key) if put(hwnd, key, value) else None
+    return int(current or 0)
+
+
 class ContextError(ValueError):
     def __init__(self, code, *, step_number=None):
         super().__init__(code)
@@ -26,8 +40,9 @@ def validate_context(spec):
         raise ContextError('invalid_window_context')
     if set(spec) == {'exe', 'title', 'mode'} and spec['mode'] == 'existing':
         return spec
-    if (set(spec) - {'related', 'owned'} == {'exe', 'title', 'after_step'} and type(spec['after_step']) is int
-            and spec['after_step'] > 0 and all(spec.get(k, True) is True for k in ('related', 'owned'))):
+    if (set(spec) - {'related', 'owned', 'timeout'} == {'exe', 'title', 'after_step'} and type(spec['after_step']) is int
+            and spec['after_step'] > 0 and all(spec.get(k, True) is True for k in ('related', 'owned'))
+            and ('timeout' not in spec or type(spec['timeout']) in (float, int) and 0 <= spec['timeout'] <= 30)):
         return spec
     raise ContextError('invalid_window_context')
 
@@ -76,6 +91,7 @@ class WindowRoutes:
         self.origins = defaultdict(dict)
         self.baselines, self.outcomes, self.bindings, self.openers = {}, {}, {}, {}
         self.observed_windows = {}
+        self.detail_lifetimes = {}
         validate_sequence(steps, allow_unbound_double=True)
         for number in (range(1, len(steps)+1) if active is None else active):
             spec = steps[number-1].get('window_context')
@@ -86,7 +102,7 @@ class WindowRoutes:
                 raise ContextError('window_context_is_main_window')
             source = spec.get('after_step')
             if source is not None:
-                self.origins[source][key] = spec
+                self.origins[source].setdefault(key, spec)
             elif key not in self.bindings:
                 records = self._rows(spec)
                 match = self._match(spec, records)
@@ -174,6 +190,11 @@ class WindowRoutes:
         if row is None or _identity(row) != (binding.hwnd, binding.pid, binding.created):
             raise ContextError('recorded_window_lifetime_changed')
         self.app.guard(binding, binding, spec['title'])
+        if self.detail_lifetimes:
+            opener = self.openers.get(spec.get('after_step'))
+            if (not opener or opener.pid != binding.pid or not self.app.bridge.owned(binding.hwnd, opener.hwnd)
+                    or any(window_cookie(self.app.bridge, hwnd) != cookie for hwnd, cookie in self.detail_lifetimes.items())):
+                raise ContextError('detail_window_lifetime_changed')
         if spec.get('owned'):
             opener = self.openers.get(spec['after_step'])
             if opener is None or binding.pid != opener.pid or not self.app.bridge.owned(binding.hwnd, opener.hwnd):
@@ -214,7 +235,7 @@ class WindowRoutes:
                                and outcome.get('observed_state') == 'after')
             if outcome.get('input_dispatched') is not True and not already_running:
                 raise ContextError('window_origin_not_confirmed')
-        deadline = time.monotonic() + (0 if self.read_only else OPEN_TIMEOUT)
+        deadline = time.monotonic() + (0 if self.read_only else spec.get('timeout', OPEN_TIMEOUT))
         while True:
             row = self._match(spec, self._rows(spec))
             if row is not None:
@@ -231,6 +252,7 @@ class WindowRoutes:
                 return found
             if self.read_only:
                 return None
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise ContextError('recorded_window_not_open')
-            time.sleep(.2)
+            time.sleep(min(.2, remaining))

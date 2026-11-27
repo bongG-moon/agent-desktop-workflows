@@ -1,4 +1,6 @@
 """Locate a unique current result value in its recorded table before using the pointer."""
+import time
+
 import control_lookup as lookup
 import coordination
 import grid_provider
@@ -52,6 +54,26 @@ def bare_group(uia, element):
     if child is not None:
         child.close()
         return False
+    return True
+
+
+def _pane_without_cells(uia, pane):
+    """Cheap negative observation for a pane with only scroll infrastructure.
+
+    Unknown children or a larger subtree take the usual provider lookup. This
+    observation describes the current instant and never authorizes a click.
+    """
+    if pane.property(30003) != 50033 or any(pane.property(p) is True for p in (30030, 30038, 30108)):
+        return False
+    for index, child in enumerate(uia.children(pane)):
+        if index >= 4:
+            return False
+        kind = child.property(30003)
+        if kind == 50014:  # ScrollBar
+            continue
+        if (kind != 50033 or any(child.property(p) is True for p in (30030, 30038, 30108))
+                or next(iter(uia.children(child)), None) is not None):
+            return False
     return True
 
 
@@ -420,7 +442,10 @@ def find(binding, uia, root_element, expected, *, column=None, column_hint=None,
     # Owner-drawn groups with no patterns or descendants have no provider text
     # to inspect. One child lookup replaces header, value and row subtree scans.
     # The caller still decides whether a delayed provider should be polled.
-    if column is not None and bare_group(uia, root_element):
+    if column is not None and (bare_group(uia, root_element) or _pane_without_cells(uia, root_element)):
+        if evidence is not None:
+            evidence.update(table_capability='no_cell_provider_observed',
+                            raw_control_type=root_element.property(30003), role=role)
         raise win.BridgeError('result_column_unavailable')
     header = None
     grid_count = None
@@ -573,12 +598,16 @@ def find_row(binding, uia, table, *, mode='single', column=None):
     return candidates[0]
 
 
-def _point_target(binding, uia, cell, point, *, body=False, header=False):
+def _point_target(binding, uia, cell, point, *, body=False, header=False, coordinate=False):
     native = win.window_from_point(*point)
     require(native and win.root_window(native) == binding.hwnd and win.hwnd_pid(native) == binding.pid,
             'result_cell_occluded')
     hit = uia.from_point(*point)
     chain = lookup.ancestry(uia, hit, cell, pid=binding.pid)
+    if coordinate:
+        require(all(e.property(30010) is True and e.property(30022) is not True for e in chain),
+                'result_coordinate_not_actionable')
+        return native, hit
     if header:
         # Plain text within the named header is fine. A filter button, splitter,
         # embedded editor or another header is a different gesture.
@@ -627,6 +656,9 @@ def _surface_point(binding, uia, table, anchor, *, require_recorded_size=False):
     require(not uia.same(table, root) and table.property(30010) is True
             and readable_surface(binding, uia, table, root), 'result_container_not_visible')
     box = uia.bounds(table)
+    if 'dpi' in anchor:
+        import window_placement
+        require(window_placement.window_dpi(binding.hwnd) == anchor['dpi'], 'recorded_result_dpi_changed')
     if require_recorded_size and (box['width'], box['height']) != (anchor['width'], anchor['height']):
         # A painted row has no identity to confirm after reflow. Its point
         # translates with the table but a resize can move it onto empty space.
@@ -640,12 +672,17 @@ def _surface_point(binding, uia, table, anchor, *, require_recorded_size=False):
 
 
 def position_in_body(binding, uia, table, anchor):
-    point = _surface_point(binding, uia, table, anchor, require_recorded_size=True)
+    point = position_at_coordinate(binding, uia, table, anchor)
     if table.property(30030) is True:
         count = table.property(30062)
         require(type(count) is int and count >= 0, 'result_grid_incomplete')
         require(count > 0, 'result_row_missing')
     return point
+
+
+def position_at_coordinate(binding, uia, table, anchor):
+    """Translate a chosen table-relative pixel without inferring a data row."""
+    return _surface_point(binding, uia, table, anchor, require_recorded_size=True)
 
 
 def _named_header(binding, uia, table, column):
@@ -679,7 +716,8 @@ def position_in_header(binding, uia, table, anchor, column):
     return _header_point(binding, uia, table, _named_header(binding, uia, table, column), anchor)
 
 
-def execute_row(binding, uia, table, guard, *, mode='single', point=None, column=None, before_header_dispatch=None):
+def execute_row(binding, uia, table, guard, *, mode='single', point=None, column=None,
+                before_header_dispatch=None, entry_guard=None):
     if mode == 'header':
         require(point is not None and bool(column), 'invalid_result_row')
         return _execute(binding, uia, guard, lambda: _named_header(binding, uia, table, column),
@@ -687,26 +725,37 @@ def execute_row(binding, uia, table, guard, *, mode='single', point=None, column
                         header_point=lambda header: _header_point(binding, uia, table, header, point),
                         before_dispatch=before_header_dispatch)
     if point is not None:
+        if mode == 'coordinate':
+            require(column is None, 'invalid_result_row')
+            return _execute(binding, uia, guard, lambda: table, 'explicit_table_coordinate', anchor=point,
+                            before_dispatch=before_header_dispatch, entry_guard=entry_guard)
         require(mode == 'recorded' and column is None, 'invalid_result_row')
         return _execute(binding, uia, guard, lambda: table, 'recorded_result_position', anchor=point)
     resolution = 'current_single_result' if mode == 'single' else 'current_first_result'
     return _execute(binding, uia, guard, lambda: find_row(binding, uia, table, mode=mode, column=column), resolution)
 
 
-def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, header_point=None, before_dispatch=None):
+def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, header_point=None,
+             before_dispatch=None, entry_guard=None):
+    coordinate = resolution == 'explicit_table_coordinate'
+
     def point_for(element, box):
         if header_point is not None:
             return header_point(element)
         if anchor is not None:
+            if coordinate:
+                return position_at_coordinate(binding, uia, element, anchor)
             return position_in_body(binding, uia, element, anchor)
         require(visibility.visible(binding, uia, element, root), 'result_cell_not_clickable')
         return (int(box['x'] + box['width'] / 2), int(box['y'] + box['height'] / 2))
 
     def hit_at(element, point):
-        return _point_target(binding, uia, element, point, body=anchor is not None, header=header_point is not None)
+        return _point_target(binding, uia, element, point, body=anchor is not None,
+                             header=header_point is not None, coordinate=coordinate)
 
+    started = time.monotonic()
     with coordination.desktop_input():
-        guard()
+        (entry_guard or guard)()
         row_action.foreground(binding)
         win._combo_surface(binding)
         tick = row_action._input_tick()
@@ -728,14 +777,21 @@ def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, head
         chain = lookup.ancestry(uia, current, root, pid=binding.pid)
         require(not any(peer.property(30003) in _ROW and peer.property(30022) is True for peer in chain),
                 'result_cell_not_clickable')
-        require(hit_at(current, point) == native_hit and win.root_window(win.foreground()) == binding.hwnd,
+        final_hit = hit_at(current, point)
+        if coordinate:
+            hit_unchanged = final_hit[0] == native_hit[0] and uia.same(final_hit[1], native_hit[1])
+        else:
+            hit_unchanged = final_hit == native_hit
+        require(hit_unchanged and win.root_window(win.foreground()) == binding.hwnd,
                 'result_cell_changed')
         require(row_action._input_tick() == tick, 'foreground_or_input_changed')
+        sending = time.monotonic()
         try:
             sent = win._send_point(*point, 'double-click')
         except Exception as error:
             sent = dict(ok=False, diagnostic=getattr(error, 'code', 'point_delivery_unknown'),
                         input_dispatched=getattr(error, 'input_dispatched', None))
+        finished = time.monotonic()
     delivered = sent['ok'] and sent.get('input_dispatched') is True
     dispatched = sent.get('input_dispatched')
     receipt = dict(status='delivered_unverified' if delivered else 'uncertain',
@@ -745,4 +801,8 @@ def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, head
     if dispatched is False:
         receipt['status'] = 'blocked'
     receipt['screen_point' if delivered else 'attempted_screen_point'] = list(point)
+    if coordinate:
+        receipt.update(result_identity_verified=False, query_completion_verified=False,
+                       pointer_preparation_seconds=round(sending-started, 4),
+                       input_delivery_seconds=round(finished-sending, 4))
     return receipt

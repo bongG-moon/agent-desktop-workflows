@@ -85,16 +85,22 @@ def _protected(uia, binding, window, group_boxes=None):
     return blocked
 
 
-def _capture(app, binding, check, *, group_boxes=None):
+def _capture(app, binding, check, *, group_boxes=None, table_box=None):
     check()
     window = row_vision._window_rect(binding)
     affinity = W.DWORD()
     query = app.bridge._sig(app.bridge.user32,'GetWindowDisplayAffinity',W.BOOL,W.HWND,C.POINTER(W.DWORD))
     if query(binding.hwnd,C.byref(affinity)) and affinity.value:
         raise tasks.TaskError('visual_window_capture_protected')
+    frame = window
+    if table_box is not None:
+        from result_trial import visible_table_box
+        visible = visible_table_box(window, table_box)
+        frame = [visible[k] for k in ('x','y','width','height')]
     with app.bridge.UIA() as uia:
         protected = _protected(uia,binding,window)
-        pixels = bytearray(row_vision._frame(binding,window))
+        pixels = bytearray(row_vision._frame(binding,window) if table_box is None else
+                           row_vision._frame(binding,window,crop=frame))
         if group_boxes is None:
             protected |= _protected(uia,binding,window)
         else:
@@ -102,15 +108,19 @@ def _capture(app, binding, check, *, group_boxes=None):
             # These candidates are never selected or persisted by size or position.
             protected |= _protected(uia,binding,window,group_boxes)
     for left,top,right,bottom in protected:
+        if table_box is not None:
+            dx, dy = frame[0]-window[0], frame[1]-window[1]
+            left, right = max(0,left-dx), min(frame[2],right-dx)
+            top, bottom = max(0,top-dy), min(frame[3],bottom-dy)
         if right > left and bottom > top:
             mask = bytes((right-left)*4)
             for y in range(top,bottom):
-                start=(y*window[2]+left)*4
+                start=(y*frame[2]+left)*4
                 pixels[start:start+len(mask)] = mask
     check()
     if window != row_vision._window_rect(binding):
         raise tasks.TaskError('grounding_window_moved')
-    return window,_png(*window[2:],pixels)
+    return frame,_png(*frame[2:],pixels)
 
 
 def _directory():
@@ -302,6 +312,11 @@ def run(app, args):
     sentence = (rows[number-1]['text'] if is_draft else None) or _instruction(step)
     if not sentence or sentence==tasks.LEGACY_INSTRUCTION_HINT:
         raise tasks.TaskError('grounding_instruction_required')
+    if double and tasks.coordinate_request(sentence):
+        source = rows[number-1].get('interpretation_source', step) if is_draft else step
+        if handoff := recovery.missing_coordinate(doc['name'], number, source, sentence):
+            return handoff
+        raise tasks.TaskError('recorded_coordinate_already_bound')
     if double and step.get('action') == 'manual' and not tasks.double_click_instruction(sentence):
         raise tasks.TaskError('double_click_instruction_requires_review')
     owner = app.bridge.Binding(app.pick_window(app.windows(plan['exe']),plan['window'],None))

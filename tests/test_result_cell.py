@@ -69,6 +69,33 @@ class ResultCellTests(unittest.TestCase):
     def bind_painted(self):
         return result_cell.bound_group(self.binding, self.uia, (100, 21), (90, 32))
 
+    def test_scroll_only_pane_avoids_descendant_text_search_and_remains_live(self):
+        group = self.prepare_painted_group()
+        group.values[30003] = 50033
+        self.node(group, 50014, 'Bottom scroll', 8, 100)
+        step = dict(action='verify-value', selector=dict(role='group', automation_id='ResultSurface'),
+                    result_column='Order', value='Q42')
+        clock = [0.]
+        def advance(seconds):
+            clock[0] += seconds
+        with (patch.object(flow, '_result_target', return_value=(group, step['selector'])),
+              patch.object(flow.time, 'monotonic', side_effect=lambda: clock[0]),
+              patch.object(flow.time, 'sleep', side_effect=advance),
+              patch.object(result_cell, '_cells_in', side_effect=AssertionError('unexpected text search'))):
+            now = flow.observe_result(self.binding, self.uia, step, 'Q42', lambda: None, wait_seconds=5)
+            self.assertEqual((now['result_observation']['attempts'], now['result_observation']['wait_seconds']), (1, 0))
+            receipt = flow.observe_result(self.binding, self.uia, step, 'Q42', lambda: None,
+                                          wait_seconds=5, after_query=True)
+        obs = receipt['result_observation']
+        self.assertEqual((receipt['status'], receipt['input_dispatched'], obs['raw_control_type']),
+                         ('blocked', False, 50033))
+        self.assertEqual(obs['table_capability'], 'no_cell_provider_observed')
+        self.assertLessEqual(obs['attempts'], 8)
+        self.assertEqual(obs['wait_seconds'], 5)
+        # A row provider can appear after VIEW, even on the exact same HWND.
+        self.node(group, 50029, 'New result', 8, 100)
+        self.assertFalse(result_cell._pane_without_cells(self.uia, group))
+
     def test_two_distinct_visual_points_bind_a_unique_group_by_identity(self):
         group = self.prepare_painted_group()
         self.assertEqual(self.bind_painted(), ({'role':'group','automation_id':'ResultSurface'}, group.box))
@@ -243,6 +270,95 @@ class ResultCellTests(unittest.TestCase):
             with self.assertRaisesRegex(win.BridgeError, 'recorded_result_surface_resized'):
                 result_cell.execute_row(self.binding, self.uia, group, lambda: None, mode='recorded', point=point)
         sent.assert_not_called()
+
+    def coordinate_pane(self):
+        pane = self.prepare_painted_group()
+        pane.values[30003] = 50033
+        pane.box = dict(x=309, y=285, width=1393, height=562)
+        scrollbar = self.node(pane, 50033, 'Scroll area', 309, 1393)
+        scrollbar.box['y'] = 820
+        step = dict(action='double-click-result', label='Open chosen position', result_row='coordinate',
+                    selector=dict(role='group', automation_id='ResultSurface'),
+                    result_point=dict(x=189, y=39, width=1393, height=562))
+        self.enterContext(patch('row_vision._window_rect', return_value=(300, 80, 1296, 839)))
+        return pane, step
+
+    def test_explicit_coordinate_on_pane_with_scroll_child_uses_no_cell_or_image(self):
+        pane, step = self.coordinate_pane()
+        sent = self.prepare_pointer()
+        flow.app.tasks._validate_current_result(step)
+        flow.validate(dict(schema=1, name='Open position', exe='Demo.exe', window='Demo', steps=[step]))
+        self.enterContext(patch.object(result_cell, 'bare_group', side_effect=AssertionError('row inference')))
+        self.enterContext(patch.object(result_cell, 'position_in_body', side_effect=AssertionError('row inspection')))
+        observed = flow.observe_result_row(self.binding, self.uia, step, lambda: None, wait_seconds=5)
+        evidence = observed['result_observation']
+        self.assertEqual((observed['status'], evidence['raw_control_type'], evidence['role'], evidence['attempts']),
+                         ('observed', 50033, 'group', 1))
+        self.assertEqual(evidence['wait_seconds'], 0)
+        self.assertEqual(len(self.uia.queries), 1)
+        for x in (309, -800):
+            pane.box['x'] = x
+            with patch('row_vision._window_rect', return_value=(x-10, 80, 1296, 839)):
+                receipt = result_cell.execute_row(self.binding, self.uia, pane, lambda: None,
+                                                  mode='coordinate', point=step['result_point'])
+            sent.assert_called_once_with(x+189, 324, 'double-click')
+            self.assertEqual((receipt['status'], receipt['result_identity_verified'], receipt['query_completion_verified']),
+                             ('delivered_unverified', False, False))
+            self.assertIn('input_delivery_seconds', receipt)
+            sent.reset_mock()
+
+    def test_coordinate_with_explicit_reference_dpi_stops_before_input_if_only_dpi_changes(self):
+        pane, step = self.coordinate_pane()
+        sent = self.prepare_pointer()
+        point = dict(step['result_point'], dpi=120)
+        self.assertTrue(flow.app.tasks.valid_result_point(point))
+        self.assertFalse(flow.app.tasks.valid_result_point(dict(point, dpi=True)))
+        with patch('window_placement.window_dpi', return_value=96):
+            with self.assertRaisesRegex(win.BridgeError, 'recorded_result_dpi_changed'):
+                result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        sent.assert_not_called()
+
+    def test_coordinate_preserves_guard_on_protected_foreign_occluded_changed_hit_and_input(self):
+        pane, step = self.coordinate_pane()
+        sent = self.prepare_pointer()
+        point = step['result_point']
+        for props, reason in (({30019: True}, 'target_protected'), ({30002: 1234}, 'target_owner_mismatch'),
+                              ({30010: False}, 'result_coordinate_not_actionable')):
+            with self.subTest(reason=reason):
+                child = self.node(pane, 50033, 'child', 450, 200)
+                child.values.update(props)
+                self.uia.from_point = lambda *xy: child
+                with self.assertRaisesRegex(win.BridgeError, reason):
+                    result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        self.uia.from_point = lambda *xy: self.header
+        with self.assertRaisesRegex(win.BridgeError, 'target_outside_window'):
+            result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        other = self.node(pane, 50033, 'child', 450, 200)
+        hits = iter([pane, other])
+        self.uia.from_point = lambda *xy: next(hits)
+        with self.assertRaisesRegex(win.BridgeError, 'result_cell_changed'):
+            result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        self.uia.from_point = lambda *xy: pane
+        with (patch.object(result_cell.row_action, '_input_tick', side_effect=[10, 11]),
+              self.assertRaisesRegex(win.BridgeError, 'foreground_or_input_changed')):
+            result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        pane.box['width'] -= 1
+        with self.assertRaisesRegex(win.BridgeError, 'recorded_result_surface_resized'):
+            result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        sent.assert_not_called()
+
+    def test_legacy_recorded_point_still_requires_data_and_partial_coordinate_is_never_repeated(self):
+        pane, step = self.coordinate_pane()
+        sent = self.prepare_pointer()
+        with self.assertRaisesRegex(win.BridgeError, 'result_point_not_data'):
+            result_cell.execute_row(self.binding, self.uia, pane, lambda: None,
+                                    mode='recorded', point=step['result_point'])
+        sent.assert_not_called()
+        sent.return_value = dict(ok=False, input_dispatched=None, diagnostic='partial_input')
+        receipt = result_cell.execute_row(self.binding, self.uia, pane, lambda: None,
+                                          mode='coordinate', point=step['result_point'])
+        self.assertEqual((receipt['status'], receipt['input_dispatched']), ('uncertain', None))
+        sent.assert_called_once_with(498, 324, 'double-click')
 
     def test_recorded_point_rejects_a_sibling_header_and_a_changed_body_before_input(self):
         group = self.prepare_painted_group()
