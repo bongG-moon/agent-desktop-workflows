@@ -55,7 +55,17 @@ def followup(result):
         return result
     result['preparation'] = 'needs_grounding'
     if recovered.get('retry_args'):
-        result['next_action'] = dict(kind='continue_preparation',
+        kind = 'continue_preparation'
+        if recovered.get('diagnostic') == 'target_window_minimized':
+            kind = 'show_recorded_window_then_retry'
+            # Earlier saved sessions carried an implicit restore flag here.
+            args = recovered['retry_args']
+            if args[:2] == ['recover', '--task'] and args[3:4] == ['--restore-window']:
+                recovered['retry_args'] = args[:3] + args[4:]
+            recovered.pop('next_action', None)
+            recovered['host_action'] = kind
+            result['host_action'] = kind
+        result['next_action'] = dict(kind=kind,
             script=str(scripts / 'desktop_select.py'), args=recovered['retry_args'])
     elif recovered.get('host_action') == 'inspect_recorded_step_when_popup_opens':
         result['next_action'] = dict(kind=recovered['host_action'], script=str(scripts / 'desktop_select.py'),

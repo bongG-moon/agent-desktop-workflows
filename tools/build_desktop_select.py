@@ -7,7 +7,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'skills' / 'desktop-select'
-VERSION = '0.4.28'
+VERSION = '0.4.29'
 FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'references/host-details.md',
                                          'references/recording-recovery.md', 'references/table-export.md',
                                          'references/rows-and-windows.md', 'scripts/desktop_select.py',
@@ -31,7 +31,8 @@ FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'refe
                                          'scripts/control_lookup.py', 'scripts/python_workflow.py', 'scripts/workflow_repair.py',
                                          'scripts/recorded_plan.py', 'scripts/storage_paths.py',
                                          'scripts/capture_trail.py', 'scripts/capture_windows.py',
-                                         'scripts/window_context.py', 'scripts/visual_target.py', 'scripts/notepad_find.py',
+                                         'scripts/window_context.py', 'scripts/window_placement.py',
+                                         'scripts/visual_target.py', 'scripts/notepad_find.py',
                                          'scripts/toolbar_button.py',
                                          'scripts/grounding.py', 'scripts/compound_plan.py',
                                          'scripts/conditional_action.py', 'scripts/scene_session.py')}

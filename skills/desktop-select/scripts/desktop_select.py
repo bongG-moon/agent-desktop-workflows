@@ -300,16 +300,15 @@ def near_region(nodes, anchor):
 def action(args, owner, *, learned=None, anchor=None):
     background = getattr(args, 'background_only', False)
     mutate = args.command in {'select', 'fill', 'open'}
-    if mutate:
-        if background:
-            input_policy.window_ready(owner)
-        else:
-            visibility.restore_for_action(owner, args.window)
+    if background and mutate:
+        input_policy.window_ready(owner)
     surface = bind_surface(owner, args.popup)
     def check():
         guard(owner, surface, args.window, mutate)
         if background and mutate:
             input_policy.window_ready(surface)
+        elif mutate and bridge.user32.IsIconic(surface.hwnd):
+            raise bridge.BridgeError('target_window_minimized')
     check()
     if not mutate:
         visibility.require_observable(surface)
@@ -1207,6 +1206,9 @@ def replay_step():
     if step['action'] == 'result-menu':
         from result_menu import execute as execute_result
         tasks._validate_context(step)
+        if step['context']['trigger'] and bridge.user32.IsIconic(owner.hwnd):
+            # This compound gesture observes a visible query-completion indicator before opening the menu.
+            visibility.restore_for_action(owner, binding['title'])
         receipt = execute_result(owner, step['context'], lambda: guard(owner, owner, binding['title'], mutate=True),
                                  binding['title'], observe_guard=lambda: guard(owner, owner, binding['title']))
         return dict(receipt, target=step['label'])

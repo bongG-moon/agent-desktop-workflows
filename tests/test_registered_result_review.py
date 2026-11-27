@@ -105,14 +105,16 @@ class RegisteredResultTests(unittest.TestCase):
         self.assertEqual(self.call('--allow-physical', '--set', 'Part=D27', '--set', 'part=D27')[1]['diagnostic'],
                          'duplicate_override')
 
-    def row_review(self, mode='single'):
+    def row_review(self, mode='single', *, point=None, diagnostic='result_row_unavailable'):
         scope = dict(exe='Demo.exe', title='Details', after_step=2, related=True)
         self.recipe['steps'][1:3] = [dict(action='double-click-result', label='Open current row',
                                               result_row=mode, selector=self.group)]
+        if point is not None:
+            self.recipe['steps'][1]['result_point'] = point
         for step in self.recipe['steps'][2:]:
             step['window_context'] = deepcopy(scope)
         self.path.write_text(json.dumps(self.recipe), encoding='utf8')
-        self.blocked['steps'][-1]['receipt']['diagnostic'] = 'result_row_unavailable'
+        self.blocked['steps'][-1]['receipt']['diagnostic'] = diagnostic
         session = workflow_repair.RepairSession(self.path)
         review = registered_result.ResultReview(session, self.recipe, self.path)
         record = review.offer(flow, self.blocked, {})
@@ -210,7 +212,8 @@ class RegisteredResultTests(unittest.TestCase):
                 self.hit.assert_not_called()
 
     def test_confirmed_demonstrated_point_persists_only_on_the_tested_registered_recipe(self):
-        review, record = self.row_review('recorded')
+        review, record = self.row_review('recorded', point=dict(x=20, y=30, width=100, height=80),
+                                         diagnostic='recorded_result_surface_resized')
         self.uia.return_value.__enter__.return_value.bounds.return_value = self.box
         self.choose.return_value = dict(point=[48,51], row_policy='recorded', confirmed=True)
         self.run.return_value = self.finished()
@@ -239,6 +242,33 @@ class RegisteredResultTests(unittest.TestCase):
             self.assertEqual(review.confirm(flow, record, self.path, {})['diagnostic'], 'result_frame_changed')
             self.assertFalse(list(self.directory.glob('*.png')))
         self.run.assert_not_called()
+
+    def test_reviewed_row_follows_a_window_move_without_repeating_query_or_recapturing(self):
+        old_placement = dict(rect=[100, 100, 128, 128], normal_rect=[100, 100, 228, 228],
+                             maximized=False, dpi=96, monitor=r'\\.\DISPLAY1')
+        review, record = self.row_review('recorded', point=dict(x=20, y=30, width=100, height=80,
+                                                                  window_placement=old_placement))
+        moved = [-920, 80, 128, 128]
+        moved_placement = dict(old_placement, rect=moved, normal_rect=[-920, 80, -792, 208])
+        moved_box = dict(self.box, x=-915, y=87)
+        self.capture.side_effect = [self.frame, (moved, self.png)]
+        self.uia.return_value.__enter__.return_value.bounds.side_effect = [self.box, self.box, moved_box]
+        self.choose.return_value = dict(point=[48, 51], row_policy='recorded', confirmed=True)
+        self.run.return_value = self.finished()
+        with (patch.object(flow, '_result_target', return_value=(MagicMock(), self.group)),
+              patch('window_placement.capture', return_value=moved_placement) as record_placement,
+              patch.object(flow, 'check_result_point') as check):
+            report = review.confirm(flow, record, self.path, {})
+        self.assertTrue(report['correction_saved'])
+        self.assertFalse(report['prior_steps_replayed'])
+        self.assertEqual(check.call_args.args[-1], (-872, 131))
+        confirmation = self.run.call_args.kwargs['result_confirmation']
+        self.assertEqual((confirmation['window_rect'], confirmation['table_box']), (moved, moved_box))
+        self.assertEqual(record_placement.call_args.kwargs['expected_rect'], moved)
+        self.assertEqual(flow.load(self.path)['steps'][1]['result_point'],
+                         dict(x=43, y=44, width=111, height=101, window_placement=moved_placement))
+        self.assertEqual(self.capture.call_count, 2)
+        self.run.assert_called_once()
 
     def test_current_row_missing_surface_never_prompts_for_an_unscoped_click(self):
         review, record = self.row_review()
@@ -409,13 +439,13 @@ class RegisteredResultTests(unittest.TestCase):
         self.assertFalse(report['prior_steps_replayed'])
         self.assertEqual([s['action'] for s in self.run.call_args.args[0]['steps']],['visual-click','read-value','invoke'])
 
-    def test_exposing_reviewed_window_still_rejects_a_moved_capture(self):
+    def test_moving_window_without_equal_table_translation_rejects_review(self):
         self.choose.return_value = self.proof
         self.capture.side_effect = lambda *args, **kwargs: (
             ([101,100,128,128],self.png) if self.foreground.called else self.snapshot(*args, **kwargs))
         _, report = self.call('--set','Part=D27','--allow-physical','--local-result-review')
         self.foreground.assert_called_once()
-        self.assertEqual(report['review_diagnostic'],'result_frame_changed')
+        self.assertEqual(report['review_diagnostic'],'result_table_changed')
         self.assertEqual(self.run.call_count,1)
 
     def test_oversized_recorded_table_is_clipped_for_review_but_raw_geometry_is_preserved(self):
@@ -464,7 +494,7 @@ class RegisteredResultTests(unittest.TestCase):
               patch.object(registered_result.ResultReview,'_try_elements',return_value=None),
               patch.object(registered_result.ResultReview,'_check_header')):
             args = self.start()
-            uia.bounds.side_effect = [self.box,dict(self.box,width=151)]
+            uia.bounds.side_effect = [self.box,self.box,dict(self.box,width=151)]
             _, changed = self.call(*args)
             self.assertEqual(changed['diagnostic'],'result_table_changed')
             self.assertFalse(changed['input_dispatched'])

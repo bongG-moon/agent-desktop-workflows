@@ -133,7 +133,7 @@ class GroundedRowTests(TestCase):
         store = Path(self.enterContext(tempfile.TemporaryDirectory()))
         path = learned_tasks.save_task(plan,store)
         original = path.read_bytes()
-        owner = SimpleNamespace(hwnd=5,pid=42,created='100',exe='Manager.exe')
+        owner = MagicMock(hwnd=5,pid=42,created='100',exe='Manager.exe')
         app = desktop_select
         def worker(args, mutating, payload=None):
             if args == ['_worker', 'recover', '--task', 'watch']:
@@ -145,7 +145,7 @@ class GroundedRowTests(TestCase):
               patch.object(flow,'bind',return_value=owner),
               patch.object(flow,'resolve_step',side_effect=app.SelectionError('target_missing')),
               patch.object(app,'windows',return_value=[]),patch.object(app,'guard'),
-              patch.object(app.visibility,'restore_for_action',return_value=False),
+              patch.object(app.bridge.user32,'IsIconic',return_value=False),
               patch.object(app.bridge,'UIA') as uia,patch.object(app.bridge,'set_dpi_awareness'),
               patch.object(grounding,'_directory',return_value=store),
               patch.object(app,'pick_window'),patch.object(app.bridge,'Binding',return_value=owner),

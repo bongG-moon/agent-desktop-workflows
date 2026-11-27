@@ -66,6 +66,32 @@ class DirectRevalidationTests(unittest.TestCase):
         self.assertEqual(self.selectors[0], {'automation_id': 'state', 'role': 'combobox', 'ancestors': [
             {'role': 'group', 'automation_id': 'pnlConditionArea'}, {'role': 'window', 'name': 'Business'}]})
 
+    def test_direct_accessibility_actions_do_not_restore_or_reposition_window(self):
+        self.nodes.append(node('0/0/3', 'textfield', identifier='filter'))
+        self.elements.append(Mock())
+        for command, target in [('fill', 'filter'), ('select', 'MES Setup'), ('open', '조회')]:
+            with self.subTest(command=command):
+                receipt = self.action(command, target)
+                self.assertTrue(receipt['input_dispatched'])
+        self.assertEqual(self.sent, ['fill', 'select', 'invoke'])
+        app.visibility.restore_for_action.assert_not_called()
+
+    def test_minimized_direct_actions_stop_without_reopening_window_or_reading_controls(self):
+        with patch.object(app.bridge.user32, 'IsIconic', return_value=True):
+            for command in ('fill', 'select', 'open'):
+                with self.subTest(command=command), self.assertRaisesRegex(app.bridge.BridgeError, 'target_window_minimized'):
+                    self.action(command)
+        self.assertFalse(self.sent)
+        app.observe.assert_not_called()
+        app.visibility.restore_for_action.assert_not_called()
+
+    def test_minimizing_between_resolution_and_dispatch_blocks_the_input(self):
+        with patch.object(app.bridge.user32, 'IsIconic', side_effect=[False, True]), \
+             self.assertRaisesRegex(app.bridge.BridgeError, 'target_window_minimized'):
+            self.action()
+        self.assertFalse(self.sent)
+        app.visibility.restore_for_action.assert_not_called()
+
     def test_initial_ambiguity_or_wrong_scope_never_reaches_native_dispatch(self):
         self.nodes.append(node('0/0/3', 'combobox', identifier='state'))
         with self.assertRaisesRegex(app.SelectionError, 'target_ambiguous'):

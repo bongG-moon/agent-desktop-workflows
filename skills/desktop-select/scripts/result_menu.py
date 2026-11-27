@@ -1,4 +1,5 @@
 """One taught query, one fresh completion signal, and one scoped context-menu route."""
+from contextlib import nullcontext
 import time
 
 import learned_tasks as tasks
@@ -154,11 +155,13 @@ def _wait_for_ready(read, *, needs_transition, timeout=24, pause=.18):
         time.sleep(pause)
 
 
-def _query(binding, locator, title):
+def _query(binding, locator, title, client=None):
     from desktop_select import guard
     from live_action import execute
-    visibility.restore_for_action(binding, title)
-    with bridge.UIA() as uia:
+    import input_policy
+    with (nullcontext(client) if client is not None else bridge.UIA()) as uia:
+        if client is None:
+            input_policy.prefer_background(uia)
         guard(binding, binding, title, True)
         element = lookup.resolve(binding, uia, locator)
         def still_valid():
@@ -186,7 +189,7 @@ def observe(binding, uia, spec):
     return dict(receipt, menu_target=spec['menu']['target'], menu_path=spec['menu']['path'])
 
 
-def execute(binding, spec, guard, title, *, observe_guard=None):
+def execute(binding, spec, guard, title, *, observe_guard=None, uia=None):
     validate_spec(spec)
     ready, trigger, output = spec['ready'], spec['trigger'], spec['output']
     info = dict(input_dispatched=False, query_dispatched=False, query_verified=False, menu_input_dispatched=False,
@@ -213,7 +216,7 @@ def execute(binding, spec, guard, title, *, observe_guard=None):
         if trigger:
             already_ready = read()
             info.update(input_dispatched=None, query_dispatched=None)
-            q = _query(binding, trigger, title)
+            q = _query(binding, trigger, title, uia)
             info.update(input_dispatched=q['input_dispatched'], query_dispatched=q['input_dispatched'])
             info.update({key: q[key] for key in ('input_mode', 'physical_input') if key in q})
             if q['input_dispatched'] is not True or q['status'] not in ('verified', 'delivered_unverified'):

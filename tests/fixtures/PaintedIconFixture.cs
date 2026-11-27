@@ -13,7 +13,8 @@ sealed class PaintedIconFixture : Form {
     readonly Panel canvas = new DoubleClickPanel();
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
-    int left = 64, pressed, missed, opened;
+    int left = 64, pressed, missed, opened, layoutChanges;
+    Point lastDoubleClick;
     bool duplicateIcon;
     Form detail;
     ListView list;
@@ -62,6 +63,7 @@ sealed class PaintedIconFixture : Form {
             else missed++;
         };
         if (showDetails) canvas.MouseDoubleClick += delegate(object sender, MouseEventArgs mouse) {
+            lastDoubleClick = canvas.PointToScreen(mouse.Location);
             if (mouse.Button == MouseButtons.Left && Icon.Contains(mouse.Location)) OpenDetails();
         };
         if (useList) {
@@ -70,11 +72,14 @@ sealed class PaintedIconFixture : Form {
             list.Items.AddRange(new ListViewItem[] { new ListViewItem("Bravo"), new ListViewItem("Charlie"),
                 targetRow = new ListViewItem("Order A123"), new ListViewItem("Echo"), new ListViewItem("Foxtrot") });
             list.MouseDoubleClick += delegate(object sender, MouseEventArgs mouse) {
+                lastDoubleClick = list.PointToScreen(mouse.Location);
                 if (list.GetItemAt(mouse.X, mouse.Y) == targetRow) OpenDetails();
                 else missed++;
             };
             Controls.Add(list);
         } else Controls.Add(canvas);
+        LocationChanged += delegate { layoutChanges++; };
+        SizeChanged += delegate { layoutChanges++; };
         Shown += delegate {
             Emit("ready");
             new Thread(ReadCommands) { IsBackground = true }.Start();
@@ -86,6 +91,8 @@ sealed class PaintedIconFixture : Form {
             list.PointToScreen(new Point(35, targetRow.Bounds.Top + targetRow.Bounds.Height / 2));
         Console.WriteLine(json.Serialize(new { kind, pid = System.Diagnostics.Process.GetCurrentProcess().Id,
             hwnd = Handle.ToInt64(), title = Text, x = center.X, y = center.Y, pressed, missed, opened,
+            lastDoubleClick = new[] {lastDoubleClick.X, lastDoubleClick.Y},
+            bounds = new[] {Left, Top, Width, Height}, maximized = WindowState == FormWindowState.Maximized, layoutChanges,
             detailHwnd = detail == null ? 0L : detail.Handle.ToInt64() }));
         Console.Out.Flush();
     }
@@ -97,6 +104,17 @@ sealed class PaintedIconFixture : Form {
             Invoke(new Action(delegate {
                 if (command == "quit") { Close(); return; }
                 if (command == "dismiss" && detail != null) { detail.Close(); }
+                if (command == "position-for-capture" || command == "translate" || command == "resize-and-translate") {
+                    var area = Screen.FromControl(this).WorkingArea;
+                    WindowState = FormWindowState.Normal;
+                    int dx = command == "position-for-capture" ? 358 : command == "translate" ? 90 : 210;
+                    int dy = command == "position-for-capture" ? 80 : command == "translate" ? 155 : 32;
+                    ClientSize = command == "resize-and-translate" ? new Size(490, 290) : new Size(420, 240);
+                    Location = new Point(area.Left + Math.Min(dx, area.Width - Width),
+                                         area.Top + Math.Min(dy, area.Height - Height));
+                    Refresh();
+                }
+                if (command == "maximize") { WindowState = FormWindowState.Maximized; Refresh(); }
                 if (command == "duplicate-icon") { duplicateIcon = true; canvas.Refresh(); }
                 if (command == "move-icon") {
                     if (list == null) { left = 246; canvas.Refresh(); }

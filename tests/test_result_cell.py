@@ -209,17 +209,40 @@ class ResultCellTests(unittest.TestCase):
         self.assertTrue(receipt['input_dispatched'])
         sent.assert_called_once_with(120, 29, 'double-click')
 
-    def test_recorded_body_position_moves_with_painted_table_without_rescaling_to_a_different_row(self):
+    def test_recorded_body_position_moves_with_painted_table_across_monitors(self):
+        group = self.prepare_painted_group()
+        group.box.update(x=368, y=277, width=1393, height=562)
+        point = result_cell.body_point(group.box, (531, 311))
+        sent = self.prepare_pointer()
+        for x, y in [(358, 80), (-1280, -90)]:
+            group.box.update(x=x+10, y=y+197)
+            with (self.subTest(origin=(x, y)), patch('row_vision._window_rect', return_value=(x, y, 1296, 839)),
+                  patch.object(result_cell, 'find_row', side_effect=AssertionError('no row scan on taught point'))):
+                receipt = result_cell.execute_row(self.binding, self.uia, group, lambda: None, mode='recorded', point=point)
+                self.assertEqual(receipt['target_resolution'], 'recorded_result_position')
+                self.assertEqual(receipt['status'], 'delivered_unverified')
+                self.assertEqual(receipt['screen_point'], [x+173, y+231])
+                sent.assert_called_once_with(x+173, y+231, 'double-click')
+                sent.reset_mock()
+
+    def test_resized_painted_table_never_uses_old_point_or_waits_for_more_rows(self):
         group = self.prepare_painted_group()
         point = result_cell.body_point(group.box, (85, 32))
-        group.box.update(x=90, y=110, width=240, height=36)
+        step = dict(action='double-click-result', result_row='recorded', result_point=point,
+                    selector=dict(role='group', automation_id='ResultSurface'))
         sent = self.prepare_pointer()
-        with (patch('row_vision._window_rect', return_value=(10, 10, 700, 400)),
-              patch.object(result_cell, 'find_row', side_effect=AssertionError('no row scan on taught point'))):
-            receipt = result_cell.execute_row(self.binding, self.uia, group, lambda: None, mode='recorded', point=point)
-        self.assertEqual(receipt['target_resolution'], 'recorded_result_position')
-        self.assertEqual(receipt['status'], 'delivered_unverified')
-        sent.assert_called_once_with(155, 122, 'double-click')
+        group.box.update(width=240, height=36)  # The old offset still fits, possibly in empty space.
+        with patch('row_vision._window_rect', return_value=(0, 0, 700, 400)):
+            observed = flow.observe_result_row(self.binding, self.uia, step, lambda: None, wait_seconds=5)
+            self.assertEqual((observed['diagnostic'], observed['input_dispatched']),
+                             ('recorded_result_surface_resized', False))
+            evidence = observed['result_observation']
+            self.assertEqual((evidence['attempts'], evidence['wait_seconds']), (1, 0))
+            self.assertEqual((evidence['recorded_table_size'], evidence['current_table_size']),
+                             ([200, 18], [240, 36]))
+            with self.assertRaisesRegex(win.BridgeError, 'recorded_result_surface_resized'):
+                result_cell.execute_row(self.binding, self.uia, group, lambda: None, mode='recorded', point=point)
+        sent.assert_not_called()
 
     def test_recorded_point_rejects_a_sibling_header_and_a_changed_body_before_input(self):
         group = self.prepare_painted_group()
@@ -306,6 +329,8 @@ class ResultCellTests(unittest.TestCase):
         receipt = self.open_header()
         self.assertEqual(receipt['status'], 'uncertain')
         self.assertIsNone(receipt['input_dispatched'])
+        self.assertNotIn('screen_point', receipt)
+        self.assertEqual(receipt['attempted_screen_point'], [42, 25])
         pointer.assert_called_once()
 
     def test_popup_which_appears_during_header_resolution_prevents_dispatch(self):

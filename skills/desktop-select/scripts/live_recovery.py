@@ -161,7 +161,8 @@ def observe_scope(app, main, surface, title, *, frame_key=None, lookups=None, bi
     if frame_key is not None:
         window, png = grounding._capture(app, surface, check)
         token, path = grounding.store_frame(grounding._directory(), _scope_key(main, surface, frame_key), png)
-        result.update(frame=token, image=str(path), screen_origin=window[:2], width=window[2], height=window[3],
+        result.update(frame=token, image=str(path), coordinates='image_pixels',
+                      screen_origin=window[:2], width=window[2], height=window[3],
                       expires_seconds=grounding.TTL)
     check()
     return result

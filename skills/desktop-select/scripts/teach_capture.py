@@ -1397,6 +1397,9 @@ class _Worker(recorder.CaptureWorker):
             point = dict(x=down['x']-bounds['x'], y=down['y']-bounds['y'],
                          width=bounds['width'], height=bounds['height'])
             if learned_tasks.valid_result_point(point):
+                import window_placement
+                if placement := window_placement.capture(self.binding.hwnd):
+                    point['window_placement'] = placement
                 return point
         return None
 

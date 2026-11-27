@@ -36,7 +36,11 @@ class PopupReadCaptureTests(unittest.TestCase):
         worker.uia.same.side_effect = lambda a, b: a is b
         notes.add(capture.manual('unsupported_recorded_action', 'first'))
         worker.recent_click = dict(token=41, step_id='first', observation=observed)
-        worker._remember_double_target(fixture.event)
+        placement = dict(rect=[180, 50, 280, 160], normal_rect=[180, 50, 460, 210],
+                         maximized=False, dpi=96, monitor=r'\\.\DISPLAY1')
+        with patch('window_placement.capture', return_value=placement) as record_placement:
+            worker._remember_double_target(fixture.event)
+        record_placement.assert_called_once_with(worker.binding.hwnd)
         worker.capture_double(dict(fixture.event, double=True, previous_token=41), observed)
         raw, = notes.snapshot()
         sentence = capture.default_text(raw)
@@ -46,7 +50,7 @@ class PopupReadCaptureTests(unittest.TestCase):
         saved = tasks.from_recording('Open header', 'Orders.exe', 'Orders', edits.apply([raw]))
         step, = saved['steps']
         self.assertEqual(step['selector'], table)
-        self.assertEqual(step['result_point'], dict(x=13, y=51, width=220, height=80))
+        self.assertEqual(step['result_point'], dict(x=13, y=51, width=220, height=80, window_placement=placement))
         self.assertEqual((step['action'], step['result_row'], step['result_column']),
                          ('double-click-result', 'header', 'Part ID'))
         self.assertNotIn('visual', step)
@@ -57,6 +61,9 @@ class PopupReadCaptureTests(unittest.TestCase):
     def test_header_requires_named_instruction_and_recorded_table_and_point(self):
         table = dict(role='table', automation_id='inventory')
         point = dict(x=31, y=12, width=124, height=64)
+        self.assertTrue(tasks.valid_result_point(point))
+        for invalid in ({'window_placement': None}, {'window_placement': {}}, {'unexpected': 0}, {'width': True}):
+            self.assertFalse(tasks.valid_result_point(dict(point, **invalid)))
         raw = dict(capture.manual('double_click_needs_review'), result_surface=table, result_point=point)
         for sentence in ('Part ID 열 머리 더블클릭', 'double-click the Part ID column header'):
             spec = tasks.compile_instruction(raw, sentence)

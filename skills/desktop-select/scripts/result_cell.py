@@ -21,6 +21,15 @@ def require(condition, code):
         raise win.BridgeError(code)
 
 
+class RecordedSurfaceResized(win.BridgeError):
+    def __init__(self, anchor, bounds):
+        super().__init__('recorded_result_surface_resized')
+        self.observation = dict(strategy='recorded_size_changed',
+                                recorded_table_size=[anchor['width'], anchor['height']],
+                                current_table_size=[bounds['width'], bounds['height']],
+                                layout_action='restore_recorded_size_or_confirm_current_point')
+
+
 def _surface(chain):
     return next((e for e in chain if e.property(30003) in _GRID), chain[-1])
 
@@ -599,23 +608,29 @@ def execute(binding, uia, root_element, expected, guard, *, column=None, column_
                     'current_result_value')
 
 
-def body_point(box, screen_point):
+def body_point(box, screen_point, *, placement=None):
     """Keep a gesture relative to the surface origin, not to a transient screen/window."""
     from learned_tasks import valid_result_point
     require(visibility.valid(box), 'result_point_outside_table')
     point = dict(x=screen_point[0] - box['x'], y=screen_point[1] - box['y'],
                  width=box['width'], height=box['height'])
+    if placement is not None:
+        point['window_placement'] = placement
     require(valid_result_point(point), 'result_point_outside_table')
     return point
 
 
-def _surface_point(binding, uia, table, anchor):
+def _surface_point(binding, uia, table, anchor, *, require_recorded_size=False):
     """Keep the demonstrated offset inside the current surface and window."""
     root = uia.from_handle(binding.hwnd)
     lookup.ancestry(uia, table, root, pid=binding.pid)
     require(not uia.same(table, root) and table.property(30010) is True
             and readable_surface(binding, uia, table, root), 'result_container_not_visible')
     box = uia.bounds(table)
+    if require_recorded_size and (box['width'], box['height']) != (anchor['width'], anchor['height']):
+        # A painted row has no identity to confirm after reflow. Its point
+        # translates with the table but a resize can move it onto empty space.
+        raise RecordedSurfaceResized(anchor, box)
     require(0 <= anchor['x'] < box['width'] and 0 <= anchor['y'] < box['height'], 'result_row_unavailable')
     point = (box['x'] + anchor['x'], box['y'] + anchor['y'])
     from row_vision import _window_rect
@@ -625,7 +640,7 @@ def _surface_point(binding, uia, table, anchor):
 
 
 def position_in_body(binding, uia, table, anchor):
-    point = _surface_point(binding, uia, table, anchor)
+    point = _surface_point(binding, uia, table, anchor, require_recorded_size=True)
     if table.property(30030) is True:
         count = table.property(30062)
         require(type(count) is int and count >= 0, 'result_grid_incomplete')
@@ -707,9 +722,9 @@ def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, head
         # Refresh the column, uniqueness and UIA hit after the final guard. Virtualized
         # rows and in-grid overlays can change without changing the native window.
         current = find_current()
-        require(uia.same(current, cell) and uia.bounds(current) == box and current.property(30010) is True,
+        require(uia.same(current, cell) and current.property(30010) is True,
                 'result_cell_changed')
-        require(point_for(current, box) == point, 'result_cell_changed')
+        require(point_for(current, box) == point and uia.bounds(current) == box, 'result_cell_changed')
         chain = lookup.ancestry(uia, current, root, pid=binding.pid)
         require(not any(peer.property(30003) in _ROW and peer.property(30022) is True for peer in chain),
                 'result_cell_not_clickable')
@@ -722,7 +737,12 @@ def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, head
             sent = dict(ok=False, diagnostic=getattr(error, 'code', 'point_delivery_unknown'),
                         input_dispatched=getattr(error, 'input_dispatched', None))
     delivered = sent['ok'] and sent.get('input_dispatched') is True
-    return dict(status='delivered_unverified' if delivered else 'uncertain',
-                diagnostic='visual_double_click_dispatched' if delivered else sent.get('diagnostic', 'partial_input'),
-                input_dispatched=sent.get('input_dispatched'), physical_input=True, input_mode='physical_pointer',
-                gesture='double-click', target_resolution=resolution, effect_verification='unverified')
+    dispatched = sent.get('input_dispatched')
+    receipt = dict(status='delivered_unverified' if delivered else 'uncertain',
+                   diagnostic='visual_double_click_dispatched' if delivered else sent.get('diagnostic', 'partial_input'),
+                   input_dispatched=dispatched, physical_input=dispatched is not False, input_mode='physical_pointer',
+                   gesture='double-click', target_resolution=resolution, effect_verification='unverified')
+    if dispatched is False:
+        receipt['status'] = 'blocked'
+    receipt['screen_point' if delivered else 'attempted_screen_point'] = list(point)
+    return receipt

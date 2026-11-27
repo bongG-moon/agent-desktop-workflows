@@ -1,5 +1,6 @@
 """Record and replay an opaque Windows icon. Uses the physical pointer on the fixture only."""
 import argparse
+from copy import deepcopy
 from pathlib import Path
 import json
 import os
@@ -24,34 +25,59 @@ def until(predicate, seconds=6):
 
 
 def exercise_legacy_draft(command, check, fixture, binding, folder, exe, title):
+    import desktop_select as app
     import review_drafts
     import row_vision
     from teach_capture import manual
 
     steps = [('unsupported_recorded_action', '기존 조회 결과', None),
-             ('double_click_needs_review', '나온 테이블 결과를 더블 클릭해서 팝업 창을 띄워줘', None),
+             ('double_click_needs_review', 'Order A123 항목을 더블클릭해줘', None),
              ('drag_needs_review', '상세 창의 메모 가져오기', 'required')]
     rows = [dict(step=manual(reason, str(i)), form=dict(alias='', text=text, mode=mode, argument=''))
             for i, (reason, text, mode) in enumerate(steps, 1)]
     source = review_drafts.ReviewStorage('legacy', exe.name, title, folder)
     source.save_draft(rows, 'invalid_step_instruction', 3)
     before = (folder/'legacy.json').read_bytes()
+    state = fixture.command('position-for-capture')
+    capture_rect = row_vision._window_rect(binding)
     frame = command('ground', '--task', 'legacy', '--only', '2')
     check('legacy_draft_can_observe_current_result', frame.get('gesture') == 'double-click'
-          and frame['input_dispatched'] is False)
-    left, top, _, _ = row_vision._window_rect(binding)
-    state = fixture.command('state')
-    values = {'<x>': str(state['x'] - left), '<y>': str(state['y'] - top), '<new task>': 'repaired'}
-    fixed = command(*(values.get(arg, arg) for arg in frame['bind_args']))
+          and frame['input_dispatched'] is False and frame.get('coordinates') == 'image_pixels'
+          and frame.get('screen_origin') == list(capture_rect[:2]))
+    image_point = (state['x'] - capture_rect[0], state['y'] - capture_rect[1])
+    values = {'<x>': str(image_point[0]), '<y>': str(image_point[1]), '<new task>': 'repaired'}
+    bind_args = [values.get(arg, arg) for arg in frame['bind_args']]
+    fixture.command('resize-and-translate')
+    stale = command(*bind_args)
+    check('old_capture_rejected_after_resize', stale.get('diagnostic') == 'grounding_frame_changed'
+          and stale['input_dispatched'] is False and fixture.command('state')['opened'] == state['opened'])
+    moved = fixture.command('translate')
+    bind_rect = row_vision._window_rect(binding)
+    check('window_moved_since_capture', capture_rect[:2] != bind_rect[:2] and capture_rect[2:] == bind_rect[2:])
+    fixed = command(*bind_args)
     check('repaired_only_one_step_and_kept_original', fixed.get('input_dispatched') is False
           and fixed.get('test_step_args') and (folder/'legacy.json').read_bytes() == before)
+    check('binding_receipt_matches_moved_fixture', fixed.get('image_point') == list(image_point)
+          and fixed.get('screen_point') == [moved['x'], moved['y']])
+    current = fixture.command('resize-and-translate')
+    replay_rect = row_vision._window_rect(binding)
+    expected = [current['x'], current['y']]
+    check('window_moved_and_resized_after_binding', replay_rect[:2] != bind_rect[:2] and replay_rect[2:] != bind_rect[2:])
+    check('expected_point_hits_fixture', app.bridge.root_window(app.bridge.window_from_point(*expected)) == binding.hwnd)
+    from smoke_registered_result import wait_for_idle
+    wait_for_idle()
     result = command(*fixed['test_step_args'])
     until(lambda: fixture.command('state')['opened'] == state['opened'] + 1)
+    received = fixture.command('state')
     check('replayed_repaired_step_with_other_steps_unfinished', result.get('input_dispatched') is True
-          and fixture.command('state')['detailHwnd'] != 0)
+          and received['detailHwnd'] != 0)
+    check('relocated_row_received_exact_screen_point', received['lastDoubleClick'] == expected and received['missed'] == 0)
+    print(json.dumps(dict(capture_rect=capture_rect, bind_rect=bind_rect, replay_rect=replay_rect,
+                          image_point=image_point, bound_screen_point=fixed['screen_point'], expected=expected, received=received['lastDoubleClick'],
+                          double_clicks=received['opened'] - state['opened'])), flush=True)
 
 
-def exercise(source, work, double_click=False, list_row=False, toolbar=False):
+def exercise(source, work, double_click=False, list_row=False, toolbar=False, maximized=False):
     installed = work/'skills/desktop-select'
     install_skill(source, installed)
     sys.path.insert(0, str(installed/'scripts'))
@@ -80,6 +106,12 @@ def exercise(source, work, double_click=False, list_row=False, toolbar=False):
         opened = fixture.ready
         title = opened['title']
         binding = app.bridge.Binding(app.pick_window(app.windows(exe.name), title, opened['hwnd']))
+        from smoke_registered_result import wait_for_idle
+        wait_for_idle()
+        if list_row:
+            fixture.command('position-for-capture')
+            if maximized:
+                fixture.command('maximize')
         foreground(binding)
         session = CaptureSession(binding, title)
         session.start()
@@ -119,14 +151,18 @@ def exercise(source, work, double_click=False, list_row=False, toolbar=False):
         directory = work/'tasks'
         learned_tasks.save_task(task, directory)
         saved = learned_tasks.load_task(task['name'], directory)
-        check('sentence_and_preclick_target_saved', saved['steps'][0]['label'] == sentence
-              and saved['steps'][0]['action']=='visual-click'
-              and saved['steps'][0]['visual'].get('gesture', 'click') == gesture
+        target = saved['steps'][0]
+        if list_row:
+            target_saved = target['action'] == 'double-click-result' and target.get('result_point')
+            check('saved_recording_has_window_placement', target_saved and target['result_point'].get('window_placement'))
+        else:
+            target_saved = target['action'] == 'visual-click' and target['visual'].get('gesture', 'click') == gesture
+        check('sentence_and_preclick_target_saved', target['label'] == sentence and target_saved
               and recorded_plan.compile_plan(saved).get('envelope'))
         if double_click:
             fixture.command('dismiss')
             foreground(binding)
-        moved = fixture.command('move-icon')
+        moved = fixture.command('translate' if list_row else 'move-icon')
         check('target_moved_before_replay', (moved['x'], moved['y']) != (x, y) and moved[counter]==1)
         def command(*args):
             result = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(installed/'scripts/desktop_select.py'), *args],
@@ -135,11 +171,38 @@ def exercise(source, work, double_click=False, list_row=False, toolbar=False):
             return json.loads(result.stdout)
         window = ['--exe', exe.name, '--window', title]
         replay = ['replay', '--task', task['name'], *window]
+        if list_row:
+            moved = fixture.command('resize-and-translate')
+            check('fixture_resized_and_moved', moved['bounds'][:2] != observed['bounds'][:2]
+                  and moved['bounds'][2:] != observed['bounds'][2:] and not moved['maximized'])
+            legacy = deepcopy(saved)
+            legacy['name'] = 'Before window placement'
+            del legacy['steps'][0]['result_point']['window_placement']
+            learned_tasks.save_task(legacy, directory)
+            blocked = command('replay', '--task', legacy['name'], *window)
+            after = fixture.command('state')
+            check('legacy_resize_stops_before_click', blocked.get('input_dispatched') is False
+                  and 'recorded_result_surface_resized' in json.dumps(blocked) and after['bounds'] == moved['bounds']
+                  and after['opened'] == 1 and after['missed'] == 0)
         background = command(*replay, '--background-only')
         check('physical_requirement_checked_before_input', background['input_dispatched'] is False
               and fixture.command('state')[counter]==1)
+        if list_row:
+            check('background_only_leaves_window_in_place', fixture.command('state')['bounds'] == moved['bounds'])
+        started = time.monotonic()
         result = command(*replay)
+        elapsed = round(time.monotonic() - started, 3)
         state = fixture.command('state')
+        if list_row:
+            click_receipt = next((row['receipt'] for row in result.get('steps', [])), {})
+            print(json.dumps(dict(recorded=observed['bounds'], moved=moved['bounds'], replayed=state['bounds'],
+                                  expected=[x, y], received=state['lastDoubleClick'], replay_seconds=elapsed,
+                                  maximized=state['maximized'],
+                                  diagnostic=click_receipt.get('diagnostic', result.get('diagnostic')))), flush=True)
+            check('restored_recorded_bounds_and_state', state['bounds'] == observed['bounds']
+                  and state['maximized'] == observed['maximized'] == maximized
+                  and click_receipt.get('recorded_placement_restored') is True)
+            check('double_click_received_at_demonstrated_screen_point', state['lastDoubleClick'] == [x, y])
         check('replay_clicked_relocated_icon_once', result['input_dispatched'] is True
               and state[counter]==2 and state['missed']==0)
         if toolbar:
@@ -162,7 +225,20 @@ def exercise(source, work, double_click=False, list_row=False, toolbar=False):
                   and fixture.command('state')['opened'] == 2)
             if list_row:
                 foreground(binding)
-                exercise_legacy_draft(command, check, fixture, binding, directory, exe, title)
+                wait_for_idle()
+                before_repeat = fixture.command('state')
+                repeat_start = time.monotonic()
+                repeated = command(*replay)
+                repeated_state = fixture.command('state')
+                check('repeat_in_recorded_layout_delivered_once', repeated.get('input_dispatched') is True
+                      and repeated_state['opened'] == 3 and repeated_state['missed'] == 0
+                      and repeated_state['bounds'] == observed['bounds'] and repeated_state['lastDoubleClick'] == [x, y]
+                      and repeated_state['layoutChanges'] == before_repeat['layoutChanges'])
+                print(json.dumps(dict(matching_layout_replay_seconds=round(time.monotonic()-repeat_start, 3))), flush=True)
+                if not maximized:
+                    fixture.command('dismiss')
+                    foreground(binding)
+                    exercise_legacy_draft(command, check, fixture, binding, directory, exe, title)
         if app.bridge.root_window(app.bridge.foreground())==binding.hwnd and app.bridge.cursor()==(moved['x'],moved['y']):
             app.bridge.user32.SetCursorPos(*old_cursor)
     finally:
@@ -178,10 +254,13 @@ if __name__ == '__main__':
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--double-click', action='store_true', help='open, read and close details in the owned fixture window')
     parser.add_argument('--list-row', action='store_true', help='exercise a double-click on a native list row')
+    parser.add_argument('--maximized', action='store_true', help='record a list row in a maximized window')
     parser.add_argument('--toolbar', action='store_true', help='test an unnamed painted toolbar button and its duplicate')
     args=parser.parse_args()
     if args.toolbar and (args.double_click or args.list_row):
         parser.error('--toolbar tests a single click on the painted button')
+    if args.maximized and not args.list_row:
+        parser.error('--maximized requires --list-row')
     work = args.work_dir.resolve()
     work.mkdir(parents=True,exist_ok=False)
-    exercise(args.skill_dir.resolve(),work,args.double_click or args.list_row,args.list_row,args.toolbar)
+    exercise(args.skill_dir.resolve(),work,args.double_click or args.list_row,args.list_row,args.toolbar,args.maximized)

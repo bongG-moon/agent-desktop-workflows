@@ -188,6 +188,25 @@ class ReviewedPointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'result_frame_changed'):
                 flow.check_result_frame(self.binding, proof, (103, 103), lambda: None)
 
+    def test_final_check_translates_only_a_matching_table_and_rejects_stale_screen_point(self):
+        png = grounding._png(8, 8, bytes((31, 61, 91, 0)) * 64)
+        proof = dict(receipt='1'*64, frame='2'*64, selector=self.selector, point=[3, 3],
+                     window_rect=self.rect, table_box=deepcopy(self.table.box))
+        moved = [-110, 80, 8, 8]
+        self.table.box.update(x=-108, y=82)
+        self.uia.root.box.update(x=-110, y=80)
+        with (patch.object(grounding, '_directory', return_value=Path('.')),
+              patch.object(grounding, 'read_frame', return_value=(None, png)),
+              patch.object(grounding, '_capture', return_value=(moved, png)),
+              patch.object(flow.app.bridge, 'UIA') as context):
+            context.return_value.__enter__.return_value = self.uia
+            flow.check_result_frame(self.binding, proof, (-107, 83), lambda: None)
+            with self.assertRaisesRegex(ValueError, 'result_frame_changed'):
+                flow.check_result_frame(self.binding, proof, (103, 103), lambda: None)
+            self.table.box['x'] += 1
+            with self.assertRaisesRegex(ValueError, 'result_table_changed'):
+                flow.check_result_frame(self.binding, proof, (-107, 83), lambda: None)
+
 
 if __name__ == '__main__':
     unittest.main()

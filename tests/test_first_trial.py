@@ -207,6 +207,18 @@ class FirstTrial(unittest.TestCase):
         self.assertEqual(short['next_action']['kind'], 'review_unresolved_instruction')
         self.assertEqual(len(full['live_scopes'][0]['targets']), 104)
 
+    def test_saved_minimized_handoff_waits_for_the_window_before_retrying_without_activation(self):
+        from recording_followup import followup
+        retry = ['recover', '--task', 'Example', '--restore-window', '--prepare']
+        saved = dict(status='needs_grounding', diagnostic='target_window_minimized', live_scopes=[],
+                     input_dispatched=False, retry_args=retry, next_action=dict(kind='continue_preparation', args=retry))
+        event = followup(dict(status='recorded', task={'name': 'Example'}, live_recovery=dict(saved), input_dispatched=False))
+        self.assertNotIn('--restore-window', json.dumps(event))
+        reported = first_trial.host_summary(followup(saved))
+        self.assertEqual(reported['host_action'], 'show_recorded_window_then_retry')
+        self.assertEqual(reported['next_action']['args'], ['recover', '--task', 'Example', '--prepare'])
+        self.assertEqual(reported['next_action']['args'], reported['retry_args'])
+
     def test_processing_timeout_keeps_the_entire_trial_request(self):
         argv = ['--session','a'*32,'--set','Region=North','--trial-id','explicit-2',
                 '--hwnd','42','--auto-repair-frame','--allow-physical']
@@ -276,6 +288,7 @@ class FirstTrial(unittest.TestCase):
             dispatched = self.trial(*session, '--allow-physical', '--set', 'Region=private-test-value')
             previous = self.trial('--task', name, '--allow-physical', '--set', 'Region=private-test-value')
         self.assertEqual([call.args[0][0] for call in self.worker.call_args_list], ['_worker', '_plan'])
+        self.assertEqual(self.worker.call_args_list[0].args[0], ['_worker', 'recover', '--task', name, '--prepare'])
         self.assertEqual(dispatched['effective_task'], prepared['name'])
         self.assertEqual(dispatched['source_steps'], prepared_receipt['source_steps'])
         self.assertEqual(dispatched['trial_receipt'], previous['trial_receipt'])

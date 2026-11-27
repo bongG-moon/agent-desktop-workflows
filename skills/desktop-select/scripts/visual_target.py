@@ -456,6 +456,7 @@ def execute(binding, spec, guard, *, read_only=False, background_only=False, fir
                 diagnostic=('visual_double_click_dispatched' if gesture == 'double-click' else 'visual_click_dispatched')
                 if delivered else result.get('diagnostic','visual_click_delivery_uncertain'),
                 input_dispatched=result.get('input_dispatched'), input_mode='physical_pointer', physical_input=True,
+                **{'screen_point' if delivered else 'attempted_screen_point': list(point)},
                 effect_verification='unverified', verification_scope='click_delivery', business_commit='not_verified',
                 **({'gesture': gesture} if gesture == 'double-click' else {}))
 

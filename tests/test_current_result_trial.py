@@ -50,6 +50,18 @@ class CurrentResultTrial(unittest.TestCase):
             self.assertEqual(report['host_action'],'report_unmatched_result')
             self.assertNotIn('result_inspection',report)
 
+    def test_resized_result_table_offers_local_point_without_repeating_query(self):
+        self.task['name'] = 'Resized table'
+        self.task['steps'][2].update(result_row='recorded', result_point=dict(x=20, y=30, width=100, height=80))
+        tasks.save_task(self.task, self.directory)
+        self.worker.return_value['steps'][-1]['receipt']['diagnostic'] = 'recorded_result_surface_resized'
+        args = ['--task', self.task['name'], '--set', 'Region=North', '--allow-physical']
+        report = self.trial(*args)
+        self.assertEqual(report['host_action'], 'confirm_result_locally_without_replaying')
+        self.assertTrue(report['result_inspection']['resume_supported'])
+        self.assertTrue(self.trial(*args)['previous_trial'])
+        self.worker.assert_called_once()
+
     def test_locked_desktop_does_not_reserve_or_dispatch_a_trial(self):
         blocked=dict(status='blocked',diagnostic='no_interactive_desktop',input_dispatched=False)
         with patch.object(input_policy,'interactive_desktop_blocked',return_value=blocked):
@@ -133,6 +145,9 @@ class CurrentResultTrial(unittest.TestCase):
              for step, sentence in raw], 'instruction_target_unavailable', 4)
         original = (self.directory / (name + '.json')).read_bytes()
         rect = list(VisualTargets.window)
+        x, y, width, height = rect
+        placement = dict(rect=rect, normal_rect=[x, y, x + width, y + height],
+                         maximized=False, dpi=96, monitor=r'\\.\DISPLAY1')
         box = dict(x=rect[0]+10, y=rect[1]+6, width=rect[2]+10, height=rect[3]-6)
         png = grounding._png(*rect[2:], image((35, 42)))
         frames = self.directory / 'frames'
@@ -143,6 +158,7 @@ class CurrentResultTrial(unittest.TestCase):
             dict(number=3, receipt=dict(status='verified', input_dispatched=True, diagnostic='recorded_window_closed'))])]
         args = ['--task', name, '--set', 'Region=North', '--local-result-review', '--allow-physical', '--summary']
         with patch.object(app.bridge, 'Binding'), patch.object(app.bridge, 'UIA') as uia, \
+             patch('window_placement.capture', return_value=placement) as record_placement, \
              patch.object(flow, '_result_target', return_value=(object(), surface)), \
              patch.object(grounding, '_capture', return_value=(rect, png)) as capture_frame, \
              patch.object(grounding, '_directory', return_value=frames), \
@@ -160,13 +176,15 @@ class CurrentResultTrial(unittest.TestCase):
         self.assertEqual(report['observations'][0]['value'], 'current memo')
         picker.assert_called_once()
         capture_frame.assert_called_once()
+        self.assertEqual(record_placement.call_args.kwargs['expected_rect'], rect)
         self.assertEqual(self.worker.call_count, 2)
         suffix = self.worker.call_args.kwargs['payload']['recipe']['steps']
         self.assertEqual([s['action'] for s in suffix], ['visual-click', 'read-value', 'invoke'])
         self.assertEqual([s['window_context']['after_step'] for s in suffix[1:]], [1, 1])
         corrected = tasks.load_task(report['effective_task'], self.directory)
         recipe = recorded_plan.get_plan(corrected, self.directory)['envelope']['recipe']
-        self.assertEqual(recipe['steps'][2]['result_point'], dict(x=25, y=36, width=180, height=114))
+        self.assertEqual(recipe['steps'][2]['result_point'],
+                         dict(x=25, y=36, width=180, height=114, window_placement=placement))
         self.assertEqual((recipe['steps'][2]['selector'], recipe['steps'][2]['result_row']), (surface, 'recorded'))
         self.assertEqual([s['window_context']['after_step'] for s in recipe['steps'][3:]], [3, 3])
         self.assertEqual((self.directory / (name + '.json')).read_bytes(), original)

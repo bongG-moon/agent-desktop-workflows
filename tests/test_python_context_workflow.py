@@ -248,7 +248,7 @@ class CompositionTests(unittest.TestCase):
                 patch.object(flow.lookup, 'bind_anchored', return_value=proof, create=True) as bind_anchor:
             result = flow.run(recipe(step))
             self.assertEqual(result['status'], 'verified')
-            self.assertEqual(self.events, ['restore', ('fill', 100, 'value')])
+            self.assertEqual(self.events, [('fill', 100, 'value')])
             expose.assert_not_called()
             bind_anchor.assert_called_once()
             proof.revalidate.assert_called_once()
@@ -284,7 +284,7 @@ class CompositionTests(unittest.TestCase):
         main = dict(action='invoke', selector=dict(name='Continue', role='button'))
         result = flow.run(recipe(popup_step(), popup_step('invoke'), main), {'Output': 'report'})
         self.assertEqual(result['status'], 'completed_unverified')
-        self.assertEqual(self.events, [('fill', 200, 'report'), ('invoke', 200, None), 'restore', ('invoke', 100, None)])
+        self.assertEqual(self.events, [('fill', 200, 'report'), ('invoke', 200, None), ('invoke', 100, None)])
 
     def test_uncertain_or_incomplete_menu_never_advances(self):
         for fields in (dict(status='uncertain'), dict(status='verified'), dict(leaf_dispatched=None), dict(menu_path_completed=False),

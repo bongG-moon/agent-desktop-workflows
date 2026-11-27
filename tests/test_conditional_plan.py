@@ -169,7 +169,8 @@ class InterpretedRecording(TestCase):
               mock.patch.object(grounding,'_directory',return_value=self.store),
               mock.patch.object(app,'windows'), mock.patch.object(app,'pick_window'),
               mock.patch.object(app.bridge,'Binding',return_value=owner), mock.patch.object(app,'guard'),
-              mock.patch.object(grounding,'WindowRoutes'), mock.patch.object(grounding.visual_target,'observe'),
+              mock.patch.object(grounding,'WindowRoutes'), mock.patch.object(grounding.visual_target,'observe',
+                  return_value=dict(window=[0,0,120,95], point=[52,47])),
               mock.patch.object(grounding,'_capture',return_value=([0,0,120,95],frame))):
             seen = grounding.run(app,args)
             self.assertEqual(seen['expected_windows'], [self.original['steps'][3]['window_context']])

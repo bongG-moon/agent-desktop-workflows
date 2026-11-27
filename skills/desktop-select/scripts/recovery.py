@@ -583,8 +583,8 @@ def _blocked(result, diagnostic, **fields):
     return {**header, **{key: value for key, value in result.items() if key not in header}}
 
 
-def _restore_args(args):
-    retry = ['recover', '--task', args.task, '--restore-window']
+def _retry_after_restore(args):
+    retry = ['recover', '--task', args.task]
     for option in ('prepare', 'image', 'only', 'bindings', 'save_as'):
         value = getattr(args, option, None)
         if value:
@@ -813,7 +813,7 @@ def run(app, args):
         reason = getattr(error, 'code', 'recorded_window_not_open')
         if reason == 'target_window_minimized' and not getattr(args, 'restore_window', False):
             return _blocked(result, reason, step_number=min(operations, default=selection[0]),
-                            retry_args=_restore_args(args), host_action='retry_same_recovery_with_restore_window')
+                            retry_args=_retry_after_restore(args), host_action='show_recorded_window_then_retry')
         return _blocked(result, reason)
 
     observations, revised, remap = {}, [], {}
@@ -929,8 +929,8 @@ def run(app, args):
                 # Reading the other controls on this minimized surface would
                 # repeat the same failure and can turn it into target_missing.
                 if not row['context'] and not getattr(args, 'restore_window', False):
-                    return _blocked(result, reason, step_number=number, retry_args=_restore_args(args),
-                                    host_action='retry_same_recovery_with_restore_window')
+                    return _blocked(result, reason, step_number=number, retry_args=_retry_after_restore(args),
+                                    host_action='show_recorded_window_then_retry')
                 return _blocked(result, reason, step_number=number, host_action='show_recorded_window_then_retry')
             if reason == 'context_point_occluded':
                 detail['recovery_hint'] = '녹화한 창의 표 지점이 가려져 있습니다. 해당 위치가 보이는 상태에서 같은 보정을 계속하세요.'

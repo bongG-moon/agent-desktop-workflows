@@ -23,7 +23,7 @@
 필드와 값은 각 단계의 설명 및 현재 창에서 식별한다. 특정 앱에서 사용했던 필드 이름이나 메뉴 경로를 다른 업무에 가져오지 않는다. 문장에 예시 값과 “실행 전에 값을 물어봐줘”가 함께 있으면 그 필드를 실행 때 받을 변수로 연결한다. 이번 실행값을 주지 않았을 때만 묻는다. `menu_binding_hint`와 `menu_preview.point_observed=true`가 함께 있으면 해당 메뉴 연결에는 힌트의 원래 키와 녹화 위치를 사용한다. 바인딩 JSON에는 단계 요약이나 화면 관찰 결과를 통째로 복사하지 않는다. 같은 단계에서 형식 오류가 반복되면 응답의 `unsupported_fields`와 `menu_binding_hint`로 해당 바인딩만 고친다.
 
 - `bind_existing_observation`이면 이번 영수증의 `bindings_template`과 미해결 단계의 원문을 사용한다. `source_fingerprint`, 고정값과 필수 변수를 유지해 안내된 `--bindings`와 `--save-as`로 연결한다. `review_unresolved_instruction`이면 반환된 단계에서 빠진 내용만 확인한다. [바인딩 예시](../사용가이드.md#자동-준비에-남은-단계가-있을-때)
-- `next_action.kind=continue_preparation`은 준비를 중단했던 상태다. 예를 들어 최소화한 창을 복원하도록 허용받았으면 같은 영수증의 재개 인자를 사용한다. 이전 초안에 준비 결과가 없으면 `desktop_select.py recover --task "<원본>" --prepare`를 사용하고, 창 복원이 허용된 경우에만 `--restore-window`를 붙인다.
+- `show_recorded_window_then_retry`가 오면 대상 창이 다시 표시된 뒤 영수증의 인자로 준비를 이어간다. 사용자가 최소화 해제를 요청한 경우에는 `recover`에 `--restore-window`를 붙일 수 있다.
 - 실제 앱에서 확인한 유일한 대상만 조작한다. 사용자가 특정 행이나 셀을 지정한 경우 그 대상이 식별될 때만 우클릭 위치를 보정한다. 이미 입력이 전달됐으면 같은 조회나 메뉴를 재실행하기 전에 현재 열린 창과 산출물을 확인한다. [우클릭 위치 보정](../사용가이드.md#첫-시험에서-우클릭-위치를-보정할-때)
 
 ## 구조화된 의도 연결

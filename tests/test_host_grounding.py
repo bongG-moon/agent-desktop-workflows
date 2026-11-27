@@ -33,19 +33,34 @@ class HostGroundingTests(TestCase):
                   mock.patch.object(app,'windows',return_value=[]), mock.patch.object(app,'pick_window'),
                   mock.patch.object(app.bridge,'Binding',return_value=binding),
                   mock.patch.object(grounding,'WindowRoutes'),mock.patch.object(app,'guard'),
-                  mock.patch.object(grounding,'_capture',return_value=([0,0,120,95],data)),
-                  mock.patch.object(grounding.visual_target,'observe') as observe):
+                  mock.patch.object(grounding,'_capture',return_value=([358,80,120,95],data)),
+                  mock.patch.object(grounding.visual_target,'observe',
+                                    return_value=dict(window=[-1420,180,120,95], point=[-1368,227])) as observe):
                 frame = grounding.run(app,args)
                 self.assertEqual(frame['gesture'],'double-click')
+                self.assertEqual((frame['screen_origin'],frame['coordinates']), ([358,80],'image_pixels'))
                 self.assertNotIn('row_binding_command',frame)
                 args.command,args.frame = 'bind-visual',frame['frame']
-                observe.side_effect = grounding.visual_target.bridge.BridgeError('visual_target_ambiguous')
-                repeat = grounding.run(app,args)
+                ambiguous = grounding.visual_target.bridge.BridgeError('visual_target_ambiguous')
+                with mock.patch.object(grounding.visual_target,'from_frame',side_effect=ambiguous):
+                    repeat = grounding.run(app,args)
+                observe.assert_not_called()
                 self.assertEqual((repeat['host_action'],repeat['frame']), ('choose_distinct_point_in_same_target',frame['frame']))
                 self.assertFalse((folder/'fixed.json').exists())
+                for reason in ('visual_target_not_found','visual_target_ambiguous','row_window_moved'):
+                    observe.side_effect = grounding.visual_target.bridge.BridgeError(reason)
+                    with mock.patch.object(grounding,'_capture') as capture:
+                        changed = grounding.run(app,args)
+                    self.assertEqual(changed, dict(status='needs_grounding', diagnostic='grounding_frame_changed',
+                        step=1, ground_args=['ground','--task','demo','--only','1'], input_dispatched=False))
+                    capture.assert_not_called()
+                    observe.assert_called_once()
+                    observe.reset_mock()
+                    self.assertFalse((folder/'fixed.json').exists())
                 observe.side_effect = None
                 receipt = grounding.run(app,args)
                 self.assertFalse(receipt['input_dispatched'])
+                self.assertEqual((receipt['image_point'], receipt['screen_point']), ([52,47],[-1368,227]))
             self.assertEqual(observe.call_args.args[1]['gesture'],'double-click')
             self.assertEqual((folder/'demo.json').read_bytes(),source_bytes)
             saved = tasks.load_task('fixed',folder)
@@ -59,6 +74,22 @@ class HostGroundingTests(TestCase):
         rgb[3::4]=bytes(48*53)
         box,pixels=grounding._pixels(grounding._png(48,53,rgb))
         self.assertEqual((box,pixels),([0,0,48,53],bytes(rgb)))
+
+    def test_image_point_matches_at_current_window_origin_on_either_monitor(self):
+        import random
+        visual = grounding.visual_target
+        size = [240,270]
+        png = grounding._png(*size, random.Random(9).randbytes(240*270*4))
+        frame, pixels = grounding._pixels(png)
+        marker = visual.from_frame(frame, pixels, (173,231))
+        binding = SimpleNamespace(hwnd=5,pid=42)
+        for origin, expected in (([358,80], [531,311]), ([-1500,-80], [-1327,151])):
+            with (self.subTest(origin=origin),
+                  mock.patch.object(visual.vision,'_window_rect',return_value=[*origin,*size]),
+                  mock.patch.object(visual.vision,'_frame',return_value=pixels),
+                  mock.patch.object(visual.bridge,'UIA'), mock.patch.object(visual,'_safe_patch') as hit):
+                self.assertEqual(visual.observe(binding,marker)['point'], expected)
+                self.assertEqual(hit.call_args.args[3], expected)
 
     def test_test_step_args_execute_only_bound_double_in_otherwise_invalid_draft(self):
         import random
@@ -80,7 +111,9 @@ class HostGroundingTests(TestCase):
                   mock.patch.object(app,'windows',return_value=[]), mock.patch.object(app,'pick_window',return_value={'hwnd':5}),
                   mock.patch.object(app.bridge,'Binding',return_value=owner),mock.patch.object(app,'guard'),
                   mock.patch.object(grounding,'_capture',return_value=([0,0,120,95],data)),
-                  mock.patch.object(grounding.visual_target,'observe'), mock.patch.object(app.coordination,'window'),
+                  mock.patch.object(grounding.visual_target,'observe',
+                                    return_value=dict(window=[0,0,120,95], point=[52,47])),
+                  mock.patch.object(app.coordination,'window'),
                   mock.patch.object(app,'worker_receipt',return_value=dict(status='delivered_unverified',
                        diagnostic='visual_double_click_dispatched',input_dispatched=True)) as send):
                 def run(argv):
@@ -138,6 +171,16 @@ class HostGroundingTests(TestCase):
                 self.assertFalse((store/(args.save_as+'.json')).exists())
                 observe.assert_not_called()
                 binding.created='100'
+                for live in (dict(window=[0,0,170,95],point=[52,47]),
+                             dict(window=[0,0,120,95],point=[52,82])):
+                    observe.return_value = live
+                    retry = grounding.run(app,args)
+                    self.assertEqual((retry['diagnostic'], retry['input_dispatched']),
+                                     ('grounding_frame_changed', False))
+                    self.assertEqual(retry['ground_args'], ['ground','--task',plan['name'],'--only','1'])
+                    self.assertFalse((store/(args.save_as+'.json')).exists())
+                observe.reset_mock()
+                observe.return_value = dict(window=[0,0,120,95],point=[52,47])
                 report=grounding.run(app,args)
                 observe.assert_called_once()
                 self.assertFalse(report['input_dispatched'])

@@ -700,6 +700,7 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
     attempts, waited, provider_seconds = 0, 0., 0.
     deadline = started + wait_seconds
     retry_selector, hint_attempted = None, False
+    layout_evidence = {}
     while True:
         guard()
         attempts += 1
@@ -718,8 +719,11 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
                 result_cell.find_row(binding, uia, table, mode=step['result_row'])
         except (ValueError, app.bridge.BridgeError) as error:
             diagnostic = getattr(error, 'code', None)
+            if isinstance(error, result_cell.RecordedSurfaceResized):
+                layout_evidence = error.observation
             header = step['result_row'] == 'header'
             if not header and diagnostic not in ('result_row_missing', 'result_row_unavailable', 'result_row_not_visible',
+                                  'recorded_result_surface_resized',
                                   'result_row_ambiguous', 'result_table_missing', 'target_missing',
                                   'result_column_ambiguous', 'result_column_unavailable', 'result_column_not_found'):
                 raise
@@ -756,6 +760,7 @@ def observe_result_row(binding, uia, step, guard, *, wait_seconds, on_match=None
             table_lookup='discovery' if step['selector'] == {'role': 'table'} else 'recorded_element')
         if header:
             receipt['result_observation']['column'] = step['result_column']
+        receipt['result_observation'].update(layout_evidence)
         return receipt
 
 
@@ -1082,9 +1087,7 @@ def check_result_frame(binding, confirmation, point, guard):
     need(relative_point == confirmation['point'], 'result_frame_changed')
     if 'table_box' in confirmation:
         import result_trial
-        need(list(rect) == list(confirmation['window_rect']) and
-             result_trial.same_table_pixels(witnessed, current, rect, confirmation['table_box']),
-             'result_frame_changed')
+        need(rect[2:] == confirmation['window_rect'][2:], 'result_frame_changed')
     else:
         need(current == witnessed, 'result_frame_changed')
     with app.bridge.UIA() as uia:
@@ -1094,7 +1097,8 @@ def check_result_frame(binding, confirmation, point, guard):
         box = check_result_point(binding, uia, confirmation['selector'], point,
                                  reviewed_frame=rect if 'table_box' in confirmation else None)
         if 'table_box' in confirmation:
-            need(box == confirmation['table_box'], 'result_table_changed')
+            result_trial.check_table_layout(confirmation['table_box'], confirmation['window_rect'], box, rect)
+            need(result_trial.same_table_pixels(witnessed, current, rect, box), 'result_frame_changed')
 
 
 def checked_result_hints(recipe, saved):
@@ -1154,6 +1158,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     active = [step for _, step in entries]
     mutates_window = not read_only and any(s['action'] not in input_policy._OBSERVATION_ACTIONS for s in active)
     requirements = input_policy.profile(active, [n for n, _ in entries])
+    foreground_steps = {entry['number'] for entry in requirements['steps'] if entry['requires_foreground']}
     if background_only and not read_only:
         refusal = input_policy.blocked(requirements)
         if refusal:
@@ -1240,31 +1245,37 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         report['window_restored'] = False
         prepared = set()
 
-        def prepare(binding, title):
+        def prepare(binding, title, *, physical=False):
             if read_only:
                 app.visibility.require_observable(binding)
                 return
-            if binding.hwnd in prepared:
+            # Observing a window for an element does not prepare it for a later physical gesture.
+            key = (binding.hwnd, physical)
+            if key in prepared:
                 return
             reserve_surface(binding)
             if background_only:
                 input_policy.window_ready(binding)
-            else:
+            elif physical:
                 restored = app.visibility.restore_for_action(binding, title)
                 report['window_restored'] = bool(restored) or report['window_restored']
-            prepared.add(binding.hwnd)
+            else:
+                app.visibility.require_observable(binding)
+            prepared.add(key)
 
         pending_opener = None
         with app.bridge.UIA() as uia:
             if background_only and not read_only:
                 input_policy.configure_uia(uia)
-            elif mutates_window and any(row['input_mode'] == 'accessibility' for row in requirements['steps']):
+            elif mutates_window and any(row['input_mode'] == 'accessibility' or
+                                        (step['action'] == 'result-menu' and step['context']['trigger'])
+                                        for row, step in zip(requirements['steps'], active)):
                 input_policy.prefer_background(uia)
             if mutates_window:
                 first = active[0]
                 if ('window_context' not in first and 'popup' not in first
                         and first['action'] not in input_policy._OBSERVATION_ACTIONS):
-                    prepare(owner, recipe['window'])
+                    prepare(owner, recipe['window'], physical=entries[0][0] in foreground_steps)
                 check = check_window_readability(owner, uia)
                 report['readability_check'] = check
                 if check['status'] != 'observed':
@@ -1329,6 +1340,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 def check_target(surface, popup=None, *, mutate=False):
                     check_context()
                     check_surface(binding, surface, title, popup, mutate=mutate)
+                    if mutate and not background_only and number not in foreground_steps:
+                        need(not app.bridge.user32.IsIconic(surface.hwnd), 'target_window_minimized')
                 after_query = (step['action'] == 'verify-value' and number > 1 and
                                app.tasks.is_query_button(recipe['steps'][number-2]) and
                                recipe['steps'][number-2].get('window_context') == context)
@@ -1337,7 +1350,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 if 'popup' not in step and step['action'] in input_policy.VALUE_OBSERVATIONS:
                     app.visibility.require_observable(binding)
                 elif 'popup' not in step and step['action'] not in ('wait', 'verify-file'):
-                    prepare(binding, title)
+                    prepare(binding, title, physical=number in foreground_steps)
                 if (not read_only and step['action'] == 'invoke' and not routes.origins.get(number)
                         and app.tasks.query_before_double_click(step, requested.get(number + 1))):
                     import visual_target
@@ -1400,6 +1413,13 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                        diagnostic='validate_result_on_execution')
                     elif 'result_row' in step:
                         import result_cell
+                        placement = step.get('result_point', {}).get('window_placement')
+                        restored = False
+                        if placement and not read_only:
+                            import window_placement
+                            restored = window_placement.restore(binding, placement, lambda: check_target(binding, mutate=True))
+                            if restored:
+                                report['window_restored'] = True
                         tables = []
                         receipt = observe_result_row(binding, uia, step, lambda: check_target(binding),
                                                      wait_seconds=RESULT_VISUAL_TIMEOUT, on_match=tables.append)
@@ -1419,12 +1439,19 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                     need(not any(routes.matching_windows(spec) for spec in routes.origins[number].values()),
                                          'expected_new_window_already_open')
                                 row_options['before_header_dispatch'] = check_header_opener
-                            receipt = result_cell.execute_row(binding, uia, table, row_guard,
-                                                              mode=step['result_row'], **row_options)
+                            try:
+                                receipt = result_cell.execute_row(binding, uia, table, row_guard,
+                                                                  mode=step['result_row'], **row_options)
+                            except result_cell.RecordedSurfaceResized as error:
+                                observed['result_observation'].update(error.observation)
+                                receipt = dict(status='blocked', diagnostic=error.code, input_dispatched=False,
+                                               result_surface_selector=step['selector'])
                             receipt.update(result_observation=observed['result_observation'],
                                            result_row=step['result_row'], query_freshness='not_asserted',
                                            value_comparison=False)
-                        elif receipt['status'] == 'blocked':
+                        if restored:
+                            receipt['recorded_placement_restored'] = True
+                        if receipt['status'] == 'blocked':
                             receipt['result_window'] = dict(hwnd=binding.hwnd, pid=binding.pid, exe_name=binding.exe,
                                 title=title, process_started_utc_ticks=binding.created)
                     else:
@@ -1475,7 +1502,6 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             receipt=dict(status='needs_review', input_dispatched=False, diagnostic=diagnostic,
                                          before_query=baseline), elapsed_seconds=round(time.monotonic()-stage_started, 4)))
                         break
-                    dispatching = not read_only
                     try:
                         opener = routes.outcomes.get((context or {}).get('after_step'), {})
                         first_match_timeout = CHILD_VISUAL_TIMEOUT if not read_only and opener.get('input_dispatched') is True else 0
@@ -1486,8 +1512,11 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                             options['before_input'] = lambda point: check_result_frame(
                                 binding, result_confirmation, point, click_guard)
                             if 'table_box' in result_confirmation and 'window_rect' in result_confirmation:
-                                options['reviewed_point'] = [result_confirmation['window_rect'][i]
-                                                             + result_confirmation['point'][i] for i in range(2)]
+                                window = row_vision._window_rect(binding)
+                                need(window[2:] == result_confirmation['window_rect'][2:], 'result_frame_changed')
+                                px, py = result_confirmation['point']
+                                options['reviewed_point'] = [window[0] + px, window[1] + py]
+                        dispatching = not read_only
                         receipt = visual_target.execute(binding, step['visual'], click_guard,
                                                         read_only=read_only, background_only=background_only,
                                                         first_match_timeout=first_match_timeout, **options)
@@ -1529,7 +1558,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     else:
                         dispatching = True
                         receipt = result_menu.execute(binding, spec, lambda: check_target(binding, mutate=True),
-                                                      title, observe_guard=lambda: check_target(binding))
+                                                      title, observe_guard=lambda: check_target(binding), uia=uia)
                         dispatching = False
                 else:
                     lookup_started = time.monotonic()
@@ -1546,7 +1575,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                     reserve_surface(surface)
                     observation = step['action'] in input_policy.VALUE_OBSERVATIONS
                     check_target(surface, popup, mutate=not read_only and not observation)
-                    if read_only and popup:
+                    if popup and (read_only or (observation and not background_only)):
                         app.visibility.require_observable(surface)
                     if background_only and not read_only:
                         input_policy.window_ready(surface)
@@ -2227,7 +2256,8 @@ def summarize_execution(report, entries):
         item = {k: row[k] for k in ('number', 'label', 'elapsed_seconds') if k in row}
         item.update(action=step['action'])
         item.update({k: receipt[k] for k in ('status', 'diagnostic', 'input_dispatched', 'menu_items', 'menu_recovery',
-                                             'verified_path', 'verification_scope', 'keys') if k in receipt})
+                                             'verified_path', 'verification_scope', 'keys', 'screen_point',
+                                             'attempted_screen_point') if k in receipt})
         if step['action'] in input_policy.VALUE_OBSERVATIONS:
             item.update({k: receipt[k] for k in ('value', 'value_evidence', 'result_observation') if k in receipt})
             if step['action'] == 'read-value' and any(
@@ -2236,7 +2266,7 @@ def summarize_execution(report, entries):
                 item.pop('value', None)
         if step['action'] == 'double-click-result' and 'result_row' in step:
             item.update({k: receipt[k] for k in ('result_row', 'result_observation', 'query_freshness',
-                                               'value_comparison', 'target_resolution') if k in receipt})
+                                               'value_comparison', 'target_resolution', 'recorded_placement_restored') if k in receipt})
         summary['steps'].append(item)
         if (receipt['status'] == 'verified' and receipt.get('diagnostic') == 'export_workbook_verified'
                 and (receipt.get('file_verified') is True or receipt.get('workbook_verified') is True)

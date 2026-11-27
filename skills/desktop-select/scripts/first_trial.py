@@ -159,6 +159,10 @@ def inspect_result(app, receipt_id):
                 raise tasks.TaskError('result_table_changed')
             result_trial.visible_table_box(rect, box)
             geometry = dict(selector=selector, table_box=box, window_rect=list(rect))
+            if inspection['result_row'] == 'recorded':
+                import window_placement
+                if placement := window_placement.capture(binding.hwnd, expected_rect=rect):
+                    geometry['window_placement'] = placement
     else:
         rect, image = grounding._capture(app, binding, check)
     token, path = grounding.store_frame(grounding._directory(), receipt_id.encode('ascii'), image)
@@ -176,6 +180,7 @@ def inspect_result(app, receipt_id):
     result = dict(status='observed', diagnostic='current_result_window_captured', input_dispatched=False,
                 source_step=inspection['source_step'], column=inspection.get('column'),
                 window=identity['title'], frame=token, image=str(path), width=rect[2], height=rect[3],
+                coordinates='image_pixels', screen_origin=list(rect[:2]),
                 image_sha256=image_digest, image_unchanged=image_unchanged,
                 image_review='reuse_if_already_seen' if image_unchanged else 'review_current_image',
                 trial_receipt=receipt_id, result_match='unverified', prior_steps_replayed=False)
@@ -292,9 +297,7 @@ def run(app, args):
             # A cold trial can prepare once. Use the exact saved evidence if the
             # recorder already did that work, including an unresolved binding.
             argv = ['_worker', 'recover', '--task', name, '--prepare']
-            if not args.background_only:
-                argv.append('--restore-window')
-            saved = app.worker_receipt(argv, mutating=False, may_queue=not args.background_only)
+            saved = app.worker_receipt(argv, mutating=False)
             cold = True
         if saved.get('host_action') != 'use_prepared_task':
             return saved
@@ -392,8 +395,8 @@ def run(app, args):
                             expected_hash=recovery._fingerprint([key, expected]), source_hash=source_key, source_task=doc['name'])
             elif (last['number'] == number and step['action'] == 'double-click-result' and step.get('result_row')
                   and receipt.get('input_dispatched') is False and window):
-                if receipt.get('diagnostic') == 'result_row_unavailable':
-                    import result_trial
+                import result_trial
+                if receipt.get('diagnostic') in result_trial.ROW_REVIEW_ERRORS:
                     report.update(host_action='inspect_current_result_without_replaying',
                         result_inspection=dict(source_step=report['source_stopped_at'], result_row=step['result_row'],
                             selector=receipt.get('result_surface_selector') or step['selector'],

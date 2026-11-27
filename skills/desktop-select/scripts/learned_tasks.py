@@ -511,9 +511,15 @@ def result_surface_hint(raw):
 
 
 def valid_result_point(point):
-    return (isinstance(point, dict) and set(point) == {'x', 'y', 'width', 'height'}
-            and all(type(value) is int for value in point.values())
-            and 0 <= point['x'] < point['width'] <= 65535 and 0 <= point['y'] < point['height'] <= 65535)
+    fields = {'x', 'y', 'width', 'height'}
+    if (not isinstance(point, dict) or point.keys() - {'window_placement'} != fields
+            or not all(type(point[key]) is int for key in fields)
+            or not (0 <= point['x'] < point['width'] <= 65535 and 0 <= point['y'] < point['height'] <= 65535)):
+        return False
+    if 'window_placement' in point:
+        import window_placement
+        return window_placement.valid(point['window_placement'])
+    return True
 
 
 def result_location(raw):

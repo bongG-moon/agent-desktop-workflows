@@ -38,6 +38,7 @@ def _png(width, height, bgra):
 
 
 def _pixels(data):
+    """Decode in image-local pixels. Only live window geometry supplies a desktop origin."""
     # Only called after verifying the digest of the exact image our writer produced.
     width,height = struct.unpack_from('>II',data,16)
     if not width or not height or width*height > MAX_PIXELS:
@@ -162,6 +163,11 @@ def read_frame(folder, scope, token):
 def _usable(step):
     return (tasks.is_recoverable(step) or tasks.is_double_click_step(step) or step.get('action')=='visual-click'
             or (step.get('action')=='open' and step.get('match')=='query'))
+
+
+def _changed_frame(task, number):
+    return dict(status='needs_grounding', diagnostic='grounding_frame_changed', step=number,
+                ground_args=['ground','--task',task,'--only',str(number)], input_dispatched=False)
 
 
 def _children(plan, number):
@@ -319,6 +325,7 @@ def run(app, args):
         window,data = _capture(app,binding,check)
         token, path = store_frame(folder, scope, data)
         return dict(status='observed',frame=token,image=str(path),width=window[2],height=window[3],
+                    coordinates='image_pixels', screen_origin=window[:2],
                     step=number,instruction=sentence,expires_seconds=TTL,input_dispatched=False,
                     **({'gesture':'double-click','host_action':'bind_demonstrated_double_click',
                         'bind_args':['bind-visual','--task',doc['name'],'--only',str(number),'--frame',token,
@@ -339,15 +346,11 @@ def run(app, args):
     frame,pixels = _pixels(data)
     try:
         spec = visual_target.from_frame(frame,pixels,tuple(args.point))
-        if double:
-            spec['gesture'] = 'double-click'
-        check()
-        visual_target.observe(binding,spec)
     except visual_target.bridge.BridgeError as error:
         if double and error.code in ('visual_target_ambiguous','visual_target_lacks_detail','visual_target_too_common'):
             return dict(status='needs_grounding', diagnostic=error.code, input_dispatched=False,
                         host_action='choose_distinct_point_in_same_target', gesture='double-click', step=number,
-                        instruction=sentence, frame=args.frame, image=str(path),
+                        instruction=sentence, frame=args.frame, image=str(path), coordinates='image_pixels',
                         bind_args=['bind-visual','--task',doc['name'],'--only',str(number),'--frame',args.frame,
                                    '--point','<x>','<y>','--save-as',args.save_as])
         if error.code != 'visual_target_ambiguous' or not _row_candidate(plan,number):
@@ -357,6 +360,22 @@ def run(app, args):
                         dict(number=number, expected_windows=children, instruction=sentence, frame=args.frame,
                              image=str(path),row_binding_command='bind-row',
                              ground_args=['ground','--task',plan['name'],'--only',str(number)])])
+    if double:
+        spec['gesture'] = 'double-click'
+    check()
+    try:
+        observed = visual_target.observe(binding,spec)
+    except visual_target.bridge.BridgeError as error:
+        if error.code in ('visual_target_not_found','visual_target_ambiguous','visual_target_too_common',
+                          'visual_window_moved','row_window_moved'):
+            return _changed_frame(doc['name'], number)
+        raise
+    window, screen_point = observed['window'], observed['point']
+    image_point = [screen_point[0] - window[0], screen_point[1] - window[1]]
+    # A translation preserves the reviewed position inside the window. A changed layout
+    # could put an identical patch in a different row between choosing and binding.
+    if window[2:] != frame[2:] or image_point != list(args.point):
+        return _changed_frame(doc['name'], number)
     check()
     step = dict(action='visual-click',label=sentence,visual=spec,**tasks._annotations(step))
     plan['steps'][number-1] = step
@@ -368,8 +387,9 @@ def run(app, args):
         pass  # A previewer can keep the PNG open until the next expiry sweep.
     test = {'gesture':'double-click', 'test_step_args':['replay','--task',plan['name'],'--only',str(number),
                                                         '--exe',plan['exe'],'--window',plan['window']]} if double else {}
+    position = dict(image_point=image_point, screen_point=screen_point)
     if draft_receipt is not None:
-        return dict(draft_receipt, bound_step=number, **test)
+        return dict(draft_receipt, bound_step=number, **position, **test)
     return dict(status='recorded',task=plan['name'],step=number,input_dispatched=False,
-                **test,
+                **position, **test,
                 execution_plan=app.execution_plan_info(app.saved_execution_plan(plan)))

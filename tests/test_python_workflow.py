@@ -374,7 +374,7 @@ class RuntimeTests(unittest.TestCase):
                      dict(action='double-click-result', result_row='single', selector=selector, label='Open current row')])
         self.uia.same.side_effect = lambda a, b: a is b
         sent = dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched',
-                    input_dispatched=True, physical_input=True)
+                    input_dispatched=True, physical_input=True, screen_point=[531,311])
         with (patch.object(flow, 'result_surface', return_value=self.element),
               patch.object(result_cell, 'find_row', return_value=self.element) as read,
               patch.object(result_cell, 'execute_row', return_value=sent) as click,
@@ -386,10 +386,99 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed_unverified', result)
         self.assertFalse(result['steps'][-1]['receipt']['value_comparison'])
         self.assertEqual(result['steps'][-1]['receipt']['query_freshness'], 'not_asserted')
+        self.assertEqual(flow.summarize_execution(result, list(enumerate(data['steps'], 1)))['steps'][-1]['screen_point'],
+                         [531, 311])
         self.assertEqual(read.call_args.kwargs['mode'], 'single')
         self.assertEqual(click.call_args.kwargs['mode'], 'single')
         invoke.assert_called_once()
         self.assertEqual([n for n, _ in flow.selected_steps(data, 2)], [2])
+
+    def test_painted_table_resize_after_readonly_probe_retains_repair_scope_without_dispatch(self):
+        import result_cell
+        point = dict(x=14, y=9, width=100, height=75)
+        selector = dict(role='group', automation_id='Result')
+        row = dict(action='double-click-result', selector=selector, result_row='recorded', result_point=point)
+        change = result_cell.RecordedSurfaceResized(point, dict(width=130, height=70))
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'position_in_body', return_value=(108, 90)),
+              patch.object(result_cell, 'execute_row', side_effect=change)):
+            report = flow.run(dict(recipe(), steps=[row]))
+        receipt = report['steps'][0]['receipt']
+        self.assertEqual((report['status'], receipt['diagnostic'], receipt['input_dispatched']),
+                         ('blocked', 'recorded_result_surface_resized', False))
+        self.assertEqual(receipt['result_surface_selector'], selector)
+        self.assertEqual(receipt['result_window']['hwnd'], self.binding.hwnd)
+        self.assertEqual(receipt['result_observation']['current_table_size'], [130, 70])
+        self.assertNotIn('screen_point', receipt)
+
+    def test_only_physical_result_replay_restores_before_checking_the_recorded_point(self):
+        import result_cell
+        import window_placement
+        placement = dict(rect=[358, 80, 800, 600], normal_rect=[358, 80, 1158, 680],
+                         monitor=r'\\.\DISPLAY1', dpi=96, maximized=False)
+        point = dict(x=10, y=4, width=100, height=50, window_placement=placement)
+        header = dict(action='double-click-result', selector=dict(role='table', automation_id='Results'),
+                      result_row='header', result_column='Code', result_point=point)
+        data = dict(recipe(), steps=[header])
+        events = []
+
+        def restore(binding, spec, guard):
+            self.assertIs(binding, self.binding)
+            self.assertEqual(spec, placement)
+            guard()
+            events.append('restore')
+            return True
+
+        def click(*args, **kwargs):
+            events.append('click')
+            return dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched', input_dispatched=True)
+
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(window_placement, 'restore', side_effect=restore) as arrange,
+              patch.object(result_cell, 'position_in_header', side_effect=lambda *a: events.append('inspect')),
+              patch.object(result_cell, 'execute_row', side_effect=click)):
+            preview = flow.run(data, read_only=True)
+            self.assertEqual(preview['status'], 'observed', preview)
+            self.assertEqual(events, ['inspect'])
+            background = flow.run(data, background_only=True)
+            self.assertFalse(background['input_dispatched'])
+            arrange.assert_not_called()
+            events.clear()
+            live = flow.run(data)
+            self.assertEqual(events, ['restore', 'inspect', 'click'])
+            summary = flow.summarize_execution(live, [(1, header)])
+            self.assertTrue(summary['steps'][0]['recorded_placement_restored'])
+            events.clear()
+            arrange.side_effect = flow.app.bridge.BridgeError('recorded_window_placement_unavailable')
+            failed = flow.run(data)
+            self.assertEqual((failed['status'], failed['diagnostic'], failed['input_dispatched']),
+                             ('blocked', 'recorded_window_placement_unavailable', False))
+            self.assertEqual(events, [])
+
+    def test_reviewed_point_at_dispatch_uses_live_origin_and_blocks_resize_before_input(self):
+        from test_visual_target import image
+        import visual_target
+        snapshot = [358, 80, 170, 120]
+        marker = visual_target.from_frame([0, 0, 170, 120], image((35, 42)), (35, 42))
+        data = dict(recipe(), steps=[dict(action='visual-click', label='Open row',
+                                         visual=dict(marker, gesture='double-click'))])
+        owner = dict(hwnd=self.binding.hwnd, pid=self.binding.pid, process_started_utc_ticks=self.binding.created,
+                     exe_name=data['exe'], title=data['window'])
+        review = dict(owner=owner, point=[35, 42], window_rect=snapshot,
+                      table_box=dict(x=368, y=90, width=120, height=100))
+        with (patch.object(flow.row_vision, '_window_rect', return_value=[-600, 54, 170, 120]) as rect,
+              patch.object(visual_target, 'execute', return_value=dict(status='delivered_unverified',
+                           diagnostic='visual_double_click_dispatched', input_dispatched=True)) as click):
+            result = flow.run(data, hwnd=owner['hwnd'], result_confirmation=review)
+            self.assertTrue(result['input_dispatched'], result)
+            self.assertEqual(click.call_args.kwargs['reviewed_point'], [-565, 96])
+            self.assertTrue(callable(click.call_args.kwargs['before_input']))
+            click.reset_mock()
+            rect.return_value = [-600, 54, 180, 120]
+            result = flow.run(data, hwnd=owner['hwnd'], result_confirmation=review)
+            self.assertEqual((result['status'], result['diagnostic'], result['input_dispatched']),
+                             ('blocked', 'result_frame_changed', False))
+            click.assert_not_called()
 
     def test_row_only_opaque_surface_has_one_scoped_handoff_and_no_retry(self):
         import result_cell

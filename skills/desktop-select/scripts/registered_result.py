@@ -123,7 +123,7 @@ class ResultReview:
         receipt = rows[-1]['receipt']
         step = self.recipe['steps'][number - 1]
         row_policy = step.get('result_row')
-        image_errors = {'result_row_unavailable'} if row_policy else flow.RESULT_IMAGE_ERRORS
+        image_errors = result_trial.ROW_REVIEW_ERRORS if row_policy else flow.RESULT_IMAGE_ERRORS
         if (not receipt.get('result_window') or receipt['input_dispatched'] is not False
                 or receipt.get('diagnostic') not in image_errors):
             return None
@@ -228,6 +228,7 @@ class ResultReview:
                     rect, png = grounding._capture(flow.app, binding, guard, group_boxes=group_boxes)
                     geometry['capture_rect'] = list(rect)
                     if group_boxes is None:
+                        repair.need(uia.bounds(table) == recorded_box, 'result_table_changed')
                         geometry['table_absolute'] = recorded_box
                         geometry['table_relative'] = [recorded_box['x'] - rect[0], recorded_box['y'] - rect[1],
                                                       recorded_box['width'], recorded_box['height']]
@@ -257,40 +258,43 @@ class ResultReview:
                 repair.need(0 <= left < right < rect[2] and left <= x <= right
                             and 0 <= head_y < y < rect[3], 'result_point_outside_column')
             repair.need(time.time() < record['expires'], 'result_review_expired')
-            head = None if row_policy else (rect[0] + (right + left)//2, rect[1] + head_y)
-            point = (rect[0]+x, rect[1]+y)
             # Reviewing the snapshot never reserves desktop input. Only this
             # explicitly confirmed physical continuation needs the target exposed.
             with flow.coordination.desktop_input():
                 guard()
                 flow.row_action.foreground(binding)
                 now, current = grounding._capture(flow.app, binding, guard)
-                repair.need(now == rect, 'result_frame_changed')
+                repair.need(now[2:] == rect[2:], 'result_frame_changed')
+                head = None if row_policy else (now[0] + (right + left)//2, now[1] + head_y)
+                point = (now[0]+x, now[1]+y)
                 with flow.app.bridge.UIA() as uia:
                     if table_box is None:
                         selector, box = result_cell.bound_group(binding, uia, head, point)
                         key_type = 'automation_id' if 'automation_id' in selector else 'name'
-                        repair.need(group_boxes.get((key_type, selector[key_type])) == box, 'result_table_changed')
+                        recorded_box = group_boxes.get((key_type, selector[key_type]))
                     else:
                         table, current_selector = flow._result_target(binding, uia, original_selector, hint,
                                                                      column=step.get('result_column'))
                         repair.need(current_selector == selector, 'result_table_changed')
                         box = uia.bounds(table)
-                        repair.need(box == recorded_box, 'result_table_changed')
-                        if not row_policy:
-                            self._check_header(flow, binding, uia, table, step['result_column'], head, point)
-                    repair.need(result_trial.same_table_pixels(png, current, rect, box), 'result_frame_changed')
+                    result_trial.check_table_layout(recorded_box, rect, box, now)
+                    if table_box is not None and not row_policy:
+                        self._check_header(flow, binding, uia, table, step['result_column'], head, point)
+                    repair.need(result_trial.same_table_pixels(png, current, now, box), 'result_frame_changed')
                     if row_policy:
                         repair.need(box['x'] <= point[0] < box['x']+box['width']
                                     and box['y'] <= point[1] < box['y']+box['height'], 'result_point_outside_table')
                     else:
-                        repair.need(box['x'] <= rect[0]+left < rect[0]+right < box['x']+box['width']
+                        repair.need(box['x'] <= now[0]+left < now[0]+right < box['x']+box['width']
                                     and box['y'] <= head[1] < point[1] < box['y']+box['height'], 'result_point_outside_table')
-                    flow.check_result_point(binding, uia, selector, point, reviewed_frame=rect)
+                    flow.check_result_point(binding, uia, selector, point, reviewed_frame=now)
+                    if row_policy == 'recorded':
+                        import window_placement
+                        placement = window_placement.capture(binding.hwnd, expected_rect=now)
             suffix = result_trial.visual_suffix(self.recipe, number, png, [x, y], reviewed=True)
             repair.need(flow.load(recipe_path) == self.recipe, 'workflow_changed_during_repair')
             confirmation = dict(owner=owner, frame=frame, receipt=key, point=[x,y], selector=selector,
-                                window_rect=rect, table_box=box)
+                                window_rect=now, table_box=box)
             if original_selector != selector:
                 confirmation['original_selector'] = original_selector
             self._write(self.pending, dict(record, claimed=True))
@@ -302,7 +306,8 @@ class ResultReview:
                     and result.get('status') in ('verified', 'completed_unverified')):
                 try:
                     revised = deepcopy(self.recipe)
-                    revised['steps'][number-1].update(selector=selector, result_point=result_cell.body_point(box, point))
+                    revised['steps'][number-1].update(selector=selector, result_point=result_cell.body_point(
+                        box, point, placement=placement))
                     flow.validate(revised)
                     repair.replace_workflow(recipe_path, self.recipe, revised, flow.load)
                     tested_recipe = revised
@@ -336,7 +341,7 @@ class ResultReview:
                 self._write(self.pending, dict(record, claimed=True))
                 result = flow.run(suffix, hwnd=owner['hwnd'], result_owner=owner)
                 return self._finish(result, record, recipe_path, number-1, 'accessibility_row', None)
-            if probe.get('diagnostic') != 'result_row_unavailable':
+            if probe.get('diagnostic') not in result_trial.ROW_REVIEW_ERRORS:
                 reply = self.feedback(record, probe['diagnostic'])
                 reply.update(host_action='report_current_result', result_observation=probe.get('result_observation'))
                 return reply

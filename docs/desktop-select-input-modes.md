@@ -1,18 +1,18 @@
 # Desktop Select 입력 방식과 원본 기능 검토
 
-입력 방식 안내를 2026-11-15에 갱신했다. 이 문서는 원본의 기능과 Desktop Select의 입력 정책을 설명한다. 과거 버전의 시험 결과를 새 기능의 검증 결과로 사용하지 않으며, 실제 회사 FX/FarPoint에서의 동작과 동시 사용 가능 여부는 별도 확인이 필요하다.
+이 문서는 원본의 기능과 Desktop Select 0.4.29의 입력 정책을 설명한다. 실제 회사 FX/FarPoint에서의 동작과 동시 사용 가능 여부는 해당 환경에서 확인해야 한다.
 
 ## 적용하는 입력 정책
 
-일반 콤보 선택, 입력란 값 설정과 버튼/메뉴 호출은 현재 대상이 제공하는 UIA 기능을 사용한다. 표 우클릭과 행 버튼(일반 녹화와 자연어 행 실행 포함)에는 실제 마우스를 사용하고, `submit`은 실제 키보드로 Enter를 보낸다. `anchor`로 지정한 위치 기반 대상은 현재 대상의 소속과 위치를 확인하기 위해 창을 앞으로 가져온다. 옵션을 생략한 기본 실행은 이 기존 동작을 유지한다.
+일반 콤보 선택, 입력란 값 설정과 버튼/메뉴 호출은 현재 대상이 제공하는 UIA 기능을 사용한다. `anchor`로 지정한 입력란도 현재 창의 상위 요소와 상대 위치로 식별한다. 이 단계들은 다른 창 뒤에서 실행할 수 있고, 대상 창이 최소화된 경우에는 멈춘다. 표 우클릭과 행 버튼에는 실제 마우스를 사용하고, `submit`은 실제 키보드로 Enter를 보낸다.
 
 `--input-plan`은 저장된 동작에서 각 단계가 요구하는 입력 방식을 분류하는 읽기 전용 확인이다. `desktop_select.py replay`와 등록된 Python 업무 스킬의 `scripts/run.py`에서 사용한다. 필수 변수값이나 실행 중인 업무 앱 없이 확인할 수 있으며, 창을 관찰하거나 복원하거나 입력하지 않는다. 저장된 실행 동작의 분류이며 실제 대상의 존재, UIA 지원 여부 또는 업무 결과를 검증하지 않는다. 녹화에서 실행안을 저장하는 `plan --task`나 현재 창을 관찰하는 Python `--read-only`와 구분한다.
 
 `row-launch --ordinal N --preview`는 현재 보이는 목록에서 N번째 행의 실행 버튼을 찾고 입력 없이 돌려준다. 실제 행 실행은 창을 앞으로 가져와 사용자 마우스를 움직인다.
 
-`--background-only`는 `select`, `fill`, `open`, `row-launch`, `replay`와 등록된 Python 실행에서 도구의 물리 입력, 창 전면화와 최소화 복원을 금지한다. 요청한 전체 단계에 우클릭, Enter 제출, 위치 기반 대상 또는 행 버튼이 포함되면 첫 입력 전에 전체 요청을 차단한다. 허용되는 앞부분만 실행하지 않는다. `--only`로 한 단계만 요청하면 그 선택 범위를 평가한다. 최소화되었거나 지원되는 UIA 경로가 없는 대상에서는 중지하고 이유를 보고한다.
+`--background-only`는 `select`, `fill`, `open`, `row-launch`, `replay`와 등록된 Python 실행에서 도구의 물리 입력, 창 전면화와 최소화 복원을 금지한다. 요청한 단계에 우클릭, Enter 제출 또는 행 버튼처럼 실제 입력이 필요한 동작이 포함되면 첫 입력 전에 전체 요청을 차단한다. `--only`로 한 단계만 요청하면 그 선택 범위를 평가한다. 최소화되었거나 지원되는 UIA 경로가 없는 대상에서는 중지하고 이유를 보고한다.
 
-UIA 호출만으로 포커스 보존이 보장되지는 않는다. Microsoft 문서에 따르면 `Invoke`와 `SetValue` 등은 기본적으로 동작 전에 대상에 포커스를 줄 수 있다. 제한 모드는 `IUIAutomation2`의 `AutoSetFocus=False`를 실제 조작에 쓰는 UIA 클라이언트에 설정하고, 같은 클라이언트에서 설정값을 다시 읽어 확인한 뒤 조작하도록 한다. 다른 클라이언트에 설정한 결과를 현재 클라이언트의 근거로 사용하지 않는다. 옵션을 생략한 실행에서는 기존 UIA 자동 포커스 설정을 유지한다. 이는 구현 정책 설명이며 이 문서만으로 실제 앱의 포커스 보존 시험을 통과했다고 판단하지 않는다. [Microsoft AutoSetFocus 문서](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomation2-get_autosetfocus)
+기본 실행은 UIA 세션을 열 때 자동 포커스를 끄고 설정값을 확인한다. 이를 지원하지 않는 환경에서는 해당 호출이 다른 물리 입력과 겹치지 않도록 차례를 기다린다. `--background-only`에서는 실제 조작에 쓰는 클라이언트에서 `AutoSetFocus=False`가 확인되어야 진행한다. [Microsoft AutoSetFocus 문서](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomation2-get_autosetfocus)
 
 이 옵션은 앱 내부 동작을 격리하지 않는다. UIA 버튼 호출에 반응해 앱이 스스로 대화상자를 열거나 포커스를 바꾸는 것까지 막지 않으며, 업무 결과 확인이나 이미 전달된 입력의 재실행 방지 규칙도 유지한다. 입력 계획을 보여 주거나 background-only로 차단한 결과를 업무 실행 성공으로 보고하지 않는다.
 

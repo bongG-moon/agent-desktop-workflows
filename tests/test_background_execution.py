@@ -123,15 +123,40 @@ class BackgroundRuntimeTests(unittest.TestCase):
         app.visibility.restore_for_action.assert_not_called()
         flow.live.execute.assert_not_called()
 
-    def test_default_policy_prefers_background_and_preserves_restore(self):
+    def test_default_accessibility_action_skips_both_window_restoration_paths(self):
         fixture = self.fixture()
-        result = flow.run(context_fixture.recipe(field()))
+        with patch('window_placement.restore') as place:
+            result = flow.run(context_fixture.recipe(field()))
+        place.assert_not_called()
         self.assertEqual('auto', result['input_policy'])
         self.assertEqual('verified', result['status'])
         self.assertTrue(result['input_dispatched'])
-        self.assertEqual(['restore', ('fill', 100, 'value')], fixture.events)
-        app.visibility.restore_for_action.assert_called_once_with(fixture.owner, 'Example window')
+        self.assertEqual([('fill', 100, 'value')], fixture.events)
+        self.assertFalse(result['window_restored'])
+        app.visibility.restore_for_action.assert_not_called()
         flow.input_policy.configure_uia.assert_called_once_with(fixture.uia)
+
+    def test_minimizing_before_or_between_element_steps_does_not_restore_or_repeat_input(self):
+        fixture = self.fixture()
+        data = context_fixture.recipe(field(), dict(action='invoke', selector=dict(role='button', name='View')))
+        with patch.object(app.bridge.user32, 'IsIconic', return_value=True) as minimized:
+            stopped = flow.run(data)
+            self.assertEqual(stopped['diagnostic'], 'target_window_minimized')
+            self.assertFalse(stopped['input_dispatched'])
+            self.assertEqual(fixture.events, [])
+            minimized.return_value = False
+            def execute(*args, **kwargs):
+                result = fixture.execute(*args, **kwargs)
+                minimized.return_value = True
+                return result
+            flow.live.execute.side_effect = execute
+            stopped = flow.run(data)
+        self.assertEqual(stopped['diagnostic'], 'target_window_minimized')
+        self.assertEqual(stopped['stopped_at'], 2)
+        self.assertIs(stopped['steps'][1]['receipt']['input_dispatched'], False)
+        self.assertIs(stopped['input_dispatched'], True)
+        self.assertEqual(fixture.events, [('fill', 100, 'value')])
+        app.visibility.restore_for_action.assert_not_called()
 
     def test_auto_context_menu_propagates_physical_mechanism_to_workflow(self):
         fixture = self.fixture()
@@ -151,6 +176,7 @@ class BackgroundRuntimeTests(unittest.TestCase):
         self.assertEqual('completed_unverified', result['status'])
         self.assertEqual('disable-autofocus', fixture.events[0])
         self.assertIn(('fill', 100, 'value'), fixture.events)
+        self.assertEqual(fixture.events, ['disable-autofocus', ('fill', 100, 'value'), 'restore', 'menu'])
         flow.input_policy.configure_uia.assert_called_once_with(fixture.uia)
         flow.context_menu.execute.assert_called_once()
 
@@ -178,7 +204,8 @@ class BackgroundRuntimeTests(unittest.TestCase):
         flow.input_policy.configure_uia.side_effect = app.bridge.BridgeError('background_autofocus_unavailable')
         result = flow.run(context_fixture.recipe(field()))
         self.assertEqual('verified', result['status'])
-        self.assertEqual(['restore', ('fill', 100, 'value')], fixture.events)
+        self.assertEqual([('fill', 100, 'value')], fixture.events)
+        app.visibility.restore_for_action.assert_not_called()
         self.assertTrue(result['input_dispatched'])
 
     def test_direct_command_background_policy_refuses_minimized_before_observing(self):

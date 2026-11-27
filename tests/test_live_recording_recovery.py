@@ -177,15 +177,15 @@ class LiveRecordingRecoveryTests(unittest.TestCase):
         with patch.object(app.visibility, 'restore_for_action', return_value=True) as restore:
             result = recovery.run(app, self.args(prepare=True))
             self.assertEqual(result['diagnostic'], 'target_window_minimized')
-            self.assertEqual(result['host_action'], 'retry_same_recovery_with_restore_window')
-            self.assertEqual(result['retry_args'], ['recover', '--task', '내 녹화', '--restore-window', '--prepare'])
+            self.assertEqual(result['host_action'], 'show_recorded_window_then_retry')
+            self.assertEqual(result['retry_args'], ['recover', '--task', '내 녹화', '--prepare'])
             self.assertLess(list(result).index('diagnostic'), list(result).index('steps'))
             self.assertFalse(result['input_dispatched'])
             self.observe.assert_not_called()
             self.observable.assert_called_once_with(self.owner)
             fingerprint = recovery._fingerprint(tasks.read_document(self.args().task, self.directory))
             result = self.bind(fingerprint, self.patches())
-            self.assertEqual(result['retry_args'], ['recover', '--task', '내 녹화', '--restore-window',
+            self.assertEqual(result['retry_args'], ['recover', '--task', '내 녹화',
                                                     '--bindings', str(self.inputs), '--save-as', '실행용'])
             self.observe.assert_not_called()
             restore.assert_not_called()

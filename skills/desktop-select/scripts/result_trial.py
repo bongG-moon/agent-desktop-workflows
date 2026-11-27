@@ -11,6 +11,9 @@ import learned_tasks as tasks
 import recovery
 
 
+ROW_REVIEW_ERRORS = {'result_row_unavailable', 'recorded_result_surface_resized'}
+
+
 def continuation(recipe, start_number, *, confirmed_initial_value=False):
     """Keep original later operations and remap only their in-suffix dependencies.
 
@@ -100,6 +103,15 @@ def visible_table_box(rect, box):
     if left >= right or top >= bottom:
         raise tasks.TaskError('result_table_outside_frame')
     return dict(x=left, y=top, width=right-left, height=bottom-top)
+
+
+def check_table_layout(recorded, original_window, current, window):
+    """A reviewed image point follows a window translation only with the same table layout."""
+    if original_window[2:] != window[2:]:
+        raise tasks.TaskError('result_frame_changed')
+    if recorded is None or current != dict(recorded, x=recorded['x'] + window[0] - original_window[0],
+                                           y=recorded['y'] + window[1] - original_window[1]):
+        raise tasks.TaskError('result_table_changed')
 
 
 def same_table_pixels(first, second, rect, box):
@@ -203,7 +215,8 @@ def _save_recorded_point(app, envelope, number, geometry, screen_point, response
     original = corrected['steps'][source_number - 1]
     step = recipe['steps'][number - 1]
     target = dict(action='double-click-result', label=step['label'], result_row='recorded',
-                  selector=deepcopy(geometry['selector']), result_point=result_cell.body_point(geometry['table_box'], screen_point))
+                  selector=deepcopy(geometry['selector']), result_point=result_cell.body_point(
+                      geometry['table_box'], screen_point, placement=geometry.get('window_placement')))
     for field in ('window_context', 'alias', 'description'):
         if field in original:
             target[field] = deepcopy(original[field])
@@ -270,7 +283,8 @@ def resume(app, args):
         confirmation = dict(owner=inspection['window'], frame=args.frame, receipt=receipt_id, point=args.point,
                             selector=deepcopy(recipe['steps'][offset-1]['selector']))
         if row_mode:
-            confirmation.update({k: deepcopy(v) for k,v in inspection['frame_geometry'].items() if k != 'frame'})
+            geometry = inspection['frame_geometry']
+            confirmation.update({k: deepcopy(geometry[k]) for k in ('selector', 'table_box', 'window_rect')})
             offset -= 1
 
         def dispatch():

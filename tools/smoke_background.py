@@ -27,6 +27,8 @@ def exercise(source, work, *, candidate_cases=True):
     user.GetForegroundWindow.restype = W.HWND
     user.GetCursorPos.argtypes = [C.POINTER(W.POINT)]
     user.IsIconic.argtypes = [W.HWND]
+    user.GetWindowRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
+    user.SetWindowPos.argtypes = [W.HWND, W.HWND, C.c_int, C.c_int, C.c_int, C.c_int, W.UINT]
     checks, results = [], []
 
     def check(name, ok):
@@ -37,7 +39,10 @@ def exercise(source, work, *, candidate_cases=True):
     def state():
         point = W.POINT()
         assert user.GetCursorPos(C.byref(point))
-        return (int(user.GetForegroundWindow() or 0), point.x, point.y)
+        rect = W.RECT()
+        assert user.GetWindowRect(target.ready['hwnd'], C.byref(rect))
+        return (int(user.GetForegroundWindow() or 0), point.x, point.y,
+                (rect.left, rect.top, rect.right, rect.bottom))
 
     def call(name, script, *arguments, physical=False):
         # Setup is outside the measured product invocation. UIA/provider calls
@@ -73,7 +78,8 @@ def exercise(source, work, *, candidate_cases=True):
             result['process_overhead_seconds'] = round(result['seconds'] - result['engine_seconds'], 4)
         results.append(result)
         check(name + '_cursor_unchanged',
-              before[0] == front.ready['hwnd'] and all(s[1:] == before[1:] for s in samples + [after]))
+              before[0] == front.ready['hwnd'] and all(s[1:3] == before[1:3] for s in samples + [after]))
+        check(name + '_target_placement_unchanged', all(s[3] == before[3] for s in samples + [after]))
         if not physical:
             check(name + '_foreground_unchanged', not result['foreground_changed'])
         return result
@@ -95,6 +101,11 @@ def exercise(source, work, *, candidate_cases=True):
         foreground(app.bridge.Binding(dict(pid=front.ready['pid'], hwnd=front.ready['hwnd'], exe_name=exe.name)))
         time.sleep(.3)
         check('foreground_fixture_precondition', state()[0] == front.ready['hwnd'])
+        left, top, right, bottom = state()[3]
+        # Move and resize just the test window, leaving the second fixture in front.
+        assert user.SetWindowPos(target.ready['hwnd'], None, left+18, top+12, right-left+10, bottom-top+10,
+                                 0x0004 | 0x0010)  # SWP_NOZORDER | SWP_NOACTIVATE
+        check('target_moved_and_resized', state()[3] == (left+18, top+12, right+28, bottom+22))
         bind = ['--exe', exe.name, '--window', target.ready['title'], '--hwnd', str(target.ready['hwnd'])]
         cli = installed / 'scripts/desktop_select.py'
         flow = installed / 'scripts/python_workflow.py'
@@ -112,6 +123,13 @@ def exercise(source, work, *, candidate_cases=True):
                  '--value', 'CURRENT-73')
         check('default_direct_fill_verified_once', r['receipt']['status'] == 'verified'
               and r['state']['text_writes'] == 1 and r['state']['text_value'] == 'CURRENT-73')
+        if candidate_cases:
+            read_path = work / 'field-read.json'
+            write_json(read_path, dict(schema=1, name='Read current field', exe=exe.name, window=target.ready['title'],
+                                       steps=[dict(action='read-value', selector=dict(role='textfield', automation_id='searchText'))]))
+            r = call('default_field_read', flow, 'run', '--recipe', str(read_path), '--hwnd', str(target.ready['hwnd']))
+            check('default_field_read_observed_current_value', r['receipt']['steps'][0]['receipt']['value'] == 'CURRENT-73'
+                  and not r['receipt']['input_dispatched'])
         r = call('default_direct_invoke', cli, 'open', *bind, '--target', 'QueryCommand', '--role', 'button')
         check('default_direct_invoke_delivered_once', r['receipt']['input_dispatched'] is True
               and r['state']['opens'] == 1 and r['state']['result_entry'] == 'CURRENT-73')
@@ -185,6 +203,14 @@ def exercise(source, work, *, candidate_cases=True):
         check('minimized_not_restored_no_input', r['receipt']['diagnostic'] == 'background_window_minimized'
               and not r['receipt']['input_dispatched'] and user.IsIconic(target.ready['hwnd'])
               and r['state']['controls']['conditionState']['writes'] == 0)
+        if candidate_cases:
+            for name, script, args in (
+                    ('minimized_default_direct', cli, ('select', *bind, '--target', 'MES Setup', '--value', 'N')),
+                    ('minimized_default_registered', runner, ('--hwnd', str(target.ready['hwnd']), '--set', 'Family=Hybrid'))):
+                r = call(name, script, *args)
+                check(name + '_stops_without_restore', r['receipt']['diagnostic'] == 'target_window_minimized'
+                      and not r['receipt']['input_dispatched'] and user.IsIconic(target.ready['hwnd'])
+                      and r['state']['opens'] == 0 and r['state']['controls']['conditionState']['writes'] == 0)
     finally:
         if front:
             front.close()
