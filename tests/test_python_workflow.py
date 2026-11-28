@@ -575,6 +575,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(current['input_dispatched'])
         locate.assert_called_once()
 
+    def test_coordinate_input_guard_reaches_trial_and_registered_summaries(self):
+        import first_trial
+        import result_cell
+        step = dict(action='double-click-result', result_row='coordinate', selector=dict(role='group', automation_id='Grid'),
+                    result_point=dict(x=20, y=33, width=350, height=240))
+        self.element.property.side_effect = lambda key: 50033 if key == 30003 else None
+        def stopped(*args, **kwargs):
+            flow.app.bridge.check_input_snapshot('before_result_double_click', 401, 402, 99, 100, foreground_ok=False)
+        with (patch.object(flow, 'result_surface', return_value=self.element),
+              patch.object(result_cell, 'position_at_coordinate', return_value=(100, 250)),
+              patch.object(result_cell, 'execute_row', side_effect=stopped) as attempt):
+            report = flow.run(dict(recipe(), steps=[step]))
+        attempt.assert_called_once()
+        compact = flow.workflow_repair.compact_stop(dict(report, host_action='inspect_current_state_without_replaying'))
+        for receipt in (report, first_trial.host_summary(report), flow.summarize_execution(report, [(1, step)]), compact):
+            self.assertEqual((receipt['diagnostic'], receipt['input_dispatched']), ('foreground_or_input_changed', False))
+            self.assertEqual(receipt['input_guard']['signals'], ['foreground_changed', 'input_tick_changed'])
+            self.assertEqual(receipt['steps'][0].get('receipt', receipt['steps'][0])['input_guard'], receipt['input_guard'])
+
     def test_explicit_header_uses_verified_selector_and_point_in_readonly_and_replay(self):
         import result_cell
         selector = dict(role='table', automation_id='Results')

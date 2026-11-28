@@ -169,6 +169,19 @@ class RegisteredResultTests(unittest.TestCase):
         self.capture.assert_not_called()
         self.choose.assert_not_called()
 
+    def test_selected_step_input_plan_accepts_known_prefix_values_and_reports_only_its_parameters(self):
+        code, plan = self.call('--input-plan', '--only', '4', '--set', 'Part=D27')
+        self.assertEqual(code, 0, plan)
+        self.assertEqual(plan['required_parameters'], [])
+        self.assertEqual(plan['result_modes'], [])
+        pair = self.call('--input-plan', '--only', '3')[1]
+        self.assertEqual(pair['result_modes'], [dict(number=3, mode='value')])
+        self.assertEqual(pair['missing_parameters'], ['Part'])
+        self.assertEqual(self.call('--input-plan')[1]['missing_parameters'], ['Part'])
+        code, report = self.call('--input-plan', '--only', '4', '--set', 'Typo=D27')
+        self.assertEqual((code, report['diagnostic']), (2, 'unknown_parameter'))
+        self.run.assert_not_called()
+
     def test_concurrent_requests_for_same_values_execute_one_full_run(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Event
@@ -316,6 +329,7 @@ class RegisteredResultTests(unittest.TestCase):
                 self.assertEqual(report['result_match_source'], 'local_row_confirmation')
                 self.assertFalse(report['prior_steps_replayed'])
                 self.assertEqual(self.choose.call_args.kwargs['row_policy'], mode)
+                self.assertEqual(self.choose.call_args.kwargs['step_number'], 2)
                 self.assertIsNone(self.choose.call_args.kwargs['expected'])
                 self.assertEqual([s['action'] for s in self.run.call_args.args[0]['steps']],
                                  ['visual-click','read-value','invoke'])

@@ -66,7 +66,7 @@ def drive_review(root, config):
         descendants.extend(widget.winfo_children())
     canvas, = [widget for widget in descendants if isinstance(widget, tk.Canvas)]
     confirm, = [widget for widget in descendants if isinstance(widget, ttk.Button)
-                and widget.cget('text') == '이 행부터 이어서 실행']
+                and widget.winfo_name() == 'confirm']
     pixels = canvas.itemcget(canvas.find_all()[0], 'image')
     dimensions = [int(root.tk.call('image', axis, pixels)) for axis in ('width', 'height')]
     origin = layout.get('visibleOrigin', layout['groupOrigin'])

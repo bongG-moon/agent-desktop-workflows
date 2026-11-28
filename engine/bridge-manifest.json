@@ -2,7 +2,7 @@
   "version": "0.1.6",
   "files": {
     "scripts/py_helper.py": "b15842a9d52360e3ce50c04c6810b28717e57869bb9ff2922df11633d708a28e",
-    "scripts/win_bridge.py": "92282bd2fc18999fe096f4f32b1446f199c8efff859e6487500e3c04359c5c5d",
+    "scripts/win_bridge.py": "bc202834e0a59bf38e7f6ee5f745f0b56aeb9b6ed5586ced07b2511d922f51c6",
     "scripts/recorder.py": "30d66b0fef694cc5cce2f4a721dbcffd21b2774b9091fbe4d108e467fb10ce0a"
   }
 }

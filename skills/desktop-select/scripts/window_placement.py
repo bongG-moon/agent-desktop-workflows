@@ -131,7 +131,7 @@ def restore(binding, spec, guard):
 
         def check():
             binding.check()
-            bridge.check_foreground_input(original, tick, hwnd)
+            bridge.check_foreground_input(original, tick, hwnd, phase='window_placement')
 
         def place(maximize, ready):
             check()

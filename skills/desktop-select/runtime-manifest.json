@@ -2,7 +2,7 @@
   "schema": 1,
   "version": "0.4.29",
   "files": {
-    "win_bridge.py": "92282bd2fc18999fe096f4f32b1446f199c8efff859e6487500e3c04359c5c5d",
+    "win_bridge.py": "bc202834e0a59bf38e7f6ee5f745f0b56aeb9b6ed5586ced07b2511d922f51c6",
     "recorder.py": "30d66b0fef694cc5cce2f4a721dbcffd21b2774b9091fbe4d108e467fb10ce0a"
   }
 }

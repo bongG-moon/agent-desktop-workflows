@@ -41,6 +41,9 @@ class HostGroundingTests(TestCase):
             rows = [dict(step=teach_capture.manual(reason, key), form=dict(alias='',text=text,mode=None,argument=''))
                     for reason,key,text in [('double_click_needs_review','cell',sentence),
                                             ('drag_needs_review','drag','팝업에서 COMMENT를 읽어줘')]]
+            surface = dict(role='group', automation_id='grid')
+            point = dict(x=15, y=16, width=160, height=120, dpi=144)
+            rows[0]['step'].update(result_surface=surface, result_point=point)
             source.save_draft(rows,'invalid_step_instruction',1)
             source_bytes = (folder/'demo.json').read_bytes()
             binding = SimpleNamespace(hwnd=5,pid=42,created='100')
@@ -85,6 +88,14 @@ class HostGroundingTests(TestCase):
             self.assertEqual((saved['steps'][0]['label'],saved['steps'][0]['visual']['gesture']), (sentence,'double-click'))
             self.assertEqual(saved['steps'][1]['action'],'manual')
             self.assertEqual(receipt['test_step_args'][4],'1')
+            visual = saved['steps'][0]
+            self.assertNotIn('result_point', visual)
+            pending = tasks.instructed_step(visual, dict(mode='draft', text='설명을 정리해 줘'))
+            tasks._validate(dict(saved, steps=[pending]))
+            for candidate in (visual, pending):
+                fixed = tasks.interpret_step(candidate, 'original position', 'double-click-result', None,
+                                             result_row='coordinate')
+                self.assertEqual((fixed['selector'], fixed['result_point']), (surface, point))
 
     def test_image_round_trip_preserves_pixel_locations(self):
         import random

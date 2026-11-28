@@ -91,6 +91,9 @@ def run_attempt(flow, recipe, args, overrides, execute):
         run_id = state.get('run_id')
         active = bool(run_id and state['status'] not in ('cancelled', 'finished'))
         detail_token = getattr(args, 'resume_detail', None)
+        coordinate = bool(state.get('detail', {}).get('coordinate'))
+        if coordinate and getattr(args, 'resume_input', None):
+            detail_token = args.resume_input
         review_token = getattr(args, 'confirm_result_locally', None)
         menu_token = getattr(args, 'resume_menu', None) or getattr(args, 'resume_input', None)
 
@@ -124,11 +127,15 @@ def run_attempt(flow, recipe, args, overrides, execute):
             return dict(status='blocked', diagnostic='detail_resume_expired', input_dispatched=False, steps=[])
         if detail:
             notice = blocked('detail_read_or_close_pending')
+            if coordinate:
+                notice['diagnostic'] = 'coordinate_click_pending'
             if time.time() >= detail['expires']:
                 return dict(notice, diagnostic='detail_resume_expired')
             if not detail_token:
-                notice['next_action'] = dict(kind='resume_detail', args=['--resume-detail', detail['ticket'], '--summary'])
+                notice['next_action'] = _result_action(detail)
                 return notice
+            if coordinate and not (getattr(args, 'resume_input', None) and getattr(args, 'allow_physical', False)):
+                return dict(notice, diagnostic='coordinate_resume_requires_physical_consent', next_action=_result_action(detail))
         elif active and state['status'] == 'menu':
             if not menu_token:
                 notice = blocked('result_menu_continuation_pending')
@@ -153,6 +160,9 @@ def run_attempt(flow, recipe, args, overrides, execute):
             # verifies the ticket before it can enter the action path.
             if not (directory / 'result-review.json').is_file():
                 return dict(status='blocked', diagnostic='result_review_expired', input_dispatched=False)
+        if not active and menu_token and not session.pending.exists():
+            return dict(status='blocked', diagnostic='result_input_resume_expired', run_id=run_id,
+                        input_dispatched=False, prior_steps_replayed=False, steps=[])
         if not active:
             run_id = secrets.token_hex(16)
             state = dict(run_id=run_id, recipe=fingerprint, variables=_variables(overrides), hwnd=hwnd, only=args.only)
@@ -163,22 +173,24 @@ def run_attempt(flow, recipe, args, overrides, execute):
             # Only a proven read/close suffix is resumable. Never run an opener
             # or accept parameters for its already-executed prefix on this path.
             repair.need(flow.load(args.recipe) == recipe, 'registered_workflow_changed')
-            suffix = recipe['steps'][detail['number']-1:]
-            repair.need(suffix and all('popup' not in s and s.get('window_context') == detail['routes'][0]['spec']
-                       and (s['action'] == 'read-value' or s['action'] == 'invoke' and s.get('verify_closed'))
-                       for s in suffix), 'invalid_detail_continuation')
-            report = flow.run(recipe, {}, hwnd=detail['scope'][0][0], resume=detail)
-            report.update(resumed_at=detail['number'], prior_steps_replayed=False, opener_step=detail['opener_step'],
-                          opener_receipt=dict(status='verified', input_dispatched=True,
-                                              verification_scope=detail['verification_scope']))
+            report = repair.continue_result(flow, recipe, detail)
+            report['previously_completed_steps'] = detail.get('completed_steps', [])
+            if detail.get('observations'):
+                report['previous_observations'] = detail['observations']
         else:
             report = execute(session)
         report['run_id'] = run_id
-        checkpoint = report.pop('_detail_checkpoint', None)
+        checkpoint = report.pop('_result_checkpoint', None)
         review = report.get('result_review')
         if checkpoint:
             checkpoint.update(ticket=secrets.token_hex(32), expires=time.time() + grounding.TTL)
-            report.update(next_action=dict(kind='resume_detail', args=['--resume-detail', checkpoint['ticket'], '--summary']),
+            prior = [r for r in report['steps'] if r['number'] < checkpoint['number']]
+            checkpoint['completed_steps'] = report.get('previously_completed_steps', []) + [r['number'] for r in prior]
+            checkpoint['observations'] = report.get('previous_observations', []) + [
+                dict(number=r['number'], field=recipe['steps'][r['number']-1].get('label'), value=r['receipt']['value'])
+                for r in prior if recipe['steps'][r['number']-1]['action'] == 'read-value' and
+                r['receipt'].get('status') == 'observed' and 'value' in r['receipt']]
+            report.update(next_action=_result_action(checkpoint),
                           **recovery())
             saved = dict(status='detail', detail=checkpoint)
         elif session.pending.exists() and (report.get('menu_repair') or report.get('input_pause')
@@ -200,12 +212,18 @@ def run_attempt(flow, recipe, args, overrides, execute):
         elif report.get('status') == 'uncertain' or (detail_token and report.get('status') != 'verified'
                 or report.get('stopped_at') and report.get('input_dispatched') is not False):
             saved = dict(status='stopped', diagnostic=report.get('diagnostic'), prior_input=report.get('input_dispatched'),
-                         handoff={k: report[k] for k in ('host_action','inspect_args','stopped_at') if k in report})
+                         handoff={k: report[k] for k in ('host_action','inspect_args','stopped_at','input_guard') if k in report})
             report.update(**recovery())
         else:
             saved = dict(status='finished')
         first_trial._write_receipt(path, dict(core, **saved, finished=time.time()))
         return report
+
+
+def _result_action(checkpoint):
+    if checkpoint.get('coordinate'):
+        return dict(kind='resume_coordinate', args=['--resume-input', checkpoint['ticket'], '--allow-physical', '--summary'])
+    return dict(kind='resume_detail', args=['--resume-detail', checkpoint['ticket'], '--summary'])
 
 
 class ResultReview:
@@ -461,9 +479,9 @@ class ResultReview:
                         geometry['visible_relative'] = table_box
                 frame, path = grounding.store_frame(grounding._directory(), key.encode('ascii'), png)
                 opened = time.monotonic()
-                options = dict(row_policy=row_policy) if row_policy else {}
                 choice = local_result_review.choose(path, step.get('result_column'), table_box=table_box,
-                                                    expected=expected, frame_size=rect[2:], **options)
+                                                    expected=expected, frame_size=rect[2:], row_policy=row_policy,
+                                                    step_number=number)
                 local_review_seconds += time.monotonic() - opened
                 if not choice or not choice.get('refresh'):
                     break

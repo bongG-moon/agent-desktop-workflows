@@ -57,6 +57,142 @@ def rows_from_task(plan):
     return rows
 
 
+def _window_key(step):
+    scope = step.get('_capture_window') or {}
+    return scope.get('exe', '').casefold(), scope.get('title', '')
+
+
+def _replacement_key(row):
+    """Match an observed target and gesture without using values or step order."""
+    from teach_capture import StepEdits, bridge
+    step, form = row['step'], row['form']
+    try:
+        fields = StepEdits().compile(step, form['alias'], form['text'], form['mode'], form['argument'])
+        command = tasks.recorded_step(StepEdits.edited_step(step, fields))
+    except (ValueError, bridge.BridgeError):
+        if not tasks._point_target(step):
+            return None
+        try:
+            command = tasks._convert(step, allow_point=True)
+        except (ValueError, bridge.BridgeError):
+            return None
+    selector = tasks._recorded_selector(command)
+    if not selector or command['action'] == 'manual':
+        return None
+    if command.get('within') and not selector.get('ancestors'):
+        selector = dict(selector, within=command['within'])
+    # Two points in one custom table and different keyboard gestures are distinct.
+    action = command['action']
+    if selector['role'] in ('textfield', 'combobox') and action in (*tasks.VALUE_ACTIONS, *tasks.OBSERVE_ACTIONS):
+        action = 'field'
+    elif action == 'close-popup':
+        action = 'open'
+    return (_window_key(step), action, selector, command.get('keys'),
+            command.get('result_row'), command.get('result_point'))
+
+
+def replace_rows(rows, selected_ids, replacements):
+    """Replace a contiguous selection while keeping forms and proven window routes."""
+    from teach_capture import StepEdits, bridge
+    from capture_trail import resolve_menu_scope
+
+    selected = set(selected_ids)
+    indexes = [i for i, row in enumerate(rows) if row['step']['id'] in selected]
+    if (not indexes or len(indexes) != len(selected)
+            or indexes != list(range(indexes[0], indexes[-1] + 1))):
+        raise ValueError('다시 녹화할 단계를 연속해서 선택하세요.')
+    if not replacements:
+        raise ValueError('기록된 동작이 없습니다. 다시 녹화하거나 취소하세요.')
+    if len(rows) - len(indexes) + len(replacements) > tasks.MAX_STEPS:
+        raise ValueError('교체 후 단계 수가 녹화 한도를 넘습니다. 새 동작을 줄여 주세요.')
+
+    first, last = indexes[0], indexes[-1] + 1
+    original, fresh = deepcopy(rows), deepcopy(replacements)
+    previous = original[first:last]
+    origin = previous[0]['step'].get('_capture_window')
+    for row in fresh:
+        if origin and '_capture_window' not in row['step']:
+            row['step']['_capture_window'] = deepcopy(origin)
+    merged = original[:first] + fresh + original[last:]
+    ids = [row['step']['id'] for row in merged]
+    if len(ids) != len(set(ids)):
+        raise ValueError('새 녹화의 단계 식별자가 중복됩니다. 다시 녹화하세요.')
+
+    old_keys = [_replacement_key(row) for row in previous]
+    new_keys = [_replacement_key(row) for row in fresh]
+    linked = {}
+    for old_index, key in enumerate(old_keys):
+        corrected_single = (len(previous) == len(fresh) == 1 and key is not None and new_keys[0] is not None
+                            and key[:2] == new_keys[0][:2] and key[2]['role'] == new_keys[0][2]['role']
+                            and key[2].get('ancestors') == new_keys[0][2].get('ancestors')
+                            and key[2].get('within') == new_keys[0][2].get('within')
+                            and key[3:] == new_keys[0][3:])
+        if key is None or old_keys.count(key) != 1 or (new_keys.count(key) != 1 and not corrected_single):
+            continue
+        source = previous[old_index]
+        new_index = 0 if corrected_single else new_keys.index(key)
+        replacement = fresh[new_index]
+        old_id, new_id = source['step']['id'], replacement['step']['id']
+        if key == new_keys[new_index]:
+            linked[old_id] = new_id
+        default_form = StepEdits().review_rows([replacement['step']])[0]['form']
+        if replacement['form'] != default_form:
+            continue
+        # Re-recording can change a literal value. Carry intentional instructions
+        # and required variables, leaving untouched generated text to the new take.
+        old_default = StepEdits().review_rows([source['step']])[0]['form']
+        if source['step']['action'] != 'saved-step' and source['form'] == old_default:
+            continue
+        candidate = replacement['step']
+        try:
+            if source['step']['action'] == 'saved-step':
+                candidate = retain_saved_arguments(source['step'], candidate)
+                if '_capture_window' in replacement['step']:
+                    candidate['_capture_window'] = replacement['step']['_capture_window']
+            form = source['form']
+            StepEdits().compile(candidate, form['alias'], form['text'], form['mode'], form['argument'])
+        except (ValueError, bridge.BridgeError):
+            continue
+        replacement['step'], replacement['form'] = candidate, deepcopy(form)
+        linked[old_id] = new_id
+
+    # A new take may demonstrate the child window and prove its actual opener,
+    # even when the original opening action had no recognizable target.
+    fresh_steps = [row['step'] for row in fresh]
+    opened = {}
+    for number, step in enumerate(fresh_steps, 1):
+        scope = resolve_menu_scope(step.get('_capture_window', {}), fresh_steps, number)
+        opener = scope.get('after_id')
+        if scope.get('related') is True and opener in {s['id'] for s in fresh_steps[:number - 1]}:
+            opened.setdefault(_window_key(step), set()).add(opener)
+
+    prior_ids = []
+    for row in merged:
+        step = row['step']
+        scope = step.get('_capture_window')
+        if scope:
+            references = [scope['after_id']] if 'after_id' in scope else list(scope.get('_openers', ()))
+            if selected.intersection(references):
+                scope = deepcopy(scope)
+                proven = opened.get(_window_key(step), set())
+                candidates = [linked.get(key, key) for key in references if key not in selected or key in linked]
+                complete = len(candidates) == len(references)
+                scope.pop('after_id', None)
+                scope.pop('_openers', None)
+                if len(proven) == 1 and next(iter(proven)) in prior_ids:
+                    scope['after_id'] = next(iter(proven))
+                elif complete and len(set(candidates)) == 1 and candidates[0] in prior_ids:
+                    scope['after_id'] = candidates[0]
+                else:
+                    scope['_openers'] = tuple(key for key in prior_ids if not complete or key in candidates)
+                    # The prior recording cannot prove which new action opened
+                    # this window. Keep the existing explicit opener picker.
+                    scope.pop('related', None)
+                step['_capture_window'] = scope
+        prior_ids.append(step['id'])
+    return merged
+
+
 def validate(doc):
     def require(condition):
         if not condition:

@@ -147,11 +147,73 @@ def prior(directory, key):
     if not path.exists():
         return None
     result = first_trial._previous(path)
+    if result.get('trial_receipt') == path.stem and result.get('result_checkpoint'):
+        later = _path(directory, path.stem)
+        if later.exists():
+            return first_trial._previous(later)
     if result.get('diagnostic') == 'first_trial_running_or_interrupted':
         original = first_trial._previous(directory / (key + '.json'))
         result.update(trial_receipt=key, resumed_after=original.get('stopped_at'), prior_steps_replayed=False,
                       steps=original.get('steps', []), observations=original.get('observations', []))
     return result
+
+
+def resume_checkpoint(app, key, *, coordinate, allow_physical):
+    """Consume one unsent position or opened-detail continuation without any image."""
+    import python_workflow as flow
+    root = app.task_directory()
+    directory, report, inspection = first_trial._inspection(app, key, allow_state=True)
+    if not report.get('result_checkpoint') or bool(inspection['checkpoint'].get('coordinate')) != coordinate:
+        raise tasks.TaskError('result_continuation_unavailable')
+    if coordinate and not allow_physical:
+        return dict(status='needs_consent', diagnostic='first_trial_physical_input_required',
+                    required_option='--allow-physical', input_dispatched=False, next_action=report['next_action'])
+    completed = prior(directory, key)
+    if completed:
+        return completed
+    if time.time() >= inspection['expires']:
+        raise tasks.TaskError('detail_resume_expired')
+    if recovery._fingerprint(tasks.read_document(inspection['source_task'], root)) != inspection['source_hash']:
+        raise tasks.TaskError('recording_draft_changed')
+    document = tasks.load_task(report['effective_task'], root, allow_review=True)
+    envelope = first_trial._compiled(document, root).get('envelope', {})
+    recipe = envelope.get('recipe')
+    if not recipe or recovery._fingerprint(recipe) != inspection['recipe_hash']:
+        raise tasks.TaskError('prepared_recording_changed')
+    checkpoint = inspection['checkpoint']
+
+    def dispatch():
+        suffix = app.worker_receipt(['_plan'], mutating=True, payload=dict(recipe=recipe, resume_checkpoint=checkpoint))
+        rows = [r for r in report['steps'] if r['number'] < checkpoint['number']]
+        observations = list(report.get('observations', []))
+        for row in suffix.get('steps', []):
+            number = row['number']
+            row['source_step'] = envelope['source_steps'][number - 1]
+            step, receipt = recipe['steps'][number - 1], row['receipt']
+            if step['action'] == 'read-value' and receipt.get('status') == 'observed' and 'value' in receipt:
+                observations.append(dict(source_step=row['source_step'], field=step['label'], value=receipt['value']))
+            rows.append(row)
+        response = dict(suffix, steps=rows, observations=observations, trial_receipt=key,
+                        effective_task=report['effective_task'], resumed_at=checkpoint['number'], prior_steps_replayed=False,
+                        resume_dispatched_input=suffix.get('input_dispatched'),
+                        input_dispatched=flow.combine(report['input_dispatched'], suffix.get('input_dispatched')))
+        next_checkpoint = response.pop('_result_checkpoint', None)
+        if response.get('stopped_at'):
+            response['source_stopped_at'] = envelope['source_steps'][response['stopped_at']-1]
+            if coordinate and next_checkpoint and next_checkpoint.get('detail'):
+                next_key = _path(directory, key).stem
+                response['trial_receipt'] = next_key
+                first_trial.attach_checkpoint(response, next_key, next_checkpoint, inspection['source_task'],
+                                              inspection['source_hash'], inspection['recipe_hash'])
+        elif suffix['status'] in ('verified', 'completed_unverified') and flow.verified_detail_read(recipe['steps'], rows):
+            response.update(status='verified', outcome='current_result_detail_read_and_closed', host_action='report_completed_trial',
+                            query_freshness='not_asserted')
+            if coordinate or recipe['steps'][checkpoint['opener_step'] - 1].get('result_row') == 'coordinate':
+                response.update(result_identity_verified=False, query_completion_verified=False)
+        elif response['status'] == 'verified' and any(r['receipt']['status'] == 'delivered_unverified' for r in rows):
+            response['status'] = 'completed_unverified'
+        return response
+    return first_trial._once(root, _path(directory, key).stem, dispatch)
 
 
 def review_locally(app, key, allow_physical):
@@ -187,7 +249,10 @@ def _choose_and_resume(app, key, allow_physical):
             rect = geometry['window_rect']
             visible = visible_table_box(rect, geometry['table_box'])
             bounds = [visible['x'] - rect[0], visible['y'] - rect[1], visible['width'], visible['height']]
-            choice = local_result_review.choose(path, table_box=bounds, frame_size=rect[2:], row_policy='recorded')
+            original_steps = original.get('original_stopped_steps', [])
+            step_number = original_steps[0] if len(original_steps) == 1 else current['source_step']
+            choice = local_result_review.choose(path, table_box=bounds, frame_size=rect[2:], row_policy='recorded',
+                                                step_number=step_number)
             if choice is None:
                 return dict(original, host_action='local_result_review_cancelled', prior_steps_replayed=False,
                             this_call_dispatched_input=False)

@@ -2141,57 +2141,6 @@ def pick_recording_window(root, session):
     return result
 
 
-def capture_one_step(root, owner, title):
-    """Observe one demonstration in its original window. A cancelled or incomplete take edits nothing."""
-    import tkinter as tk
-    from tkinter import ttk
-    import recorder_theme
-    take = CaptureSession(owner, title)
-    dialog = tk.Toplevel(root)
-    dialog.title('이 단계 다시 녹화')
-    dialog.transient(root)
-    recorder_theme.configure(dialog)
-    scale = dialog.winfo_fpixels('1i') / 96.0
-    panel = ttk.Frame(dialog, padding=round(24 * scale))
-    panel.pack(fill='both', expand=True)
-    ttk.Label(panel, text='Desktop Select', style='Brand.TLabel').pack(anchor='w')
-    ttk.Label(panel, text='이 단계 다시 녹화', style='Title.TLabel').pack(anchor='w', pady=(round(4 * scale), round(14 * scale)))
-    ttk.Label(panel, text=title, wraplength=round(460 * scale), style='Muted.TLabel').pack(anchor='w')
-    ttk.Label(panel, text='대상 창에서 한 동작을 시연한 뒤 적용을 누르세요.',
-              wraplength=round(460 * scale)).pack(anchor='w', pady=round(12 * scale))
-    result = None
-    error = None
-    def accept():
-        nonlocal result, error
-        try:
-            result = take.finish(report_empty=False)['steps']
-        except (bridge.BridgeError, OSError, ValueError) as exc:
-            error = exc
-        finally:
-            dialog.destroy()
-    ttk.Button(panel, text='취소', command=dialog.destroy, style='Quiet.TButton').pack(side='left')
-    ttk.Button(panel, text='이 동작 적용', command=accept, style='Primary.TButton').pack(side='right')
-    on_windows = root.tk.call('tk', 'windowingsystem') == 'win32'
-    recorder_theme.fit_window(dialog, minimum_height=210)
-    try:
-        take.start()
-        if on_windows:
-            root.attributes('-disabled', True)
-        root.wait_window(dialog)
-    finally:
-        if on_windows:
-            root.attributes('-disabled', False)
-        if not take.ended:
-            take.cancel()
-        if dialog.winfo_exists():
-            dialog.destroy()
-    if error:
-        raise error
-    if result is not None and (len(result) != 1 or take.notes.partial):
-        raise ValueError(f'{len(result)}개 동작이 기록됐습니다. 대상 창에서 한 동작을 다시 시연하세요.')
-    return result[0] if result else None
-
-
 def saved_recording_actions(receipt, *, notice=''):
     """Offer revisions after the session's saved result has already been published."""
     import tkinter as tk
@@ -2239,7 +2188,7 @@ def saved_recording_actions(receipt, *, notice=''):
 
 
 def capture(binding, *, title, save_recording=None, save_draft=None, initial_draft=None, initial_step=None,
-            on_ready=None, locate_window=None):
+            on_ready=None, locate_window=None, section=None, parent=None, replace_rows=None):
     """Block while the user records from a small, local start/finish window."""
     import tkinter as tk
     from tkinter import ttk
@@ -2254,8 +2203,10 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     session = new_session() if binding is not None else None
     if session is not None:
         session.binding.check()
-    root = tk.Tk()
-    root.title('Desktop Select 녹화')
+    root = tk.Toplevel(parent) if parent is not None else tk.Tk()
+    root.title('선택 구간 다시 녹화' if replace_rows else 'Desktop Select 녹화')
+    if parent is not None:
+        root.transient(parent)
     result = None
     editing = None
     edits = StepEdits()
@@ -2284,6 +2235,17 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     ttk.Label(heading, textvariable=phase, style='Title.TLabel').pack(anchor='w')
     primary = ttk.Frame(header)
     primary.pack(side='right')
+    if section:
+        first, last = section
+        if first > last:
+            range_text = f'기존 {last}단계 뒤에 이번 녹화를 추가합니다.'
+        elif first == last:
+            range_text = f'수정본의 {first}단계를 이번 녹화로 교체합니다.'
+        else:
+            range_text = f'수정본의 {first}~{last}단계를 이번 녹화로 교체합니다.'
+        ttk.Label(frame, name='recording_range', text=range_text, style='Muted.TLabel').pack(
+            anchor='w', pady=(px(6), 0))
+        message.set(f'작업 창을 {first}단계 직전 상태로 준비하고 ‘구간 녹화 시작’을 누르세요.')
     active_title = tk.StringVar(value=title)
     active_window = ttk.Frame(frame, padding=(px(14), px(10)), style='Card.TFrame')
     active_window.pack(fill='x', pady=(px(16), px(10)))
@@ -2294,20 +2256,26 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     status_line.pack(anchor='w', pady=(0, 10))
     table = ttk.Frame(frame, style='Card.TFrame', padding=1)
     table.pack(fill='both', expand=True)
-    listing = ttk.Treeview(table, name='steps', columns=('number', 'window', 'instruction', 'status'),
-                           show='headings', selectmode='browse', height=7, style='Steps.Treeview')
-    for key, heading, chars in [('number', '단계', 3), ('window', '작업 창', 14),
-                                ('instruction', '실행할 동작', 34), ('status', '상태', 9)]:
+    columns = [('number', '순서' if section else '단계', 5 if section else 3), ('window', '작업 창', 12)]
+    if replace_rows:
+        columns.append(('target', '기록된 대상', 12))
+    columns.extend([('instruction', '실행할 동작', 24 if replace_rows else 34), ('status', '상태', 9)])
+    listing = ttk.Treeview(table, name='steps', columns=tuple(c[0] for c in columns),
+                           show='headings', selectmode='extended', height=7, style='Steps.Treeview')
+    for key, heading, chars in columns:
         width = font.measure('가') * chars + 12
         listing.heading(key, text=heading, anchor='w')
         listing.column(key, width=width, minwidth=min(width, 60), stretch=key == 'instruction', anchor='w')
     listing.tag_configure('unresolved', foreground='#9A6B28')
+    listing.tag_configure('recent', background='#EEECFF')
     scroll = ttk.Scrollbar(table, command=listing.yview)
     listing.configure(yscrollcommand=scroll.set)
     scroll.pack(side='right', fill='y')
     listing.pack(side='left', fill='both', expand=True)
     empty_hint = ttk.Label(table, text='기록한 단계가 여기에 표시됩니다.', style='Card.Muted.TLabel')
     empty_hint.place(relx=.5, rely=.5, anchor='center')
+    selection_summary = ttk.Label(frame, name='selection_summary', style='Muted.TLabel')
+    selection_summary.pack(fill='x', pady=(6, 0))
     window_detail = ttk.Label(frame, name='step_window', wraplength=540, style='Muted.TLabel')
     form = ttk.Frame(frame, padding=px(18), style='Card.TFrame')
     form.columnconfigure(1, weight=1)
@@ -2354,6 +2322,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     controls = ttk.Frame(frame)
     controls.pack(side='bottom', fill='x', before=table, pady=(16, 0))
     shown_rows = {}
+    latest_row = None
     unfinished = set()
 
     def steps_now():
@@ -2567,18 +2536,47 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         update_step_menu(step)
         refresh_preview()
 
+    def selected_indices(steps=None):
+        selected = set(listing.selection())
+        return [i for i, step in enumerate(steps_now() if steps is None else steps) if step['id'] in selected]
+
+    def update_selection_controls(steps=None):
+        indices = selected_indices(steps)
+        contiguous = bool(indices) and indices == list(range(indices[0], indices[-1] + 1))
+        available = review is not None
+        rerecord_button.state(['!disabled'] if available and contiguous else ['disabled'])
+        delete_button.state(['!disabled'] if available and indices else ['disabled'])
+        edit_button.state(['!disabled'] if available and len(indices) == 1 else ['disabled'])
+        if not available:
+            selection_summary.configure(text='')
+            return
+        if len(indices) > 1:
+            selection_summary.configure(text=(f'{indices[0] + 1}~{indices[-1] + 1}단계 선택됨'
+                                             if contiguous else '다시 녹화할 단계는 연속해서 선택하세요.'))
+            form.pack_forget()
+        elif indices:
+            selection_summary.configure(text='Shift 키로 이어진 여러 단계를 선택할 수 있습니다.')
+            if not form.winfo_manager():
+                form.pack(side='bottom', fill='x', after=controls, pady=(8, 0))
+        else:
+            selection_summary.configure(text='수정할 단계를 선택하세요.')
+            form.pack_forget()
+
     def select_row(*_):
         nonlocal editing
         selected = listing.selection()
-        delete_button.state(['!disabled'] if selected and review is not None else ['disabled'])
-        if not selected or (editing and editing['id'] == selected[0]):
+        update_selection_controls()
+        if len(selected) == 1 and editing and editing['id'] == selected[0]:
             return
         flush()
-        editing = next((step for step in steps_now() if step['id'] == selected[0]), None)
+        editing = (next((step for step in steps_now() if step['id'] == selected[0]), None)
+                   if len(selected) == 1 else None)
         if editing is not None:
             load(editing)
             if review is not None:
                 render(review['steps'])
+        else:
+            show_step_window(None, [])
 
     def update_readiness(step, data):
         compiled = learned_tasks.recorded_step(edits.edited_step(step, data))
@@ -2589,7 +2587,8 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         return compiled
 
     def update_save_button(steps):
-        label = '초안 저장' if unfinished or unresolved_window(steps) else '저장'
+        label = (f'기존 {section[1] - section[0] + 1}단계를 새 {len(steps)}개 동작으로 교체' if replace_rows
+                 else '초안 저장' if unfinished or unresolved_window(steps) else '저장')
         save.configure(text=label, state='normal' if steps else 'disabled')
 
     def update_review_status(steps):
@@ -2605,17 +2604,24 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         unlinked = unresolved_window(steps)
         update_save_button(steps)
         phase.set(f'단계 검토 ({len(steps)}개)')
+        if replace_rows:
+            message.set('동작을 선택해 설명을 수정하거나 삭제한 뒤 교체 버튼을 누르세요.' if steps else
+                        '기록된 동작이 없습니다. 취소한 뒤 다시 녹화하세요.')
+            return
         message.set(f'{unlinked}단계의 창 연결을 나중에 지정하려면 초안 저장을 누르세요.' if unlinked else
                     f'{missing}개 단계가 확인 필요 상태입니다. 설명을 확인하고 초안 저장을 누르세요.' if missing
                     else '실행 문장을 확인하고 저장하세요.' if steps else '단계를 추가하거나 취소하세요.')
 
     def render(steps):
-        nonlocal editing
+        nonlocal editing, latest_row
+        newest = steps[-1]['id'] if steps and review is None else None
+        if latest_row != newest and latest_row and listing.exists(latest_row):
+            listing.item(latest_row, tags=tuple(t for t in listing.item(latest_row, 'tags') if t != 'recent'))
+        latest_row = newest
         if steps:
             empty_hint.place_forget()
         else:
             empty_hint.place(relx=.5, rely=.5, anchor='center')
-        edit_button.state(['!disabled'] if review is not None else ['disabled'])
         if review is not None:
             update_review_status(steps)
         keep = {step['id'] for step in steps}
@@ -2639,9 +2645,22 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             state = step_status(step, directive)
             if review is not None and step['id'] in unfinished and state == '준비됨':
                 state = '확인 필요'
-            row = (i, step.get('_capture_window', {}).get('title', title), text, state)
+            row = (i, step.get('_capture_window', {}).get('title', title))
+            if replace_rows:
+                selector = learned_tasks._recorded_selector(step.get('saved', step)) or {}
+                target = step.get('field_label') or selector.get('name') or selector.get('automation_id') or selector.get('query')
+                target = target or step.get('label') or '대상 확인 필요'
+                row += (target,)
+            display_state = state
+            if replace_rows and review is None and state == '준비됨':
+                positional = (step['action'] in ('visual-click', 'row-action', 'result-menu')
+                              or step.get('result_point') is not None)
+                display_state = '위치 기록' if positional else '요소 인식'
+            row += (text, display_state)
             if shown_rows.get(step['id']) != row:
                 tags = () if state == '준비됨' else ('unresolved',)
+                if review is None and i == len(steps):
+                    tags += ('recent',)
                 if listing.exists(step['id']):
                     listing.item(step['id'], values=row, tags=tags)
                 else:
@@ -2650,6 +2669,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         if steps and not listing.selection():
             listing.selection_set(steps[0]['id'])
         show_step_window(editing, steps)
+        update_selection_controls(steps)
 
     def apply_text():
         flush()
@@ -2698,25 +2718,23 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
 
     def delete_step():
         nonlocal editing
-        selected = listing.selection()
-        if editing is None or not selected or selected[0] != editing['id']:
+        selected = set(listing.selection())
+        if not selected or review is None:
             return
-        if review is None:
-            message.set('마치고 검토를 누른 뒤 불필요한 단계를 삭제하세요.')
-            return
-        removed = editing['id']
-        old_index = next(i for i, s in enumerate(review['steps']) if s['id'] == removed)
-        review['steps'][:] = [step for step in review['steps'] if step['id'] != removed]
+        flush()
+        old_index = next(i for i, step in enumerate(review['steps']) if step['id'] in selected)
+        review['steps'][:] = [step for step in review['steps'] if step['id'] not in selected]
         prior = []
         for step in review['steps']:
             scope = step.get('_capture_window', {})
-            if scope.get('after_id') == removed:
+            if scope.get('after_id') in selected:
                 del scope['after_id']
                 scope['_openers'] = tuple(prior)
-            elif removed in scope.get('_openers', ()):
-                scope['_openers'] = tuple(key for key in scope['_openers'] if key != removed)
+            elif selected.intersection(scope.get('_openers', ())):
+                scope['_openers'] = tuple(key for key in scope['_openers'] if key not in selected)
             prior.append(step['id'])
-        edits.forget(removed)
+        for removed in selected:
+            edits.forget(removed)
         editing = None
         alias.set('')
         instruction.set('')
@@ -2758,11 +2776,17 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         load(editing)
 
     def relearn_step():
-        nonlocal editing
-        if review is None or editing is None:
+        nonlocal editing, edits
+        if review is None:
+            return
+        indices = selected_indices()
+        if not indices or indices != list(range(indices[0], indices[-1] + 1)):
+            message.set('다시 녹화할 단계는 연속해서 선택하세요.')
             return
         flush()
-        source = editing
+        source = review['steps'][indices[0]]
+        selected = [review['steps'][i]['id'] for i in indices]
+        rows = edits.review_rows(review['steps'])
         scope = source.get('_capture_window')
         target_title = scope['title'] if scope else title
         try:
@@ -2780,51 +2804,27 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
                 if locate_window is None:
                     raise ValueError('작업 창을 다시 열어 주세요.')
                 owner = locate_window(scope)
-            replacement = capture_one_step(root, owner, target_title)
-        except (bridge.BridgeError, OSError, ValueError) as exc:
+            from review_drafts import replace_rows as merge_rows
+            def apply_replacement(fresh):
+                merged = merge_rows(rows, selected, fresh)
+                return dict(status='replaced', rows=merged, count=len(fresh), input_dispatched=False)
+            answer = capture(owner, title=target_title, parent=root,
+                             section=(indices[0] + 1, indices[-1] + 1), replace_rows=apply_replacement,
+                             locate_window=locate_window)
+        except (RuntimeError, OSError, ValueError) as exc:
             message.set(f'{target_title}에서 다시 녹화하지 못했습니다 ({exc}).')
             return
-        if replacement is None:
+        if answer.get('status') != 'replaced':
             return
-        key = source['id']
-        if source['action'] == 'saved-step':
-            from review_drafts import retain_saved_arguments
-            try:
-                replacement = retain_saved_arguments(source, replacement)
-            except (bridge.BridgeError, ValueError):
-                message.set('이번 시연에 기존 값이나 변수를 적용할 수 없어 이전 단계를 유지했습니다.')
-                return
-        replacement = dict(replacement, id=key)
-        if scope:
-            replacement['_capture_window'] = scope
-        text, chosen, arg = edits.form(source)
-        nickname = edits.alias(source)
-        text = text or default_text(replacement)
-        def executable(raw, fields):
-            try:
-                compiled = learned_tasks.recorded_step(edits.edited_step(raw, fields))
-                return compiled['action'] != 'manual' and 'instruction_draft' not in compiled
-            except (bridge.BridgeError, ValueError):
-                return False
-        try:
-            proposed = edits.compile(replacement, nickname, text, chosen, arg)
-        except (bridge.BridgeError, ValueError):
-            proposed = None
-        if executable(source, edits.get(source)) and (proposed is None or not executable(replacement, proposed)
-                or replacement['action'] == 'manual' and not replacement.get('visual_hint')):
-            message.set('이번 시연으로 기존 지시를 실행할 대상을 확인하지 못해 이전 단계를 유지했습니다.')
-            return
-        edits.forget(key)
-        try:
-            edits.store(replacement, nickname, text, chosen, arg)
-        except (bridge.BridgeError, ValueError):
-            pass  # store preserves the original fields for draft review.
-        steps = review['steps']
-        steps[steps.index(source)] = replacement
-        editing = replacement
-        render(steps)
-        load(editing)
-        message.set('선택한 단계에 새 동작을 적용했습니다. 저장하면 반영됩니다.')
+        edits = StepEdits()
+        review['steps'] = edits.restore_rows(answer['rows'])
+        editing = None
+        render(review['steps'])
+        new_ids = [step['id'] for step in review['steps'][indices[0]:indices[0] + answer['count']]]
+        listing.selection_set(new_ids)
+        listing.see(new_ids[0])
+        select_row()
+        message.set(f'선택한 {len(selected)}단계를 새 {answer["count"]}개 동작으로 교체했습니다. 저장하면 반영됩니다.')
 
     listing.bind('<<TreeviewSelect>>', select_row)
     alias.trace_add('write', refresh_preview)
@@ -2842,13 +2842,15 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
                             command=lambda: teach_extra('menu', replace=True))
     step_tools.bind_to(edit_button)
     edit_button.pack(side='left')
-    delete_button = ttk.Button(editing_controls, name='delete_step', text='선택 단계 삭제',
+    rerecord_button = ttk.Button(controls, name='rerecord', text='선택 구간 다시 녹화',
+                                command=relearn_step, state='disabled')
+    rerecord_button.pack(side='left', padx=(0, px(12)))
+    delete_button = ttk.Button(controls, name='delete_step', text='선택 단계 삭제',
                                style='Danger.TButton', command=delete_step, state='disabled')
-    delete_button.pack(side='left', padx=(px(8), 0))
+    delete_button.pack(side='left', padx=(0, px(12)))
 
     def update_step_menu(step):
         step_tools.delete(0, 'end')
-        step_tools.add_command(label='이 단계 다시 녹화', description='선택한 동작 하나를 다시 시연합니다.', command=relearn_step)
         step_tools.add_command(label='위로 이동', command=lambda: move_step(-1))
         step_tools.add_command(label='아래로 이동', command=lambda: move_step(1))
         selector = learned_tasks._recorded_selector(step.get('saved', step))
@@ -2933,6 +2935,9 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             return
         session.notes.max_steps = remaining
         try:
+            phase.set('녹화 시작 준비 중')
+            message.set('‘녹화 중’ 표시가 뜨면 작업 창에서 시연을 시작하세요.')
+            root.update_idletasks()
             session.start()
         except Exception as exc:
             diagnostic = exc.code if isinstance(exc, bridge.BridgeError) else 'recording_start_failed'
@@ -2947,7 +2952,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             return
         review = {'status': 'recorded', 'steps': completed_steps.copy(), 'input_dispatched': False}
         if session.started:
-            review['steps'].extend(session.finish(report_empty=not completed_steps)['steps'])
+            review['steps'].extend(session.finish(report_empty=not completed_steps and not replace_rows)['steps'])
         render(review['steps'])
         update_phase()
         focus_instruction_after_idle()
@@ -3135,6 +3140,8 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
 
     def persist_review(steps):
         """Preserve editable rows if they cannot yet form a valid task."""
+        if replace_rows is not None:
+            return replace_rows(edits.review_rows(steps))
         number = unresolved_window(steps)
         if number:
             return persist_editor_rows(steps, learned_tasks.TaskError('recorded_window_opener_required'), number)
@@ -3174,7 +3181,8 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             code = getattr(exc, 'code', 'task_store_unavailable' if isinstance(exc, OSError) else 'recording_save_failed')
             number = getattr(exc, 'step_number', None)
             location = f'{number}단계 ' if number else ''
-            message.set(f'{location}파일을 저장하지 못했습니다 ({code}). 작성 내용이 이 창에 있습니다. 다시 저장하세요.')
+            message.set(f'교체 내용을 적용하지 못했습니다 ({exc}). 기록한 동작을 확인하세요.' if replace_rows else
+                        f'{location}파일을 저장하지 못했습니다 ({code}). 작성 내용이 이 창에 있습니다. 다시 저장하세요.')
             return
         if receipt is not None:
             result = receipt
@@ -3194,10 +3202,16 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             steps = steps_now()
             render(steps)
             warnings = sum(step_status(s, edits.get(s).get('instruction')) != '준비됨' for s in steps)
-            phase.set('녹화 일시 정지' if session.notes.state == 'paused' or session.notes.limit else '녹화 중')
+            paused = session.notes.state == 'paused' or session.notes.limit
+            phase.set('녹화 일시 정지' if paused else recording_phase)
             if not picking_window:
                 hint = getattr(session, 'active_hint', '')
-                message.set(f'{len(steps)}단계 기록' + (f'   ·   확인 필요 {warnings}개' if warnings else '')
+                progress = f'{len(steps)}단계 기록'
+                if section and not paused:
+                    progress = (f'이번 구간에 {len(steps)}개 동작을 기록했습니다.' if steps
+                                else '지금 작업 창에서 첫 동작을 시연하세요.')
+                    progress += ' 끝나면 ‘마치고 검토’를 누르세요.'
+                message.set(progress + (f'   ·   확인 필요 {warnings}개' if warnings else '')
                             + (f'   {hint}' if hint else ''))
             if steps and steps[-1]['id'] != tick.last_id:
                 listing.see(steps[-1]['id'])
@@ -3206,7 +3220,9 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             poll_timer = root.after(200, tick)
 
     tick.last_id = None
-    begin = ttk.Button(primary, text='시작', command=start, style='Primary.TButton')
+    ready_phase = '구간 녹화 준비' if section else '녹화 준비'
+    recording_phase = '구간 녹화 중' if section else '녹화 중'
+    begin = ttk.Button(primary, command=start, style='Primary.TButton')
     link_window = ttk.Button(primary, text='열린 창 선택', command=choose_window)
     end = ttk.Button(primary, text='마치고 검토', command=finish, style='Primary.TButton')
     save = ttk.Button(primary, text='저장', command=save_review, style='Primary.TButton')
@@ -3221,7 +3237,7 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         add_menu.entryconfigure(0, state='normal' if exists else 'disabled')
     add_menu.configure(postcommand=update_add_menu)
     add_menu.bind_to(add_button)
-    add_button.pack(side='left')
+    add_button.pack(side='left', padx=(0, px(12)))
     ttk.Button(controls, text='취소', command=cancel, style='Quiet.TButton').pack(side='right')
 
     def update_phase():
@@ -3231,25 +3247,25 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
             count = len(review['steps'])
             update_review_status(review['steps'])
             save.pack()
-            if count:
+            if count and len(listing.selection()) == 1:
                 form.pack(side='bottom', fill='x', after=controls, pady=(8, 0))
             else:
                 form.pack_forget()
         elif session.started:
-            phase.set('녹화 중')
+            phase.set(recording_phase)
             message.set('대상 창에서 동작을 수행한 뒤 마치고 검토를 누르세요.')
             if isinstance(session, CaptureTrail):
                 link_window.pack(side='left', padx=(0, 5))
             end.pack(side='left')
         else:
-            phase.set('녹화 준비' if not completed_steps else '녹화 일시 정지')
+            phase.set('녹화 일시 정지' if completed_steps else ready_phase)
             if completed_steps:
                 begin.configure(text='이어 녹화')
                 begin.pack(side='left', padx=(0, 4))
                 end.pack(side='left')
                 message.set(f'{len(completed_steps)}단계 기록')
             else:
-                begin.configure(text='시작')
+                begin.configure(text='구간 녹화 시작' if section else '시작')
                 begin.pack()
         recorder_theme.fit_window(root, minimum_width=640, minimum_height=400)
 
@@ -3277,7 +3293,9 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
         nonlocal result
         result = {'status': 'blocked', 'diagnostic': 'recording_ui_failed', 'input_dispatched': False}
         root.destroy()
-    root.report_callback_exception = failed
+    callback_owner = root._root()
+    previous_callback = callback_owner.report_callback_exception
+    callback_owner.report_callback_exception = failed
     if on_ready is not None:
         def report_ready(event=None):
             nonlocal on_ready
@@ -3292,9 +3310,21 @@ def capture(binding, *, title, save_recording=None, save_draft=None, initial_dra
     if review is None:
         poll_timer = root.after(200, tick)
     try:
-        root.mainloop()
+        if parent is None:
+            root.mainloop()
+        else:
+            on_windows = root.tk.call('tk', 'windowingsystem') == 'win32'
+            if on_windows:
+                parent.attributes('-disabled', True)
+            try:
+                parent.wait_window(root)
+            finally:
+                if on_windows and parent.winfo_exists():
+                    parent.attributes('-disabled', False)
         return result or {'status': 'cancelled', 'steps': [], 'input_dispatched': False}
     finally:
+        if parent is not None:
+            callback_owner.report_callback_exception = previous_callback
         for timer in (poll_timer, point_timer, focus_timer):
             if timer:
                 root.after_cancel(timer)

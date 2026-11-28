@@ -420,8 +420,8 @@ def restore_routes(flow, recipe, record, routes):
         routes.bindings[flow.window_context._key(spec)] = child
 
 
-def detail_checkpoint(routes, owner, report, only):
-    """Offer only a confirmed opened window and its still-unsent detail suffix."""
+def result_checkpoint(routes, owner, report, only):
+    """Resume an unsent positional opener or the read/close suffix of a proven one."""
     rows = report.get('steps', [])
     if not rows:
         return None
@@ -437,6 +437,17 @@ def detail_checkpoint(routes, owner, report, only):
     remaining = routes.steps[number-1:]
     if not remaining:
         return None
+    import window_context
+    first = remaining[0]
+    if (only is None and first.get('result_row') == 'coordinate' and not first.get('window_context')
+            and report.get('input_dispatched') is True and not first.get('popup')
+            and len(rows) == number and all(r['receipt'].get('status') in
+            ('verified', 'observed', 'waited', 'delivered_unverified') for r in rows[:-1])
+            and _coordinate_suffix(remaining, number)):
+        cookie = window_context.window_cookie(routes.app.bridge, owner.hwnd, create=True)
+        if cookie:
+            return dict(coordinate=True, number=number, scope=[identity(owner), identity(owner)], routes=[],
+                        checked_fields=[], owner_cookie=cookie, query_sent=False, only=None)
     spec = remaining[0].get('window_context') or {}
     opener = spec.get('after_step')
     if not opener or any('popup' in step or step.get('window_context') != spec or
@@ -453,7 +464,6 @@ def detail_checkpoint(routes, owner, report, only):
     child, parent = saved[0]['child'], saved[0]['parent']
     if child[1] != parent[1] or not routes.app.bridge.owned(child[0], parent[0]):
         return None
-    import window_context
     cookies = [window_context.window_cookie(routes.app.bridge, hwnd, create=True) for hwnd in (parent[0], child[0])]
     if not all(cookies):
         return None
@@ -461,15 +471,44 @@ def detail_checkpoint(routes, owner, report, only):
                 only=None, query_sent=False, opener_step=opener, verification_scope='recorded_window_opened')
 
 
-def header_stop(report, recipe):
-    """Inspect the failed header or its dependent detail without resending a query."""
+def _coordinate_suffix(steps, number):
+    return (steps[0].get('result_row') == 'coordinate' and not steps[0].get('window_context') and
+            all(s.get('window_context', {}).get('after_step') == number and 'popup' not in s
+                and (s['action'] == 'read-value' or s['action'] == 'invoke' and s.get('verify_closed'))
+                for s in steps[1:]))
+
+
+def continue_result(flow, recipe, checkpoint):
+    """Restore the original window and run only actions that have not been delivered."""
+    number = checkpoint['number']
+    need(type(number) is int and 1 <= number <= len(recipe['steps']), 'invalid_result_continuation')
+    suffix = recipe['steps'][number-1:]
+    if checkpoint.get('coordinate'):
+        need(_coordinate_suffix(suffix, number) and checkpoint.get('owner_cookie'), 'invalid_coordinate_continuation')
+        report = flow.run(recipe, {}, hwnd=checkpoint['scope'][0][0], resume=checkpoint, track_detail=True)
+        return dict(report, resumed_at=number, prior_steps_replayed=False,
+                    result_identity_verified=False, query_completion_verified=False)
+    need(checkpoint.get('detail') is True
+         and len(checkpoint['routes']) == 1 and all('popup' not in s and
+         s.get('window_context') == checkpoint['routes'][0]['spec'] and
+         (s['action'] == 'read-value' or s['action'] == 'invoke' and s.get('verify_closed')) for s in suffix),
+         'invalid_detail_continuation')
+    report = flow.run(recipe, {}, hwnd=checkpoint['scope'][0][0], resume=checkpoint)
+    return dict(report, resumed_at=number, prior_steps_replayed=False, opener_step=checkpoint['opener_step'],
+                opener_receipt=dict(status='verified', input_dispatched=True,
+                                    verification_scope=checkpoint['verification_scope']))
+
+
+def result_state_stop(report, recipe):
+    """Observe a stopped positional action or its detail without replaying input."""
     number = report.get('stopped_at')
-    if (report.get('status') not in ('blocked', 'uncertain', 'mismatch') or report.get('input_dispatched') is False
+    if (report.get('status') not in ('blocked', 'uncertain', 'mismatch')
             or type(number) is not int or not 1 <= number <= len(recipe['steps'])):
         return None
     step = recipe['steps'][number - 1]
     opener = step.get('window_context', {}).get('after_step', number)
-    if recipe['steps'][opener - 1].get('result_row') == 'header':
+    mode = recipe['steps'][opener - 1].get('result_row')
+    if mode == 'coordinate' or mode == 'header' and report.get('input_dispatched') is not False:
         return dict(host_action='inspect_current_state_without_replaying',
                     inspect_args=['--read-only', '--only', str(number), '--summary'])
 
@@ -480,7 +519,7 @@ def compact_stop(report):
     result = {k: v for k, v in report.items() if k not in ('input_requirements', 'inspection_owner', 'state_inspection')}
     result['steps'] = [dict({k: v for k, v in row.items() if k != 'receipt'},
                             **{k: v for k, v in row.get('receipt', {}).items()
-                               if k in ('status', 'diagnostic', 'input_dispatched', 'verification_scope')})
+                               if k in ('status', 'diagnostic', 'input_dispatched', 'verification_scope', 'input_guard')})
                        for row in report.get('steps', [])]
     return result
 
@@ -618,7 +657,7 @@ def _run_registered(flow, recipe, args, overrides, scene_session=None, *, enable
                           only=resume['only'] if resume else args.only, track_menu=True, resume=resume,
                           scene_session=scene_session, allow_recorded_selection=allow_recorded_selection, **surface_options)
         if header_run:
-            stop = header_stop(report, recipe)
+            stop = result_state_stop(report, recipe)
             if stop:
                 report.update(stop)
                 try:

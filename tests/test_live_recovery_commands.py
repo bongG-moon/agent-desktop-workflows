@@ -53,6 +53,19 @@ class RecoveryCommandsTests(unittest.TestCase):
             self.assertEqual(app.tasks.load_task(base['name'], tmp), base)
             windows.assert_not_called()
 
+    def test_continue_editor_receives_the_real_replacement_or_append_range(self):
+        base = recording()
+        count = len(base['steps'])
+        with (tempfile.TemporaryDirectory() as tmp, patch.object(app, 'task_directory', return_value=Path(tmp)),
+              patch.object(app, 'windows'), patch.object(app, 'pick_window'), patch.object(app.bridge, 'Binding'),
+              patch.object(app, 'guard'), patch.object(app, 'edit_recording', return_value={'status':'cancelled'}) as ui):
+            app.tasks.save_task(base, tmp)
+            for options, first in ((['--from-step', '2'], 2), ([], count + 1)):
+                args = app.parser().parse_args(['continue-recording', '--task', base['name'], *options])
+                self.assertEqual(app.run(args), {'status':'cancelled'})
+                self.assertEqual(ui.call_args.kwargs['section'], (first, count))
+            self.assertEqual(app.tasks.load_task(base['name'], tmp), base)
+
     def test_current_image_must_agree_around_pointer_in_same_sized_window(self):
         def png(changed, width=64):
             data = bytearray(width * 64 * 4)

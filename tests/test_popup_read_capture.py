@@ -86,6 +86,8 @@ class PopupReadCaptureTests(unittest.TestCase):
         for text in ('표 상대 좌표로 더블클릭', '결과 표의 지정한 위치를 더블클릭', 'double-click the recorded table point'):
             step = tasks.interpret_step(raw, text, 'double-click-result', table, result_row='coordinate')
             self.assertEqual(step['result_point'], point)
+        for text in ('저장된 표 상대 좌표로 결과 행을 더블클릭해 줘', '선택한 지점을 더블클릭', 'double-click the saved table position'):
+            self.assertEqual(tasks.compile_instruction(raw, text)['result_row'], 'coordinate', text)
         for key in ('result_surface', 'result_point'):
             missing = dict(raw)
             missing.pop(key)
@@ -96,6 +98,74 @@ class PopupReadCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(tasks.TaskError, 'recorded_coordinate_required'):
             tasks.interpret_step(raw, '표 상대 좌표로 더블클릭', 'double-click-result',
                                  dict(table, automation_id='other'), result_row='coordinate')
+
+    def test_draft_coordinate_correction_preserves_popup_and_geometry_through_edit_replay_and_registration(self):
+        import python_workflow as workflow
+        import review_drafts
+        table = dict(role='group', automation_id='Results')
+        placement = dict(rect=[310, 70, 825, 500], normal_rect=[310, 70, 825, 500], maximized=False,
+                         dpi=120, monitor=r'\\.\DISPLAY1')
+        point = dict(x=75, y=40, width=400, height=180, dpi=120, window_placement=placement)
+        query = button()
+        query.update(id='query', label='조회')
+        raw = dict(capture.manual('double_click_needs_review', 'open'), result_surface=table, result_point=point)
+        child = dict(capture.capture_step(field()), _capture_window=dict(
+            exe='Orders.exe', title='Details', related=True, _openers=['query', 'open']))
+        source_rows = [dict(step=s, form=dict(alias='', text=text, mode=None, argument='')) for s, text in (
+            (query, '조회 버튼을 눌러줘'), (raw, '조회 결과 행 더블클릭'), (child, '열린 창에서 Comment내용 추출'))]
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            store = review_drafts.ReviewStorage('original', 'Orders.exe', 'Orders', directory)
+            store.save_draft(source_rows, 'double_click_needs_review', 2)
+            with patch.object(desktop_select, 'task_directory', return_value=directory), patch.object(desktop_select, 'worker_receipt') as worker:
+                def instruct(name, new_name, text, *args):
+                    return desktop_select.run(desktop_select.parser().parse_args([
+                        'instruct', '--task', name, '--only', '2', '--save-as', new_name, '--text', text, *args]))
+                result = instruct('original', 'chosen', '기록한 자리에서 상세 보기', '--mode', 'coordinate')
+                self.assertEqual(result['execution_plan']['status'], 'saved', result)
+                result = instruct('chosen', 'reworded', '조회 결과 행 더블클릭')
+                self.assertEqual(result['execution_plan']['status'], 'saved', result)
+                worker.assert_not_called()
+                plan = tasks.load_task('reworded', directory)
+                recipe = recorded_plan.compile_plan(plan)['envelope']['recipe']
+                click = recipe['steps'][1]
+                self.assertEqual((click['result_row'], click['selector'], click['result_point']), ('coordinate', table, point))
+                self.assertEqual(recipe['steps'][2]['window_context']['after_step'], 2)
+                self.assertEqual([s['action'] for s in recipe['steps']], ['invoke', 'double-click-result', 'read-value'])
+                self.assertFalse(tasks.query_before_double_click(*recipe['steps'][:2]))
+                self.assertEqual(tasks.compile_instruction(click, '첫 번째 결과 행 더블클릭')['result_row'], 'first')
+                skill = directory / 'open-result'
+                self.assertEqual(workflow.register(recipe, skill, source_task=plan, first_trial=True)['status'], 'registered')
+                self.assertEqual(workflow.load(skill / 'workflow.json')['steps'][1], click)
+                replay = desktop_select.parser().parse_args([
+                    'replay', '--task', 'reworded', '--exe', 'Orders.exe', '--window', 'Orders', '--only', '2'])
+                worker.return_value = dict(status='blocked', input_dispatched=False, steps=[])
+                desktop_select.fast_replay(plan, replay, {})
+                worker.assert_called_once()
+                self.assertEqual(worker.call_args.kwargs['payload']['only'], '2')
+            self.assertEqual(tasks.read_document('original', directory)['rows'][1], source_rows[1])
+
+    def test_edited_result_condition_cannot_reuse_an_unqualified_position(self):
+        raw = dict(capture.manual('double_click_needs_review'),
+                   result_surface=dict(role='group', automation_id='Results'),
+                   result_point=dict(x=20, y=22, width=250, height=120))
+        coordinate = tasks.interpret_step(raw, '선택한 위치 더블클릭', 'double-click-result', None, result_row='coordinate')
+        for text in ('조회 결과 행을 더블클릭', '현재 결과 목록의 행을 두 번 눌러 상세 창을 열어줘',
+                     'double-click the result row', '녹화한 항목(조회 행) 더블클릭'):
+            with self.subTest(text=text):
+                self.assertEqual(tasks.compile_instruction(coordinate, text)['result_row'], 'coordinate')
+        for step in (coordinate, raw):
+            for text in ('조회 결과에서 녹화한 이미지와 동일한 행 더블클릭', '조회 결과에서 선택된 행 더블클릭',
+                         '조회 결과에서 값이 다른 행 더블클릭', 'double-click the selected result row'):
+                with self.subTest(text=text, action=step['action']):
+                    self.assertIsNone(tasks.current_result_intent(step, text))
+                    instruction = tasks.compile_instruction(step, text)
+                    self.assertEqual(instruction['mode'], 'draft')
+                    edited = tasks.instructed_step(step, instruction)
+                    plan = recorded_plan.compile_plan(dict(schema=1, name='Edited', exe='Orders.exe',
+                                                           window='Orders', steps=[edited]))
+                    self.assertEqual(plan['status'], 'not_compatible')
+                    self.assertNotIn('envelope', plan)
 
     def test_query_purpose_and_field_read_do_not_infer_extra_actions(self):
         raw = capture.manual('unsupported_recorded_action')
@@ -243,6 +313,14 @@ class PopupReadCaptureTests(unittest.TestCase):
         column = tasks.compile_instruction(raw, '조회 결과에서 장비 ID 부분 더블클릭')
         self.assertEqual((column['result_row'], column['result_column']), ('first', '장비 ID'))
         self.assertNotIn('result_point', column)
+        first = tasks.instructed_step(raw, column)
+        saved = dict(schema=1, name='column', exe='Orders.exe', window='Orders', steps=[first])
+        recipe = recorded_plan.compile_plan(saved)['envelope']['recipe']
+        self.assertNotIn('result_point', recipe['steps'][0])
+        self.assertNotIn('recorded_position', recipe['steps'][0])
+        fixed = tasks.interpret_step(first, 'open at demonstrated position', 'double-click-result', None,
+                                     result_row='coordinate')
+        self.assertEqual((fixed['selector'], fixed['result_point']), (surface, point))
         quoted = tasks.compile_instruction(raw, '조회 결과에서 "Asset ID" 열을 더블클릭')
         self.assertEqual(quoted['result_column'], 'Asset ID')
         for constrained in ('조회 결과에서 상태가 진행중인 행 더블클릭',

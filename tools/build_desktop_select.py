@@ -16,7 +16,7 @@ FILES = {name: SKILL / name for name in ('SKILL.md', '사용가이드.md', 'refe
                                          'scripts/learned_tasks.py', 'scripts/review_drafts.py',
                                          'scripts/recorder_launch.py', 'scripts/recorder_targets.py',
                                          'scripts/recording_followup.py', 'scripts/first_trial.py', 'scripts/result_trial.py',
-                                         'scripts/trial_menu.py',
+                                         'scripts/trial_menu.py', 'scripts/request_timing.py',
                                          'scripts/local_result_review.py', 'scripts/registered_result.py',
                                          'scripts/recovery.py', 'scripts/live_recovery.py', 'scripts/menu_capture.py',
                                          'scripts/continue_recording.py',

@@ -52,20 +52,20 @@ def _foreground(binding):
         binding.check()
         _idle_foreground(original, tick)
         bridge._sig(user, 'BringWindowToTop', W.BOOL, W.HWND)(binding.hwnd)
-        _idle_foreground(original, tick, binding.hwnd)
+        _idle_foreground(original, tick, binding.hwnd, phase='after_bring_window_to_top')
         user.SetForegroundWindow(binding.hwnd)
     finally:
         if not attached(thread, previous, False):
             raise bridge.BridgeError('focus_queue_detach_failed')
     for _ in range(6):
         binding.check()
-        if bridge.pointer_keys_down() or _input_tick() != tick:
-            raise bridge.BridgeError('foreground_or_input_changed')
         active = bridge.foreground()
-        if bridge.root_window(active) == binding.hwnd:
+        matched = bridge.root_window(active) == binding.hwnd
+        bridge.check_input_snapshot('after_queue_activation', original, active, tick, _input_tick(),
+                                    foreground_ok=matched or active == original, held=bridge.pointer_keys_down(classify=True),
+                                    allowed_hwnd=binding.hwnd)
+        if matched:
             return
-        if active != original:
-            break
         time.sleep(.04)
     raise bridge.BridgeError('target_not_foreground')
 

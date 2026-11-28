@@ -138,7 +138,8 @@ class ReviewDraftStorageTests(unittest.TestCase):
         editor = self.editor()
 
         def accept_correction(owner, *, title, initial_draft, initial_step, save_recording, save_draft, on_ready,
-                              locate_window):
+                              locate_window, section):
+            self.assertIsNone(section)
             self.assertIsNone(on_ready)
             self.assertEqual(initial_draft, self.rows)
             self.assertEqual(initial_step, editor.previous['step_number'])

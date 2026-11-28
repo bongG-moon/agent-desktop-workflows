@@ -29,6 +29,7 @@ def host_summary(report):
         return result
 
     result = continuation_options(compact_preparation(report))
+    result.pop('result_checkpoint', None)
     if result.get('host_action') == 'inspect_current_state_without_replaying':
         from workflow_repair import compact_stop
         return compact_stop(result)
@@ -113,8 +114,10 @@ def _inspection(app, receipt_id, *, allow_state=False):
     directory = tasks._directory(app.task_directory() / 'first-trials')
     report = _previous(directory / (receipt_id + '.json'))
     inspection = report.get('result_inspection')
-    if allow_state and report.get('state_inspection'):
-        inspection = report['state_inspection']
+    if allow_state:
+        inspection = report.get('result_checkpoint') or report.get('state_inspection') or inspection
+        if not inspection and report.get('trial_receipt') == receipt_id:
+            return directory, report, None
     if not inspection or report.get('trial_receipt') != receipt_id:
         raise tasks.TaskError('result_inspection_unavailable')
     return directory, report, inspection
@@ -125,6 +128,18 @@ def inspect_result(app, receipt_id):
     import grounding
     import result_trial
     directory, report, inspection = _inspection(app, receipt_id, allow_state=True)
+    resumed = result_trial.prior(directory, receipt_id)
+    if resumed and (report.get('result_checkpoint') or resumed.get('resume_dispatched_input') is not False):
+        return resumed
+    if inspection is None:
+        return dict(status='observed', trial_receipt=receipt_id, input_dispatched=False, prior_steps_replayed=False,
+                    previous_input_dispatched=report.get('input_dispatched'), trial_status=report['status'],
+                    **{k: report[k] for k in ('host_action', 'next_action', 'stopped_at', 'diagnostic') if k in report})
+    if report.get('result_checkpoint'):
+        if time.time() >= inspection['expires']:
+            raise tasks.TaskError('detail_resume_expired')
+        return dict(status='observed', trial_receipt=receipt_id, input_dispatched=False, prior_steps_replayed=False,
+                    stopped_at=report['stopped_at'], next_action=report['next_action'])
     if report.get('state_inspection'):
         import python_workflow
         if not 0 <= time.time() - inspection['observed_at'] <= grounding.TTL:
@@ -137,9 +152,6 @@ def inspect_result(app, receipt_id):
         observed = python_workflow.run(recipe, read_only=True, only=str(report['stopped_at']),
                                        hwnd=owner['hwnd'], result_owner=owner)
         return dict(observed, previous_input_dispatched=report['input_dispatched'], prior_steps_replayed=False)
-    resumed = result_trial.prior(directory, receipt_id)
-    if resumed and resumed.get('resume_dispatched_input') is not False:
-        return resumed
     if not 0 <= time.time() - inspection['observed_at'] <= grounding.TTL:
         raise tasks.TaskError('result_inspection_expired')
     identity = inspection['window']
@@ -220,6 +232,17 @@ def _once(directory, key, callback):
     except (ValueError, OSError):
         result['receipt_diagnostic'] = 'first_trial_receipt_unavailable'
     return result
+
+
+def attach_checkpoint(report, key, checkpoint, source_task, source_hash, recipe_hash):
+    import grounding
+    coordinate = checkpoint.get('coordinate')
+    flags = ['--coordinate', '--allow-physical'] if coordinate else ['--detail']
+    report.update(host_action='resume_unsent_coordinate' if coordinate else 'resume_open_detail_without_replaying',
+                  next_action=dict(kind='resume_coordinate' if coordinate else 'resume_detail',
+                                   args=['resume-trial', '--receipt', key, *flags, '--summary']),
+                  result_checkpoint=dict(checkpoint=checkpoint, expires=time.time() + grounding.TTL,
+                                         source_task=source_task, source_hash=source_hash, recipe_hash=recipe_hash))
 
 
 def run(app, args):
@@ -337,7 +360,8 @@ def run(app, args):
         if recovery._fingerprint(tasks.read_document(doc['name'], directory)) != source_key:
             return dict(status='blocked', diagnostic='recording_draft_changed', input_dispatched=False)
         prepared_at = time.monotonic()
-        payload = dict(recipe=recipe, overrides=overrides, hwnd=args.hwnd, background_only=args.background_only)
+        payload = dict(recipe=recipe, overrides=overrides, hwnd=args.hwnd, background_only=args.background_only,
+                       track_detail=True)
         if any(python_workflow.workflow_repair.menu(step) for step in recipe['steps']):
             import trial_menu
             trial_menu.prepare(app, key, doc, name, envelope)
@@ -369,7 +393,10 @@ def run(app, args):
                 and report.get('input_dispatched') is not False
                 and not (report.get('menu_repair') or report.get('input_pause', {}).get('ticket'))):
             report['host_action'] = 'check_current_effect_before_continuing'
-        if python_workflow.workflow_repair.header_stop(report, recipe) and report.get('inspection_owner'):
+        checkpoint = report.pop('_result_checkpoint', None)
+        if checkpoint:
+            attach_checkpoint(report, key, checkpoint, doc['name'], source_key, recovery._fingerprint(recipe))
+        elif python_workflow.workflow_repair.result_state_stop(report, recipe) and report.get('inspection_owner'):
             report.update(host_action='inspect_current_state_without_replaying',
                           inspect_args=['inspect-trial', '--receipt', key, '--summary'],
                           state_inspection=dict(observed_at=time.time(), recipe_hash=recovery._fingerprint(recipe)))

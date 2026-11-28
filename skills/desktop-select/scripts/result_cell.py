@@ -782,9 +782,10 @@ def _execute(binding, uia, guard, find_current, resolution, *, anchor=None, head
             hit_unchanged = final_hit[0] == native_hit[0] and uia.same(final_hit[1], native_hit[1])
         else:
             hit_unchanged = final_hit == native_hit
-        require(hit_unchanged and win.root_window(win.foreground()) == binding.hwnd,
-                'result_cell_changed')
-        require(row_action._input_tick() == tick, 'foreground_or_input_changed')
+        require(hit_unchanged, 'result_cell_changed')
+        current_hwnd = win.foreground()
+        win.check_input_snapshot('before_result_double_click', binding.hwnd, current_hwnd, tick, row_action._input_tick(),
+                                 foreground_ok=win.root_window(current_hwnd) == binding.hwnd)
         sending = time.monotonic()
         try:
             sent = win._send_point(*point, 'double-click')

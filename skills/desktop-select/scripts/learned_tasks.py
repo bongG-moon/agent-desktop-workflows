@@ -190,14 +190,18 @@ def _plain_table_gesture(sentence):
         return False
     target = re.split(r'더블\s*클릭|두\s*번', sentence, maxsplit=1)[0].strip()
     target = re.sub(r'^double[ -]?click\s+', '', target, flags=re.I).rstrip('.!')
-    return bool(re.fullmatch(r'(?:그냥\s*)?(?:(?:이|그|해당|현재|녹화한|시연한)\s*)?'
-                             r'(?:표|목록|리스트|테이블|행|줄|항목|list|grid|table)(?:을|를)?'
-                             r'|(?:(?:this|that|the)(?: recorded)?\s+)?(?:list|grid|table|row|item)', target, re.I))
+    return bool(re.fullmatch(
+        r'(?:그냥\s*)?(?:(?:이|그|해당|현재|녹화한|시연한|나온)\s*)?(?:(?:조회|검색)(?:된|한)?\s*)?'
+        r'(?:(?:결과(?:\s*(?:표|목록|리스트|테이블))?|(?:표|테이블)\s*결과)(?:의|에서)?\s*(?:행|줄|항목)?'
+        r'|표|목록|리스트|테이블|행|줄|항목|list|grid|table)(?:을|를)?'
+        r'|(?:(?:this|that|the)(?: recorded)?\s+)?(?:(?:current|query|search)\s+)?'
+        r'(?:results?(?:\s+(?:row|item|grid|table|list))?|list|grid|table|row|item)', target, re.I))
 
 
 _HEADER_WORD = re.compile(r'열\s*머리(?:글)?|헤더|\bheader\b', re.I)
-_POINT_WORD = re.compile(r'좌표|(?:녹화한|시연한|지정한|선택한)\s*위치|\bcoordinates?\b|'
-                         r'\b(?:recorded|selected|specified)\s+(?:table\s+)?(?:point|position)\b', re.I)
+_TAUGHT_POINT = r'녹화(?:한|된)?|저장(?:한|된)?|시연한|지정한|선택한'
+_POINT_WORD = re.compile(rf'좌표|(?:{_TAUGHT_POINT})\s*(?:위치|지점)|\bcoordinates?\b|'
+                         r'\b(?:recorded|saved|selected|specified)\s+(?:table\s+)?(?:point|position)\b', re.I)
 
 
 def coordinate_request(sentence):
@@ -207,20 +211,21 @@ def coordinate_request(sentence):
         return False
     target = re.split(r'더블\s*클릭|두\s*번', subject, maxsplit=1)[0].strip()
     return bool(re.fullmatch(
-        r'(?:(?:조회\s*)?결과\s*)?(?:(?:표|목록|리스트|테이블)(?:의|에서)?\s*)?'
-        r'(?:(?:녹화한|시연한|지정한|선택한)\s*)?(?:표\s*)?(?:상대\s*)?(?:좌표|위치)(?:을|를|에서|로)?'
-        r'|double[ -]?click\s+(?:the\s+)?(?:recorded|selected|specified)\s+(?:table\s+)?'
+        rf'(?:(?:{_TAUGHT_POINT})\s*)?(?:(?:조회\s*)?결과\s*)?(?:(?:표|목록|리스트|테이블)(?:의|에서)?\s*)?'
+        rf'(?:(?:{_TAUGHT_POINT})\s*)?(?:표\s*)?(?:상대\s*)?(?:좌표|위치|지점)(?:을|를|에서|로)?'
+        r'(?:\s*(?:조회\s*)?(?:결과\s*)?(?:행|항목)(?:을|를)?)?'
+        r'|double[ -]?click\s+(?:the\s+)?(?:recorded|saved|selected|specified)\s+(?:table\s+)?'
         r'(?:point|position|coordinates?)[.!]?', target, re.I))
 
 
 def _coordinate_intent(raw, sentence):
-    if not coordinate_request(sentence) or not valid_result_point(raw.get('result_point')):
+    if not (is_double_click_step(raw) or raw.get('action') == 'double-click-result'):
         return None
-    selector = raw.get('selector') if raw.get('action') == 'double-click-result' else result_surface_hint(raw)
-    if not selector or not any(k in selector for k in ('automation_id', 'name')):
+    position = taught_position(raw)
+    if not position:
         return None
     return dict(mode='double-click-result', text=sentence, label=sentence[:200],
-                result_row='coordinate', selector=deepcopy(selector), result_point=deepcopy(raw['result_point']))
+                result_row='coordinate', **position)
 
 
 def _header_intent(raw, sentence, subject):
@@ -238,7 +243,7 @@ def _header_intent(raw, sentence, subject):
         return None
     if observed is not None and (not _text(observed, 100) or observed.casefold() != column.casefold()):
         return None
-    selector = raw.get('selector') if raw.get('action') == 'double-click-result' else result_surface_hint(raw)
+    selector = recorded_result_selector(raw)
     if not selector or not any(key in selector for key in ('automation_id', 'name')):
         return None
     return dict(mode='double-click-result', text=sentence, label=sentence[:200], result_row='header',
@@ -256,7 +261,7 @@ def current_result_intent(raw, sentence):
             return _header_intent(raw, sentence, subject)
         return None
     if _POINT_WORD.search(subject):
-        if is_double_click_step(raw) or raw.get('action') == 'double-click-result':
+        if coordinate_request(subject):
             return _coordinate_intent(raw, sentence)
         return None
     named_result = re.search(r'결과|조회\s*(?:행|줄|항목)|\bresults?\b', subject, re.I)
@@ -300,6 +305,13 @@ def current_result_intent(raw, sentence):
         return None
     selector = selector or {'role': 'table'}
     mode = 'single' if single else 'first' if first or column else 'recorded'
+    if mode == 'recorded' and not _plain_table_gesture(subject):
+        # Extra words may select a different row. Preserve their meaning for
+        # interpretation instead of dispatching the previously taught position.
+        return None
+    if mode == 'recorded' and raw.get('result_row') == 'coordinate':
+        # Editing the caption of an explicitly positioned gesture keeps its input mode.
+        return _coordinate_intent(raw, sentence)
     intent = dict(mode='double-click-result', text=sentence, label=sentence[:200], result_row=mode, selector=selector)
     if column:
         intent['result_column'] = column[2].strip()
@@ -544,6 +556,25 @@ def result_surface_hint(raw):
     return None
 
 
+def recorded_result_selector(raw):
+    return raw.get('selector') if raw.get('action') == 'double-click-result' else result_surface_hint(raw)
+
+
+def taught_position(raw):
+    """Keep original geometry available when an edit uses a different targeting method."""
+    if 'result_point' not in raw:
+        position = raw.get('recorded_position')
+        if position is not None:
+            if not isinstance(position, dict) or set(position) != {'selector', 'result_point'}:
+                raise TaskError('invalid_recorded_position')
+            _validate_current_result(dict(action='double-click-result', label='position', result_row='coordinate', **position))
+        return deepcopy(position)
+    selector = recorded_result_selector(raw)
+    if valid_result_point(raw['result_point']) and selector and {'automation_id', 'name'}.intersection(selector):
+        return dict(selector=deepcopy(selector), result_point=deepcopy(raw['result_point']))
+    return None
+
+
 def valid_result_point(point):
     fields = {'x', 'y', 'width', 'height'}
     if (not isinstance(point, dict) or point.keys() - {'window_placement', 'dpi'} != fields
@@ -738,9 +769,12 @@ def interpret_step(raw_step, sentence, action, selector, *, label=None, result_r
                 raise TaskError('recorded_header_required')
             step.update(result_column=header['result_column'], result_point=header['result_point'])
         elif result_row == 'coordinate':
-            point = current_result_intent(raw_step, sentence)
-            if not point or point['result_row'] != 'coordinate' or point['selector'] != selector:
+            # A structured choice already specifies the mode. Check its gesture and
+            # recorded geometry directly, independent of the original caption.
+            point = _coordinate_intent(raw_step, sentence)
+            if not point or selector is not None and point['selector'] != selector:
                 raise TaskError('recorded_coordinate_required')
+            step['selector'] = point['selector']
             step['result_point'] = point['result_point']
         _validate_current_result(step)
     else:
@@ -1397,6 +1431,9 @@ def instructed_step(raw_step, spec):
         result['row_cue'] = deepcopy(raw_step['row_cue'])
     if result['action'] in ('manual', 'visual-click'):
         result.update(result_location(raw_step))
+    if ((result['action'] == 'double-click-result' or is_double_click_step(result))
+            and 'result_point' not in result and (position := taught_position(raw_step))):
+        result['recorded_position'] = position
     return result
 
 
@@ -1632,6 +1669,8 @@ def _visual_step(raw, label):
     validate_spec(raw.get('visual'))
     result = dict(action='visual-click', label=label, visual=raw['visual'], **_annotations(raw))
     result.update(result_location(raw))
+    if 'recorded_position' in raw:
+        result['recorded_position'] = deepcopy(raw['recorded_position'])
     return result
 
 
@@ -1849,6 +1888,11 @@ def _validate_current_result(step):
 def _validate_step(s, parameters):
     if not isinstance(s, dict) or not isinstance(s.get('action'), str):
         raise TaskError('invalid_task_step')
+    if 'recorded_position' in s:
+        if 'result_point' in s or not (s['action'] == 'double-click-result' or is_double_click_step(s)) or not taught_position(s):
+            raise TaskError('invalid_recorded_position')
+        s = dict(s)
+        s.pop('recorded_position')
     if 'row_cue' in s or 'recorded_row' in s:
         # These fields are editorial evidence only; the recipe compiler selects
         # executable fields explicitly for each of the allowed action types.

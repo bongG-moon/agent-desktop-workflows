@@ -34,6 +34,7 @@ import row_vision
 import window_context
 import conditional_action
 import workflow_repair
+import request_timing
 
 
 CHILD_VISUAL_TIMEOUT = 30
@@ -364,14 +365,17 @@ def worker_timeout(recipe):
                         for step in recipe['steps'] if 'after_step' in (spec := step.get('window_context', {}))})
 
 
-def values_for(recipe, overrides):
-    parameters = {s['parameter'].casefold(): s['parameter'] for s in recipe['steps'] if 'parameter' in s}
+def values_for(recipe, overrides, *, steps=None):
+    all_parameters = {s['parameter'].casefold(): s['parameter'] for s in recipe['steps'] if 'parameter' in s}
+    selected = recipe['steps'] if steps is None else steps
+    parameters = {s['parameter'].casefold(): s['parameter'] for s in selected if 'parameter' in s}
     values = {k.casefold(): v for k, v in overrides.items()}
     need(len(values) == len(overrides) and all(app.tasks.valid_value(v, 'textfield') for v in values.values()),
          'invalid_override')
-    if values.keys() - parameters.keys():
+    if values.keys() - all_parameters.keys():
         raise WorkflowError('unknown_parameter', required_parameters=list(parameters.values()))
-    for step in recipe['steps']:
+    values = {k: v for k, v in values.items() if k in parameters}
+    for step in selected:
         key = step.get('parameter', '').casefold()
         if key in values:
             role = 'textfield' if step['action'] == 'verify-value' else step['selector']['role']
@@ -1168,7 +1172,7 @@ def checked_result_hints(recipe, saved):
 def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_selection=False,
         background_only=False, only=None, scene_session=None, resume=None, track_menu=False,
         registered_session=None, result_confirmation=None, result_surface_hint=None,
-        remember_result_elements=False, result_owner=None):
+        remember_result_elements=False, result_owner=None, track_detail=False):
     recipe = validate(recipe)
     result_hints = checked_result_hints(recipe, result_surface_hint)
     if hwnd is not None:
@@ -1203,7 +1207,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
         refusal = input_policy.blocked(requirements)
         if refusal:
             return refusal
-    values, missing = values_for(dict(recipe, steps=active if resume and resume.get('detail') else requested), overrides or {})
+    checked_suffix = resume and (resume.get('detail') or resume.get('coordinate'))
+    values, missing = values_for(recipe, overrides or {}, steps=active if checked_suffix else requested)
     if missing and not read_only:
         return dict(status='needs_input', missing_parameters=missing, steps=[], input_dispatched=False)
     if not read_only:
@@ -1231,7 +1236,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     if not read_only and scene_session is None and any(s['action']=='conditional-open' for s in active):
         from scene_session import start
         return start(__file__, recipe, dict(overrides=overrides, hwnd=hwnd, only=only, resume=resume,
-                                            track_menu=track_menu, allow_recorded_selection=allow_recorded_selection),
+                                            track_menu=track_menu, track_detail=track_detail,
+                                            allow_recorded_selection=allow_recorded_selection),
                      worker_timeout(recipe))
     report = dict(status='observed' if read_only else 'verified', steps=[], input_dispatched=False,
                   business_commit='not_verified', input_requirements=requirements,
@@ -1245,6 +1251,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     routes = None
     reservations = ExitStack()
     stage_started = started
+    step_starts = {}
     try:
         owner = bind(recipe['exe'], recipe['window'], hwnd)
         report['window_bind_seconds'] = round(time.monotonic() - started, 4)
@@ -1271,6 +1278,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
 
         if resume:
             need(workflow_repair.matches_identity(owner, resume['scope'][0]), 'menu_repair_window_changed')
+            if resume.get('coordinate'):
+                need(window_context.window_cookie(app.bridge, owner.hwnd) == resume['owner_cookie'],
+                     'coordinate_window_lifetime_changed')
         if background_only and not read_only:
             input_policy.window_ready(owner)
         active_scopes = window_context.effect_scopes(recipe['steps'], (n for n, _ in entries))
@@ -1336,6 +1346,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             report['preparation_seconds'] = round(time.monotonic() - started, 4)
             for index, (number, step) in enumerate(entries):
                 stage_started = time.monotonic()
+                step_starts[number] = stage_started
                 before_key, after_key = (0, 0) if read_only else _key_intervals(active, index)
                 app.guard(owner, owner, recipe['window'])
                 context = step.get('window_context')
@@ -1379,6 +1390,9 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                         routes.check(context, binding)
 
                 def check_target(surface, popup=None, *, mutate=False):
+                    if resume and resume.get('coordinate') and number == resume['number']:
+                        need(window_context.window_cookie(app.bridge, owner.hwnd) == resume['owner_cookie'],
+                             'coordinate_window_lifetime_changed')
                     check_context()
                     check_surface(binding, surface, title, popup, mutate=mutate)
                     if mutate and not background_only and number not in foreground_steps:
@@ -1503,6 +1517,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                                 if step['result_row'] != 'coordinate' and error.code != 'result_point_not_data':
                                     raise
                                 receipt = dict(status='blocked', diagnostic=error.code, input_dispatched=False)
+                                if getattr(error, 'input_guard', None):
+                                    receipt['input_guard'] = error.input_guard
                             receipt.update(result_observation=observed['result_observation'],
                                            result_row=step['result_row'], query_freshness='not_asserted',
                                            value_comparison=False)
@@ -1833,6 +1849,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
                 else:
                     report.update(status=receipt['status'], stopped_at=number,
                                   diagnostic=receipt.get('diagnostic', 'step_not_verified'))
+                    if 'input_guard' in receipt:
+                        report['input_guard'] = receipt['input_guard']
                     if step['action'] in ('context-menu', 'submit', 'press-key') and receipt['status'] in ('verified', 'waited'):
                         report.update(status='blocked', diagnostic='submission_completion_unproven')
                     break
@@ -1843,6 +1861,8 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             step = recipe['steps'][number - 1]
         failure = dict(status='uncertain' if dispatching else 'blocked',
                        input_dispatched=None if dispatching else False, diagnostic=diagnostic)
+        if getattr(error, 'input_guard', None):
+            failure['input_guard'] = report['input_guard'] = error.input_guard
         if number:
             report['stopped_at'] = number
         if number and (not report['steps'] or report['steps'][-1]['number'] != number):
@@ -1855,15 +1875,16 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
     finally:
         try:
             try:
-                if track_menu and routes is not None and (only is not None or report.get('stopped_at')):
-                    checkpoint = workflow_repair.detail_checkpoint(routes, owner, report, only)
+                if (track_menu or track_detail) and routes is not None and (only is not None or report.get('stopped_at')):
+                    checkpoint = workflow_repair.result_checkpoint(routes, owner, report, only)
                     if checkpoint:
-                        report['_detail_checkpoint'] = checkpoint
+                        report['_result_checkpoint'] = checkpoint
             finally:
                 if anchor_proof is not None:
                     anchor_proof.close()
         finally:
             reservations.close()
+            request_timing.record_steps(step_starts, report.get('steps', ()))
     if (report['status'] == 'completed_unverified' and 'stopped_at' not in report
             and only is None and not resume and verified_detail_read(recipe['steps'], report['steps'])):
         report.update(status='verified', outcome='current_result_detail_read_and_closed',
@@ -1875,7 +1896,7 @@ def run(recipe, overrides=None, *, read_only=False, hwnd=None, allow_recorded_se
             dict(number=row['number'], field=step.get('label') or step['selector'].get('query') or
                  step['selector'].get('name') or step['selector'].get('automation_id'), value=row['receipt']['value'])
             for row, step in zip(report['steps'], recipe['steps']) if step['action'] == 'read-value']
-    if not read_only and workflow_repair.header_stop(report, recipe):
+    if not read_only and workflow_repair.result_state_stop(report, recipe):
         report['inspection_owner'] = dict(hwnd=owner.hwnd, pid=owner.pid, exe_name=owner.exe,
                                            title=recipe['window'], process_started_utc_ticks=owner.created)
     report['elapsed_seconds'] = round(time.monotonic() - started, 4)
@@ -2019,6 +2040,8 @@ def run_instructions(recipe, skill_name, *, host='claude', command=RUN_COMMAND):
         import result_trial
         repair += ('중단되면 이번 영수증의 재개 인자를 그대로 쓴다. 사용자가 처음부터 다시 실행하라고 한 경우에만 '
                    '`--new-attempt`로 새 실행을 시작한다.\n\n')
+        if any(s.get('result_row') == 'coordinate' for s in recipe['steps']):
+            repair += '저장된 표 좌표를 그대로 쓴다. 위치 단계에서 멈추면 `next_action.args`로 같은 실행을 잇는다.\n\n'
         if any(s.get('result_row') == 'header' for s in recipe['steps']):
             repair += '녹화한 열 머리글이나 상세 창에서 멈추면 `inspect_args`로 현재 상태를 확인한다.\n\n'
         if any(result_trial.supported(recipe, n) for n in range(1, len(recipe['steps']) + 1)):
@@ -2047,8 +2070,8 @@ def run_instructions(recipe, skill_name, *, host='claude', command=RUN_COMMAND):
             '이미 확인된 값, 창 닫힘과 파일을 화면으로 다시 검사하지 않는다. '
             '이미지 확인이 필요한 중단 응답에서만 반환된 이미지를 읽고, 같은 창의 같은 판단에서 동일한 frame 또는 image_sha256은 다시 읽지 않는다. '
             '로컬 확인창과 Python 내부 픽셀 검사는 모델에 이미지를 보내라는 지시가 아니다. '
-            'input_pause이면 사용자에게 입력을 잠시 멈춰 달라고 안내한다. 사용자가 멈췄다고 하면 제공된 resume_args로 이어간다. '
-            'retry_full_run_after_idle은 전체를 다시 시작할 수 있다. 그 밖에는 이미 보낸 입력의 결과부터 확인한다. '
+            'input_pause이면 input_guard에 기록된 창 전환이나 입력 변화만 설명한다. 입력 주체는 알 수 없다. '
+            '상태가 안정되면 제공된 재개 인자를 사용한다. 전체 재시도는 입력 미전달이 확인되고 사용자가 요청할 때만 한다. '
             '녹화 순서 설명이나 중단 후 복구가 필요할 때만 '
             f'[업무 상세 안내]({GUIDE_REFERENCE})를 읽는다.\n' + GUIDE_END)
 
@@ -2474,6 +2497,11 @@ def register_first_run(recipe, args, source_task=None):
 
 
 def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    return request_timing.invoke(_main, args, args)
+
+
+def _main(argv):
     entered = time.monotonic()
     requested_at = time.time()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -2589,6 +2617,7 @@ def main(argv=None):
                     need(args._worker and expected == workflow_repair.digest(recipe), 'workflow_changed_before_worker')
         if args.command == 'register' and args.run:
             result = register_first_run(recipe, args, source_task)
+            request_timing.receipt(result)
             print(json.dumps(result, ensure_ascii=False))
             return (0 if result['status'] in ('registered', 'observed', 'verified')
                     or (args.summary and result.get('outcome') == 'workbook_verified') else
@@ -2655,7 +2684,14 @@ def main(argv=None):
             need(not args.remember_physical or (eligible and args.allow_physical and not repairing),
                  'repeat_approval_requires_full_physical_test')
             if args.input_plan:
+                names = list(dict.fromkeys(s['parameter'] for s in active['steps'] if 'parameter' in s))
+                missing = names
+                if args.set:
+                    _, missing = values_for(recipe, app.tasks.parse_overrides(args.set), steps=active['steps'])
                 print(json.dumps(dict(status='observed', input_dispatched=False,
+                                      required_parameters=names, missing_parameters=missing,
+                                      result_modes=[dict(number=n, mode=s.get('result_row', 'value')) for n, s in entries
+                                                    if s['action'] == 'double-click-result'],
                                       input_requirements=requirements), ensure_ascii=False))
                 return 0
             if args.background_only and not args.read_only:
@@ -2675,7 +2711,10 @@ def main(argv=None):
                     supplied.setdefault((name.casefold(), separator, value), item)
                 args.set = list(supplied.values())
             overrides = app.tasks.parse_overrides(args.set)
-            _, missing = values_for(active, overrides)
+            _, missing = values_for(recipe, overrides, steps=active['steps'])
+            if args.only is not None and overrides:
+                selected_names = {s['parameter'].casefold() for s in active['steps'] if 'parameter' in s}
+                overrides = {k: v for k, v in overrides.items() if k.casefold() in selected_names}
             if ((registered or header_requested) and not args.allow_physical and not args.repeat_approval_used and not args.resume_input and not args.resume_detail and
                     (repairing or (mutating and requirements['physical_input_required']))):
                 diagnostic = 'registered_physical_consent_required' if registered else 'physical_consent_required'
@@ -2746,8 +2785,9 @@ def main(argv=None):
                 result = summarize_execution(result, entries)
                 result = workflow_repair.compact_stop(result)
         if (mutating and result.get('diagnostic') in workflow_repair.INPUT_CHANGED
-                and not result.get('input_pause')):
-            untouched = result.get('input_dispatched') is False and not (args.resume_input or args.resume_menu)
+                and not result.get('input_pause') and not result.get('next_action')):
+            untouched = (result.get('input_dispatched') is False and result.get('previous_input_dispatched', False) is False
+                         and not (args.resume_input or args.resume_menu))
             result['input_pause'] = dict(host_action='retry_full_run_after_idle' if untouched
                                          else 'check_current_effect_before_continuing')
     except (Exception, KeyboardInterrupt) as error:
@@ -2775,6 +2815,7 @@ def main(argv=None):
                 result['execution_validation'] = 'unknown' if result.get('input_dispatched') is None else 'not_run'
     if args._worker:
         result = dict(result, _worker_entered=entered)
+    request_timing.receipt(result)
     print(json.dumps(result, ensure_ascii=False))
     return (0 if result['status'] in ('registered', 'observed', 'verified')
               or (getattr(args, 'summary', False) and result.get('outcome') == 'workbook_verified') else

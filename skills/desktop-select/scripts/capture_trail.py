@@ -11,6 +11,8 @@ import win_bridge as bridge
 
 def _double_opener(step):
     """A reviewed action keeps the same gesture as its raw recording evidence."""
+    if isinstance(step, dict) and step.get('action') == 'saved-step':
+        step = step['saved']
     return (learned_tasks.is_double_click_step(step)
             or isinstance(step, dict) and step.get('action') == 'double-click-result')
 

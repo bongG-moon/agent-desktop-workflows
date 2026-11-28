@@ -34,7 +34,7 @@ class LocalReviewTests(unittest.TestCase):
         path = Path(directory.name)/'sample.png'
         image = tk.PhotoImage(master=self.root,width=160,height=120)
         image.write(str(path),format='png')
-        self.review = local.ResultReview(self.root,path,'Code',[20,10,120,80],expected='PART-42')
+        self.review = local.ResultReview(self.root,path,'Code',[20,10,120,80],expected='PART-42', step_number=3)
         self.root.update_idletasks()
 
     @staticmethod
@@ -53,6 +53,27 @@ class LocalReviewTests(unittest.TestCase):
         self.review.value.set('PART-42')
         self.review.confirm.invoke()
         self.assertEqual(self.review.result,dict(header=[27,15,68],point=[38,42],value='PART-42'))
+
+    def test_instructions_follow_the_current_gesture_and_reset_after_reselecting(self):
+        review = self.review
+        title = self.root.nametowidget('!frame.step_title')
+        self.assertIn('3단계', title.cget('text'))
+        self.assertIn('캡처에서 「Code」 열 제목', review.instruction.get())
+        self.assertTrue(review.entry.instate(['disabled']))
+        review.press(self.event(7, 5))
+        review.release(self.event(48, 5))
+        self.assertIn('「PART-42」', review.instruction.get())
+        review.press(self.event(18, 32))
+        review.release(self.event(18, 32))
+        self.assertIn('보이는 글자를 아래 입력란', review.instruction.get())
+        review.value.set('OTHER')
+        self.assertIn('요청값과 다릅니다', review.instruction.get())
+        review.value.set('PART-42')
+        self.assertIn(review.confirm.cget('text'), review.instruction.get())
+        review.press(self.event(70, 32))
+        review.release(self.event(70, 32))
+        self.assertIn('「PART-42」', review.instruction.get())
+        self.assertTrue(review.confirm.instate(['disabled']))
 
     def test_other_column_header_and_similar_text_cannot_confirm(self):
         for point in ((65,20),(10,4),(10,5)):
@@ -73,8 +94,11 @@ class LocalReviewTests(unittest.TestCase):
             image.write(str(path), format='png')
             review = local.ResultReview(self.root, path, None, [20,10,120,80], row_policy='single')
             self.assertIsNone(review.entry)
+            self.assertIn('한 번 클릭', review.instruction.get())
+            self.assertTrue(review.row_check.instate(['disabled']))
             review.press(self.event(18,32))
             review.release(self.event(18,32))
+            self.assertIn('체크', review.instruction.get())
             self.assertTrue(review.confirm.instate(['disabled']))
             review.confirmed.set(True)
             review.update_button()

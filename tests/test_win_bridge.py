@@ -642,8 +642,12 @@ class BridgeTests(unittest.TestCase):
                     patch.object(w.kernel32, 'GetTickCount', return_value=190),
                     patch.object(w.time, 'sleep') as sleep):
                 if changed:
-                    with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed'):
+                    with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed') as stopped:
                         w.wait_for_quiet_foreground(701, 90)
+                    self.assertEqual(stopped.exception.input_guard, dict(phase='after_quiet_wait', source='undetermined',
+                                     expected_foreground_hwnd=701, observed_foreground_hwnd=701,
+                                     last_input_tick_before=90, last_input_tick_after=91, held_input='none',
+                                     quiet_wait_ms=400, signals=['input_tick_changed']))
                 else:
                     w.wait_for_quiet_foreground(701, 90)
                 sleep.assert_called_once_with(.4)
@@ -655,10 +659,26 @@ class BridgeTests(unittest.TestCase):
               patch.object(w, 'input_tick', side_effect=[100, 100, 101]),
               patch.object(w.kernel32, 'GetTickCount', return_value=600)):
             user.IsIconic.return_value = True
-            with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed'):
+            with self.assertRaisesRegex(w.BridgeError, 'foreground_or_input_changed') as stopped:
                 w.activate(self._request(), input_checkpoint=(701, 100))
+            evidence = stopped.exception.input_guard
+            self.assertEqual((evidence['phase'], evidence['allowed_foreground_hwnd']), ('after_window_restore', 900))
+            self.assertEqual(evidence['signals'], ['input_tick_changed'])
             user.ShowWindow.assert_called_once_with(900, 9)
             user.SetForegroundWindow.assert_not_called()
+
+    def test_input_guard_reports_allowed_activation_and_only_the_held_input_category(self):
+        for key, category in ((4, 'mouse_button'), (65, 'keyboard_key')):
+            with (self.subTest(category=category), patch.object(w, 'foreground', return_value=902),
+                  patch.object(w, 'input_tick', return_value=123), patch.object(w, 'user32') as user,
+                  self.assertRaises(w.BridgeError) as stopped):
+                user.GetAsyncKeyState.side_effect = lambda vk: 0x8000 if vk == key else 0
+                w.check_foreground_input(701, 123, 902, phase='after_activation')
+            self.assertIs(stopped.exception.input_dispatched, False)
+            self.assertEqual(stopped.exception.input_guard, dict(phase='after_activation', source='undetermined',
+                             expected_foreground_hwnd=701, observed_foreground_hwnd=902, allowed_foreground_hwnd=902,
+                             signals=['key_or_button_held'], last_input_tick_before=123, last_input_tick_after=123,
+                             held_input=category))
 
     def test_dispatch_exception_has_unknown_outcome_and_no_retry(self):
         patches, user = self._point_context()

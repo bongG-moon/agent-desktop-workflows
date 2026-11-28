@@ -33,6 +33,67 @@ class CurrentResultTrial(unittest.TestCase):
                        result_surface_selector={'role':'group','automation_id':'results'}))])
         tasks.save_task(self.task,self.directory)
 
+    def test_open_detail_first_trial_resumes_only_proven_suffix_once_without_capture(self):
+        import grounding
+        checkpoint = dict(detail=True, number=4, opener_step=3, verification_scope='recorded_window_opened',
+                          scope=[[7, 2, 1], [8, 2, 1]], window_cookies=[63, 64])
+        self.worker.return_value.update(stopped_at=4, _result_checkpoint=checkpoint)
+        prefix = self.worker.return_value['steps']
+        prefix[1]['receipt']['diagnostic'] = 'business_result_not_verified'
+        prefix[2]['receipt'] = dict(status='verified', verification_scope='recorded_window_opened',
+                                     result_row='single', value_comparison=False, input_dispatched=True)
+        prefix.append(dict(number=4, receipt=dict(status='blocked', diagnostic='target_missing', input_dispatched=False)))
+        args = ['--task', self.task['name'], '--set', 'Region=North', '--allow-physical']
+        with patch.object(grounding, '_capture', side_effect=AssertionError('unexpected image')), \
+                patch.object(input_policy, 'interactive_desktop_blocked', return_value=None):
+            paused = self.trial(*args)
+            key = paused['trial_receipt']
+            continuation = paused['next_action']['args']
+            inspected = app.run(app.parser().parse_args(['inspect-trial', '--receipt', key]))
+            self.assertEqual(inspected['next_action']['args'], continuation)
+            self.assertNotIn('result_checkpoint', first_trial.host_summary(paused))
+            self.worker.return_value = dict(status='verified', input_dispatched=True, steps=[
+                dict(number=4, receipt=dict(status='observed', value='sample', value_evidence=dict(status='observed'),
+                                            input_dispatched=False)),
+                dict(number=5, receipt=dict(status='verified', diagnostic='recorded_window_closed', input_dispatched=True))])
+            with patch.object(app, 'worker_receipt', self.worker):
+                resumed = app.run(app.parser().parse_args(continuation))
+                again = app.run(app.parser().parse_args(continuation))
+                inspected = app.run(app.parser().parse_args(['inspect-trial', '--receipt', key]))
+            self.assertEqual([s['number'] for s in resumed['steps']], [1, 2, 3, 4, 5])
+            self.assertEqual(resumed['observations'][0]['value'], 'sample')
+            self.assertEqual(inspected['observations'], resumed['observations'])
+            self.assertTrue(again['previous_trial'])
+            self.assertFalse(resumed['prior_steps_replayed'])
+            self.assertEqual(self.worker.call_count, 2)
+            self.assertEqual(self.worker.call_args.kwargs['payload']['resume_checkpoint'], checkpoint)
+
+    def test_coordinate_trial_uses_no_frame_and_never_retries_uncertain_delivery(self):
+        import grounding
+        self.task['name'] = 'Positional lookup'
+        self.task['steps'][2].update(result_row='coordinate', result_point=dict(x=12,y=15,width=60,height=100))
+        tasks.save_task(self.task, self.directory)
+        checkpoint = dict(coordinate=True, number=3, scope=[[7,2,1], [7,2,1]], owner_cookie=123)
+        self.worker.return_value.update(_result_checkpoint=checkpoint)
+        options = ['--task', self.task['name'], '--allow-physical', '--set', 'Region=South']
+        with patch.object(grounding, '_capture', side_effect=AssertionError('unexpected image')), \
+                patch.object(input_policy, 'interactive_desktop_blocked', return_value=None), patch.object(app, 'worker_receipt', self.worker):
+            receipt = self.trial(*options)
+            self.assertTrue(self.worker.call_args.kwargs['payload']['track_detail'])
+            args = receipt['next_action']['args']
+            self.assertEqual(receipt['next_action']['kind'], 'resume_coordinate')
+            without_permission = app.run(app.parser().parse_args([a for a in args if a != '--allow-physical']))
+            self.assertEqual(without_permission['status'], 'needs_consent')
+            self.worker.return_value = dict(status='uncertain', diagnostic='partial_sendinput', input_dispatched=None,
+                                            stopped_at=3, steps=[dict(number=3,receipt=dict(status='uncertain',input_dispatched=None))])
+            resumed = app.run(app.parser().parse_args(args))
+            self.assertIsNone(resumed['resume_dispatched_input'])
+            self.assertFalse(resumed['prior_steps_replayed'])
+            self.assertNotIn('next_action', resumed)
+            self.assertEqual(self.trial(*options)['diagnostic'], 'partial_sendinput')
+            self.assertEqual(app.run(app.parser().parse_args(args))['diagnostic'], 'partial_sendinput')
+            self.assertEqual(self.worker.call_count, 2)
+
     def test_opaque_current_row_offers_one_resume_without_expected_value(self):
         report = self.trial('--task',self.task['name'],'--set','Region=North','--allow-physical')
         self.assertEqual(report['host_action'],'inspect_current_result_without_replaying')
@@ -168,6 +229,7 @@ class CurrentResultTrial(unittest.TestCase):
             report = self.trial(*args)
             again = self.trial(*args)
         self.assertTrue(report.get('correction_saved'), report)
+        self.assertEqual(picker.call_args.kwargs['step_number'], 3)
         self.assertFalse(report['prior_steps_replayed'])
         self.assertEqual(report['effective_task'], again['effective_task'])
         self.assertTrue(again['previous_trial'])

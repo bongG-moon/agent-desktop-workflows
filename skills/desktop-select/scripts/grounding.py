@@ -253,7 +253,7 @@ def _save_row(plan, store, number, spec):
             temp.unlink(missing_ok=True)
 
 
-def _save_bound_copy(doc, plan, rows, number, fingerprint, store):
+def save_bound_copy(doc, plan, rows, number, fingerprint, store):
     """Preserve the form of every unresolved sibling in a new draft if compilation is incomplete."""
     import recovery
     import review_drafts
@@ -274,10 +274,16 @@ def _save_bound_copy(doc, plan, rows, number, fingerprint, store):
             draft_rows = deepcopy(doc['rows'])
             bound, row = plan['steps'][number-1], draft_rows[number-1]
             old = row['step']
-            row['step'] = dict(id=old['id'],action='visual-click',label=bound['label'],visual=bound['visual'])
+            if bound['action'] == 'visual-click':
+                row['step'] = {k: deepcopy(bound[k]) for k in ('action','label','visual','recorded_position') if k in bound}
+                row['step']['id'] = old['id']
+            else:
+                saved = dict(bound)
+                saved.pop('window_context', None)
+                row['step'] = dict(id=old['id'], action='saved-step', label=bound['label'], saved=saved)
             if '_capture_window' in old:
                 row['step']['_capture_window'] = old['_capture_window']
-            row['form'].update(text=bound['label'], mode=None, argument='')
+            row['form'].update(review_drafts.saved_form(bound))
             revised = dict(doc, name=plan['name'], rows=draft_rows, diagnostic=problem[1], step_number=problem[0])
             tasks._write_document(review_drafts.validate(revised), store)
             return review_drafts.receipt(revised, 'recorded')
@@ -392,10 +398,13 @@ def run(app, args):
     if window[2:] != frame[2:] or image_point != list(args.point):
         return _changed_frame(doc['name'], number)
     check()
+    position = tasks.taught_position(step) if double else None
     step = dict(action='visual-click',label=sentence,visual=spec,**tasks._annotations(step))
+    if position:
+        step['recorded_position'] = position
     plan['steps'][number-1] = step
     plan['name'] = args.save_as
-    draft_receipt = _save_bound_copy(doc, plan, rows, number, fingerprint, store)
+    draft_receipt = save_bound_copy(doc, plan, rows, number, fingerprint, store)
     try:
         path.unlink(missing_ok=True)
     except OSError:

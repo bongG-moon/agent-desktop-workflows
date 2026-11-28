@@ -25,7 +25,7 @@ python -X utf8 -B "${CLAUDE_SKILL_DIR}/scripts/desktop_select.py" try-recording 
 
 - 필요한 값과 물리 입력 허용 여부는 한 번에 묻는다. `unknown_parameter`면 응답의 `required_parameters`와 요청을 대조해 대상이 명확한 값은 재사용한다. 저장 처리 중이면 `retry_args`로 이어간다. 중단된 시험은 같은 요청으로 결과를 확인하고, 사용자가 새 실행을 요청했을 때만 새 `--trial-id`를 지정한다.
 - 보정은 이미 받은 단계와 현재 화면의 근거를 사용한다. 메뉴 이미지와 `resume_args`가 있으면 해당 이미지를 한 번 확인해 그 지점부터 이어간다. 이미지가 필요하고 아직 없을 때만 `frame_args`를 쓴다. `image_unchanged`이면 이미 본 이미지를 재사용한다.
-- 준비가 막히면 `next_action`을 따른다. 상세 창은 여는 단계 뒤에 찾고, 행의 값 비교는 요청한 경우에만 한다. 문장 해석이 필요할 때만 [실행 의도 연결](references/recording-recovery.md#구조화된-의도-연결)을 읽는다.
+- 저장된 좌표 방식은 표 안의 지정 위치를 사용한다. 상세 읽기와 닫기까지 같은 호출로 실행하고, 중단되면 `next_action`의 인자 그대로 이어간다. 문장 해석이 필요할 때만 [실행 의도 연결](references/recording-recovery.md#구조화된-의도-연결)을 읽는다.
 - 결과 확인이 필요하면 응답의 `result_inspection`과 재개 인자를 따른다. 추가 판단이 필요한 경우에만 [결과 확인](references/recording-recovery.md), [표와 메뉴](references/table-export.md), [행과 창](references/rows-and-windows.md)을 읽는다.
 
 ## 등록과 반복 실행

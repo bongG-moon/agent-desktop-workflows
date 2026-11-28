@@ -103,7 +103,7 @@ def _summary(number, row, doc):
     item = dict(number=number, text=row['text'], action=step['action'],
                 window=scope.get('title', doc['window']), exe=scope['exe'])
     for key in ('target', 'reason', 'label', 'role', 'match', 'alias', 'description', 'menu_anchor',
-                'menu_window_point', 'result_surface', 'wait_after'):
+                'menu_window_point', 'result_surface', 'result_point', 'recorded_position', 'result_row', 'wait_after'):
         if key in step:
             item[key] = step[key]
     if location := tasks.row_location(step):
@@ -271,8 +271,11 @@ def _interpreted_binding(row, item, inventory=None, *, app=None, surface=None):
     if inventory is None:
         # A closed downstream window cannot be observed now. Only retain its
         # actual demonstrated identity, then resolve it after the opener runs.
-        captured = (tasks.result_surface_hint(source) if item['mode'] == 'double-click-result'
-                    else tasks._recorded_selector(source))
+        if item.get('result_row') == 'coordinate':
+            captured = (tasks.taught_position(source) or {}).get('selector')
+        else:
+            captured = (tasks.recorded_result_selector(source) if item['mode'] == 'double-click-result'
+                        else tasks._recorded_selector(source))
         _require(captured == step['selector'] and any(k in captured for k in ('name', 'automation_id')),
                  'recorded_target_required_for_deferred_binding')
     else:
@@ -599,12 +602,17 @@ def double_click_handoff(name, number):
                 capture_requires_consent=True)
 
 
-def missing_coordinate(name, number, source, sentence):
+def missing_coordinate(name, number, source, sentence, *, explicit=False):
     """A missing taught position cannot be recovered by observing pixels in a different frame."""
-    if not tasks.is_double_click_step(source) or not tasks.coordinate_request(sentence):
+    if not (tasks.is_double_click_step(source) or source.get('action') == 'double-click-result'):
+        return None
+    if not explicit and not tasks.coordinate_request(sentence):
+        return None
+    if tasks.taught_position(source):
         return None
     missing = []
-    if not tasks.result_surface_hint(source):
+    table = tasks.recorded_result_selector(source)
+    if not table or not any(k in table for k in ('automation_id', 'name')):
         missing.append('selector')
     if not tasks.valid_result_point(source.get('result_point')):
         missing.append('result_point')

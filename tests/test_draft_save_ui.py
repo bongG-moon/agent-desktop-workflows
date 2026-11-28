@@ -162,34 +162,95 @@ class DraftSaveUITests(unittest.TestCase):
         self.assertEqual(saved[1]['alias'], '결과 내보내기')
         draft.assert_not_called()
 
-    def test_single_step_dialog_rejects_empty_multiple_or_partial_takes(self):
+    def test_replacement_editor_shows_live_targets_and_reviews_multiple_actions(self):
+        import copy
         import tkinter as tk
-        try:
-            root = tk.Tk()
-        except tk.TclError as exc:
-            self.skipTest(str(exc))
+        from tkinter import ttk
+        from types import SimpleNamespace
+        root = tk.Tk()
         root.withdraw()
-        self.addCleanup(root.destroy)
-        step = capture.capture_step(combo())
-        def apply():
-            dialog = next(w for w in root.winfo_children() if w.winfo_class() == 'Toplevel')
-            panel = dialog.winfo_children()[0]
-            next(w for w in panel.winfo_children() if w.winfo_class() == 'TButton'
-                 and w.cget('text') == '이 동작 적용').invoke()
-
-        for steps, partial in (([], False), ([step, step], False), ([step], True), ([step], False)):
-            with self.subTest(count=len(steps), partial=partial), patch.object(capture, 'CaptureSession') as factory:
-                take = factory.return_value
-                take.notes.partial = partial
-                take.finish.return_value = {'steps': steps}
-                root.after(30, apply)
-                if len(steps) == 1 and not partial:
-                    self.assertEqual(capture.capture_one_step(root, object(), 'Example'), step)
-                else:
-                    with self.assertRaises(ValueError):
-                        capture.capture_one_step(root, object(), 'Example')
-                take.start.assert_called_once_with()
-                take.finish.assert_called_once_with(report_empty=False)
+        errors, recorded, accepted = [], [], []
+        owner = Mock()
+        owner.hwnd = None
+        take = SimpleNamespace(binding=owner, started=False, ended=False,
+                               notes=SimpleNamespace(state='recording', limit=False, max_steps=100,
+                                                     snapshot=lambda: copy.deepcopy(recorded)), poll=Mock())
+        def start():
+            take.started = True
+        def finish(**_):
+            take.ended = True
+            return dict(steps=copy.deepcopy(recorded))
+        take.start, take.finish = Mock(side_effect=start), Mock(side_effect=finish)
+        take.cancel = Mock()
+        def widgets(parent):
+            for child in parent.winfo_children():
+                yield child
+                yield from widgets(child)
+        def get(dialog, name):
+            return next(w for w in widgets(dialog) if w.winfo_name() == name
+                        or isinstance(w, ttk.Button) and w.cget('text') == name)
+        def callback():
+            dialog = next(w for w in root.winfo_children() if isinstance(w, tk.Toplevel))
+            try:
+                tree = get(dialog, 'steps')
+                self.assertEqual(tree.get_children(), ())
+                take.start.assert_not_called()
+                get(dialog, '구간 녹화 시작').invoke()
+                first = capture.capture_step(combo())
+                first['id'] = 'fresh-a'
+                recorded.append(first)
+                def check_live():
+                    try:
+                        self.assertEqual(tree.get_children(), ('fresh-a',))
+                        self.assertEqual(tree.set('fresh-a', 'target'), 'Mode')
+                        self.assertEqual(tree.set('fresh-a', 'status'), '요소 인식')
+                        recorded[0]['value'] = 'P'
+                        second = capture.capture_step(combo('Family'))
+                        second['id'] = 'fresh-b'
+                        recorded.append(second)
+                        dialog.after(250, check_updated)
+                    except Exception as error:
+                        errors.append(error)
+                        dialog.destroy()
+                def check_updated():
+                    try:
+                        self.assertEqual(tree.get_children(), ('fresh-a', 'fresh-b'))
+                        self.assertIn('P', tree.set('fresh-a', 'instruction'))
+                        self.assertEqual(tree.set('fresh-b', 'target'), 'Family')
+                        get(dialog, '마치고 검토').invoke()
+                        dialog.update()
+                        self.assertEqual(get(dialog, '기존 1단계를 새 2개 동작으로 교체').winfo_manager(), 'pack')
+                        tree.selection_set('fresh-b')
+                        dialog.update()
+                        entry = get(dialog, 'instruction')
+                        entry.delete(0, 'end')
+                        entry.insert(0, 'Family를 N으로 선택')
+                        get(dialog, '기존 1단계를 새 2개 동작으로 교체').invoke()
+                    except Exception as error:
+                        errors.append(error)
+                        dialog.destroy()
+                dialog.after(250, check_live)
+            except Exception as error:
+                errors.append(error)
+                dialog.destroy()
+        def save(rows):
+            accepted.extend(rows)
+            return dict(status='replaced')
+        root.after(40, callback)
+        deadline = root.after(4000, root.destroy)
+        try:
+            with patch.object(capture, 'CaptureSession', return_value=take):
+                result = capture.capture(owner, title='Example', parent=root, section=(2, 2), replace_rows=save)
+        finally:
+            root.after_cancel(deadline)
+            root.destroy()
+        if errors:
+            raise errors[0]
+        self.assertEqual(result, dict(status='replaced'))
+        self.assertEqual([r['step']['id'] for r in accepted], ['fresh-a', 'fresh-b'])
+        self.assertEqual(accepted[1]['form']['text'], 'Family를 N으로 선택')
+        take.start.assert_called_once_with()
+        take.finish.assert_called_once_with(report_empty=False)
 
     def review(self, rows, interact, persist, draft, *, initial_step=None, locate_window=None, visible=False):
         try:
@@ -548,46 +609,70 @@ class DraftSaveUITests(unittest.TestCase):
         self.assertEqual(task.call_args_list[0], task.call_args_list[1])
         draft.assert_not_called()
 
-    def test_reorder_preserves_window_dependency_and_retakes_one_step_with_its_fields(self):
-        rows = [row('first', 'Mode를 N으로 선택'), row('open', '입력받은 변수를 Mode 조건에 입력해줘',
-                    alias='옵션', mode='required', argument='Mode'), row('child', 'Mode를 N으로 선택')]
+    def test_reorder_does_not_move_an_opener_after_its_child(self):
+        rows = [row('first', 'Mode를 N으로 선택'), row('open', 'Mode를 N으로 선택'),
+                row('child', 'Mode를 N으로 선택')]
         rows[2]['step']['_capture_window'] = dict(after_id='open', related=True, title='Other', exe='Other.exe')
-        replacement = capture.capture_step(combo())
-        replacement['target']['locator']['automation_id'] = 'correctedMode'
-        task, draft, locate = Mock(return_value={'status': 'saved'}), Mock(), Mock(return_value=object())
+        task, draft = Mock(return_value=dict(status='saved')), Mock()
+        def edit(root, get):
+            select_step(root, get, 'open')
+            step_menu(get).invoke('아래로 이동')
+            self.assertEqual(get('steps').get_children(), ('first', 'open', 'child'))
+            step_menu(get).invoke('위로 이동')
+            self.assertEqual(get('steps').get_children(), ('open', 'first', 'child'))
+            get('저장').invoke()
+        self.review(rows, edit, task, draft)
+        self.assertEqual(task.call_args.args[0][-1]['window_context']['after_step'], 1)
 
+    def test_selected_range_replacement_keeps_prefix_suffix_and_supports_cancel(self):
+        rows = [row('first', 'Mode를 N으로 선택'), row('second', 'Family를 N으로 선택', field='Family'),
+                row('third', 'Mode를 N으로 선택'), row('last', 'Mode를 N으로 선택')]
+        fresh = [row('fresh-a', 'Family를 N으로 선택', field='Family'),
+                 row('fresh-b', 'Mode를 N으로 선택'), row('fresh-c', 'Mode를 N으로 선택')]
+        task, draft, locate = Mock(return_value={'status': 'saved'}), Mock(), Mock(return_value=Mock())
+        original = capture.capture
+        calls = []
+        def nested(*args, **kwargs):
+            if kwargs.get('parent') is None:
+                return original(*args, **kwargs)
+            calls.append(kwargs['section'])
+            if len(calls) == 1:
+                return dict(status='cancelled')
+            return kwargs['replace_rows'](fresh)
         def edit(root, get):
             tree = get('steps')
-            button = get('step_tools')
-            menu = button.nametowidget(button.cget('menu'))
-            tree.selection_set('open')
+            tree.selection_set(('first', 'third'))
             root.update()
-            menu.invoke('아래로 이동')
-            self.assertEqual(tree.get_children(), ('first', 'open', 'child'))
-            menu.invoke('위로 이동')
-            self.assertEqual(tree.get_children(), ('open', 'first', 'child'))
-            menu.invoke('이 단계 다시 녹화')  # an unrecognized take cannot displace the valid one
-            self.assertEqual(get('steps').set('open', 'status'), '준비됨')
-            menu.invoke('이 단계 다시 녹화')
-            self.assertEqual(get('alias').get(), '옵션')
-            get('preview').invoke()
-            self.assertEqual(get('argument').get(), 'Mode')
-            tree.selection_set('child')
+            self.assertTrue(get('rerecord').instate(['disabled']))
+            tree.selection_set(('second', 'third'))
             root.update()
-            menu.invoke('이 단계 다시 녹화')  # cancellation in the other window
+            self.assertFalse(get('rerecord').instate(['disabled']))
+            self.assertFalse(get('instruction').winfo_viewable())
+            get('rerecord').invoke()
+            self.assertEqual(tree.get_children(), ('first', 'second', 'third', 'last'))
+            get('rerecord').invoke()
+            self.assertEqual(len(tree.get_children()), 5)
+            self.assertEqual(tree.get_children()[0], 'first')
+            self.assertEqual(tree.get_children()[-1], 'last')
+            self.assertEqual(len(tree.selection()), 3)
             get('저장').invoke()
-
-        with patch.object(capture, 'capture_one_step', side_effect=[
-                capture.manual('capture_target_unavailable'), replacement, None]) as take:
+        with patch.object(capture, 'capture', side_effect=nested):
             self.review(rows, edit, task, draft, locate_window=locate)
-        self.assertEqual(take.call_count, 3)
-        self.assertEqual([c.args[0] for c in locate.call_args_list], [None, None, rows[2]['step']['_capture_window']])
-        steps = task.call_args.args[0]
-        self.assertEqual([s['id'] for s in steps], ['open', 'first', 'child'])
-        self.assertEqual(steps[0]['target']['locator']['automation_id'], 'correctedMode')
-        self.assertEqual((steps[0]['alias'], steps[0]['instruction']['parameter']), ('옵션', 'Mode'))
-        self.assertEqual(steps[2]['window_context']['after_step'], 1)
+        self.assertEqual(calls, [(2, 3), (2, 3)])
+        self.assertEqual(len(task.call_args.args[0]), 5)
         draft.assert_not_called()
+
+    def test_multiple_selected_steps_delete_together(self):
+        rows = [row(key, 'Mode를 N으로 선택') for key in ('a', 'b', 'c', 'd')]
+        task, draft = Mock(return_value=dict(status='saved')), Mock()
+        def edit(root, get):
+            get('steps').selection_set(('b', 'c'))
+            root.update()
+            get('선택 단계 삭제').invoke()
+            self.assertEqual(get('steps').get_children(), ('a', 'd'))
+            get('저장').invoke()
+        self.review(rows, edit, task, draft)
+        self.assertEqual([s['id'] for s in task.call_args.args[0]], ['a', 'd'])
 
     def test_resume_focuses_failed_child_and_can_replace_existing_manual_opener(self):
         rows = [row('launch', 'Mode를 N으로 선택'), row('manual', ''), row('child', 'Mode를 N으로 선택')]

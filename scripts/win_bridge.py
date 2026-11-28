@@ -212,26 +212,61 @@ def input_tick():
     return info.tick
 
 
-def pointer_keys_down():
+def pointer_keys_down(*, classify=False):
     # IME mode VKs can remain asserted with no events on a Korean keyboard.
     # Mouse buttons, modifiers, typing keys, etc. must still be up. Changes
     # in IME input are independently detected by the session's input tick.
-    return any(user32.GetAsyncKeyState(key) & 0x8000 for key in _POINTER_GUARD_KEYS)
+    for key in _POINTER_GUARD_KEYS:
+        if user32.GetAsyncKeyState(key) & 0x8000:
+            if classify:
+                return 'mouse_button' if key in (1, 2, 4, 5, 6) else 'keyboard_key'
+            return True
+    return False
 
 
-def check_foreground_input(original, tick, restored=None):
-    if (foreground() not in (original, restored) or pointer_keys_down() or input_tick() != tick):
-        raise BridgeError('foreground_or_input_changed')
+def check_input_snapshot(phase, expected_hwnd, observed_hwnd, tick_before, tick_after, *,
+                         foreground_ok, held=None, allowed_hwnd=None, quiet_wait_ms=None,
+                         diagnostic='foreground_or_input_changed'):
+    """Describe the observed change without identifying keystrokes or attributing an input source."""
+    if foreground_ok and not held and tick_before == tick_after:
+        return
+    error = BridgeError(diagnostic)
+    signals = []
+    if not foreground_ok:
+        signals.append('foreground_changed')
+    if held:
+        signals.append('key_or_button_held')
+    if tick_before is not None and tick_after is not None and tick_after != tick_before:
+        signals.append('input_tick_changed')
+    evidence = dict(phase=phase, signals=signals, source='undetermined',
+                    expected_foreground_hwnd=expected_hwnd, observed_foreground_hwnd=observed_hwnd,
+                    last_input_tick_before=tick_before, last_input_tick_after=tick_after)
+    if held is not None:
+        evidence['held_input'] = held or 'none'
+    if allowed_hwnd is not None:
+        evidence['allowed_foreground_hwnd'] = allowed_hwnd
+    if quiet_wait_ms is not None:
+        evidence['quiet_wait_ms'] = quiet_wait_ms
+    error.input_guard = evidence
+    raise error
+
+
+def check_foreground_input(original, tick, restored=None, *, phase='before_activation', quiet_wait_ms=None):
+    current = foreground()
+    held = pointer_keys_down(classify=True)
+    check_input_snapshot(phase, original, current, tick, input_tick(),
+                         foreground_ok=current in (original, restored), held=held, allowed_hwnd=restored,
+                         quiet_wait_ms=quiet_wait_ms)
 
 
 def wait_for_quiet_foreground(original, tick):
-    check_foreground_input(original, tick)
+    check_foreground_input(original, tick, phase='before_quiet_wait')
     age_ms = (kernel32.GetTickCount() - tick) & 0xffffffff
     if age_ms < _FOREGROUND_QUIET_MS:
         # One bounded wait before activation. A new event or a change of
         # foreground ends this attempt; never restart the clock on user input.
         time.sleep((_FOREGROUND_QUIET_MS - age_ms) / 1000)
-        check_foreground_input(original, tick)
+        check_foreground_input(original, tick, phase='after_quiet_wait', quiet_wait_ms=_FOREGROUND_QUIET_MS - age_ms)
 
 
 def window_from_point(x, y):
@@ -1213,16 +1248,17 @@ def activate(request, *, input_checkpoint=None):
         if user32.IsIconic(binding.hwnd):
             user32.ShowWindow(binding.hwnd, 9)
             binding.check()
-            check_foreground_input(original, tick, binding.hwnd)
+            check_foreground_input(original, tick, binding.hwnd, phase='after_window_restore')
         returned = bool(user32.SetForegroundWindow(binding.hwnd))
         time.sleep(.1)
         binding.check()
-        check_foreground_input(original, tick, binding.hwnd)
+        check_foreground_input(original, tick, binding.hwnd, phase='after_activation')
         matched = root_window(foreground()) == binding.hwnd
         return {'ok': matched, 'status': 'completed' if matched else 'unavailable', 'input_dispatched': True,
                 'delivery': 'delivered_unverified', 'foreground_verified': matched, 'activation_returned': returned}
     except BridgeError as error:
-        raise BridgeError(error.code, dispatched=None) from error
+        error.dispatched = error.input_dispatched = None
+        raise
     except BaseException as error:
         raise BridgeError('activation_outcome_unknown', dispatched=None) from error
 
@@ -1282,8 +1318,9 @@ def point(request):
         binding.check()
         if uia.bounds(element) != rect or window_from_point(x, y) != hit:
             raise BridgeError('target_moved')
-        if root_window(foreground()) != fg or input_tick() != tick:
-            raise BridgeError('foreground_or_input_changed')
+        current = foreground()
+        check_input_snapshot('before_point_dispatch', fg, current, tick, input_tick(),
+                             foreground_ok=root_window(current) == fg)
         return _send_point(x, y, action)
 
 
@@ -1338,10 +1375,14 @@ def _combo_surface(binding):
     binding.check()
     if not user32.IsWindowVisible(binding.hwnd) or user32.IsIconic(binding.hwnd):
         raise BridgeError('window_not_visible')
-    if not binding.contains_window(foreground()):
-        raise BridgeError('target_not_foreground')
-    if pointer_keys_down():
-        raise BridgeError('physical_input_busy')
+    current = foreground()
+    if not binding.contains_window(current):
+        check_input_snapshot('pointer_surface', binding.hwnd, current, None, None, foreground_ok=False,
+                             diagnostic='target_not_foreground')
+    held = pointer_keys_down(classify=True)
+    if held:
+        check_input_snapshot('pointer_surface', binding.hwnd, current, None, None, foreground_ok=True, held=held,
+                             diagnostic='physical_input_busy')
 
 
 def _hit_center(binding, uia, element, *, option=False, combo=None):

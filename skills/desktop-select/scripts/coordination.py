@@ -105,6 +105,8 @@ def worker_timings(receipt, started, queue_seconds=0):
     entered = receipt.pop('_worker_entered', None)
     if isinstance(entered, (int, float)) and started <= entered <= finished:
         receipt['worker_startup_seconds'] = round(entered - started, 4)
+        from request_timing import record_span
+        record_span('worker_startup', started, entered)
     if isinstance(queue_seconds, (int, float)) and queue_seconds > 0:
         receipt['queue_seconds'] = round(queue_seconds, 3)
 

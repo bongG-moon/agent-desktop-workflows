@@ -340,8 +340,16 @@ class ResultCellTests(unittest.TestCase):
             result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
         self.uia.from_point = lambda *xy: pane
         with (patch.object(result_cell.row_action, '_input_tick', side_effect=[10, 11]),
-              self.assertRaisesRegex(win.BridgeError, 'foreground_or_input_changed')):
+              self.assertRaisesRegex(win.BridgeError, 'foreground_or_input_changed') as failure):
             result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        self.assertEqual(failure.exception.input_guard, dict(phase='before_result_double_click',
+                         signals=['input_tick_changed'], source='undetermined', expected_foreground_hwnd=self.binding.hwnd,
+                         observed_foreground_hwnd=self.binding.hwnd, last_input_tick_before=10, last_input_tick_after=11))
+        with (patch.object(win, 'foreground', return_value=98765), patch.object(win, 'root_window', side_effect=lambda hwnd:
+              98765 if hwnd == 98765 else self.binding.hwnd), self.assertRaises(win.BridgeError) as changed_window):
+            result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)
+        self.assertEqual(changed_window.exception.input_guard['signals'], ['foreground_changed'])
+        self.assertEqual(changed_window.exception.input_guard['observed_foreground_hwnd'], 98765)
         pane.box['width'] -= 1
         with self.assertRaisesRegex(win.BridgeError, 'recorded_result_surface_resized'):
             result_cell.execute_row(self.binding, self.uia, pane, lambda: None, mode='coordinate', point=point)

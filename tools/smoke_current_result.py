@@ -68,6 +68,23 @@ def check_coordinate_stops(fixture, recipe, runner, scripts, run, work):
     assert counts == (0, 0, 0) and resized.get('diagnostic') == 'recorded_result_surface_resized', resized
     assert resized['input_dispatched'] is False and 'result_review' not in resized, resized
 
+    # The query succeeds in the resized window. Only its unsent click and the
+    # opened dialog's read/close should run after restoring the original size.
+    pending, counts = call(['--set', 'Part=RESUME', '--allow-physical', '--summary'], 'query-before-resize-stop')
+    assert counts == (1, 0, 0) and pending.get('diagnostic') == 'recorded_result_surface_resized', pending
+    assert pending['stopped_at'] == 4 and pending['steps'][-1].get('receipt', pending['steps'][-1])['input_dispatched'] is False, pending
+    assert pending['next_action']['kind'] == 'resume_coordinate' and 'result_review' not in pending, pending
+    resume_args = pending['next_action']['args']
+    assert '--resume-input' in resume_args and '--allow-physical' in resume_args, pending
+    fixture.command('resize')
+    completed, counts = call(resume_args, 'unsent-coordinate-resumed')
+    assert counts == (0, 1, 1) and completed['run_id'] == pending['run_id'], completed
+    assert completed['status'] == 'verified' and completed['prior_steps_replayed'] is False, completed
+    assert 'Note for RESUME' in json.dumps(completed) and 'recorded_window_closed' in json.dumps(completed), completed
+    spent, counts = call(resume_args, 'spent-coordinate-ticket')
+    assert counts == (0, 0, 0) and spent['status'] == 'blocked' and spent['input_dispatched'] is False, spent
+    fixture.command('resize')
+
     saved = deepcopy(recipe)
     saved['steps'][3]['result_point']['window_placement'] = original
     spec = work/'coordinate-with-placement.json'
@@ -146,7 +163,7 @@ def exercise(package, work, *, coordinate=False, check_stops=False):
             if check_stops:
                 check_coordinate_stops(fixture, base, runner, scripts, run, work)
                 return
-            values = ('D124','D083','D124','D083','D124') if coordinate else ('LAB-42','LAB-73','PART-A')
+            values = ('D311','D613','D124') if coordinate else ('LAB-42','LAB-73','PART-A')
             for number, value in enumerate(values,1):
                 if not coordinate:
                     fixture.command(mode)

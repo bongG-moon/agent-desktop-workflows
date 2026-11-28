@@ -437,6 +437,11 @@ def execution_plan_info(result):
 def save_instruction(args):
     """Keep freeform source prose and its once-interpreted action in a new task."""
     source = tasks.load_task(args.task, task_directory(), allow_review=True)
+    mode = getattr(args, 'mode', None)
+    if mode == 'coordinate' or (mode is None and tasks.coordinate_request(args.text)):
+        if any(getattr(args, key, None) is not None for key in ('argument', 'target', 'role', 'within', 'wait_after', 'row')):
+            raise tasks.TaskError('invalid_coordinate_binding')
+        return save_coordinate_instruction(source, args)
     if source.get('kind') == review_drafts.KIND:
         # Ground the user's original double-click directly from the editor draft.
         # Dispatching a generic button action or surveying every other row cannot bind it.
@@ -512,6 +517,43 @@ def save_instruction(args):
         step['wait_after'] = args.wait_after
     plan['name'] = args.save_as
     tasks.save_task(plan, task_directory())
+    return dict(status='recorded', task=tasks.summary(plan), source_task=source['name'],
+                execution_plan=execution_plan_info(saved_execution_plan(plan)), input_dispatched=False)
+
+
+def save_coordinate_instruction(source, args):
+    """Save the chosen gesture from local recording evidence, even from an editor draft."""
+    directory = task_directory()
+    tasks.check_new_task(args.save_as, directory)
+    draft = source.get('kind') == review_drafts.KIND
+    sequence = [row['form'] for row in source['rows']] if draft else source['steps']
+    number = tasks._step_number(dict(steps=sequence), args.only)
+    index = number - 1
+    raw = source['rows'][index]['step'] if draft else sequence[index]
+    captured = raw.get('saved', raw)
+    import recovery
+    if handoff := recovery.missing_coordinate(source['name'], number, captured, args.text, explicit=True):
+        return handoff
+    step = tasks.interpret_step(captured, args.text, 'double-click-result', None, result_row='coordinate')
+    alias = getattr(args, 'alias', None)
+    if alias is None:
+        alias = sequence[index].get('alias')
+    if alias is not None:
+        step.pop('alias', None)
+        step.update(tasks._annotations(dict(alias=alias)))
+    rows = recovery._rows(source) if draft else None
+    if rows:
+        if rows[index].get('scope_problem'):
+            raise tasks.TaskError(rows[index]['scope_problem'], step_number=number)
+        if rows[index]['context']:
+            step['window_context'] = rows[index]['context']
+    plan = dict(schema=1, name=args.save_as, exe=source['exe'], window=source['window'],
+                steps=[row['step'] for row in rows] if rows else list(sequence))
+    plan['steps'][index] = step
+    from grounding import save_bound_copy
+    draft_receipt = save_bound_copy(source, plan, rows, number, recovery._fingerprint(source), directory)
+    if draft_receipt is not None:
+        return dict(draft_receipt, source_task=source['name'])
     return dict(status='recorded', task=tasks.summary(plan), source_task=source['name'],
                 execution_plan=execution_plan_info(saved_execution_plan(plan)), input_dispatched=False)
 
@@ -597,9 +639,9 @@ def fast_replay(plan, args, overrides):
         if len(matches) != 1:
             return None
         chosen = recipe['steps'][matches[0]]
-        if chosen['action'] == 'double-click-result':
+        if chosen['action'] == 'double-click-result' and chosen.get('result_row') != 'coordinate':
             return dict(status='blocked', diagnostic='verified_result_row_required', input_dispatched=False, steps=[])
-        if (chosen['action'] not in ('conditional-open','row-open','submit','press-key', *tasks.OBSERVE_ACTIONS)
+        if (chosen['action'] not in ('conditional-open','row-open','double-click-result','submit','press-key', *tasks.OBSERVE_ACTIONS)
                 and not chosen.get('verify_closed') and not tasks.is_double_click_step(chosen)):
             return None
         only = str(matches[0] + 1)
@@ -759,7 +801,7 @@ def _replay_recorded(plan, args, overrides, background):
         return tasks.replay(plan,args.exe,args.window,overrides,invoke,only=args.only)
 
 
-def edit_recording(owner, storage, *, report_ready=False):
+def edit_recording(owner, storage, *, report_ready=False, section=None):
     try:
         import tkinter
     except ImportError as error:
@@ -781,7 +823,7 @@ def edit_recording(owner, storage, *, report_ready=False):
     try:
         result = capture(owner, title=storage.title, initial_draft=storage.initial_rows(), initial_step=focus,
                          save_recording=storage.save_recording, save_draft=storage.save_draft,
-                         on_ready=ready if report_ready else None, locate_window=locate_window)
+                         on_ready=ready if report_ready else None, locate_window=locate_window, section=section)
     except tkinter.TclError as error:
         raise SelectionError('recording_ui_failed') from error
     if storage.saved_plan is not None:
@@ -939,6 +981,11 @@ def run(args):
         return first_trial.inspect_result(sys.modules[__name__], args.receipt)
     if args.command == 'resume-trial':
         import result_trial
+        if args.detail or args.coordinate:
+            if args.detail and args.allow_physical or any(v is not None for v in (args.point, args.column, args.value, args.row_policy)):
+                raise SelectionError('invalid_result_continuation_options')
+            return result_trial.resume_checkpoint(sys.modules[__name__], args.receipt, coordinate=args.coordinate,
+                                                  allow_physical=args.allow_physical)
         if getattr(args, 'local_result_review', False):
             if any(v is not None for v in (args.point, args.column, args.value, args.row_policy)):
                 raise SelectionError('invalid_result_review_options')
@@ -1255,13 +1302,15 @@ def parser():
     trial.add_argument('--auto-repair-frame', action='store_true',
                        help='include an approved local menu-area image only after a before-click position failure')
     trial.add_argument('--local-result-review', action='store_true', help='pick a missing recorded row position on this PC and continue the same trial')
-    inspection = commands.add_parser('inspect-trial', help='capture the still-open result window from a paused trial without sending input')
+    inspection = commands.add_parser('inspect-trial', help='observe a paused trial; capture only when result confirmation requires an image')
     inspection.add_argument('--receipt', required=True)
-    resume = commands.add_parser('resume-trial', help='continue from a unique result cell confirmed in a scoped trial image')
+    resume = commands.add_parser('resume-trial', help='continue the same trial from its result or opened detail receipt')
     resume.add_argument('--receipt', required=True)
     selection = resume.add_mutually_exclusive_group(required=True)
     selection.add_argument('--frame')
     selection.add_argument('--local-result-review', action='store_true')
+    selection.add_argument('--detail', action='store_true', help='read or close the proven opened window without replaying the query or opener')
+    selection.add_argument('--coordinate', action='store_true', help='continue the unsent recorded coordinate in the same window')
     resume.add_argument('--column')
     resume.add_argument('--value')
     resume.add_argument('--row-policy', choices=('single', 'first', 'recorded'), help='confirm visible rows without a value comparison')
@@ -1320,7 +1369,8 @@ def parser():
     edit.add_argument('--task', required=True)
     edit.add_argument('--only', required=True, help='recorded step number or alias')
     edit.add_argument('--text', required=True, help='original natural-language instruction')
-    edit.add_argument('--mode', choices=('fixed', 'required', 'recorded'))
+    edit.add_argument('--mode', choices=('fixed', 'required', 'recorded', 'coordinate'),
+                      help='coordinate uses the recorded table-relative double-click without checking row values')
     edit.add_argument('--argument', help='literal value or required parameter name')
     edit.add_argument('--alias', help='explicitly associate this name with the recorded target')
     edit.add_argument('--target', help='interpreted current-screen field or command name when recording missed it')
@@ -1383,6 +1433,9 @@ def worker(args):
     if getattr(args, 'summary', False):
         from first_trial import host_summary
         result = host_summary(result)
+    if args is not None and args.command in ('try-recording', 'resume-trial', 'replay'):
+        import request_timing
+        request_timing.receipt(result)
     print(json.dumps(result, ensure_ascii=args is not None and args.command == 'recorder'))
     return result_code(result, summary=getattr(args, 'summary', False))
 
@@ -1447,9 +1500,11 @@ def main():
             if 'menu_trial' in payload:
                 import trial_menu
                 result = trial_menu.execute(sys.modules[__name__], payload)
+            elif 'resume_checkpoint' in payload:
+                result = python_workflow.workflow_repair.continue_result(python_workflow, payload['recipe'], payload['resume_checkpoint'])
             else:
                 result = python_workflow.run(payload['recipe'], payload['overrides'], hwnd=payload.get('hwnd'),
-                                         allow_recorded_selection=True,
+                                         allow_recorded_selection=True, track_detail=payload.get('track_detail', False),
                                          background_only=payload.get('background_only', False), only=payload.get('only'),
                                          **({'result_confirmation': payload['result_confirmation']}
                                             if 'result_confirmation' in payload else {}))
@@ -1488,4 +1543,5 @@ def main():
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    import request_timing
+    raise SystemExit(request_timing.invoke(main, sys.argv[1:]))

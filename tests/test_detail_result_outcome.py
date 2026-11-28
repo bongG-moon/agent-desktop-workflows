@@ -168,6 +168,8 @@ class OwnedWindowTests(TestCase):
             return dict(status='observed', result_observation=dict(strategy='uia'), input_dispatched=False)
 
         def open_row(*args, **kwargs):
+            if not point_clear:
+                return dict(status='blocked', diagnostic='foreground_or_input_changed', input_dispatched=False)
             self.rows.append(detail)
             actions.append('double-click')
             return dict(status='delivered_unverified', diagnostic='visual_double_click_dispatched', input_dispatched=True)
@@ -199,6 +201,7 @@ class OwnedWindowTests(TestCase):
                 (flow, 'lookup_observation', dict(side_effect=read_note)), (flow.live,'execute',dict(side_effect=close))):
             self.enterContext(patch.object(module, name, **options))
 
+        point_clear = True
         opened = run('--allow-physical', '--only', '2')
         self.assertIn('next_action', opened, opened)
         args = opened['next_action']['args']
@@ -229,6 +232,28 @@ class OwnedWindowTests(TestCase):
         self.assertEqual([r['number'] for r in resumed['steps']], [3,4])
         self.assertEqual(actions[-4:], ['query', 'double-click', 'read', 'close'])
         self.assertEqual(resumed['run_id'], paused['run_id'])
+
+        self.task['steps'][1].update(result_row='coordinate', result_point=dict(x=10,y=12,width=80,height=55))
+        path.write_text(json.dumps(self.task), encoding='utf8')
+        point_clear = False
+        before = len(actions)
+        paused = run('--allow-physical', '--new-attempt')
+        self.assertEqual(actions[before:], ['query'])
+        self.assertEqual(paused['next_action']['kind'], 'resume_coordinate', paused)
+        command = paused['next_action']['args']
+        self.assertEqual(run('--allow-physical')['next_action']['args'], command)
+        self.assertEqual(run(*[v for v in command if v != '--allow-physical'])['diagnostic'],
+                         'coordinate_resume_requires_physical_consent')
+        point_clear = True
+        resumed = run(*command)
+        self.assertEqual(actions[before:], ['query', 'double-click', 'read', 'close'], resumed)
+        self.assertEqual(resumed['previously_completed_steps'], [1])
+        self.assertEqual(resumed['run_id'], paused['run_id'])
+        self.assertFalse(resumed['result_identity_verified'])
+        self.assertFalse(resumed['prior_steps_replayed'])
+        repeated = run(*command)
+        self.assertEqual((repeated['run_id'], repeated['diagnostic']), (paused['run_id'], 'result_input_resume_expired'))
+        self.assertEqual(actions[before:], ['query', 'double-click', 'read', 'close'])
 
     def test_same_title_without_owner_cannot_satisfy_the_opener(self):
         routes = window_context.WindowRoutes(self.task['steps'], self.owner, self.task['window'])
